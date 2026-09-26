@@ -403,6 +403,10 @@ pub struct PipelineInputAssemblyStateCreateInfo {
     pub s_type: i32,
     pub p_next: *const c_void,
     pub flags: u32,
+    /// ⚠️ **字段顺序必须与规范一致**：`topology` 在 `primitiveRestartEnable` **之前**。
+    /// 本项目曾把这两者写反 ⇒ 结构体从 24 字节变成 32 字节，驱动读到的 `pNext`
+    /// 变成别的字段，`vkCreateGraphicsPipelines` 直接 `STATUS_STACK_BUFFER_OVERRUN`。
+    /// 字段都是 4 字节整数时，顺序错不会报编译错误，只会让驱动读到垃圾。
     pub topology: i32,
     pub primitive_restart_enable: u32,
 }
@@ -486,7 +490,7 @@ pub struct PipelineLayoutCreateInfo {
     pub set_layout_count: u32,
     pub p_set_layouts: *const c_void,
     pub push_constant_range_count: u32,
-    pub p_push_constant_ranges: *const c_void,
+    pub p_push_constant_ranges: *const PushConstantRange,
 }
 
 #[repr(C)]
@@ -495,6 +499,17 @@ pub struct PushConstantRange {
     pub stage_flags: u32,
     pub offset: u32,
     pub size: u32,
+}
+
+/// `VkPipelineDynamicStateCreateInfo`
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PipelineDynamicStateCreateInfo {
+    pub s_type: i32,
+    pub p_next: *const c_void,
+    pub flags: u32,
+    pub dynamic_state_count: u32,
+    pub p_dynamic_states: *const i32,
 }
 
 #[repr(C)]
@@ -513,7 +528,7 @@ pub struct GraphicsPipelineCreateInfo {
     pub p_multisample_state: *const PipelineMultisampleStateCreateInfo,
     pub p_depth_stencil_state: *const c_void,
     pub p_color_blend_state: *const PipelineColorBlendStateCreateInfo,
-    pub p_dynamic_state: *const c_void,
+    pub p_dynamic_state: *const PipelineDynamicStateCreateInfo,
     pub layout: PipelineLayoutHandle,
     pub render_pass: RenderPassHandle,
     pub subpass: u32,

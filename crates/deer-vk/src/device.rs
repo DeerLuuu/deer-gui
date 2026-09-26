@@ -244,6 +244,404 @@ impl VkDevice {
     pub fn memory_type_count(&self) -> u32 {
         self.memory_type_count
     }
+
+    /// 创建一个**渲染通道**：一个颜色附件、一个子通道。
+    ///
+    /// 附件的 `initialLayout` 取 `UNDEFINED`、`finalLayout` 取 `TRANSFER_SRC_OPTIMAL` ——
+    /// 这样一帧画完就能直接回读（离屏渲染的常规做法）。
+    /// `load_op` 可配：想每帧清屏就传 `CLEAR`，想保留上一帧内容就传 `LOAD`。
+    pub fn create_render_pass(
+        &self,
+        format: i32,
+        load_op: i32,
+        final_layout: i32,
+    ) -> GpuResult<RenderPass> {
+        let attachment = vk::AttachmentDescription {
+            flags: 0,
+            format,
+            samples: vk::VK_SAMPLE_COUNT_1_BIT,
+            load_op,
+            store_op: vk::VK_ATTACHMENT_STORE_OP_STORE,
+            stencil_load_op: vk::VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            stencil_store_op: vk::VK_ATTACHMENT_STORE_OP_DONT_CARE,
+            initial_layout: vk::VK_IMAGE_LAYOUT_UNDEFINED_ATTACHMENT,
+            final_layout,
+        };
+        let color_ref = vk::AttachmentReference {
+            attachment: 0,
+            layout: vk::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+        };
+        let subpass = vk::SubpassDescription {
+            flags: 0,
+            pipeline_bind_point: vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
+            input_attachment_count: 0,
+            p_input_attachments: std::ptr::null(),
+            color_attachment_count: 1,
+            p_color_attachments: &color_ref,
+            p_resolve_attachments: std::ptr::null(),
+            p_depth_stencil_attachment: std::ptr::null(),
+            preserve_attachment_count: 0,
+            p_preserve_attachments: std::ptr::null(),
+        };
+        // 依赖：外部 → 子通道（等着色器写入完成），子通道 → 外部（保证回读前写完）
+        let deps = [
+            vk::SubpassDependency {
+                src_subpass: u32::MAX, // VK_SUBPASS_EXTERNAL
+                dst_subpass: 0,
+                src_stage_mask: vk::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                dst_stage_mask: vk::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                src_access_mask: 0,
+                dst_access_mask: vk::VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                dependency_flags: 0,
+            },
+            vk::SubpassDependency {
+                src_subpass: 0,
+                dst_subpass: u32::MAX,
+                src_stage_mask: vk::VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                dst_stage_mask: vk::VK_PIPELINE_STAGE_TRANSFER_BIT,
+                src_access_mask: vk::VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+                dst_access_mask: vk::VK_ACCESS_TRANSFER_READ_BIT,
+                dependency_flags: 0,
+            },
+        ];
+        let info = vk::RenderPassCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            attachment_count: 1,
+            p_attachments: &attachment,
+            subpass_count: 1,
+            p_subpasses: &subpass,
+            dependency_count: deps.len() as u32,
+            p_dependencies: deps.as_ptr(),
+        };
+        let mut handle: vk::RenderPassHandle = std::ptr::null_mut();
+        // SAFETY: 上述结构体都在本栈帧存活；句柄是可写输出。
+        let rc = unsafe {
+            (self.fns.create_render_pass)(self.handle, &info, std::ptr::null(), &mut handle)
+        };
+        if rc != ffi::VK_SUCCESS {
+            return Err(GpuError::Driver {
+                code: rc,
+                message: format!("vkCreateRenderPass 失败：{}", vk_result_name(rc)),
+            });
+        }
+        Ok(RenderPass {
+            handle,
+            device: self.handle,
+            destroy: self.fns.destroy_render_pass,
+        })
+    }
+
+    /// 创建管线布局。
+    ///
+    /// 推送常量的 `size` 必须是 4 的倍数。**注意范围大小与实际 push 的大小要一致** ——
+    /// 不匹配是那种「能建成功但运行时行为诡异」的错误。
+    pub fn create_pipeline_layout(
+        &self,
+        push_constant: Option<(u32, u32, u32)>,
+    ) -> GpuResult<PipelineLayout> {
+        let range = push_constant.map(|(stage_flags, offset, size)| vk::PushConstantRange {
+            stage_flags,
+            offset,
+            size,
+        });
+        if let Some(r) = &range {
+            if r.size % 4 != 0 {
+                return Err(GpuError::Unsupported(format!(
+                    "推送常量大小必须是 4 的倍数，实际 {}",
+                    r.size
+                )));
+            }
+        }
+        let info = vk::PipelineLayoutCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            set_layout_count: 0,
+            p_set_layouts: std::ptr::null(),
+            push_constant_range_count: if range.is_some() { 1 } else { 0 },
+            p_push_constant_ranges: range.as_ref().map_or(std::ptr::null(), |r| r),
+        };
+        let mut handle: vk::PipelineLayoutHandle = std::ptr::null_mut();
+        // SAFETY: 结构体在栈上存活；句柄是可写输出。
+        let rc = unsafe {
+            (self.fns.create_pipeline_layout)(self.handle, &info, std::ptr::null(), &mut handle)
+        };
+        if rc != ffi::VK_SUCCESS {
+            return Err(GpuError::Driver {
+                code: rc,
+                message: format!("vkCreatePipelineLayout 失败：{}", vk_result_name(rc)),
+            });
+        }
+        Ok(PipelineLayout {
+            handle,
+            device: self.handle,
+            destroy: self.fns.destroy_pipeline_layout,
+        })
+    }
+
+    /// 创建一个**图形管线**（单颜色附件、无顶点输入、动态 viewport/scissor、alpha 混合开）。
+    ///
+    /// **这是 SPIR-V 的真正验收关**：`vkCreateShaderModule` 很宽容（实测连 `bound = 0`
+    /// 都接受），而 `vkCreateGraphicsPipelines` 会把两个阶段**链接并与管线状态校验**，
+    /// 因此它拒绝就意味着着色器或状态真的有问题。
+    pub fn create_graphics_pipeline(
+        &self,
+        vs: &ShaderModule,
+        fs: &ShaderModule,
+        layout: &PipelineLayout,
+        render_pass: &RenderPass,
+    ) -> GpuResult<Pipeline> {
+        let entry = c"main";
+        let stages = [
+            vk::PipelineShaderStageCreateInfo {
+                s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                p_next: std::ptr::null(),
+                flags: 0,
+                stage: vk::VK_SHADER_STAGE_VERTEX_BIT,
+                module: vs.handle(),
+                p_name: entry.as_ptr(),
+                p_specialization_info: std::ptr::null(),
+            },
+            vk::PipelineShaderStageCreateInfo {
+                s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                p_next: std::ptr::null(),
+                flags: 0,
+                stage: vk::VK_SHADER_STAGE_FRAGMENT_BIT,
+                module: fs.handle(),
+                p_name: entry.as_ptr(),
+                p_specialization_info: std::ptr::null(),
+            },
+        ];
+        self.create_graphics_pipeline_raw(&stages, layout, render_pass)
+    }
+
+    /// 用**显式给定**的阶段列表建管线。
+    ///
+    /// 存在的理由：① 支持非「顶点+片段」的组合（未来加几何/细分阶段）；
+    /// ② 让测试能构造**非法**阶段组合，从而验证驱动确实在校验
+    /// （没有这条，「建成功」的结论就无法排除「驱动什么都没检查」）。
+    pub fn create_graphics_pipeline_raw(
+        &self,
+        stages: &[vk::PipelineShaderStageCreateInfo],
+        layout: &PipelineLayout,
+        render_pass: &RenderPass,
+    ) -> GpuResult<Pipeline> {
+        if stages.is_empty() {
+            return Err(GpuError::Unsupported(
+                "图形管线至少要有一个着色器阶段".to_string(),
+            ));
+        }
+        // 顶点完全由着色器内的常量表 + 推送常量决定 ⇒ 无需顶点缓冲/属性
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            vertex_binding_description_count: 0,
+            p_vertex_binding_descriptions: std::ptr::null(),
+            vertex_attribute_description_count: 0,
+            p_vertex_attribute_descriptions: std::ptr::null(),
+        };
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            topology: vk::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+            primitive_restart_enable: vk::VK_FALSE,
+        };
+        // viewport/scissor 用**动态状态**：`count = 1` 但指针为空是合法的，因为值由
+        // `vkCmdSetViewport` / `vkCmdSetScissor` 在录制时给。这对 GUI 渲染很关键
+        // （每帧尺寸都可能变，不该重建管线）。
+        let viewport_state = vk::PipelineViewportStateCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            viewport_count: 1,
+            p_viewports: std::ptr::null(),
+            scissor_count: 1,
+            p_scissors: std::ptr::null(),
+        };
+        let dynamic_states = [vk::VK_DYNAMIC_STATE_VIEWPORT, vk::VK_DYNAMIC_STATE_SCISSOR];
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo {
+            s_type: 27, // VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO
+            p_next: std::ptr::null(),
+            flags: 0,
+            dynamic_state_count: dynamic_states.len() as u32,
+            p_dynamic_states: dynamic_states.as_ptr(),
+        };
+        let raster = vk::PipelineRasterizationStateCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            depth_clamp_enable: vk::VK_FALSE,
+            rasterizer_discard_enable: vk::VK_FALSE,
+            polygon_mode: vk::VK_POLYGON_MODE_FILL,
+            cull_mode: vk::VK_CULL_MODE_NONE, // GUI 不做背面剔除（矩形两个朝向都可能）
+            front_face: vk::VK_FRONT_FACE_COUNTER_CLOCKWISE,
+            depth_bias_enable: vk::VK_FALSE,
+            depth_bias_constant_factor: 0.0,
+            depth_bias_clamp: 0.0,
+            depth_bias_slope_factor: 0.0,
+            line_width: 1.0,
+        };
+        let multisample = vk::PipelineMultisampleStateCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            rasterization_samples: vk::VK_SAMPLE_COUNT_1_BIT,
+            sample_shading_enable: vk::VK_FALSE,
+            min_sample_shading: 1.0,
+            p_sample_mask: std::ptr::null(),
+            alpha_to_coverage_enable: vk::VK_FALSE,
+            alpha_to_one_enable: vk::VK_FALSE,
+        };
+        // 标准 alpha 混合：GUI 有半透明面板，必须开
+        let blend_attachment = vk::PipelineColorBlendAttachmentState {
+            blend_enable: vk::VK_TRUE,
+            src_color_blend_factor: vk::VK_BLEND_FACTOR_SRC_ALPHA,
+            dst_color_blend_factor: vk::VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+            color_blend_op: vk::VK_BLEND_OP_ADD,
+            src_alpha_blend_factor: vk::VK_BLEND_FACTOR_ONE,
+            dst_alpha_blend_factor: vk::VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
+            alpha_blend_op: vk::VK_BLEND_OP_ADD,
+            color_write_mask: vk::VK_COLOR_COMPONENT_RGBA_BITS,
+        };
+        let color_blend = vk::PipelineColorBlendStateCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            logic_op_enable: vk::VK_FALSE,
+            logic_op: vk::VK_LOGIC_OP_COPY,
+            attachment_count: 1,
+            p_attachments: &blend_attachment,
+            blend_constants: [0.0; 4],
+        };
+        let info = vk::GraphicsPipelineCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            stage_count: stages.len() as u32,
+            p_stages: stages.as_ptr(),
+            p_vertex_input_state: &vertex_input,
+            p_input_assembly_state: &input_assembly,
+            p_tessellation_state: std::ptr::null(),
+            p_viewport_state: &viewport_state,
+            p_rasterization_state: &raster,
+            p_multisample_state: &multisample,
+            p_depth_stencil_state: std::ptr::null(),
+            p_color_blend_state: &color_blend,
+            p_dynamic_state: &dynamic_state,
+            layout: layout.handle(),
+            render_pass: render_pass.handle(),
+            subpass: 0,
+            base_pipeline_handle: std::ptr::null_mut(),
+            base_pipeline_index: -1,
+        };
+        let mut handle: vk::PipelineHandle = std::ptr::null_mut();
+        // SAFETY: 上述结构体与数组都在本栈帧存活；`handle` 是可写输出。
+        // pipelineCache 传空（合法）；一次只建一个。
+        let rc = unsafe {
+            (self.fns.create_graphics_pipelines)(
+                self.handle,
+                std::ptr::null_mut(),
+                1,
+                &info,
+                std::ptr::null(),
+                &mut handle,
+            )
+        };
+        if rc != ffi::VK_SUCCESS {
+            return Err(GpuError::Driver {
+                code: rc,
+                message: format!(
+                    "vkCreateGraphicsPipelines 失败（{}）⇒ 着色器或管线状态有问题",
+                    vk_result_name(rc)
+                ),
+            });
+        }
+        if handle.is_null() {
+            // 驱动返回成功却没写输出参数 —— 这类情况几乎总是「我们给的结构体与驱动理解的不一致」。
+            return Err(GpuError::Driver {
+                code: rc,
+                message: "vkCreateGraphicsPipelines 返回成功但管线句柄为空（结构体或参数不符）".to_string(),
+            });
+        }
+        Ok(Pipeline {
+            handle,
+            device: self.handle,
+            destroy: self.fns.destroy_pipeline,
+        })
+    }
+}
+
+/// 一个渲染通道。`Drop` 时销毁。
+pub struct RenderPass {
+    handle: vk::RenderPassHandle,
+    device: vk::DeviceHandle,
+    destroy: vk::PfnDestroyRenderPass,
+}
+
+impl RenderPass {
+    pub fn handle(&self) -> vk::RenderPassHandle {
+        self.handle
+    }
+}
+
+impl Drop for RenderPass {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            // SAFETY: 句柄由本设备创建且未销毁；设备此时仍存活。
+            unsafe { (self.destroy)(self.device, self.handle, std::ptr::null()) };
+            self.handle = std::ptr::null_mut();
+        }
+    }
+}
+
+/// 一个管线布局。`Drop` 时销毁。
+pub struct PipelineLayout {
+    handle: vk::PipelineLayoutHandle,
+    device: vk::DeviceHandle,
+    destroy: vk::PfnDestroyPipelineLayout,
+}
+
+impl PipelineLayout {
+    pub fn handle(&self) -> vk::PipelineLayoutHandle {
+        self.handle
+    }
+}
+
+impl Drop for PipelineLayout {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            // SAFETY: 同上。
+            unsafe { (self.destroy)(self.device, self.handle, std::ptr::null()) };
+            self.handle = std::ptr::null_mut();
+        }
+    }
+}
+
+/// 一个图形管线。`Drop` 时销毁。
+pub struct Pipeline {
+    handle: vk::PipelineHandle,
+    device: vk::DeviceHandle,
+    destroy: vk::PfnDestroyPipeline,
+}
+
+impl Pipeline {
+    pub fn handle(&self) -> vk::PipelineHandle {
+        self.handle
+    }
+}
+
+impl Drop for Pipeline {
+    fn drop(&mut self) {
+        if !self.handle.is_null() {
+            // SAFETY: 同上。
+            unsafe { (self.destroy)(self.device, self.handle, std::ptr::null()) };
+            self.handle = std::ptr::null_mut();
+        }
+    }
 }
 
 impl Drop for VkDevice {

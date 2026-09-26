@@ -33,6 +33,7 @@ const OP_ENTRY_POINT: u16 = 15;
 const OP_EXECUTION_MODE: u16 = 16;
 const OP_CAPABILITY: u16 = 17;
 const OP_TYPE_VOID: u16 = 19;
+const OP_TYPE_BOOL: u16 = 20;
 const OP_TYPE_INT: u16 = 21;
 const OP_TYPE_FLOAT: u16 = 22;
 const OP_TYPE_VECTOR: u16 = 23;
@@ -51,6 +52,11 @@ const OP_ACCESS_CHAIN: u16 = 65;
 const OP_DECORATE: u16 = 71;
 const OP_MEMBER_DECORATE: u16 = 72;
 const OP_COMPOSITE_EXTRACT: u16 = 81;
+const OP_BITWISE_AND: u16 = 194;
+const OP_CONVERT_U_TO_F: u16 = 112;
+const OP_U_DIV: u16 = 134;
+const OP_I_EQUAL: u16 = 170;
+const OP_SELECT: u16 = 169;
 const OP_F_ADD: u16 = 129;
 const OP_F_SUB: u16 = 131;
 const OP_F_MUL: u16 = 133;
@@ -67,10 +73,8 @@ pub const SC_PUSH_CONSTANT: u32 = 9;
 
 // ── 装饰（SPIR-V 3.6 Decoration） ────────────────────────────────────────────
 
-const DECORATION_BLOCK: u32 = 2;
 const DECORATION_BUILT_IN: u32 = 11;
 const DECORATION_LOCATION: u32 = 30;
-const DECORATION_OFFSET: u32 = 35;
 
 // ── 内建量与执行模型 ─────────────────────────────────────────────────────────
 
@@ -184,6 +188,7 @@ impl Module {
         self.op(OP_DECORATE, &ops)
     }
 
+    #[allow(dead_code)]
     pub fn member_decorate(&mut self, ty: u32, member: u32, decoration: u32, params: &[u32]) -> &mut Module {
         let mut ops = vec![ty, member, decoration];
         ops.extend_from_slice(params);
@@ -330,6 +335,45 @@ impl Module {
         r
     }
 
+    /// `OpBitwiseAnd`
+    pub fn bitwise_and(&mut self, ty: u32, a: u32, b: u32) -> u32 {
+        let r = self.id();
+        self.op(OP_BITWISE_AND, &[ty, r, a, b]);
+        r
+    }
+
+    pub fn type_bool(&mut self) -> u32 {
+        let r = self.id();
+        self.op(OP_TYPE_BOOL, &[r]);
+        r
+    }
+
+    /// `OpIEqual`
+    pub fn op_i_equal(&mut self, bool_ty: u32, a: u32, b: u32) -> u32 {
+        let r = self.id();
+        self.op(OP_I_EQUAL, &[bool_ty, r, a, b]);
+        r
+    }
+
+    /// `OpSelect`
+    pub fn op_select(&mut self, ty: u32, cond: u32, true_val: u32, false_val: u32) -> u32 {
+        let r = self.id();
+        self.op(OP_SELECT, &[ty, r, cond, true_val, false_val]);
+        r
+    }
+
+    /// `OpUDiv`（无符号整数除法）
+    pub fn op_udiv(&mut self, ty: u32, result: u32, a: u32, b: u32) -> &mut Module {
+        self.op(OP_U_DIV, &[ty, result, a, b])
+    }
+
+    /// `OpConvertUToF`（无符号整数 → 浮点）
+    pub fn convert_u_to_f(&mut self, ty: u32, value: u32) -> u32 {
+        let r = self.id();
+        self.op(OP_CONVERT_U_TO_F, &[ty, r, value]);
+        r
+    }
+
     pub fn return_void(&mut self) -> &mut Module {
         self.op(OP_RETURN, &[])
     }
@@ -355,11 +399,110 @@ impl Module {
 
 // ── 着色器 ───────────────────────────────────────────────────────────────────
 
+/// 最小顶点着色器：**空 `main`**，不声明任何变量。
+///
+/// 用途：诊断。如果连它建管线都崩，那问题不在 SPIR-V 内容，而在管线状态或模块句柄。
+pub fn vertex_shader_empty() -> Vec<u8> {
+    let mut m = Module::new();
+    m.shader_capability().memory_model_glsl450().source_unknown();
+    let void = m.type_void();
+    let fn_ty = m.type_function(void, &[]);
+    let fn_id = m.id();
+    let block = m.id();
+    m.entry_point(EXECUTION_MODEL_VERTEX, fn_id, "main", &[]);
+    m.function(void, fn_id, fn_ty, block);
+    m.return_void();
+    m.function_end();
+    m.finish()
+}
+
+/// 最小片段着色器：**空 `main`**，不写任何输出。
+pub fn fragment_shader_empty() -> Vec<u8> {
+    let mut m = Module::new();
+    m.shader_capability().memory_model_glsl450().source_unknown();
+    let void = m.type_void();
+    let fn_ty = m.type_function(void, &[]);
+    let fn_id = m.id();
+    let block = m.id();
+    m.entry_point(EXECUTION_MODEL_FRAGMENT, fn_id, "main", &[]);
+    m.execution_mode(fn_id, EXECUTION_MODE_ORIGIN_UPPER_LEFT, &[]);
+    m.function(void, fn_id, fn_ty, block);
+    m.return_void();
+    m.function_end();
+    m.finish()
+}
+
+/// 诊断用：写一个**常量** `gl_Position`（不用 `gl_VertexIndex`、不用数组）。
+pub fn vertex_shader_const_position() -> Vec<u8> {
+    let mut m = Module::new();
+    m.shader_capability().memory_model_glsl450().source_unknown();
+    let void = m.type_void();
+    let f32_ty = m.type_float();
+    let v4 = m.type_vector(f32_ty, 4);
+    let ptr_out_v4 = m.type_pointer(SC_OUTPUT, v4);
+    let fn_ty = m.type_function(void, &[]);
+    let out_pos = m.variable(ptr_out_v4, SC_OUTPUT);
+    let x = m.constant_f32(f32_ty, 0.0);
+    let y = m.constant_f32(f32_ty, 0.0);
+    let z = m.constant_f32(f32_ty, 0.0);
+    let w = m.constant_f32(f32_ty, 1.0);
+    let pos = m.constant_composite(v4, &[x, y, z, w]);
+    let fn_id = m.id();
+    let block = m.id();
+    m.entry_point(EXECUTION_MODEL_VERTEX, fn_id, "main", &[out_pos]);
+    m.debug_name(out_pos, "gl_Position");
+    m.decorate(out_pos, DECORATION_BUILT_IN, &[BUILTIN_POSITION]);
+    m.function(void, fn_id, fn_ty, block);
+    m.store(out_pos, pos);
+    m.return_void();
+    m.function_end();
+    m.finish()
+}
+
+/// 诊断用：读 `gl_VertexIndex` 但不索引数组（只是把它当标量用不到的地方）。
+pub fn vertex_shader_reads_vertex_index() -> Vec<u8> {
+    let mut m = Module::new();
+    m.shader_capability().memory_model_glsl450().source_unknown();
+    let void = m.type_void();
+    let f32_ty = m.type_float();
+    let u32_ty = m.type_uint();
+    let v4 = m.type_vector(f32_ty, 4);
+    let ptr_out_v4 = m.type_pointer(SC_OUTPUT, v4);
+    let ptr_in_u32 = m.type_pointer(SC_INPUT, u32_ty);
+    let fn_ty = m.type_function(void, &[]);
+    let out_pos = m.variable(ptr_out_v4, SC_OUTPUT);
+    let in_index = m.variable(ptr_in_u32, SC_INPUT);
+    let x = m.constant_f32(f32_ty, 0.0);
+    let y = m.constant_f32(f32_ty, 0.0);
+    let z = m.constant_f32(f32_ty, 0.0);
+    let w = m.constant_f32(f32_ty, 1.0);
+    let pos = m.constant_composite(v4, &[x, y, z, w]);
+    let fn_id = m.id();
+    let block = m.id();
+    m.entry_point(EXECUTION_MODEL_VERTEX, fn_id, "main", &[out_pos, in_index]);
+    m.debug_name(out_pos, "gl_Position");
+    m.decorate(out_pos, DECORATION_BUILT_IN, &[BUILTIN_POSITION]);
+    m.debug_name(in_index, "gl_VertexIndex");
+    m.decorate(in_index, DECORATION_BUILT_IN, &[BUILTIN_VERTEX_INDEX]);
+    m.function(void, fn_id, fn_ty, block);
+    let _idx = m.load(u32_ty, in_index); // 读出来，但不使用它的值
+    m.store(out_pos, pos);
+    m.return_void();
+    m.function_end();
+    m.finish()
+}
+
 /// 顶点着色器（三角形）：把 3 个 NDC 顶点写进 `gl_Position`。
 ///
-/// 顶点取自常量数组，按 `gl_VertexIndex` 选一个 ⇒ **不需要顶点缓冲**，
-/// 只要一条 `vkCmdDraw(3,1,0,0)`。这样「管线能否跑通」与「缓冲/内存管理是否正确」
-/// 是两个可分开定位的问题。
+/// ## ⚠️ 这里为什么不用常量数组索引（一个实测教训）
+///
+/// 早期版本把 3 个顶点放进 `OpConstantComposite` 数组，再用 `gl_VertexIndex`
+/// 做**运行时索引**（`OpAccessChain`）。实测：**驱动在编译期直接崩**
+/// （`STATUS_STACK_BUFFER_OVERRUN`），而 `vkCreateShaderModule` 明明接受了它
+/// —— 因为驱动建模块时只存字节，**建管线时才真正编译**。
+///
+/// 改成本实现：用 `gl_VertexIndex` 做 `OpSelect` 逐分量选，**没有任何动态索引**。
+/// 顶点仍是编译期常量（数组元素本身是常量），只是选择过程在运行时。
 pub fn vertex_shader_triangle(positions_ndc: [[f32; 2]; 3]) -> Vec<u8> {
     let mut m = Module::new();
     m.shader_capability().memory_model_glsl450().source_unknown();
@@ -367,25 +510,29 @@ pub fn vertex_shader_triangle(positions_ndc: [[f32; 2]; 3]) -> Vec<u8> {
     let void = m.type_void();
     let f32_ty = m.type_float();
     let u32_ty = m.type_uint();
+    let bool_ty = m.type_bool();
     let v2 = m.type_vector(f32_ty, 2);
     let v4 = m.type_vector(f32_ty, 4);
     let ptr_out_v4 = m.type_pointer(SC_OUTPUT, v4);
     let ptr_in_u32 = m.type_pointer(SC_INPUT, u32_ty);
-    let len3 = m.constant_u32(u32_ty, 3);
-    let arr3 = m.type_array(v2, len3);
     let fn_ty = m.type_function(void, &[]);
 
     let out_pos = m.variable(ptr_out_v4, SC_OUTPUT);
     let in_index = m.variable(ptr_in_u32, SC_INPUT);
 
-    let mut corners = Vec::new();
+    // 三个顶点的分量常量
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
     for p in positions_ndc {
-        let x = m.constant_f32(f32_ty, p[0]);
-        let y = m.constant_f32(f32_ty, p[1]);
-        corners.push(m.constant_composite(v2, &[x, y]));
+        xs.push(m.constant_f32(f32_ty, p[0]));
+        ys.push(m.constant_f32(f32_ty, p[1]));
     }
-    let table = m.constant_composite(arr3, &corners);
-
+    // 角点逐分量选择：i0 = 0，故 i1 = (i0 == 1)，i2 = (i0 == 2)
+    let k0 = m.constant_u32(u32_ty, 0);
+    let k1 = m.constant_u32(u32_ty, 1);
+    let k2 = m.constant_u32(u32_ty, 2);
+    let b_ty = m.type_pointer(SC_FUNCTION, bool_ty);
+    let _ = b_ty;
     let z0 = m.constant_f32(f32_ty, 0.0);
     let w1 = m.constant_f32(f32_ty, 1.0);
 
@@ -399,13 +546,19 @@ pub fn vertex_shader_triangle(positions_ndc: [[f32; 2]; 3]) -> Vec<u8> {
 
     m.function(void, fn_id, fn_ty, block);
     let idx = m.load(u32_ty, in_index);
-    let ptr_fn_v2 = m.type_pointer(SC_FUNCTION, v2);
-    let p = m.access_chain(ptr_fn_v2, table, &[idx]);
-    let corner = m.load(v2, p);
-    let pos4 = m.constant_composite(v4, &[corner, z0, w1]);
+    // 逐分量选：从顶点 0 出发，依次「若 idx==k 则换成顶点 k」
+    let mut cur_x = xs[0];
+    let mut cur_y = ys[0];
+    for k in 1..3 {
+        let cond = m.op_i_equal(bool_ty, idx, if k == 1 { k1 } else { k2 });
+        cur_x = m.op_select(f32_ty, cond, xs[k], cur_x);
+        cur_y = m.op_select(f32_ty, cond, ys[k], cur_y);
+    }
+    let pos4 = m.constant_composite(v4, &[cur_x, cur_y, z0, w1]);
     m.store(out_pos, pos4);
     m.return_void();
     m.function_end();
+    let _ = (k0, v2);
     m.finish()
 }
 
@@ -441,14 +594,31 @@ pub fn fragment_shader_solid(color: [f32; 4]) -> Vec<u8> {
     m.finish()
 }
 
-/// 顶点着色器（**推送常量矩形**）：用一条 `vkCmdPushConstants` 传入矩形边界，
-/// 画 6 个顶点（两个三角形）覆盖它。
+/// 顶点着色器（**推送常量矩形**）—— ⚠️ **实验性，当前在 Intel 驱动上不可用**。
 ///
-/// 推送常量是 GUI 渲染的关键手段：**不必为每个矩形建/改顶点缓冲**，
-/// 每个矩形只需一次 push（开销远小于重建缓冲）。真实 GUI 渲染器普遍这么做。
+/// ## 状态：已知不工作（不要用它建管线）
 ///
-/// 推送常量块的布局：`{ vec4 bounds }`，其中
-/// `bounds = (left_ndc, top_ndc, right_ndc, bottom_ndc)`。
+/// 实测（Intel RaptorLake，Vulkan 1.4.309）：用这支着色器建图形管线时，
+/// `vkCreateGraphicsPipelines` **要么返回成功但不写管线句柄（空句柄）、要么直接
+/// `STATUS_ACCESS_VIOLATION`**。试过三种推送常量写法都不行：
+///
+/// 1. `{vec4}` struct + `Block` + `OpAccessChain` 取成员 → 返回成功、句柄为空
+/// 2. 同一个 struct，改为直接 `OpLoad` 整个 Block → 返回成功、句柄为空
+/// 3. 直接声明为 `vec4`（不加 Block）→ 访问违例
+///
+/// `vkCreateShaderModule` 对三种写法**都接受** —— 再次印证「建模块时的校验极弱，
+/// 真正编译发生在建管线时」。
+///
+/// ## 对 M2a 的影响与后续方案
+///
+/// M2a-3 的验收（**图形管线能建成功**）已由不带推送常量的着色器达成：
+/// `vertex_shader_empty` / `vertex_shader_const_position` / `vertex_shader_triangle`。
+/// 所以**不阻塞** M2a-4..6（命令缓冲 / 离屏渲染 / 回读）。
+///
+/// 矩形绘制后续改为**顶点缓冲**方案（每个矩形 6 个顶点上传到缓冲）——
+/// 那是标准做法、不依赖推送常量，代价是每矩形一次缓冲写。等 M2a 出图后再做。
+///
+/// 保留本函数是为了：① 记录这条实测教训；② 后续换驱动/换写法时有个起点。
 pub fn vertex_shader_rect_pushconstant() -> Vec<u8> {
     let mut m = Module::new();
     m.shader_capability().memory_model_glsl450().source_unknown();
@@ -456,46 +626,26 @@ pub fn vertex_shader_rect_pushconstant() -> Vec<u8> {
     let void = m.type_void();
     let f32_ty = m.type_float();
     let u32_ty = m.type_uint();
-    let v2 = m.type_vector(f32_ty, 2);
     let v4 = m.type_vector(f32_ty, 4);
     let ptr_out_v4 = m.type_pointer(SC_OUTPUT, v4);
     let ptr_in_u32 = m.type_pointer(SC_INPUT, u32_ty);
     let ptr_pc_v4 = m.type_pointer(SC_PUSH_CONSTANT, v4);
-    let ptr_fn_v4 = m.type_pointer(SC_FUNCTION, v4);
-    let ptr_fn_v2 = m.type_pointer(SC_FUNCTION, v2);
-    let len6 = m.constant_u32(u32_ty, 6);
-    let arr6 = m.type_array(v2, len6);
-    let fn_ty = m.type_function(void, &[]);
+    let _ = ptr_pc_v4;    let fn_ty = m.type_function(void, &[]);
 
-    // 推送常量块：一个 vec4 成员，偏移 0，标记为 Block
-    let pc_struct = m.type_struct(&[v4]);
-    m.member_decorate(pc_struct, 0, DECORATION_OFFSET, &[0]);
-    m.decorate(pc_struct, DECORATION_BLOCK, &[]);
+    // 推送常量：**直接声明为 vec4**（不加 Block）。
+    // 规范允许把推送常量块声明成「单个标量/向量」；实测这样做驱动才接受，
+    // 而声明成 `{vec4}` struct + Block 会让 `vkCreateGraphicsPipelines`
+    // **返回成功却不写管线句柄**（空句柄 —— 最容易被忽略的失败方式）。
+    let ptr_pc_v4 = m.type_pointer(SC_PUSH_CONSTANT, v4);
     let pc_var = m.variable(ptr_pc_v4, SC_PUSH_CONSTANT);
 
     let out_pos = m.variable(ptr_out_v4, SC_OUTPUT);
     let in_index = m.variable(ptr_in_u32, SC_INPUT);
 
-    // 6 个角点（单位正方形，两个三角形）：(0,0)(1,0)(0,1) (0,1)(1,0)(1,1)
-    let unit = [
-        [0.0f32, 0.0f32],
-        [1.0, 0.0],
-        [0.0, 1.0],
-        [0.0, 1.0],
-        [1.0, 0.0],
-        [1.0, 1.0],
-    ];
-    let mut corners = Vec::new();
-    for p in unit {
-        let x = m.constant_f32(f32_ty, p[0]);
-        let y = m.constant_f32(f32_ty, p[1]);
-        corners.push(m.constant_composite(v2, &[x, y]));
-    }
-    let table = m.constant_composite(arr6, &corners);
-
-    let i0 = m.constant_u32(u32_ty, 0);
-    let z0 = m.constant_f32(f32_ty, 0.0);
-    let w1 = m.constant_f32(f32_ty, 1.0);
+    let k0 = m.constant_u32(u32_ty, 0);
+    let k1 = m.constant_u32(u32_ty, 1);
+    let f0 = m.constant_f32(f32_ty, 0.0);
+    let f1 = m.constant_f32(f32_ty, 1.0);
 
     let fn_id = m.id();
     let block = m.id();
@@ -508,29 +658,34 @@ pub fn vertex_shader_rect_pushconstant() -> Vec<u8> {
     m.function(void, fn_id, fn_ty, block);
     // idx = gl_VertexIndex
     let idx = m.load(u32_ty, in_index);
-    // corner = unit[idx]  ⇒ (u, v) ∈ {0,1}²
-    let cp = m.access_chain(ptr_fn_v2, table, &[idx]);
-    let corner = m.load(v2, cp);
-    let u = m.composite_extract(f32_ty, corner, &[0]);
-    let v = m.composite_extract(f32_ty, corner, &[1]);
-    // bounds = push constant vec4 ⇒ (x0, y0, x1, y1)
-    let bp = m.access_chain(ptr_fn_v4, pc_var, &[i0]);
-    let bounds = m.load(v4, bp);
+    // x_bit = idx & 1 ; y_bit = (idx >> 1) & 1
+    let x_bit = m.bitwise_and(u32_ty, idx, k1);
+    // 用整数除法当右移（避免再引入移位操作码）：idx / 2
+    let two = m.constant_u32(u32_ty, 2);
+    let half = m.id();
+    m.op_udiv(u32_ty, half, idx, two);
+    let y_bit = m.bitwise_and(u32_ty, half, k1);
+    // 0/1 → 0.0/1.0
+    let xf = m.convert_u_to_f(f32_ty, x_bit);
+    let yf = m.convert_u_to_f(f32_ty, y_bit);
+
+    // bounds = 推送常量（一个 vec4）⇒ (x0, y0, x1, y1)
+    let bounds = m.load(v4, pc_var);
     let x0 = m.composite_extract(f32_ty, bounds, &[0]);
     let y0 = m.composite_extract(f32_ty, bounds, &[1]);
     let x1 = m.composite_extract(f32_ty, bounds, &[2]);
     let y1 = m.composite_extract(f32_ty, bounds, &[3]);
-    // pos = (x0 + (x1 - x0) * u, y0 + (y1 - y0) * u_or_v)
     let dx = m.f_sub(f32_ty, x1, x0);
     let dy = m.f_sub(f32_ty, y1, y0);
-    let px = m.f_mul(f32_ty, dx, u);
-    let py = m.f_mul(f32_ty, dy, v);
+    let px = m.f_mul(f32_ty, dx, xf);
+    let py = m.f_mul(f32_ty, dy, yf);
     let fx = m.f_add(f32_ty, x0, px);
     let fy = m.f_add(f32_ty, y0, py);
-    let pos4 = m.constant_composite(v4, &[fx, fy, z0, w1]);
+    let pos4 = m.constant_composite(v4, &[fx, fy, f0, f1]);
     m.store(out_pos, pos4);
     m.return_void();
     m.function_end();
+    let _ = k0;
     m.finish()
 }
 
