@@ -10,7 +10,7 @@
 > ### 🚀 第一次用？看这三份文档
 > | 文档 | 用途 |
 > |---|---|
-> | [**教程**](docs/TUTORIAL.md) | 一步一步，12 节（§0–§11），每节可独立运行 |
+> | [**教程**](docs/TUTORIAL.md) | 一步一步，13 节（§0–§12），每节可独立运行 |
 > | [**功能清单**](FEATURES.md) | **有哪些功能、做到哪一步、哪些还不能** ← 唯一真相 |
 > | [**逐功能指南**](docs/features/) | 某个功能的完整用法与坑 |
 >
@@ -24,16 +24,21 @@
 > **维护约定**：新增功能时**必须同时**加示例 + 加指南 + 登记 `FEATURES.md`
 > （缺一不算完成）。理由见 `FEATURES.md` 结尾 —— M1 交付后曾出现「库能跑但没人知道怎么用」。
 
-## 现状（里程碑 M1 完成；M2a / M4 进行中）
+## 现状（里程碑 M1、M2 完成；M4 进行中）
 
 | 项 | 状态 |
 |---|---|
 | `deer-layout`：节点树 + 布局代数 + 命中测试 + `.dui` 解析 | ✅ **24 条断言全绿**（18 布局不变量 + 5 FFI 布局 + 1 忽略） |
 | `deer-gpu`：GPU HAL + CPU 参考后端（软件光栅化） | ✅ 类型与契约就位；CPU 后端能把绘制列表渲成像素，**并能贴真实字形（离屏）** |
-| `deer-vk`：Vulkan 后端（**自己声明符号 + 运行时动态加载**） | ✅ **真机枚举到 2 个 GPU**（Intel RaptorLake / NVIDIA RTX 5070 Ti, Vulkan 1.4.341） |
-| 窗口 / 交换链 / 呈现 | ⬜ 里程碑 M2b（要先定窗口方案 Q-1） |
+| `deer-vk`：Vulkan 后端（**自己声明符号 + 运行时动态加载**） | ✅ **真机枚举到 2 个 GPU**（Intel RaptorLake / NVIDIA RTX 5070 Ti, Vulkan 1.4.341）；设备/管线/离屏回读（M2a）+ surface/交换链/呈现（M2b） |
+| `deer-window`：窗口层（winit） | ✅ 真窗口 + 事件循环（**仅 Windows**）；**本 workspace 唯一第三方依赖**，登记在 `ROADMAP.md` Q-1 |
+| **窗口上屏**（surface + 交换链 + 帧同步 + 呈现） | ✅ 里程碑 M2b；窗口里是 GPU 清屏色 + 几何（**还不是界面**） |
 | 真实字形（字体解析 + 光栅化 + 图集 + 真实度量/换行） | 🔄 **离屏 CPU 已能出真字**（M4-1..5）；**GPU 侧文本**与 hinting/亚像素未做 |
 | dock（可停靠面板布局） | ⬜ 里程碑 M5 |
+
+> **依赖口径**：除窗口层 `deer-window` 的 `winit`（登记在 `ROADMAP.md` Q-1）外，
+> 其余零第三方依赖 —— `deer-layout` / `deer-gpu` / `deer-vk` 都没有第三方依赖，
+> `deer-gui` 不开 `window` feature 时也没有。
 
 ## 快速开始
 
@@ -41,9 +46,15 @@
 cargo test --workspace          # 全部断言（数量见输出；随里程碑增长）
 cargo test -p deer-vk -- --nocapture   # 看本机枚举到的 GPU
 
-# 渲染一张图（现在唯一能「看见」东西的方式）
+# 渲染一张图（离屏，CI 友好）
 cargo run -p deer-gui --example render_to_png
 # → render_out/render_to_png.png
+
+# 开一个真窗口（M2b；**feature 必须带上**，仅 Windows）
+cargo run -p deer-gui --features window --example window_preview
+
+# M2b 的完整门禁：真窗口 e2e **默认跳过**，必须显式打开（跳过也算 pass，别当证据）
+#   PowerShell：$env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo test -p deer-vk
 ```
 
 ### 自己写代码渲染
@@ -102,7 +113,10 @@ crates/
 │                  ── 零平台依赖，可在无 GPU 的 CI 里完整断言
 ├── deer-gpu/      GPU HAL：Backend/Device/Swapchain/Frame trait、DrawList、CPU 参考后端
 │                  ── 加一个后端 = 实现一个 trait
-└── deer-vk/       Vulkan 后端：自己声明 extern 符号 + LoadLibraryW 动态加载
+├── deer-vk/       Vulkan 后端：自己声明 extern 符号 + LoadLibraryW 动态加载；surface/交换链/呈现
+└── deer-window/   窗口层：原生窗口 + 事件循环（winit）
+                   ── **唯一引入第三方依赖的地方**（`winit`，登记在 ROADMAP Q-1）；
+                      只把不透明的 RawWindowHandle 交给渲染层，所以换窗口实现不动渲染层
 ```
 
 ### 两条构筑路径，一棵树

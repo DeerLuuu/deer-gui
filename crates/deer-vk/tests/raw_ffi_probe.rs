@@ -98,14 +98,20 @@ fn raw_render_path() {
     assert_eq!(rc, 0, "vkCreateImageView {rc}");
 
     // ── 渲染通道（finalLayout = 6 = TRANSFER_SRC_OPTIMAL） ──
+    //
+    // ⚠️ `stencil_store_op` 曾经写 `2`（= `VK_ATTACHMENT_LOAD_OP_DONT_CARE` 的值）——
+    // `VkAttachmentStoreOp` 只有 0/1，校验层原文：
+    //   `pCreateInfo->pAttachments[0].stencilStoreOp (2) does not fall within the begin..end
+    //    range of the VkAttachmentStoreOp enumeration`（VUID-VkAttachmentDescription-stencilStoreOp-parameter）。
+    // 驱动宽容接受（渲染结果照旧正确），只有校验层会抓 —— 所以一律用**具名常量**，不写数字。
     let attach = vk::AttachmentDescription {
         flags: 0,
         format: FMT,
         samples: 1,
         load_op: vk::VK_ATTACHMENT_LOAD_OP_CLEAR,
-        store_op: 1,
-        stencil_load_op: 2,
-        stencil_store_op: 2,
+        store_op: vk::VK_ATTACHMENT_STORE_OP_STORE,
+        stencil_load_op: vk::VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        stencil_store_op: vk::VK_ATTACHMENT_STORE_OP_DONT_CARE,
         initial_layout: 0,
         final_layout: 6,
     };
@@ -381,8 +387,9 @@ fn raw_render_path() {
     unsafe {
         (fns.cmd_begin_render_pass)(cmd, &rpb, 0);
         (fns.cmd_bind_pipeline)(cmd, 0, pipeline);
-        (fns.cmd_set_viewport)(cmd, 0, 1, &viewport);
-        (fns.cmd_set_scissor)(cmd, 0, 1, &scissor);
+        // ⚠️ **不要**在这里调 `vkCmdSetViewport`/`vkCmdSetScissor`：本探针的管线是
+        // **静态 viewport/scissor**（`p_viewports = &viewport`，且没声明 dynamic state），
+        // 对静态状态调用动态设置命令违反 VUID-vkCmdDraw-None-08608（校验层原文见 t18 报告）。
         (fns.cmd_draw)(cmd, 3, 1, 0, 0);
         (fns.cmd_end_render_pass)(cmd);
     }
@@ -423,10 +430,14 @@ fn raw_render_path() {
     // 一开始我把它们录进了第二个命令缓冲、只提交了第二个 ⇒ 图像从未被渲染、
     // 回读到全 0。修正后这条路径才是有效的对照实验。
     let barrier = vk::ImageMemoryBarrier {
-        s_type: 45,
+        s_type: vk::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         p_next: std::ptr::null(),
-        src_access_mask: 1 << 8,
-        dst_access_mask: 1 << 7,
+        src_access_mask: vk::VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        // `dstAccessMask` 必须与 `dstStageMask`（下面的 `1 << 12` = TRANSFER）**相容**。
+        // 曾经写 `1 << 7` = `VK_ACCESS_COLOR_ATTACHMENT_READ_BIT`，校验层报
+        // `dstAccessMask (VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT) is not supported by stage mask
+        //  (VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT)`。这里要的是「拷贝能读到渲染结果」。
+        dst_access_mask: vk::VK_ACCESS_TRANSFER_READ_BIT,
         old_layout: 6, // 渲染通道的 finalLayout 已经是 TRANSFER_SRC_OPTIMAL
         new_layout: 6,
         src_queue_family_index: u32::MAX,
@@ -573,6 +584,32 @@ fn raw_render_path() {
         "右上角应当是背景色（直角三角形不覆盖它）"
     );
     println!("像素位置也正确（三角形在左上象限，符合 Vulkan 的 NDC y 向下）✅");
+
+    // ── 收尾：**销毁本探针创建的所有对象** ──
+    //
+    // 曾经这里什么都不销毁：进程退出前 `vkDestroyDevice` 会报
+    //   `VkDevice ... has 14 leaked objects that have not been destroyed`
+    // （校验层原文）。探针的结论不受影响，但「带校验层跑全量」就不能是 0 消息。
+    // 顺序 = 依赖倒序：栅栏/池 → 缓冲与其内存 → 管线 → 帧缓冲 → 视图 → 图像与其内存
+    //                → 管线布局 → 渲染通道 → 着色器模块。
+    // SAFETY: 下面每个句柄都由本函数创建且尚未销毁；`dev` 仍存活（测试函数结束才 drop）。
+    unsafe {
+        (fns.destroy_fence)(device, fence, std::ptr::null());
+        // 命令缓冲随池一起回收
+        (fns.destroy_command_pool)(device, pool, std::ptr::null());
+        (fns.destroy_buffer)(device, staging, std::ptr::null());
+        (fns.free_memory)(device, stage_mem, std::ptr::null());
+        (fns.destroy_pipeline)(device, pipeline, std::ptr::null());
+        (fns.destroy_framebuffer)(device, fb, std::ptr::null());
+        (fns.destroy_image_view)(device, view, std::ptr::null());
+        (fns.destroy_image)(device, image, std::ptr::null());
+        (fns.free_memory)(device, img_mem, std::ptr::null());
+        (fns.destroy_pipeline_layout)(device, pl, std::ptr::null());
+        (fns.destroy_render_pass)(device, render_pass, std::ptr::null());
+        (fns.destroy_shader_module)(device, vs, std::ptr::null());
+        (fns.destroy_shader_module)(device, fs, std::ptr::null());
+    }
+    println!("对象已全部显式销毁（不再有 leaked objects）✅");
 }
 
 /// 挑一个同时满足所有 `want` 位的可用内存类型。

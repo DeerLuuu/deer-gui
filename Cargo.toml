@@ -4,6 +4,7 @@ members = [
     "crates/deer-layout",
     "crates/deer-gpu",
     "crates/deer-vk",
+    "crates/deer-window",
     "crates/deer-gui",
 ]
 # `test_project/deer-hello` 是「用本库建独立项目」的**示例工程**，刻意排除在 workspace 外：
@@ -22,6 +23,7 @@ rust-version = "1.85"
 deer-layout = { path = "crates/deer-layout" }
 deer-gpu = { path = "crates/deer-gpu" }
 deer-vk = { path = "crates/deer-vk" }
+deer-window = { path = "crates/deer-window" }
 deer-gui = { path = "crates/deer-gui" }
 
 [profile.release]

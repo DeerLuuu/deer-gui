@@ -12,21 +12,37 @@
 //!
 //! ## 当前状态
 //!
-//! 里程碑 M1 只到「实例 + 物理设备枚举」：这就能验证
-//! ① 符号解析正确、② 结构体布局正确、③ 这台机器的 Vulkan 可用。
-//! 逻辑设备 / 交换链 / 管线 / 出图在 M2–M3。
+//! | 里程碑 | 内容 | 状态 |
+//! |---|---|---|
+//! | M1 | 实例 + 物理设备枚举 | ✅ |
+//! | M2a | 逻辑设备 + 自研 SPIR-V + 渲染通道/管线 + 离屏图像与回读（逐像素验证） | ✅ |
+//! | M2b | **窗口 + `VkSurfaceKHR` + 交换链 + 帧同步 + 呈现**（`surface.rs` / `swapchain.rs` / `windowed.rs`） | ✅ |
+//! | M3 | **把 `DrawList`（矩形/圆角/文本）送上 GPU**、纹理与字形图集上传 | ⬜ |
+//!
+//! HAL 接线见 [`hal`]：`VkBackend::open()` 返回的 `VkDevice` 现在是**真设备**，
+//! `create_swapchain` 会建出真正能呈现的交换链。**注意 M2b 的边界**：
+//! `Frame::record` 对非空 `DrawList` 会明确报 `Unsupported`（那是 M3），
+//! 纹理上传与交换链回读同样未实现 —— 都报错，不静默假装。
 
 #![deny(clippy::all)]
 
 pub mod device;
 pub mod ffi;
 pub mod ffi_dev;
+pub mod hal;
 pub mod loader;
 pub mod offscreen;
 pub mod spirv;
+pub mod surface;
+pub mod swapchain;
+pub mod windowed;
 
 pub use device::{Pipeline, PipelineLayout, RenderPass, ShaderModule, VkDevice};
+pub use hal::{VulkanDevice, VulkanFrame, VulkanSwapchain};
 pub use offscreen::{Buffer, CommandPool, Fence, Framebuffer, Image, ImageView, Memory, OffscreenRenderer};
+pub use surface::Surface;
+pub use swapchain::{Acquire, Present, Semaphore, Swapchain, SwapchainConfig};
+pub use windowed::{FrameOutcome, WindowedRenderer};
 
 use deer_gpu::{AdapterInfo, AdapterKind, Backend, Device, GpuError, GpuResult};
 use ffi::PhysicalDeviceType;
@@ -113,13 +129,13 @@ impl Backend for VkBackend {
     }
 
     fn open(&self, adapter: usize) -> GpuResult<Box<dyn Device>> {
-        if adapter >= self.physical_devices.len() {
-            return Err(GpuError::NoAdapter);
-        }
-        // M2 在此创建 VkDevice + 队列。当前**明确报「未实现」**，
-        // 而不是返回一个假装能用的对象（假成功比报错难查得多）。
-        Err(GpuError::Unsupported(
-            "deer-vk: 逻辑设备创建在里程碑 M2 实现（当前只到实例 + 设备枚举）".to_string(),
-        ))
+        let info = self
+            .adapters
+            .get(adapter)
+            .cloned()
+            .ok_or(GpuError::NoAdapter)?;
+        // M2b：返回**真设备**（此前这里返回「M2 未实现」）。
+        // 逻辑设备与交换链推迟到 `create_swapchain` 拿到窗口时创建 —— 见 [`hal`] 的设计说明。
+        Ok(Box::new(hal::VulkanDevice::new(adapter, info)))
     }
 }

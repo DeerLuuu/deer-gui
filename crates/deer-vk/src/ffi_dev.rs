@@ -48,6 +48,21 @@ pub const REMAINING_ARRAY_LAYERS: u32 = u32::MAX;
 pub const REMAINING_MIP_LEVELS: u32 = u32::MAX;
 
 // ── 结构体类型枚举（只列用到的） ─────────────────────────────────────────────
+//
+// ✅ **全部逐条核对过**：值取自本机 Vulkan SDK `1.4.357.0` 的
+// `Include/vulkan/vulkan_core.h`（`VK_HEADER_VERSION 357`）里 `typedef enum VkStructureType`
+// 的**枚举序号**（顺序即值，与官方 `vk.xml` 一致）。
+//
+// ⚠️ 为什么值得写这段注释：本项目**两次**因为「凭记忆写 sType」出错 ——
+// ① `VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT` 曾写少 3（1000128001 vs 1000128004）；
+// ② `VkImageMemoryBarrier` 曾写 47（那是 `VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO`，
+//    正确是 45）。写错的症状是「驱动不报错、行为诡异」或校验层一句
+//    `pImageMemoryBarriers[0].sType must be ...`，所以新增常量时**必须查头文件**，不要凭记忆。
+//
+// 注意下面几个「看起来该有、其实没有」的 sType：`VkAttachmentDescription` /
+// `VkSubpassDescription` / `VkAttachmentReference` 在规范里**没有 sType 字段**，
+// 因此没有对应的 `VK_STRUCTURE_TYPE_*`。本项目曾为它们编了 8 / 9 / 7 三个常量（全错），
+// 已删除 —— 留着只会诱导人去填一个不存在的字段。
 
 pub const VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO: i32 = 2;
 pub const VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO: i32 = 3;
@@ -60,11 +75,9 @@ pub const VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO: i32 = 22;
 pub const VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO: i32 = 23;
 pub const VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO: i32 = 24;
 pub const VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO: i32 = 26;
+pub const VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO: i32 = 27;
 pub const VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO: i32 = 30;
 pub const VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO: i32 = 28;
-pub const VK_STRUCTURE_TYPE_ATTACHMENT_DESCRIPTION: i32 = 8;
-pub const VK_STRUCTURE_TYPE_SUBPASS_DESCRIPTION: i32 = 9;
-pub const VK_STRUCTURE_TYPE_ATTACHMENT_REFERENCE: i32 = 7;
 pub const VK_STRUCTURE_TYPE_RENDER_PASS_CREATE_INFO: i32 = 38;
 pub const VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO: i32 = 43;
 pub const VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO: i32 = 37;
@@ -77,6 +90,12 @@ pub const VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO: i32 = 42;
 pub const VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO: i32 = 12;
 pub const VK_STRUCTURE_TYPE_FENCE_CREATE_INFO: i32 = 8;
 pub const VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO: i32 = 9;
+/// `VkBufferMemoryBarrier`（同步三兄弟里的第一个）
+pub const VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER: i32 = 44;
+/// `VkImageMemoryBarrier` —— ⚠️ **45**，不是 47（M2a 曾写错，见文件头注释）
+pub const VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER: i32 = 45;
+/// `VkMemoryBarrier`
+pub const VK_STRUCTURE_TYPE_MEMORY_BARRIER: i32 = 46;
 
 // ── 枚举值 ───────────────────────────────────────────────────────────────────
 
@@ -117,10 +136,17 @@ pub const VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT: u32 = 1 << 0;
 pub const VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT: u32 = 1 << 1;
 pub const VK_MEMORY_PROPERTY_HOST_COHERENT_BIT: u32 = 1 << 2;
 /// `VkBufferUsageFlagBits`
+///
+/// ⚠️ `VERTEX_BUFFER` 是 **1 << 7**（0x80），不是 1 << 5 —— 1 << 5 是
+/// `VK_BUFFER_USAGE_STORAGE_BUFFER_BIT`。本项目的 `vbo_probe` 就曾因此**用存储缓冲的
+/// usage 去建顶点缓冲**（驱动宽容接受、画得出来，只有校验层报
+/// `was created with VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT but requires VK_BUFFER_USAGE_2_VERTEX_BUFFER_BIT`）。
+/// 值已与 SDK 1.4.357.0 的 `vulkan_core.h` 核对。
 pub const VK_BUFFER_USAGE_TRANSFER_SRC_BIT: u32 = 1 << 0;
 pub const VK_BUFFER_USAGE_TRANSFER_DST_BIT: u32 = 1 << 1;
-pub const VK_BUFFER_USAGE_VERTEX_BUFFER_BIT: u32 = 1 << 5;
 pub const VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT: u32 = 1 << 4;
+pub const VK_BUFFER_USAGE_STORAGE_BUFFER_BIT: u32 = 1 << 5;
+pub const VK_BUFFER_USAGE_VERTEX_BUFFER_BIT: u32 = 1 << 7;
 /// `VkSharingMode`
 pub const VK_SHARING_MODE_EXCLUSIVE: i32 = 0;
 /// `VkAttachmentLoadOp`
@@ -130,7 +156,10 @@ pub const VK_ATTACHMENT_LOAD_OP_DONT_CARE: i32 = 2;
 /// `VkAttachmentStoreOp`
 pub const VK_ATTACHMENT_STORE_OP_STORE: i32 = 0;
 pub const VK_ATTACHMENT_STORE_OP_DONT_CARE: i32 = 1;
-/// `VkImageLayout` 在附件描述里用 Undefined
+/// `VkImageLayout::VK_IMAGE_LAYOUT_UNDEFINED` 的**项目内别名**（附件描述里用 Undefined）。
+///
+/// 注意：这个名字**不是** Vulkan 规范里的名字（规范只有 `VK_IMAGE_LAYOUT_UNDEFINED`）；
+/// 全量常量审计时别把它当成「查不到 = 写错」。
 pub const VK_IMAGE_LAYOUT_UNDEFINED_ATTACHMENT: i32 = 0;
 /// `VkPipelineBindPoint`
 pub const VK_PIPELINE_BIND_POINT_GRAPHICS: i32 = 0;
@@ -139,8 +168,11 @@ pub const VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST: i32 = 3;
 /// `VkPolygonMode`
 pub const VK_POLYGON_MODE_FILL: i32 = 0;
 /// `VkCullModeFlagBits`
+///
+/// ⚠️ `FRONT = 1`、`BACK = 2`（这里曾把 `BACK` 写成 1 << 0）。
 pub const VK_CULL_MODE_NONE: u32 = 0;
-pub const VK_CULL_MODE_BACK_BIT: u32 = 1 << 0;
+pub const VK_CULL_MODE_FRONT_BIT: u32 = 1 << 0;
+pub const VK_CULL_MODE_BACK_BIT: u32 = 1 << 1;
 /// `VkFrontFace`
 pub const VK_FRONT_FACE_COUNTER_CLOCKWISE: i32 = 0;
 pub const VK_FRONT_FACE_CLOCKWISE: i32 = 1;
@@ -158,6 +190,7 @@ pub const VK_COLOR_COMPONENT_R_BIT: u32 = 1 << 0;
 pub const VK_COLOR_COMPONENT_G_BIT: u32 = 1 << 1;
 pub const VK_COLOR_COMPONENT_B_BIT: u32 = 1 << 2;
 pub const VK_COLOR_COMPONENT_A_BIT: u32 = 1 << 3;
+/// R|G|B|A 的**项目内组合**（规范里没有这个常量名，只有四个单独的位）
 pub const VK_COLOR_COMPONENT_RGBA_BITS: u32 = 0xf;
 /// `VkPipelineStageFlagBits`
 pub const VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT: u32 = 1 << 0;
@@ -166,9 +199,13 @@ pub const VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT: u32 = 1 << 10;
 pub const VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: u32 = 1 << 13;
 pub const VK_PIPELINE_STAGE_ALL_COMMANDS_BIT: u32 = 1 << 16;
 /// `VkAccessFlagBits`
-pub const VK_ACCESS_TRANSFER_WRITE_BIT: u32 = 1 << 9;
+///
+/// ⚠️ `TRANSFER_WRITE` 是 **1 << 12**（0x1000），不是 1 << 9
+/// （1 << 9 = 0x200 是 `VK_ACCESS_SHADER_WRITE_BIT`）。这里曾写错。
+pub const VK_ACCESS_TRANSFER_WRITE_BIT: u32 = 1 << 12;
 pub const VK_ACCESS_TRANSFER_READ_BIT: u32 = 1 << 11;
 pub const VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT: u32 = 1 << 8;
+pub const VK_ACCESS_COLOR_ATTACHMENT_READ_BIT: u32 = 1 << 7;
 pub const VK_ACCESS_MEMORY_READ_BIT: u32 = 1 << 15;
 /// `VkDependencyFlagBits`
 pub const VK_DEPENDENCY_BY_REGION_BIT: u32 = 1;

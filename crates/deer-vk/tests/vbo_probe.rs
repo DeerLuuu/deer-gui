@@ -134,14 +134,16 @@ fn vertex_buffer_path() {
     assert_eq!(rc, 0, "vkCreateImageView {rc}");
 
     // ── 渲染通道 ──
+    // ⚠️ `stencil_store_op` 曾经写 `2`（值属于 `VkAttachmentLoadOp`）—— 见 `raw_ffi_probe.rs`
+    // 同名处的说明与校验层原文。一律用**具名常量**。
     let attach = vk::AttachmentDescription {
         flags: 0,
         format: FMT,
         samples: 1,
         load_op: vk::VK_ATTACHMENT_LOAD_OP_CLEAR,
-        store_op: 1,
-        stencil_load_op: 2,
-        stencil_store_op: 2,
+        store_op: vk::VK_ATTACHMENT_STORE_OP_STORE,
+        stencil_load_op: vk::VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+        stencil_store_op: vk::VK_ATTACHMENT_STORE_OP_DONT_CARE,
         initial_layout: 0,
         final_layout: 6,
     };
@@ -460,8 +462,9 @@ fn vertex_buffer_path() {
     unsafe {
         (fns.cmd_begin_render_pass)(cmd, &rpb, 0);
         (fns.cmd_bind_pipeline)(cmd, 0, pipeline);
-        (fns.cmd_set_viewport)(cmd, 0, 1, &viewport);
-        (fns.cmd_set_scissor)(cmd, 0, 1, &scissor);
+        // ⚠️ 不调 `vkCmdSetViewport`/`vkCmdSetScissor`：本探针的管线是**静态 viewport/scissor**
+        // （`p_viewports = &viewport`、未声明 dynamic state），对静态状态调动态设置命令违反
+        // VUID-vkCmdDraw-None-08608。
         // **关键**：绑定顶点缓冲（binding 0，offset 0）
         let offset: vk::DeviceSize = 0;
         (fns.cmd_bind_vertex_buffers)(cmd, 0, 1, &vbuf, &offset);
@@ -470,10 +473,11 @@ fn vertex_buffer_path() {
     }
 
     let barrier = vk::ImageMemoryBarrier {
-        s_type: 45,
+        s_type: vk::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
         p_next: std::ptr::null(),
-        src_access_mask: 1 << 8,
-        dst_access_mask: 1 << 7,
+        src_access_mask: vk::VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+        // 必须与 dstStageMask（TRANSFER）相容；曾经写 `1 << 7` = COLOR_ATTACHMENT_READ（见 t18 报告）
+        dst_access_mask: vk::VK_ACCESS_TRANSFER_READ_BIT,
         old_layout: 6,
         new_layout: 6,
         src_queue_family_index: u32::MAX,
@@ -575,6 +579,29 @@ fn vertex_buffer_path() {
         ratio * 100.0
     );
     println!("真实顶点缓冲路径同样正确 ✅");
+
+    // ── 收尾：销毁本探针创建的所有对象（否则 `vkDestroyDevice` 报
+    //    `has 16 leaked objects that have not been destroyed`）──
+    // SAFETY: 每个句柄都由本函数创建且尚未销毁；`dev` 仍存活。
+    unsafe {
+        (fns.destroy_fence)(device, fence, std::ptr::null());
+        (fns.destroy_command_pool)(device, pool, std::ptr::null()); // 命令缓冲随池回收
+        (fns.destroy_buffer)(device, staging, std::ptr::null());
+        (fns.free_memory)(device, smem, std::ptr::null());
+        (fns.destroy_pipeline)(device, pipeline, std::ptr::null());
+        (fns.destroy_framebuffer)(device, fb, std::ptr::null());
+        (fns.destroy_image_view)(device, view, std::ptr::null());
+        (fns.destroy_image)(device, image, std::ptr::null());
+        (fns.free_memory)(device, imem, std::ptr::null());
+        // 顶点缓冲：先缓冲后内存
+        (fns.destroy_buffer)(device, vbuf, std::ptr::null());
+        (fns.free_memory)(device, vmem, std::ptr::null());
+        (fns.destroy_pipeline_layout)(device, pl, std::ptr::null());
+        (fns.destroy_render_pass)(device, render_pass, std::ptr::null());
+        (fns.destroy_shader_module)(device, vs, std::ptr::null());
+        (fns.destroy_shader_module)(device, fs, std::ptr::null());
+    }
+    println!("对象已全部显式销毁（不再有 leaked objects）✅");
 }
 
 /// 挑一个同时满足所有 `want` 位的可用内存类型。

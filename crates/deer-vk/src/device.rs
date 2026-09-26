@@ -91,6 +91,13 @@ pub struct VkDevice {
     handle: vk::DeviceHandle,
     queue: vk::QueueHandle,
     queue_family_index: u32,
+    /// 呈现队列（M2b）。单队列族实现里它与 `queue` 是同一个句柄 ——
+    /// 但仍然单独存一份：将来图形/呈现分离时，只有这里会变。
+    present_queue: vk::QueueHandle,
+    present_queue_family_index: u32,
+    /// 物理设备句柄（交换链要查 surface 能力，那些查询都在物理设备上）。
+    /// 生命周期：与实例同寿（Own 时实例在后台线程里，Borrowed 时归调用方）。
+    physical_device: ffi::PhysicalDeviceHandle,
     fns: DeviceFns,
     adapter: deer_gpu::AdapterInfo,
     memory_type_count: u32,
@@ -110,13 +117,50 @@ unsafe impl Sync for VkDevice {}
 impl VkDevice {
     /// 打开一个逻辑设备（选第一个含图形队列的队列族）。
     pub fn open(adapter_index: usize) -> GpuResult<VkDevice> {
+        VkDevice::open_inner(adapter_index, InstancePlan::Own)
+    }
+
+    /// 打开设备，并保证拿到一个**同时支持图形与呈现**的队列族（拿不到就明确报错）。
+    ///
+    /// ## 实例从哪来（这条最容易搞错）
+    ///
+    /// `VkSurfaceKHR` **属于创建它的那个实例**：`VkSurfaceKHR` 与 `VkPhysicalDevice`
+    /// 必须来自同一个 `VkInstance`（`vkGetPhysicalDeviceSurfaceSupportKHR` 的 VU）。
+    /// 所以本函数**借用** `surface` 的实例，而不是另建一个：
+    ///
+    /// ```text
+    ///   WindowedRenderer::new:
+    ///     instance = Instance::create_with_extensions(..surface 扩展..)   // 归它所有
+    ///     surface  = Surface::create(&instance, window)                    // 记下实例句柄
+    ///     device   = VkDevice::open_with_present(adapter, &surface)        // 借用上面那个实例
+    /// ```
+    ///
+    /// ## 生命周期契约（调用方必须保证）
+    ///
+    /// `surface` 背后的实例必须比返回的 `VkDevice` **活得久**。
+    /// [`crate::windowed::WindowedRenderer`] 用字段顺序保证（device 比 surface/instance
+    /// 先析构）。实例只在**创建设备这一次**被访问（后台线程随后只是 park）。
+    pub fn open_with_present(adapter_index: usize, surface: &crate::surface::Surface) -> GpuResult<VkDevice> {
+        let target = PresentTarget {
+            // 句柄存成 usize：函数指针与整数都是 Send，于是「借用」不需要把
+            // 非 Send 的 `Instance` 搬进后台线程。
+            instance: surface.instance_handle() as usize,
+            surface: surface.handle() as usize,
+            core: surface.core_fns(),
+            support: surface.support_fn(),
+        };
+        VkDevice::open_inner(adapter_index, InstancePlan::Borrowed(target))
+    }
+
+    /// `open` / `open_with_present` 的公共部分：起一个「生命周期线程」持有 Vulkan 对象。
+    fn open_inner(adapter_index: usize, plan: InstancePlan) -> GpuResult<VkDevice> {
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<ReadyInfo, GpuError>>();
         let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
 
         let thread = std::thread::Builder::new()
             .name("deer-vk-lifetime".to_string())
             .spawn(move || {
-                lifetime_thread(adapter_index, ready_tx, stop_rx);
+                lifetime_thread(adapter_index, plan, ready_tx, stop_rx);
             })
             .map_err(|e| GpuError::Driver {
                 code: -1,
@@ -128,6 +172,9 @@ impl VkDevice {
                 handle: info.handle,
                 queue: info.queue,
                 queue_family_index: info.queue_family_index,
+                present_queue: info.present_queue,
+                present_queue_family_index: info.present_queue_family_index,
+                physical_device: info.physical_device,
                 fns: info.fns,
                 adapter: info.adapter,
                 memory_type_count: info.memory_type_count,
@@ -161,6 +208,21 @@ impl VkDevice {
 
     pub fn queue_family_index(&self) -> u32 {
         self.queue_family_index
+    }
+
+    /// 呈现队列（`open_with_present` 下由「图形 + 呈现」共用的那个队列族提供）。
+    pub fn present_queue(&self) -> vk::QueueHandle {
+        self.present_queue
+    }
+
+    /// 呈现队列的队列族索引。
+    pub fn present_queue_family_index(&self) -> u32 {
+        self.present_queue_family_index
+    }
+
+    /// 物理设备句柄（`pub(crate)`：交换链要查 surface 能力）。
+    pub(crate) fn physical_device(&self) -> ffi::PhysicalDeviceHandle {
+        self.physical_device
     }
 
     pub fn fns(&self) -> &DeviceFns {
@@ -340,6 +402,7 @@ impl VkDevice {
             handle,
             device: self.handle,
             destroy: self.fns.destroy_render_pass,
+            final_layout,
         })
     }
 
@@ -575,7 +638,7 @@ impl VkDevice {
         };
         let dynamic_states = [vk::VK_DYNAMIC_STATE_VIEWPORT, vk::VK_DYNAMIC_STATE_SCISSOR];
         let dynamic_state = vk::PipelineDynamicStateCreateInfo {
-            s_type: 27, // VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO
+            s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
             p_next: std::ptr::null(),
             flags: 0,
             dynamic_state_count: if static_viewport.is_none() {
@@ -699,11 +762,24 @@ pub struct RenderPass {
     handle: vk::RenderPassHandle,
     device: vk::DeviceHandle,
     destroy: vk::PfnDestroyRenderPass,
+    /// 建通道时给的 `finalLayout`（颜色附件离开渲染通道后所处的布局）。
+    ///
+    /// **为什么必须记下来**：渲染完成后要对图像做别的操作（例如 `vkCmdCopyImageToBuffer`
+    /// 回读）时，`VkImageMemoryBarrier.oldLayout` 必须是**图像当前的实际布局**。
+    /// 曾经在 `offscreen.rs` 里写死 `COLOR_ATTACHMENT_OPTIMAL`，而这里的 `finalLayout`
+    /// 是 `TRANSFER_SRC_OPTIMAL` ⇒ 校验层报 `cannot transition the layout ...`。
+    /// 现在由调用方问 [`RenderPass::final_layout`] 拿事实，不再靠记忆。
+    final_layout: i32,
 }
 
 impl RenderPass {
     pub fn handle(&self) -> vk::RenderPassHandle {
         self.handle
+    }
+
+    /// 颜色附件离开渲染通道后的布局（即建通道时传入的 `finalLayout`）。
+    pub fn final_layout(&self) -> i32 {
+        self.final_layout
     }
 }
 
@@ -804,6 +880,9 @@ struct ReadyInfo {
     mem_props: vk::PhysicalDeviceMemoryProperties,
     queue: vk::QueueHandle,
     queue_family_index: u32,
+    present_queue: vk::QueueHandle,
+    present_queue_family_index: u32,
+    physical_device: ffi::PhysicalDeviceHandle,
     fns: DeviceFns,
     adapter: deer_gpu::AdapterInfo,
     memory_type_count: u32,
@@ -815,46 +894,109 @@ struct ReadyInfo {
 // `DeviceFns` 全是函数指针，天然 `Send`。
 unsafe impl Send for ReadyInfo {}
 
+/// 设备创建时「实例从哪来」。
+enum InstancePlan {
+    /// 自己创建实例（并拥有、销毁它）—— `VkDevice::open` 用。
+    Own,
+    /// 借用调用方（surface）的实例，**不拥有、不销毁** —— `VkDevice::open_with_present` 用。
+    Borrowed(PresentTarget),
+}
+
+/// 借用路径需要的最小信息（全是可跨线程的值，不含 `Instance` 本身）。
+struct PresentTarget {
+    /// `InstanceHandle` 的裸值（非 0）。
+    instance: usize,
+    /// `SurfaceHandle` 的裸值。
+    surface: usize,
+    /// 该实例的「枚举物理设备 + 取属性」函数。
+    core: ffi::CoreFns,
+    /// `vkGetPhysicalDeviceSurfaceSupportKHR`（实例级函数，但取到后是纯指针）。
+    support: crate::surface::PfnGetPhysicalDeviceSurfaceSupportKHR,
+}
+
 /// 后台线程：创建实例与设备，报告句柄，然后 `park` 等停止信号。
 fn lifetime_thread(
     adapter_index: usize,
+    plan: InstancePlan,
     ready: Sender<Result<ReadyInfo, GpuError>>,
     stop: Receiver<()>,
 ) {
-    let instance = match ffi::Instance::create() {
-        Ok(i) => i,
+    let (info, owned_instance) = match create_device(adapter_index, &plan) {
+        Ok(v) => v,
         Err(e) => {
             let _ = ready.send(Err(e));
             return;
         }
     };
-    let fns = match resolve_device_fns(&instance) {
-        Ok(f) => f,
-        Err(e) => {
-            let _ = ready.send(Err(e));
-            return;
-        }
-    };
+    let destroy_device = info.fns.destroy_device;
+    let device = info.handle;
 
-    let physical_devices = match instance.enumerate_physical_devices() {
-        Ok(d) => d,
-        Err(e) => {
-            let _ = ready.send(Err(e));
-            return;
-        }
-    };
-    let Some(pd) = physical_devices.get(adapter_index).copied() else {
-        let _ = ready.send(Err(GpuError::NoAdapter));
+    if ready.send(Ok(info)).is_err() {
+        // 主线程已经不等了 ⇒ 立刻清理
+        // SAFETY: 设备刚创建、尚未销毁。
+        unsafe { (destroy_device)(device, std::ptr::null()) };
         return;
+    }
+
+    // 等停止信号（`recv` 在发送端析构时也会返回，避免永久阻塞）
+    let _ = stop.recv();
+
+    // 销毁顺序：设备 → 实例（Own 时 `owned_instance` 的 Drop 负责后者；
+    // Borrowed 时它是 None —— 例 **不属于我们**，绝不能在这里销毁）。
+    // SAFETY: 设备由本线程创建、尚未销毁，且此刻没有其他线程在使用它
+    // （`VkDevice` 的 Drop 会先 join 本线程）。
+    unsafe { (destroy_device)(device, std::ptr::null()) };
+    drop(owned_instance);
+}
+
+/// 创建设备（在后台线程里跑）：实例 → 物理设备 → 队列族 → 设备扩展 → `vkCreateDevice`。
+///
+/// 返回 `(就绪信息, 需要本线程保活的实例)`：`Own` 时是 `Some`（最后销毁），
+/// `Borrowed` 时是 `None`（借来的实例由调用方管）。
+fn create_device(
+    adapter_index: usize,
+    plan: &InstancePlan,
+) -> GpuResult<(ReadyInfo, Option<ffi::Instance>)> {
+    // ① 实例（自己建 or 借用）
+    //
+    // `DEER_VK_VALIDATION=1` ⇒ 这条路径也开校验层（与 `VkBackend::new` / `WindowedRenderer` 一致）。
+    //
+    // 曾经这里**故意不读**这个环境变量：那时 offscreen 路径有 3 个真缺陷
+    // （barrier sType 写成 47、oldLayout 与渲染通道 finalLayout 不符、图像内存 `mem::forget` 泄漏），
+    // 而且损坏的推送常量着色器会让进程 0xc0000005 崩溃 —— 接上校验层就会吐一堆消息/崩溃。
+    // 这些已在 task-18 全部修掉（着色器那条在测试里加了显式「地雷门」），所以现在接回来，
+    // 让「`DEER_VK_VALIDATION=1` 跑全量 deer-vk」真正覆盖设备/离屏/窗口三条路径。
+    let owned_instance = match plan {
+        InstancePlan::Own => Some(ffi::Instance::create_with_validation(
+            ffi::Instance::validation_from_env(),
+        )?),
+        InstancePlan::Borrowed(_) => None,
+    };
+    let (instance_handle, core) = match plan {
+        InstancePlan::Own => {
+            let inst = owned_instance
+                .as_ref()
+                .expect("Own 分支刚刚创建了实例");
+            (inst.handle(), inst.core_fns())
+        }
+        InstancePlan::Borrowed(t) => (t.instance as ffi::InstanceHandle, t.core),
     };
 
-    // 找一个带图形位的队列族
+    // SAFETY: `instance_handle` 在本函数期间一直存活 —— Own 时由 `owned_instance` 持有，
+    // Borrowed 时由调用方按 `open_with_present` 的生命周期契约保证。
+    let physical_devices = unsafe { core.enumerate_physical_devices(instance_handle)? };
+    let Some(pd) = physical_devices.get(adapter_index).copied() else {
+        return Err(GpuError::NoAdapter);
+    };
+
+    let fns = resolve_device_fns()?;
+
+    // ② 队列族：图形 +（呈现路径）能向该 surface 呈现
     let mut count: u32 = 0;
     // SAFETY: 传 null 是 Vulkan 规定的「只查数量」用法。
     unsafe { (fns.get_queue_family_properties)(pd, &mut count, std::ptr::null_mut()) };
     if count == 0 {
-        let _ = ready.send(Err(GpuError::NoAdapter));
-        return;
+        return Err(GpuError::NoAdapter);
     }
     let mut families = vec![vk::QueueFamilyProperties {
         queue_flags: 0,
@@ -868,17 +1010,70 @@ fn lifetime_thread(
     }; count as usize];
     // SAFETY: 数组容量与 `count` 一致。
     unsafe { (fns.get_queue_family_properties)(pd, &mut count, families.as_mut_ptr()) };
+    families.truncate(count as usize);
 
-    let Some(qfi) = families
-        .iter()
-        .position(|f| f.queue_flags & vk::VK_QUEUE_GRAPHICS_BIT != 0)
-    else {
-        let _ = ready.send(Err(GpuError::Unsupported(
-            "没有任何队列族支持图形操作".to_string(),
-        )));
-        return;
+    let mut chosen_family: Option<u32> = None;
+    for (i, f) in families.iter().enumerate() {
+        if f.queue_flags & vk::VK_QUEUE_GRAPHICS_BIT == 0 {
+            continue;
+        }
+        match plan {
+            InstancePlan::Own => {
+                chosen_family = Some(i as u32);
+                break;
+            }
+            InstancePlan::Borrowed(t) => {
+                let mut supported: u32 = 0;
+                // SAFETY: `pd` 来自 `instance_handle`；surface 按契约来自同一实例；
+                // `supported` 是可写输出。
+                let rc = unsafe {
+                    (t.support)(
+                        pd,
+                        i as u32,
+                        t.surface as ffi::SurfaceHandle,
+                        &mut supported,
+                    )
+                };
+                if rc != ffi::VK_SUCCESS {
+                    return Err(GpuError::Driver {
+                        code: rc,
+                        message: format!(
+                            "vkGetPhysicalDeviceSurfaceSupportKHR 失败（队列族 {i}）：{}",
+                            vk_result_name(rc)
+                        ),
+                    });
+                }
+                if supported == vk::VK_TRUE {
+                    chosen_family = Some(i as u32);
+                    break;
+                }
+            }
+        }
+    }
+    let Some(qfi) = chosen_family else {
+        return Err(match plan {
+            InstancePlan::Own => GpuError::Unsupported("没有任何队列族支持图形操作".to_string()),
+            InstancePlan::Borrowed(_) => GpuError::Unsupported(
+                "本机这个设备**没有**任何队列族同时支持「图形」与「在该窗口上呈现」\
+                 ⇒ 无法为这个窗口建交换链（换一张显卡试试，例如 DEER_WINDOW_ADAPTER=1）"
+                    .to_string(),
+            ),
+        });
     };
-    let qfi = qfi as u32;
+
+    // ③ 设备扩展：呈现路径必须启用 `VK_KHR_swapchain`（交换链是**设备**扩展）
+    let mut enabled_extensions: [*const std::ffi::c_char; 1] = [std::ptr::null()];
+    let enable_swapchain = matches!(plan, InstancePlan::Borrowed(_));
+    if enable_swapchain {
+        let ext = crate::swapchain::SWAPCHAIN_EXTENSION;
+        if !ffi::device_extension_available(pd, ext)? {
+            return Err(GpuError::Unsupported(format!(
+                "本机这个物理设备不支持设备扩展 {ext}（交换链必需）\
+                 ⇒ 无法呈现到窗口（可以换一张显卡试试）"
+            )));
+        }
+        enabled_extensions[0] = c"VK_KHR_swapchain".as_ptr();
+    }
 
     let priority: f32 = 1.0;
     let queue_info = vk::DeviceQueueCreateInfo {
@@ -897,21 +1092,31 @@ fn lifetime_thread(
         p_queue_create_infos: &queue_info,
         enabled_layer_count: 0,
         pp_enabled_layer_names: std::ptr::null(),
-        enabled_extension_count: 0,
-        pp_enabled_extension_names: std::ptr::null(),
+        enabled_extension_count: if enable_swapchain { 1 } else { 0 },
+        pp_enabled_extension_names: if enable_swapchain {
+            enabled_extensions.as_ptr()
+        } else {
+            std::ptr::null()
+        },
         p_enabled_features: std::ptr::null(),
     };
     let mut device: vk::DeviceHandle = std::ptr::null_mut();
-    // SAFETY: 上述结构体都在本栈帧存活；句柄是可写输出。
-    let rc = unsafe {
-        (fns.create_device)(pd, &device_info, std::ptr::null(), &mut device)
-    };
+    // SAFETY: 上述结构体都在本栈帧存活；扩展名是 `'static` C 字符串字面量；
+    // 句柄是可写输出。
+    let rc = unsafe { (fns.create_device)(pd, &device_info, std::ptr::null(), &mut device) };
     if rc != ffi::VK_SUCCESS {
-        let _ = ready.send(Err(GpuError::Driver {
+        return Err(GpuError::Driver {
             code: rc,
-            message: format!("vkCreateDevice 失败：{}", vk_result_name(rc)),
-        }));
-        return;
+            message: format!(
+                "vkCreateDevice 失败：{}{}",
+                vk_result_name(rc),
+                if enable_swapchain {
+                    "（本次启用了设备扩展 VK_KHR_swapchain）"
+                } else {
+                    ""
+                }
+            ),
+        });
     }
 
     let mut queue: vk::QueueHandle = std::ptr::null_mut();
@@ -925,7 +1130,8 @@ fn lifetime_thread(
     let mem_props_value = unsafe { mem_props.assume_init() };
     let memory_type_count = mem_props_value.memory_type_count;
 
-    let adapter = match unsafe { instance.physical_device_properties(pd) } {
+    // SAFETY: `pd` 来自 `instance_handle`，实例在 `owned_instance` 或调用方手里存活。
+    let adapter = match unsafe { core.properties(pd) } {
         Ok(p) => deer_gpu::AdapterInfo {
             name: p.device_name,
             kind: match p.device_type {
@@ -940,45 +1146,34 @@ fn lifetime_thread(
         Err(e) => {
             // SAFETY: 设备刚创建、尚未销毁。
             unsafe { (fns.destroy_device)(device, std::ptr::null()) };
-            let _ = ready.send(Err(e));
-            return;
+            return Err(e);
         }
     };
 
-    if ready
-        .send(Ok(ReadyInfo {
+    Ok((
+        ReadyInfo {
             handle: device,
             queue,
             queue_family_index: qfi,
+            // 单队列族实现：图形与呈现共用同一个队列
+            present_queue: queue,
+            present_queue_family_index: qfi,
+            physical_device: pd,
             fns,
             adapter,
             memory_type_count,
             mem_props: mem_props_value,
-        }))
-        .is_err()
-    {
-        // 主线程已经不等了 ⇒ 立刻清理
-        // SAFETY: 设备刚创建、尚未销毁。
-        unsafe { (fns.destroy_device)(device, std::ptr::null()) };
-        return;
-    }
-
-    // 等停止信号（`recv` 在发送端析构时也会返回，避免永久阻塞）
-    let _ = stop.recv();
-
-    // 销毁顺序：设备 → 实例（`instance` 的 Drop 负责后者）
-    // SAFETY: 设备由本线程创建、尚未销毁，且此刻没有其他线程在使用它
-    // （`VkDevice` 的 Drop 会先 join 本线程）。
-    unsafe { (fns.destroy_device)(device, std::ptr::null()) };
-    drop(instance);
+        },
+        owned_instance,
+    ))
 }
 
-fn resolve_device_fns(instance: &ffi::Instance) -> GpuResult<DeviceFns> {
+/// 解析设备级函数表（全是函数指针，故 `Send`，可拷进后台线程与 `VkDevice`）。
+fn resolve_device_fns() -> GpuResult<DeviceFns> {
     let lib = Lib::open()?;
     // SAFETY: 每个符号名都与 `vk::Pfn*` 声明的签名一致（见 ffi_dev.rs 的类型定义）。
     // 这些函数在 Vulkan 1.0 就是全局导出的，所以不需要 vkGetInstanceProcAddr。
     unsafe {
-        let _ = instance; // 保留参数以便将来切到 vkGetInstanceProcAddr
         Ok(DeviceFns {
             create_device: lib.sym("vkCreateDevice")?,
             destroy_device: lib.sym("vkDestroyDevice")?,

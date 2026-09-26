@@ -22,6 +22,7 @@
 | [9](#9-建你自己的项目) | 建你自己的项目 | 独立工程 |
 | [10](#10-现状与边界) | 现状与边界 | 知道什么还不能做 |
 | [11](#11-真实文字) | 真实文字 | 一张**真字形**的图 |
+| [12](#12-在窗口里看到画面) | 在窗口里看到画面 | 一个**真窗口** |
 
 ---
 
@@ -329,13 +330,14 @@ deer-gui = { path = "Z:/deer-gui/crates/deer-gui" }
 
 ## 10. 现状与边界
 
-**能做的**：描述界面 → 算布局 → 离屏渲染成 PNG / 像素。
+**能做的**：描述界面 → 算布局 → 离屏渲染成 PNG / 像素；在 Windows 上还能**开真窗口**，
+用 GPU 把画面呈现上去（M2b，见第 12 章）。
 **不能做的**（别误以为能）：
 
 | 想做的事 | 现状 |
 |---|---|
-| 界面显示在**窗口**里 | ❌ M2b（要先定窗口方案） |
-| **GPU 渲染**出图 | 🔄 离屏 Vulkan **已能画出正确像素**（M2a-6），但绘制仍有已知缺陷（见 `features/gpu-offscreen.md`）；**窗口呈现**做不到 |
+| 界面显示在**窗口**里 | ✅ **能开窗**（M2b，**仅 Windows**）：窗口里是 GPU 清屏色 + 几何；**界面（控件/文字）上屏是 M3** |
+| **GPU 渲染**出图 | ✅ 离屏 Vulkan 已画出正确像素（M2a-6 修复了 SPIR-V 段序缺陷）；✅ 窗口呈现已打通（M2b）；❌ **消费 `DrawList`（界面）是 M3** |
 | 图片里的字是**真字体** | ✅ **离屏**已支持（第 11 章）；**GPU 侧文本**仍 ❌（M3） |
 | **鼠标点击 / 键盘输入** | ❌ M5（`hit_test` 有了，但没有事件派发） |
 | **Tab 焦点** / 方向键导航 | ❌ M5 |
@@ -388,9 +390,55 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - 想深入底层（自己把字形打进图集）：`cargo run -p deer-gui --example glyph_atlas`，
   配合 [`features/glyph-raster.md`](features/glyph-raster.md) 与 [`features/glyph-atlas.md`](features/glyph-atlas.md)。
 
-**仍然做不到**：GPU 侧文本（M3：Vulkan 还不消费 `DrawCmd::Text`）、窗口、子像素定位、多字体回退、
-富文本/图标字体、hinting、CFF 字体。完整边界见
+**仍然做不到**：GPU 侧文本（M3）、**窗口里显示界面**（M3：窗口能开，但里面还没有控件/文字）、
+子像素定位、多字体回退、富文本/图标字体、hinting、CFF 字体。完整边界见
 [`features/text-rendering.md`](features/text-rendering.md) 第 6 节。
+
+---
+
+## 12. 在窗口里看到画面
+
+**目标**：弹出一个**真窗口**，用 GPU 把画面呈现上去（M2b）。
+
+```powershell
+cargo run -p deer-gui --features window --example window_preview
+```
+
+**你会看到**：弹出一个窗口（标题带 `deer-gui` 前缀），里面是 GPU 画的清屏色 + 一块几何三角形，
+连续呈现若干帧后**自动退出**（退出码 0），终端里打印适配器 / 交换链格式 / present mode / 图像数 / 帧数。
+
+| 环境变量 | 作用 |
+|---|---|
+| `DEER_WINDOW_FRAMES` | 呈现多少帧后退出（示例默认 **120**） |
+| `DEER_WINDOW_HOLD` | 设为 `1`（或 `true`）时**不自动退出**，一直开着直到你手动关窗口 |
+| `DEER_WINDOW_ADAPTER` | 用第几张显卡（默认 `0`；示例会打印实际适配器名） |
+| `DEER_WINDOW_READBACK` | 设为 `0` 关掉第一帧的像素回读（自检显式降级，不再给像素级证据） |
+| `DEER_VK_VALIDATION` | 设为 `1` 打开 Vulkan 校验层（诊断用） |
+
+```powershell
+# 只看 10 帧（适合快速自检）
+$env:DEER_WINDOW_FRAMES='10'; cargo run -p deer-gui --features window --example window_preview
+# 想慢慢看：窗口会一直开着，点右上角 × 关闭
+$env:DEER_WINDOW_HOLD='1'; cargo run -p deer-gui --features window --example window_preview
+```
+
+**这一章的关键概念**：
+- **`--features window` 不能省**：窗口层是可选的 `deer-window`（winit），不开 feature 时
+  `deer-gui` 仍然零第三方依赖。示例是 `required-features = ["window"]` 的，漏了会报
+  `target ... requires the features: window`。
+- **事件循环必须在主线程**：窗口与事件循环由 `deer_window::run(config, app)` 管，
+  你实现 `App`（`init` 建渲染器 / `redraw` 画一帧 / 可选 `resized`）。
+- **窗口里还不是界面**：M2b 只保证「GPU 画的像素能出现在窗口上」——现在显示的是清屏色 + M2a
+  验证过的几何。把 `DrawList`（控件/文字/裁剪）送上 GPU 是 **M3**。
+- **交换链会过期**：`render_and_present()` 返回 `OutOfDate` 时**必须 resize 后重试**，不许当成功。
+- **第一帧会回读像素核对**（`read_back_last_frame()`）：终端里能看到
+  `像素回读 : 四角 [71, 79, 105, 255] = sRGB 编码后的清屏色 rgb(0x10,0x14,0x24)` ——
+  注意**不是** `[16,20,36]`（sRGB 附件的驱动编码）；回读**强制一次 GPU→CPU 同步**，所以只在第一帧做一次。
+- 目前**只有 Windows** 实现了窗口句柄的填充；非 Windows 会明确返回 `Err`。
+
+**仍然做不到**：鼠标/键盘输入（M5）、窗口里的界面（M3）、多窗口 / 全屏 / HDR / 帧率上限。
+完整边界见 [`features/window.md`](features/window.md) 与
+[`features/vulkan-swapchain.md`](features/vulkan-swapchain.md) 第 6 节。
 
 ---
 
@@ -407,4 +455,5 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | 原始像素 | `cargo run -p deer-gui --example pixels` | PNG + PPM |
 | 真实文字 | `cargo run -p deer-gui --example text_render` | 真字形界面图 + 度量/像素自检 |
 | 字形光栅化 + 图集 | `cargo run -p deer-gui --example glyph_atlas` | 图集 PNG + 覆盖率/利用率统计 |
+| 真窗口预览 | `cargo run -p deer-gui --features window --example window_preview` | 一个真窗口（GPU 清屏色 + 几何）+ 帧数统计 |
 | Vulkan 现状 | `cargo run -p deer-gui --example vulkan_devices` | 本机 GPU + 着色器验收 |

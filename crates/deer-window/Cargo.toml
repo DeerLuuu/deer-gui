@@ -1,0 +1,17 @@
+[package]
+name = "deer-window"
+description = "deer-gui 的窗口层：原生窗口 + 事件循环（**本 workspace 唯一引入第三方依赖的 crate**，理由见 ROADMAP 依赖纪律 Q-1）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "deer_window"
+path = "src/lib.rs"
+
+[dependencies]
+deer-gpu.workspace = true
+# 唯一登记在案的第三方依赖：窗口/事件循环。选它的理由（与自写 Win32 的对比）见 ROADMAP.md 的 Q-1。
+# 注意：`deer-vk` **不依赖** winit —— HAL 用不透明的 `RawWindowHandle` 传原生句柄。
+winit = "0.30"

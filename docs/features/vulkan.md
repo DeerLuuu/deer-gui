@@ -1,6 +1,6 @@
 # 功能指南：Vulkan 后端（vulkan）
 
-> 状态 🔄 **只到「设备就绪 + 着色器被驱动接受」，不能出图** ·
+> 状态 🔄 **设备 + 管线 + 离屏 + 上屏都通了；还没有「把 `DrawList` 送上 GPU」** ·
 > 示例 `cargo run -p deer-gui --example vulkan_devices` ·
 > 清单条目见 [`FEATURES.md`](../../FEATURES.md)
 
@@ -16,11 +16,24 @@ Vulkan 符号自己声明、运行时动态加载。
 | 枚举物理设备（拿到显卡名/类型/版本） | ✅ |
 | 打开逻辑设备 + 图形队列 | ✅ |
 | 自研 SPIR-V 汇编器的产物被驱动接受 | ✅ |
-| **创建管线**（`vkCreateGraphicsPipelines`） | ❌ M2a-3 |
-| **渲染出图**（渲染通道 + 命令缓冲 + 回读） | ❌ M2a-4..6 |
-| **渲染到窗口** | ❌ M2b（要先定窗口方案） |
+| **创建管线**（`vkCreateGraphicsPipelines`） | ✅ **M2a-3** |
+| **渲染出图**（渲染通道 + 命令缓冲 + 回读 + 绘制几何） | ✅ **M2a-4..6** → 见 [`gpu-offscreen.md`](gpu-offscreen.md) |
+| **渲染到窗口**（`VkSurfaceKHR` + 交换链 + 帧同步 + 呈现） | ✅ **M2b** → 见 [`vulkan-swapchain.md`](vulkan-swapchain.md) |
+| 把界面（`DrawList`）送上 GPU | ❌ **M3**（`Frame::record` 对非空绘制列表明确返回 `Unsupported`；空列表/只有 `NodeHint` 可以记录） |
+| 交换链回读（HAL 的 `Frame::read_pixels`） | ❌ **明确 `Unsupported`**：HAL 的 `read_pixels` 在**提交前**调用，而交换链图像的回读数据只有**呈现之后**才有效 ⇒ 错误信息指向 `WindowedRenderer::read_back_last_frame()`。离屏回读请用 [`gpu-offscreen.md`](gpu-offscreen.md) 的 `OffscreenRenderer` |
+| 纹理（`create_texture` / `upload_texture`，字形图集上传） | ❌ **M3**（明确报 `Unsupported`） |
 
-**所以现在要出图请用 CPU 后端**（见 [`rendering.md`](rendering.md)）。
+**所以现在要出「界面」的图仍然用 CPU 后端**（见 [`rendering.md`](rendering.md)）：
+Vulkan 能离屏画几何、也能把像素呈现在窗口里，但**还不消费 `DrawList`**（那是 M3）。
+
+> **校验层开关（如实登记）**：`DEER_VK_VALIDATION=1` 在**三条路径上一致生效** —— `VkBackend::new`、
+> 设备/离屏路径（`create_device`）与窗口路径（`WindowedRenderer`）都读它。
+> 唯一的遗留是推送常量矩形着色器 `spirv.rs::vertex_shader_rect_pushconstant` 损坏
+> （校验层报 `VUID-StandaloneSpirv-PushConstant-06808`，请求校验层时会让进程 `0xc0000005` 崩溃；
+> `device_smoke` / `pipeline_smoke` 里涉及它的测试因此在校验层下**显式跳过**，t15）。
+> 设备/离屏路径曾经**故意不读**这个变量（那时 offscreen 有 3 个真缺陷），**t18 修完后重新接回**。
+> 本机实测 `DEER_VK_VALIDATION=1 cargo test -p deer-vk` → 86 passed / 0 failed、零校验消息（数字随测试增长）；
+> 窗口示例 30 帧同样零消息、`exit=0`。细节与「修好它属于 M3」见 [`ROADMAP.md`](../../ROADMAP.md) 的 Q-5。
 
 ## 2. 最小示例
 
@@ -116,7 +129,8 @@ for _ in 0..3 { let d = deer_vk::VkDevice::open(0)?; d.wait_idle()?; }
 - GPU HAL 契约：[`gpu-hal.md`](gpu-hal.md)
 - 里程碑与剩余步骤：[`../../ROADMAP.md`](../../ROADMAP.md)（M2a-3..6、M2b）
 - 内部原理：[`../M1-report.md`](../M1-report.md)
-- **做不到**：出图、窗口、交换链、管线、多线程
+- **做不到**：把界面（`DrawList`）送上 GPU（M3）、纹理上传（M3）、多线程（HAL 无 `Send`/`Sync`，见 Q-4）。
+  交换链回读**不走 HAL**：`Frame::read_pixels()` 明确 `Unsupported`，用 `WindowedRenderer::read_back_last_frame()`（见 [`vulkan-swapchain.md`](vulkan-swapchain.md)）
 
 ## 9. 检查清单
 

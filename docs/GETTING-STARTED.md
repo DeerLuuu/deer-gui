@@ -8,8 +8,13 @@
 
 **用代码描述界面（哪些控件、怎么排），它算出每个控件的位置，然后画成图片。**
 
-现在的定位是「**离屏渲染**」：输入一棵界面树，输出一张 PNG 图片或一块像素缓冲。
-**还不能开窗口显示**（那是里程碑 M2–M3）。
+两种「看见」的方式：
+1. **离屏渲染**（主力用法，CI 友好）：输入一棵界面树，输出一张 PNG 图片或一块像素缓冲；
+2. **开真窗口**（M2b 起，**仅 Windows**）：`cargo run -p deer-gui --features window --example window_preview`
+   会弹出一个窗口，用 GPU 呈现画面 —— 但窗口里现在**还不是界面**（把界面送上 GPU 是 M3）。
+
+> 依赖口径：只有窗口层（`deer-window` 的 `winit`）是登记在案的第三方依赖；
+> 不写窗口代码时，这个项目仍然是零第三方依赖。登记见 [`../ROADMAP.md`](../ROADMAP.md) 的 Q-1。
 
 ---
 
@@ -18,11 +23,14 @@
 | 你想做的事 | 现在行不行 |
 |---|---|
 | 描述界面、算出布局、导出图片 | ✅ **行** |
-| 把界面渲染到窗口里显示、用鼠标点 | ❌ 不行（M2–M5） |
+| 开一个真窗口，用 GPU 呈现画面 | ✅ **行（M2b，仅 Windows）**：`cargo run -p deer-gui --features window --example window_preview` |
+| 在窗口里显示**界面**（控件/文字） | ❌ 不行：把 `DrawList` 送上 GPU 是 **M3**（窗口现在只有清屏色 + 几何） |
+| 用鼠标点、键盘输入 | ❌ 不行（**M5**） |
 | 图片上的字是真的字体 | ✅ **可以**（离屏 CPU）：带字体入口见[第 11 章](TUTORIAL.md#11-真实文字) / [`features/text-rendering.md`](features/text-rendering.md)。**不带字体的老入口仍是方块占位** |
 
-**所以它现在适合**：验证布局、生成界面设计稿/示意图、给文档配图、做布局算法的实验。
-**不适合**：做一个真正能用的桌面软件（那要等窗口和输入做完）。
+**所以它现在适合**：验证布局、生成界面设计稿/示意图、给文档配图、做布局算法的实验，
+以及（Windows 上）验证「窗口 + Vulkan 上屏」这条链。
+**不适合**：做一个真正能用的桌面软件（那要等 M3 的界面渲染与 M5 的输入）。
 
 ---
 
@@ -342,6 +350,10 @@ Theme {
 
 > 唯一的完整清单是 `crates/deer-gui/src/lib.rs` 里的 `pub mod prelude` —— 本清单与它不一致时以它为准。
 > 用法见 [`TUTORIAL.md` §11](TUTORIAL.md#11-真实文字) 与 [`features/text-rendering.md`](features/text-rendering.md)。
+>
+> **窗口（M2b，仅 Windows）不在 prelude 里**：开了 `window` feature 后另有一个 `deer_gui::window` 模块
+> （`App` / `Flow` / `WindowConfig` / `WindowInfo` / `run`），用完整路径访问，见
+> [§12](TUTORIAL.md#12-在窗口里看到画面) 与 [`features/window.md`](features/window.md)。
 
 ---
 
@@ -353,12 +365,14 @@ Theme {
 | 最小出图 | `cargo run -p deer-gui --example render_to_png` | `render_out/render_to_png.png` |
 | 真实文字（真字形） | `cargo run -p deer-gui --example text_render` | `render_out/text_render.png`（外加 `text_render_atlas.png` 字形图集） |
 | 字形光栅化 + 图集 | `cargo run -p deer-gui --example glyph_atlas` | `render_out/glyph_atlas.png` |
+| 真窗口预览（M2b） | `cargo run -p deer-gui --features window --example window_preview` | 一个真窗口（GPU 清屏色 + 几何），跑 N 帧后自动退出 |
 
 代码分别在
 [`examples/tutorial.rs`](../crates/deer-gui/examples/tutorial.rs)、
 [`examples/render_to_png.rs`](../crates/deer-gui/examples/render_to_png.rs)、
-[`examples/text_render.rs`](../crates/deer-gui/examples/text_render.rs) 与
-[`examples/glyph_atlas.rs`](../crates/deer-gui/examples/glyph_atlas.rs)。
+[`examples/text_render.rs`](../crates/deer-gui/examples/text_render.rs)、
+[`examples/glyph_atlas.rs`](../crates/deer-gui/examples/glyph_atlas.rs) 与
+[`examples/window_preview.rs`](../crates/deer-gui/examples/window_preview.rs)。
 
 ---
 
@@ -366,5 +380,7 @@ Theme {
 
 - 想**动手**：先跑 `tutorial`，再改 `render_out/05-form.dui` 重新跑，观察布局变化。
 - 想**理解原理**：读 [`M1-report.md`](M1-report.md)（布局不变量与踩过的坑）。
-- 想**知道何时能开窗**：看 [`../ROADMAP.md`](../ROADMAP.md)——窗口是 M2–M3，
-  真实字形**本轮已落地**（离屏 CPU，见[第 11 章](TUTORIAL.md#11-真实文字)），鼠标键盘交互是 M5。
+- 想**看真窗口**（仅 Windows）：`cargo run -p deer-gui --features window --example window_preview`
+  —— 见[第 12 章](TUTORIAL.md#12-在窗口里看到画面) 与 [`features/window.md`](features/window.md)。
+- 想**知道路线**：看 [`../ROADMAP.md`](../ROADMAP.md) —— M2（窗口 + 上屏）已完成；
+  窗口里显示界面是 **M3**；真实字形已落地（离屏 CPU，见[第 11 章](TUTORIAL.md#11-真实文字)）；鼠标键盘交互是 M5。

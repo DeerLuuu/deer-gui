@@ -68,7 +68,9 @@ fn main() {
     // ⑤ 如实说明边界
     println!("\n=== 当前边界（不要误读） ===");
     println!("  ✅ 能：枚举 GPU、打开逻辑设备、对着色器做驱动验收");
-    println!("  ❌ 不能：渲染出图（渲染通道/管线/命令缓冲在 M2a-3..6）");
-    println!("  ❌ 不能：渲染到窗口（M2b，需要先定窗口方案 Q-1）");
-    println!("\n现阶段要出图请用 CPU 后端：cargo run -p deer-gui --example render_to_png");
+    println!("  ✅ 能：离屏出图 + 回读（M2a-4..6）与渲染到窗口 / 上屏（M2b）");
+    println!("  ❌ 不能：把界面树（DrawList）送到 GPU —— 那是 M3");
+    println!("\n出图示例：cargo run -p deer-gui --example render_to_png（CPU）");
+    println!("          cargo run -p deer-gui --example gpu_offscreen（Vulkan 离屏）");
+    println!("真窗口上屏：cargo run -p deer-gui --features window --example window_preview");
 }

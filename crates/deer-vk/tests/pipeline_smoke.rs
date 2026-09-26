@@ -15,6 +15,13 @@ use deer_vk::device::VkDevice;
 use deer_vk::ffi_dev as vk;
 use deer_vk::spirv;
 
+/// `DEER_VK_VALIDATION=1` 是否被请求（判据与 `deer_vk::ffi::Instance::validation_from_env()` 一致）。
+fn validation_requested() -> bool {
+    std::env::var("DEER_VK_VALIDATION")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 fn open() -> Option<VkDevice> {
     match VkDevice::open(0) {
         Ok(d) => Some(d),
@@ -75,6 +82,16 @@ fn graphics_pipeline_is_created_on_real_driver() {
 /// 三种推送常量写法分别导致「空句柄」或「访问违例」。
 #[test]
 fn push_constant_rect_shader_is_known_broken() {
+    // 校验层下**显式跳过**：同一支损坏的 SPIR-V 会让校验层/驱动把进程打成
+    // 0xc0000005（STATUS_ACCESS_VIOLATION）。跳过要打印原因，不伪装通过。
+    if validation_requested() {
+        eprintln!(
+            "跳过：`spirv::vertex_shader_rect_pushconstant()` 已知损坏\
+             （PushConstant 变量不是 OpTypeStruct，违反 VUID-StandaloneSpirv-PushConstant-06808），\
+             开启校验层时会让进程 0xc0000005 崩溃 —— 本测试在校验层下不执行。"
+        );
+        return;
+    }
     let Some(dev) = open() else { return };
     let bytes = spirv::vertex_shader_rect_pushconstant();
     // 模块本身仍会被驱动接受（这正说明建模块的校验极弱）

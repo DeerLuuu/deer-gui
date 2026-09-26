@@ -19,7 +19,7 @@
 | 枚举 GPU / 打开设备 | ✅ |
 | 渲染通道 / 管线布局 / 图形管线 | ✅ **本页** |
 | **画出像素**（命令缓冲 + 离屏图像 + 回读 + 绘制） | ✅ M2a-4..6 → 见 [`gpu-offscreen.md`](gpu-offscreen.md) |
-| **渲染到窗口** | ❌ M2b |
+| **渲染到窗口**（`VkSurfaceKHR` + 交换链 + 呈现） | ✅ **M2b** → 见 [`vulkan-swapchain.md`](vulkan-swapchain.md) |
 
 ## 2. 最小示例
 

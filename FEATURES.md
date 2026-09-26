@@ -49,23 +49,25 @@
 | **零依赖 PNG 编码器** | ✅ | [pixels](docs/features/pixels.md#自己编码-png) | `cargo run -p deer-gui --example pixels` |
 | **绘制列表**（树 → 与后端无关的命令） | ✅ | [draw-list](docs/features/draw-list.md) | `cargo run -p deer-gui --example draw_list` |
 | **主题**（颜色 + 字号） | ✅ | [theme](docs/features/theme.md) | `cargo run -p deer-gui --example theme` |
-| **GPU HAL**（后端抽象：`Backend`/`Device`/`Frame`/`Renderer`） | 🔄 | [gpu-hal](docs/features/gpu-hal.md) | `cargo run -p deer-gui --example vulkan_devices` |
+| **GPU HAL**（后端抽象：`Backend`/`Device`/`Frame`/`Renderer`；设备/交换链/呈现已通，`record(DrawList)` 属 M3；`read_pixels` 明确 `Unsupported` 并指向呈现帧回读） | 🔄 | [gpu-hal](docs/features/gpu-hal.md) | `cargo run -p deer-gui --example vulkan_devices` |
 | **CPU 参考后端**（软件光栅化） | ✅ | [rendering](docs/features/rendering.md#cpu-后端软件光栅化) | `cargo run -p deer-gui --example draw_list` |
-| **Vulkan 后端**（设备 + 着色器） | 🔄 | [vulkan](docs/features/vulkan.md) | `cargo run -p deer-gui --example vulkan_devices` |
+| **Vulkan 后端**（设备 + 着色器 + 管线，真机真跑） | ✅ | [vulkan](docs/features/vulkan.md) | `cargo run -p deer-gui --example vulkan_pipeline` |
 | **Vulkan 图形管线**（渲染通道 + 管线 + 绘制，像素经真机验证） | ✅ | [vulkan-pipeline](docs/features/vulkan-pipeline.md) | `cargo run -p deer-gui --example vulkan_pipeline` |
 | **Vulkan 离屏渲染 + 回读**（含**绘制几何**，已修复段序缺陷） | ✅ | [gpu-offscreen](docs/features/gpu-offscreen.md) | `cargo run -p deer-gui --example gpu_offscreen` |
 | **字形光栅化**（轮廓 → 覆盖率位图，超采样抗锯齿） | ✅ | [glyph-raster](docs/features/glyph-raster.md) | `cargo run -p deer-gui --example glyph_atlas` |
 | **字形图集**（货架打包 + 1px padding + 按需增高） | ✅ | [glyph-atlas](docs/features/glyph-atlas.md) | `cargo run -p deer-gui --example glyph_atlas` |
 | **真实字体度量与换行**（`FontMeasure` 替换「每字符 0.6em」近似） | ✅ | [text-rendering](docs/features/text-rendering.md) | `cargo run -p deer-gui --example text_render` |
 | **真实字形渲染**（CPU 后端贴真实字形，不再是方块占位） | ✅ | [text-rendering](docs/features/text-rendering.md) | `cargo run -p deer-gui --example text_render` |
+| **窗口**（真窗口 + 事件循环，**仅 Windows**） | ✅ | [window](docs/features/window.md) | `cargo run -p deer-gui --features window --example window_preview` |
+| **Vulkan 上屏**（`VkSurfaceKHR` + 交换链 + 帧同步 + 呈现） | ✅ | [vulkan-swapchain](docs/features/vulkan-swapchain.md) | `cargo run -p deer-gui --features window --example window_preview` |
 
 ## 四、还没做的（**不要以为能跑**）
 
 | 功能 | 里程碑 | 现状说明 |
 |---|---|---|
-| **渲染到窗口**（屏幕上显示） | M2b | 完全不能。需要先定窗口方案（`ROADMAP.md` Q-1） |
-| **GPU 渲染真实界面**（Vulkan 后端消费 `DrawList`） | M3 | 离屏清屏 / 回读 / 绘制几何已在真机验证（M2a-6 修复了 SPIR-V 段序缺陷）；但 Vulkan 后端**还不消费 `DrawList`**，界面目前只能由 CPU 后端出图 |
-| **GPU 侧文本**（Vulkan 消费 `DrawCmd::Text` / 字形图集） | M3 | 依赖 M4 的字形图集（**已就绪**）；Vulkan 目前只到离屏清屏与绘制几何，**尚未消费 `DrawCmd::Text`** |
+| **GPU 渲染真实界面**（Vulkan 后端消费 `DrawList`） | M3 | 离屏清屏 / 回读 / 绘制几何已在真机验证（M2a-6），**窗口上屏**（surface + 交换链 + 呈现）已在 M2b 打通；但 Vulkan 后端**还不消费 `DrawList`** —— 窗口里现在只有清屏色 + 几何三角形，界面仍只能由 CPU 后端出图 |
+| **GPU 侧文本**（Vulkan 消费 `DrawCmd::Text` / 字形图集） | M3 | 依赖 M4 的字形图集（**已就绪**）；Vulkan 上屏链已通，但**尚未消费 `DrawCmd::Text`** |
+| **推送常量矩形着色器**（`spirv.rs::vertex_shader_rect_pushconstant`） | M3 | **这支 SPIR-V 是损坏的**（校验层 `VUID-StandaloneSpirv-PushConstant-06808`）；请求校验层时会让进程 `0xc0000005` 崩溃，所以 `device_smoke` / `pipeline_smoke` 里涉及它的测试在**校验层下显式跳过**（t15）。**task-18 后三条路径（`VkBackend::new` / 设备·离屏 / 窗口）都读 `DEER_VK_VALIDATION`**（当时 offscreen 的 3 个真缺陷已修）；实测 `DEER_VK_VALIDATION=1 cargo test -p deer-vk` → 86 passed / 0 failed、零校验消息（本机实测，数字随测试增长）。矩形改**顶点缓冲**即可修 |
 | **字形 hinting**（小字号像素对齐） | M4 残余 | 不做 —— 不读 `glyf` 的 instructions，用超采样抗锯齿代替 |
 | **亚像素定位 / LCD 子像素渲染** | M4 残余 | 不做 —— 字形按**整数像素**落位 |
 | **字距与连字**（`kern` / `GSUB` / `GPOS`） | M4 残余 | 不做整形，`advance` 就是 `hmtx` 的原始值 |

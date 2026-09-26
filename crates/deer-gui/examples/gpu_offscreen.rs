@@ -149,12 +149,12 @@ fn main() {
     assert_ne!(at(72, 72), [0, 255, 0, 255], "(72,72) 应在三角形外");
     println!("像素位置也正确 ✅");
 
-    // ⑧ 边界
-    println!("\n=== 当前边界 ===");
+    // ⑧ 边界（随里程碑推进要跟着改，别留旧说法）
+    println!("\n=== 当前边界（M2b 之后）===");
     println!("  ✅ 能：建渲染通道/管线、录制命令缓冲、提交、栅栏同步、清屏、**绘制几何**、回读 RGBA8");
-    println!("  ❌ 不能：把界面树（DrawList）渲染到 GPU —— 那是 M3（GPU 渲染器）");
-    println!("  ❌ 不能：渲染到窗口（M2b，需先定窗口方案）");
-    println!("  ❌ 推送常量在 Intel 驱动上仍不可用（矩形绘制改走顶点缓冲）");
+    println!("  ✅ 能：渲染到窗口 / 上屏（M2b，见 --features window --example window_preview）");
+    println!("  ❌ 不能：把界面树（DrawList）送到 GPU —— 那是 M3（GPU 渲染器）");
+    println!("  ❌ 推送常量在 Intel 驱动上仍不可用（矩形绘制改走顶点缓冲；见 ROADMAP Q-5）");
     println!("\n要出可看的界面图请用 CPU 后端：cargo run -p deer-gui --example render_to_png");
 
     dev.wait_idle().expect("空闲等待");

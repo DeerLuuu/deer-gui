@@ -235,8 +235,16 @@ impl Drop for Fence {
 ///
 /// 设计取舍：**不引入全局状态机**。调用方按顺序调方法，每步失败都返回 `GpuError`。
 /// 这样它能在测试里被逐步验证，也不会像「隐式帧循环」那样难以调试。
+///
+/// ## 字段顺序 = 析构顺序（**不要重排**）
+///
+/// - `image` 在 `image_memory` **之前** ⇒ 先销毁 `VkImage`、再 `vkFreeMemory`（内存不能
+///   先于绑定它的图像消失）；
+/// - 两者都在 `device`（不在本结构里，由 `VkDevice` 持有）之前 ⇒ `vkFreeMemory` 时设备仍存活。
 pub struct OffscreenRenderer {
     pub image: Image,
+    /// 图像绑定的设备内存。**必须由本结构持有**（曾经用 `mem::forget` 泄漏掉）。
+    image_memory: Memory,
     pub view: ImageView,
     pub framebuffer: Framebuffer,
     pub pool: CommandPool,
@@ -473,11 +481,20 @@ impl OffscreenRenderer {
             });
         }
 
-        // 图像内存的所有权转移给 `image`（它的 Drop 不释放内存，所以这里显式保管）
-        std::mem::forget(image_memory);
-
+        // **所有权明确**：图像内存归 `OffscreenRenderer`（`image_memory` 字段）。
+        //
+        // 这里曾经是 `std::mem::forget(image_memory)` + 一句「所有权转移给 image（它的 Drop
+        // 不释放内存，所以这里显式保管）」—— 那句话自相矛盾，实际效果是**没人释放**：
+        // 校验层在 `vkDestroyDevice` 时报 `has 1 leaked objects that have not been destroyed`，
+        // 每个 `OffscreenRenderer` 泄漏一块设备内存。
+        //
+        // 现在的规则：`Memory` 的 Drop 会 `vkFreeMemory`；把它作为字段持有即可。
+        // 字段**声明在 `image` 之后**（Rust 按声明顺序析构）⇒ 先销毁图像、再释放内存，
+        // 不会出现「内存先没了而图像还绑着它」。**不会双释放**：`Image::drop` 只销毁
+        // `VkImage`（它不持有内存），`Memory::drop` 只释放 `VkDeviceMemory`，两者各管一头。
         Ok(OffscreenRenderer {
             image,
+            image_memory,
             view,
             framebuffer,
             pool,
@@ -497,6 +514,11 @@ impl OffscreenRenderer {
     }
     pub fn height(&self) -> u32 {
         self.height
+    }
+
+    /// 图像绑定的设备内存句柄（诊断/泄漏排查用；所有权仍在本结构，`Drop` 时释放）。
+    pub fn image_memory(&self) -> vk::DeviceMemoryHandle {
+        self.image_memory.handle()
     }
 
     /// 录制一帧：清屏 + 绑定管线 + 动态 viewport/scissor + 画 `vertex_count` 个顶点。
@@ -586,14 +608,25 @@ impl OffscreenRenderer {
         }
 
         // —— 屏障 + 拷回暂存缓冲 ——
-        // 渲染通道的 finalLayout 已经是 TRANSFER_SRC_OPTIMAL，但为了不依赖那一点，
-        // 这里显式再做一次屏障（重复屏障是合法的，代价可忽略）。
+        //
+        // ⚠️ 这里曾经写死 `old_layout = COLOR_ATTACHMENT_OPTIMAL`，并配一句
+        // 「渲染通道的 finalLayout 已经是 TRANSFER_SRC_OPTIMAL，但为了不依赖那一点，
+        //  这里显式再做一次屏障（重复屏障是合法的）」—— **两句都错**：
+        //   · `oldLayout` 必须等于图像**当前实际**布局。渲染通道的 `finalLayout` 是
+        //     `TRANSFER_SRC_OPTIMAL`，所以声明成 `COLOR_ATTACHMENT_OPTIMAL` 是一次
+        //     「从错误布局出发」的转换，校验层直接报 `cannot transition the layout ...`；
+        //   · 「重复屏障」只有 `oldLayout == newLayout` 时才叫重复；从别的布局出发不是。
+        //
+        // 正确做法：向渲染通道要它的 `finalLayout()`，用它当 `oldLayout`。
+        // 这样无论调用方建渲染通道时给的是什么 finalLayout（本模块文档推荐
+        // `TRANSFER_SRC_OPTIMAL`），这次转换的起点都是事实。屏障本身仍然必要 ——
+        // 它建立 `COLOR_ATTACHMENT_WRITE → TRANSFER_READ` 的内存可见性依赖。
         let barrier = vk::ImageMemoryBarrier {
-            s_type: 47, // VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER
+            s_type: vk::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             p_next: std::ptr::null(),
             src_access_mask: vk::VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
             dst_access_mask: vk::VK_ACCESS_TRANSFER_READ_BIT,
-            old_layout: vk::VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+            old_layout: render_pass.final_layout(),
             new_layout: vk::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
             src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
             dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,

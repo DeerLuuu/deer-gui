@@ -6,7 +6,9 @@
 //!
 //! 产物：`render_out/render_to_png.png`（相对于仓库根运行时的路径）。
 //!
-//! 说明：渲染是**离屏**的（CPU 软件光栅化），不涉及窗口。窗口渲染在里程碑 M2b。
+//! 说明：渲染是**离屏**的（CPU 软件光栅化），不涉及窗口。
+//! 想看真窗口上屏（Vulkan + 交换链，M2b）：
+//! `cargo run -p deer-gui --features window --example window_preview`。
 //! 这条路径**不带字体**，所以文字仍是等宽格占位（`ApproxMeasure` 度量）；
 //! 要真实字形请看 `examples/text_render.rs`（里程碑 M4）。
 

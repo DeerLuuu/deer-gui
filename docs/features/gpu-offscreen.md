@@ -23,7 +23,7 @@
 | 回读像素（`copyImageToBuffer` + map） | ✅ |
 | **`vkCmdDraw` 绘制几何** | ✅ **（曾经不通，根因已找到并修复）** |
 | 把界面树（`DrawList`）渲染到 GPU | ❌ 需要 M3 的 GPU 渲染器 |
-| 渲染到窗口 | ❌ M2b |
+| 渲染到窗口（`VkSurfaceKHR` + 交换链 + 呈现） | ✅ **M2b 已打通**（见 [`vulkan-swapchain.md`](vulkan-swapchain.md)）；本节讲的是**离屏**回读路径 |
 
 ## 2. 最小示例
 
@@ -169,7 +169,7 @@ SPIR-V 的逻辑布局段顺序是**规范强制**的（`OpEntryPoint` 必须在
 - 图形管线：[`vulkan-pipeline.md`](vulkan-pipeline.md)
 - SPIR-V 汇编器：[`vulkan.md`](vulkan.md)
 - GPU HAL：[`gpu-hal.md`](gpu-hal.md)
-- **做不到**：把 `DrawList` 渲染到 GPU（M3）、窗口呈现（M2b）、推送常量（Intel 上不可用）
+- **做不到**：把 `DrawList` 渲染到 GPU（M3）、推送常量（Intel 上不可用）；窗口呈现**已在 M2b 打通**（见 [`window.md`](window.md)、[`vulkan-swapchain.md`](vulkan-swapchain.md)），但那不属于本节这条离屏路径
 
 ## 7. 检查清单
 

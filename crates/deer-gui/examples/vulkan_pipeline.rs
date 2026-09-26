@@ -9,8 +9,10 @@
 //! —— 因为 `vkCreateShaderModule` 极宽容（连非法 `bound` 都接受），
 //! 驱动真正编译着色器是在建管线的时候。
 //!
-//! **边界（务必读）**：这一步**还不会画出任何像素**。命令缓冲、离屏图像、回读
-//! 在 M2a-4..6；渲染到窗口在 M2b。所以本示例只证明「管线可以建出来」。
+//! **边界（务必读）**：本示例只证明「管线可以建出来」。
+//! 离屏出图与回读在 M2a-4..6（`--example gpu_offscreen`）；
+//! 渲染到窗口 / 上屏已在 **M2b** 落地（`--features window --example window_preview`）；
+//! 把界面（`DrawList`）送上 GPU 是 **M3**。
 
 use deer_gpu::Backend;
 use deer_vk::ffi_dev as vk;
@@ -19,6 +21,20 @@ use deer_vk::VkDevice;
 
 fn main() {
     println!("=== GPU 图形管线（M2a-3）===\n");
+
+    // ⚠️ 本示例用的**推送常量矩形着色器已知损坏**（`spirv::vertex_shader_rect_pushconstant`，
+    // 见 `ROADMAP.md` Q-5）：请求校验层后，校验层会报
+    // `VUID-StandaloneSpirv-PushConstant-06808`，随后进程访问违例（0xc0000005）。
+    // 所以这里**显式跳过**（不是「通过」，也不是崩掉）—— 判据用库里的唯一真相
+    // `deer_vk::ffi::Instance::validation_from_env()`，不自己手写一遍环境变量解析。
+    if deer_vk::ffi::Instance::validation_from_env() {
+        println!("⚠️ 检测到 DEER_VK_VALIDATION：本示例使用的推送常量着色器**已知损坏**");
+        println!("   校验层会报 VUID-StandaloneSpirv-PushConstant-06808，随后进程访问违例 0xc0000005。");
+        println!("   ⇒ 显式跳过本示例（**这不是通过**）。要看校验层下的真实验证，请跑：");
+        println!("      cargo run -p deer-gui --features window --example window_preview");
+        println!("      cargo run -p deer-gui --example gpu_offscreen");
+        return;
+    }
 
     // ① 枚举设备（挑独显更好，但这里只用第一个可用的）
     let vk_backend = match deer_vk::VkBackend::new() {
@@ -106,12 +122,16 @@ fn main() {
         Err(e) => println!("  模块被拒：{e}"),
     }
 
-    // ⑧ 边界
-    println!("\n=== 当前边界 ===");
+    // ⑧ 边界（注意：这几条随里程碑推进要跟着改，别留旧说法）
+    println!("\n=== 当前边界（M2b 之后）===");
     println!("  ✅ 能：枚举 GPU / 打开设备 / 建渲染通道 / 建图形管线");
-    println!("  ❌ 不能：**画出像素**（命令缓冲 + 离屏图像 + 回读在 M2a-4..6）");
-    println!("  ❌ 不能：渲染到窗口（M2b，需先定窗口方案）");
-    println!("\n要出图请用 CPU 后端：cargo run -p deer-gui --example render_to_png");
+    println!("  ✅ 能：离屏出图 + 回读（M2a-4..6，见 --example gpu_offscreen）");
+    println!("  ✅ 能：渲染到窗口 / 上屏（M2b，见 --features window --example window_preview）");
+    println!("  ❌ 不能：把界面（`DrawList`）送上 GPU —— 这是 M3");
+    println!("\n本示例本身只证明「管线能建出来」；出图请看：");
+    println!("  离屏 PNG（CPU 后端）：cargo run -p deer-gui --example render_to_png");
+    println!("  离屏 PNG（Vulkan）  ：cargo run -p deer-gui --example gpu_offscreen");
+    println!("  真窗口上屏          ：cargo run -p deer-gui --features window --example window_preview");
 
     dev.wait_idle().expect("空闲等待");
 }

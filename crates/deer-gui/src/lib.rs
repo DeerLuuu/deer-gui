@@ -11,7 +11,8 @@
 //! | 树 + 几何 → 绘制列表 → **像素**（CPU 后端） | ✅ |
 //! | 把像素写成 PNG 文件 | ✅ |
 //! | **真实字体字形**（零依赖 TTF 解析 + 光栅化 + 图集 + 真实度量） | ✅ |
-//! | 渲染到窗口 / 屏幕上 | ❌ 里程碑 M2b |
+//! | **渲染到窗口 / 屏幕上**（M2b：窗口 + `VkSurfaceKHR` + 交换链 + 呈现） | ✅ 需开 `window` feature |
+//! | GPU 侧**界面**（Vulkan 消费 `DrawList`，窗口里显示真实界面） | ❌ 里程碑 M3 |
 //! | GPU 侧文本（把字形图集上传给 Vulkan） | ❌ 里程碑 M3 |
 //! | 输入事件与焦点 | ❌ 里程碑 M5 |
 //!
@@ -41,6 +42,14 @@
 pub use deer_gpu::{self as gpu, DrawCmd, DrawList, GpuError, GpuResult, Theme};
 pub use deer_layout::{self as layout, Node};
 pub use deer_vk::{self as vk, VkBackend};
+
+/// 窗口层（**需要 `window` feature**）。
+///
+/// 这是本 workspace 唯一引入第三方依赖（`winit`）的地方，理由是窗口/事件循环的
+/// 平台代码量与跨平台覆盖（见 `ROADMAP.md` 的 Q-1）。渲染层通过 HAL 的不透明
+/// [`gpu::RawWindowHandle`] 拿原生句柄，**不依赖 winit** —— 所以换窗口实现不会动渲染栈。
+#[cfg(feature = "window")]
+pub use deer_window as window;
 
 use std::path::Path;
 

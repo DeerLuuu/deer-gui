@@ -51,12 +51,13 @@ std::fs::write("out.png", png)?;
 |---|---|
 | `deer_gpu::png::encode_rgba(w, h, &pixels) -> Result<Vec<u8>, String>` | 编成 PNG 字节流（可直接 `fs::write`） |
 
-**为什么自己写编码器**：本项目不允许引第三方依赖（没有 `image` / `png` crate）。
+**为什么自己写编码器**：本项目**除窗口层 `winit`（已登记例外，见 [`ROADMAP.md`](../../ROADMAP.md) 的 Q-1）外**不引第三方依赖
+（没有 `image` / `png` crate；`deer-gpu` 本身仍然零第三方依赖）。
 实现用 zlib 的 **stored（未压缩）deflate** 块 —— 合法 zlib 流且绕开压缩算法，
 CRC32 与 Adler32 自己实现（约 20 行各）。
 
 **代价**：文件比真实压缩大（≈ 原始像素 + 少量开销）。例如 300×200 的图约 240 KB。
-换来的是**零依赖**。
+换来的是**这个编码器零依赖**。
 
 ## 4. 自检
 

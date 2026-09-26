@@ -10,6 +10,22 @@ rust-version.workspace = true
 deer-layout.workspace = true
 deer-gpu.workspace = true
 deer-vk.workspace = true
+# 窗口层是**可选**的：只有开 `window` feature 才会把 winit 拉进来，
+# 这样「只用离屏渲染 / 布局」的使用者不会被动拿到第三方依赖。
+deer-window = { workspace = true, optional = true }
+
+[features]
+default = []
+# 真窗口预览（M2b）：`cargo run -p deer-gui --features window --example window_preview`
+window = ["dep:deer-window"]
+
+[[example]]
+name = "window_preview"
+required-features = ["window"]
+
+[[example]]
+name = "hal_window_path"
+required-features = ["window"]
 
 [lib]
 name = "deer_gui"

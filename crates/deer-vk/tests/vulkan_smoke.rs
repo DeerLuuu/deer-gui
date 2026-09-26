@@ -48,22 +48,40 @@ fn vk_backend_enumerates_real_adapters() {
 }
 
 #[test]
-fn vk_backend_reports_unsupported_for_device_creation_in_m1() {
-    // M1 只到实例 + 枚举。`open()` 必须**明确报未实现**，而不是返回一个假装能用的设备。
-    // 假成功比报错难查得多，所以这条断言是刻意的。
+fn vk_backend_opens_a_real_device_and_reports_m2b_boundaries() {
+    // M1 阶段这条断言是「open() 必须明确报未实现」。**M2b 之后它变成了真设备**，
+    // 所以这里改成验证新契约：拿到真设备，且**尚未实现的部分明确报错**（不许假装能用）。
     let Ok(vk) = VkBackend::new() else {
         println!("跳过：本机没有可用的 Vulkan");
         return;
     };
-    let err = match vk.open(0) {
-        Ok(_) => panic!("M1 阶段 open() 必须返回错误，而不是返回一个假装能用的设备"),
-        Err(e) => e,
-    };
-    let msg = err.to_string();
+
+    let mut device = vk.open(0).expect("M2b 之后 open(0) 必须返回设备");
     assert!(
-        msg.contains("M2"),
-        "错误信息应指明实现里程碑，实际：{msg}"
+        !device.info().name.is_empty(),
+        "适配器名不能为空（说明真的枚举到了设备）"
     );
+
+    // 诚实边界①：还没建交换链就 begin_frame ⇒ 明确报错，而不是给一个空帧
+    let err = device
+        .begin_frame()
+        .err()
+        .expect("没有交换链时 begin_frame 必须报错");
+    assert!(
+        err.to_string().contains("交换链"),
+        "错误信息要说清原因，实际：{err}"
+    );
+
+    // 诚实边界②：纹理（字形图集上传）是 M3 ⇒ 明确报错
+    let err = device
+        .create_texture(deer_gpu::TextureDesc {
+            width: 4,
+            height: 4,
+            format: deer_gpu::TargetFormat::Rgba8Unorm,
+            readable: false,
+        })
+        .expect_err("纹理创建未实现，必须报错");
+    assert!(err.to_string().contains("M3"), "实际：{err}");
 
     // 越界的适配器索引也必须报错（而不是 panic）
     assert!(vk.open(999).is_err(), "越界索引必须返回错误");

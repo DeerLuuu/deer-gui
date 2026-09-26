@@ -1160,6 +1160,33 @@ pub fn fragment_shader_solid(color: [f32; 4]) -> Vec<u8> {
 /// 2. 同一个 struct，改为直接 `OpLoad` 整个 Block → 返回成功、句柄为空
 /// 3. 直接声明为 `vec4`（不加 Block）→ 访问违例
 ///
+/// ## ⚠️⚠️ 规范违规（2025 补记）：**开启校验层会崩进程**
+///
+/// 校验层（`DEER_VK_VALIDATION=1` + `VK_LAYER_KHRONOS_validation`）对当前写法直接报：
+///
+/// ```text
+/// vkCreateShaderModule(): pCreateInfo->pCode (spirv-val produced an error):
+/// PushConstant OpVariable <id> '10[%10]' has illegal type.
+/// Such variables must be typed as OpTypeStruct
+///   %10 = OpVariable %_ptr_PushConstant_v4float_0 PushConstant
+/// VUID-StandaloneSpirv-PushConstant-06808
+/// ```
+///
+/// 也就是说第 3 种写法（`vec4` 直连，不加 `Block`）**不是**规范允许的形式 ——
+/// PushConstant 存储类的变量**必须**是 `OpTypeStruct`。报错之后进程会以
+/// **`0xc0000005`（STATUS_ACCESS_VIOLATION）**结束（实测：`--test-threads=1` 也可复现，
+/// 且只发生在 `vkCreateShaderModule` 这一步）。
+///
+/// 后果与处置：
+/// - `tests/device_smoke.rs::push_constant_rect_shader_is_accepted_by_driver` 与
+///   `tests/pipeline_smoke.rs::push_constant_rect_shader_is_known_broken` 都在
+///   校验层下**显式跳过**（打印原因，不伪装通过）—— 于是「带校验层跑全量 deer-vk」是安全动作；
+/// - 修好它的正路是：把推送常量块声明成 `OpTypeStruct` + `Block`（并在 `vkCreatePipelineLayout`
+///   里给出匹配的 `VkPushConstantRange`），然后靠**管线创建**（不是建模块）验收；
+/// - 在修好之前，**不要让 `VkDevice::open()` 去读 `DEER_VK_VALIDATION`**：
+///   那会让所有打开设备的测试都踩到这颗地雷（`device.rs` 里有同样的注释）。
+/// - `crates/deer-gui/examples/vulkan_pipeline.rs` 也调用本函数：开校验层跑它同样会崩。
+///
 /// `vkCreateShaderModule` 对三种写法**都接受** —— 再次印证「建模块时的校验极弱，
 /// 真正编译发生在建管线时」。
 ///
