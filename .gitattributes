@@ -1,0 +1,14 @@
+# 让行尾与检出平台无关（deer-ui 的经验：CRLF 混入会破坏字节级可复现性）
+* text=auto eol=lf
+
+# Rust 源码
+*.rs text eol=lf
+
+# 场景文件（.dui）：行尾是格式的一部分，必须固定
+*.dui text eol=lf
+
+# 二进制
+*.png binary
+*.ttf binary
+*.otf binary
+*.spv binary
