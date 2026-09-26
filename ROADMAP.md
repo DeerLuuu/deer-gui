@@ -1,0 +1,40 @@
+# deer-gui 路线图
+
+> 定位：**从零实现的 Rust GUI 运行时**。不依赖 web/DOM，不依赖 `wgpu`/`ash`/`vulkano`。
+> 依赖边界：**连 GPU 后端也自己写**（Vulkan 先行，DX12/Metal 后续；抽象层保证「加后端 = 实现一个 trait」）。
+
+## 里程碑
+
+| # | 里程碑 | 内容 | 状态 |
+|---|---|---|---|
+| **M1** | **核心 + HAL + Vulkan 设备枚举** | 节点树、布局代数、命中测试、`.dui` 解析；GPU HAL + CPU 参考后端；Vulkan 实例与物理设备枚举（自己声明符号 + 动态加载） | ✅ **完成** |
+| **M2** | Vulkan 逻辑设备 + 交换链 | `VkDevice`/队列/`VkSurfaceKHR`/交换链、帧同步（信号量/栅栏）、清屏出图；窗口用 `RawWindowHandle` 抽象（首个平台实现：Win32） | ⬜ |
+| **M3** | 渲染器 + 管线（矩形/圆角/裁剪） | 顶点/片段着色器（SPIR-V 内嵌）、顶点缓冲、批处理、裁剪栈映射到 scissor、`DrawList` → GPU | ⬜ |
+| **M4** | 文本 | 字体解析（TTF/OTF）+ 字形光栅化 + 图集 + 文本度量（替换 `ApproxMeasure`）+ 换行 | ⬜ |
+| **M5** | 输入 + 焦点 + dock | 事件循环、命中测试路由（`hit_test` 已就位）、焦点系统（含方向键）、**可停靠面板布局**（拖动改位置 / 边缘折叠） | ⬜ |
+| **M6** | 控件族 | 从 `deer-ui` 迁移 12 个控件的**语义**：`Btn`/`ChipGroup`/`Segmented`/`TabBar`/`Switch`/`NumberField`/`ScrubNum`/`ColorField`/`Dialog`/`Overlay`/`DropMenu`/`HoverTip`/`Icon`/`Row`/`RowActions`/`Keep` | ⬜ |
+| **M7** | DX12 / Metal 后端 | 各自实现 HAL trait；用 `deer-gpu` 的 CPU 参考后端做像素级对照 | ⬜ |
+
+## 依赖纪律（硬性）
+
+1. **不引图形抽象库**：无 `wgpu`、`ash`、`vulkano`、`glow`。
+2. **不引 GUI 框架**：无 `egui`、`iced`、`tauri`。
+3. **最小生态依赖**：目前 **零依赖**（`deer-layout`/`deer-gpu`/`deer-vk` 都没有 `[dependencies]` 之外的第三方）。
+   后续允许的例外必须逐条登记并说明理由（例如：字体解析可能需要 `ttf-parser`；窗口可能需要 `winit`，
+   但**窗口不在 M1–M4 的范围内**）。
+
+## 与 deer-ui 的关系
+
+- **只取控件语义**（有哪些控件、什么行为、什么状态），**不取实现**（DOM/CSS/React 全部丢弃）。
+- 布局代数来自 deer-ui 的 TypeScript 验证原型（V0）：那 28 条断言在这里以 Rust 测试重建，
+  并保留了它抓到过的三个缺陷的回归守卫。
+- `deer-ui` 本身不动，仍可作为 web 场景的组件库存在。
+
+## 已知未决（登记，不阻塞）
+
+| # | 项 | 说明 |
+|---|---|---|
+| Q-1 | 窗口抽象 | `RawWindowHandle` 已定义，但 M2 需要决定：自己写 Win32（`CreateWindowExW`），还是允许 `winit`。**这条会显著影响工作量**，M1 未决。 |
+| Q-2 | SPIR-V 来源 | 无 SDK ⇒ 无 `glslc`。M3 需要决定：内嵌预编译字节 / 自写极简着色器编译器 / 在构建脚本里调用外部编译器（可选依赖）。 |
+| Q-3 | 文本度量与布局的耦合 | `Measure` trait 已留出注入点；M4 接真实字体后，`ApproxMeasure` 需保留为**确定性测试用**实现。 |
+| Q-4 | 线程模型 | HAL 故意不实现 `Send`/`Sync`；M2 需要定「渲染线程 vs UI 线程」的边界。 |

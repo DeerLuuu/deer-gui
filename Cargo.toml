@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = ["crates/deer-layout", "crates/deer-gpu", "crates/deer-vk"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+deer-layout = { path = "crates/deer-layout" }
+deer-gpu = { path = "crates/deer-gpu" }
+deer-vk = { path = "crates/deer-vk" }
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -1,0 +1,15 @@
+[package]
+name = "deer-vk"
+description = "deer-gui 的 Vulkan 后端：**自己声明 Vulkan 符号**，不依赖 ash / wgpu / vulkano"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "deer_vk"
+path = "src/lib.rs"
+
+[dependencies]
+deer-gpu.workspace = true
+deer-layout.workspace = true

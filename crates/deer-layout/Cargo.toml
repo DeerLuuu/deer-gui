@@ -1,0 +1,13 @@
+[package]
+name = "deer-layout"
+description = "deer-gui 的语言无关核心：节点树、布局代数、命中测试、场景文件解析"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "deer_layout"
+path = "src/lib.rs"
+
+[dependencies]

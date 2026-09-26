@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# 场景文件的运行期输出（后续截图/回读用）
+/out
+*.png
+
+# 编辑器
+.vscode/
+.idea/
