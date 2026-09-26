@@ -52,6 +52,7 @@ const OP_ACCESS_CHAIN: u16 = 65;
 const OP_DECORATE: u16 = 71;
 const OP_MEMBER_DECORATE: u16 = 72;
 const OP_COMPOSITE_EXTRACT: u16 = 81;
+const OP_COMPOSITE_CONSTRUCT: u16 = 80;
 const OP_BITWISE_AND: u16 = 194;
 const OP_CONVERT_U_TO_F: u16 = 112;
 const OP_U_DIV: u16 = 134;
@@ -263,11 +264,29 @@ impl Module {
         r
     }
 
+    /// `OpConstantComposite resultType result constituents...`
+    ///
+    /// ⚠️ **所有 `constituents` 必须都是常量**。若成员是运行时算出来的值
+    /// （`OpSelect` / `OpLoad` / 算术结果），必须改用 [`Self::composite_construct`]
+    /// —— 用错会让 SPIR-V 非法，而驱动**不报错、只是不画**。
+    /// 本项目就踩过这个坑（三角形着色器曾因此完全画不出像素）。
     pub fn constant_composite(&mut self, ty: u32, parts: &[u32]) -> u32 {
         let r = self.id();
         let mut ops = vec![ty, r];
         ops.extend_from_slice(parts);
         self.op(OP_CONSTANT_COMPOSITE, &ops);
+        r
+    }
+
+    /// `OpCompositeConstruct resultType result constituents...`
+    ///
+    /// 成员**可以是运行时值**。把多个标量/向量凑成一个向量时用这个，
+    /// 而不是 `OpConstantComposite`。
+    pub fn composite_construct(&mut self, ty: u32, parts: &[u32]) -> u32 {
+        let r = self.id();
+        let mut ops = vec![ty, r];
+        ops.extend_from_slice(parts);
+        self.op(OP_COMPOSITE_CONSTRUCT, &ops);
         r
     }
 
@@ -309,6 +328,7 @@ impl Module {
         r
     }
 
+    /// `OpCompositeExtract result composite index0 index1 ...`
     pub fn composite_extract(&mut self, ty: u32, composite: u32, indexes: &[u32]) -> u32 {
         let r = self.id();
         let mut ops = vec![ty, r, composite];
@@ -572,6 +592,89 @@ pub fn vertex_shader_select_full_vec4(positions: [[f32; 4]; 3]) -> Vec<u8> {
     m.finish()
 }
 
+/// 诊断用：**三个顶点都由纯常量 vec4 直接写出**，完全不用 `OpSelect` /
+/// `OpCompositeConstruct` / `gl_VertexIndex`。
+///
+/// 用途：最干净的判别 —— 若它画得出，问题在「顶点位置计算」路径；
+/// 若画不出，问题在光栅化/管线状态，与着色器逻辑无关。
+///
+/// 顶点位置按 `gl_VertexIndex` 选取这一步被**去掉了**：SPIR-V 里三个顶点
+/// 都执行同一条 `OpStore`（存同一个常量）。所以三个顶点重合 ⇒ 退化三角形、
+/// 不产生像素。为让它有面积，改为**每次执行的顶点都落在同一处**是不行的；
+/// 因此本函数实际只用于验证「常量路径能不能画出**任何**东西」——
+/// 配合 `POINT_LIST` 或退化三角形不产生像素都属于预期。
+pub fn vertex_shader_single_constant() -> Vec<u8> {
+    let mut m = Module::new();
+    m.shader_capability().memory_model_glsl450().source_unknown();
+    let void = m.type_void();
+    let f32_ty = m.type_float();
+    let v4 = m.type_vector(f32_ty, 4);
+    let ptr_out_v4 = m.type_pointer(SC_OUTPUT, v4);
+    let fn_ty = m.type_function(void, &[]);
+    let out_pos = m.variable(ptr_out_v4, SC_OUTPUT);
+    let fn_id = m.id();
+    let block = m.id();
+    m.entry_point(EXECUTION_MODEL_VERTEX, fn_id, "main", &[out_pos]);
+    m.debug_name(out_pos, "gl_Position");
+    m.decorate(out_pos, DECORATION_BUILT_IN, &[BUILTIN_POSITION]);
+    m.function(void, fn_id, fn_ty, block);
+    let x = m.constant_f32(f32_ty, -0.8);
+    let y = m.constant_f32(f32_ty, -0.8);
+    let z = m.constant_f32(f32_ty, 0.0);
+    let w = m.constant_f32(f32_ty, 1.0);
+    let pos = m.constant_composite(v4, &[x, y, z, w]);
+    m.store(out_pos, pos);
+    m.return_void();
+    m.function_end();
+    m.finish()
+}
+
+/// 顶点着色器（**顶点缓冲输入**）：从 location 0 读一个 `vec2` 位置。
+///
+/// 这是**完全标准**的 Vulkan 顶点路径（真实顶点缓冲 + 顶点属性），
+/// 不依赖 `gl_VertexIndex`、`OpSelect` 或任何内置变量。
+///
+/// 存在的理由：用来判别「这个驱动能不能画出任何几何」。
+/// 若它画得出，问题在「从内置变量算顶点位置」那条路；
+/// 若它也画不出，问题在更底层（管线状态或用法）。
+pub fn vertex_shader_from_vertex_buffer() -> Vec<u8> {
+    let mut m = Module::new();
+    m.shader_capability().memory_model_glsl450().source_unknown();
+
+    let void = m.type_void();
+    let f32_ty = m.type_float();
+    let v2 = m.type_vector(f32_ty, 2);
+    let v4 = m.type_vector(f32_ty, 4);
+    let ptr_in_v2 = m.type_pointer(SC_INPUT, v2);
+    let ptr_out_v4 = m.type_pointer(SC_OUTPUT, v4);
+    let fn_ty = m.type_function(void, &[]);
+
+    let in_pos = m.variable(ptr_in_v2, SC_INPUT);
+    let out_pos = m.variable(ptr_out_v4, SC_OUTPUT);
+
+    let z = m.constant_f32(f32_ty, 0.0);
+    let w = m.constant_f32(f32_ty, 1.0);
+
+    let fn_id = m.id();
+    let block = m.id();
+    m.entry_point(EXECUTION_MODEL_VERTEX, fn_id, "main", &[in_pos, out_pos]);
+    m.debug_name(in_pos, "in_pos");
+    m.decorate(in_pos, DECORATION_LOCATION, &[0]);
+    m.debug_name(out_pos, "gl_Position");
+    m.decorate(out_pos, DECORATION_BUILT_IN, &[BUILTIN_POSITION]);
+
+    m.function(void, fn_id, fn_ty, block);
+    let p = m.load(v2, in_pos);
+    let x = m.composite_extract(f32_ty, p, &[0]);
+    let y = m.composite_extract(f32_ty, p, &[1]);
+    // x / y 是运行时值 ⇒ 必须用 OpCompositeConstruct
+    let pos4 = m.composite_construct(v4, &[x, y, z, w]);
+    m.store(out_pos, pos4);
+    m.return_void();
+    m.function_end();
+    m.finish()
+}
+
 /// 顶点着色器（三角形）：把 3 个 NDC 顶点写进 `gl_Position`。
 ///
 /// ## ⚠️ 这里为什么不用常量数组索引（一个实测教训）
@@ -634,7 +737,9 @@ pub fn vertex_shader_triangle(positions_ndc: [[f32; 2]; 3]) -> Vec<u8> {
         cur_x = m.op_select(f32_ty, cond, xs[k], cur_x);
         cur_y = m.op_select(f32_ty, cond, ys[k], cur_y);
     }
-    let pos4 = m.constant_composite(v4, &[cur_x, cur_y, z0, w1]);
+    // ⚠️ `cur_x` / `cur_y` 是 `OpSelect` 的**运行时结果** ⇒ 必须用 `OpCompositeConstruct`，
+    // 不能用 `OpConstantComposite`（那会生成非法 SPIR-V，驱动不报错、只是不画）。
+    let pos4 = m.composite_construct(v4, &[cur_x, cur_y, z0, w1]);
     m.store(out_pos, pos4);
     m.return_void();
     m.function_end();
@@ -761,7 +866,8 @@ pub fn vertex_shader_rect_pushconstant() -> Vec<u8> {
     let py = m.f_mul(f32_ty, dy, yf);
     let fx = m.f_add(f32_ty, x0, px);
     let fy = m.f_add(f32_ty, y0, py);
-    let pos4 = m.constant_composite(v4, &[fx, fy, f0, f1]);
+    // ⚠️ `fx` / `fy` 是算术结果（运行时值）⇒ 用 `OpCompositeConstruct`。
+    let pos4 = m.composite_construct(v4, &[fx, fy, f0, f1]);
     m.store(out_pos, pos4);
     m.return_void();
     m.function_end();

@@ -73,6 +73,8 @@ pub struct DeviceFns {
     pub cmd_begin_render_pass: vk::PfnCmdBeginRenderPass,
     pub cmd_end_render_pass: vk::PfnCmdEndRenderPass,
     pub cmd_bind_pipeline: vk::PfnCmdBindPipeline,
+    /// `vkCmdBindVertexBuffers`（顶点缓冲路径用）
+    pub cmd_bind_vertex_buffers: vk::PfnCmdBindVertexBuffers,
     pub cmd_set_viewport: vk::PfnCmdSetViewport,
     pub cmd_set_scissor: vk::PfnCmdSetScissor,
     pub cmd_draw: vk::PfnCmdDraw,
@@ -1023,6 +1025,7 @@ fn resolve_device_fns(instance: &ffi::Instance) -> GpuResult<DeviceFns> {
             cmd_begin_render_pass: lib.sym("vkCmdBeginRenderPass")?,
             cmd_end_render_pass: lib.sym("vkCmdEndRenderPass")?,
             cmd_bind_pipeline: lib.sym("vkCmdBindPipeline")?,
+            cmd_bind_vertex_buffers: lib.sym("vkCmdBindVertexBuffers")?,
             cmd_set_viewport: lib.sym("vkCmdSetViewport")?,
             cmd_set_scissor: lib.sym("vkCmdSetScissor")?,
             cmd_draw: lib.sym("vkCmdDraw")?,

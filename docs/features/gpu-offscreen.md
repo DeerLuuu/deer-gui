@@ -33,11 +33,41 @@
 | 动态 viewport/scissor 的问题 | 改用**静态 viewport**写进管线，同样不画 |
 | 清屏值或回读路径有问题 | 换清屏色，回读值跟着变 ⇒ 这条链是对的 |
 | 管线没建成功 | 句柄非空，`vkCreateGraphicsPipelines` 返回成功 |
+| alpha 混合的问题 | 开/关混合**都不画** |
+| `OpConstantComposite` 误用运行时值 | 已修正为 `OpCompositeConstruct`（**这是个真 bug，但不是本缺陷的原因**），改完仍不画 |
+| **`deer-vk` 的封装有 bug** | ❌ **已排除**：见下 |
+| **顶点来源（内置变量 vs 顶点缓冲）** | ❌ **已排除**：见下 |
+
+### 两个决定性的排除实验（`crates/deer-vk/tests/`）
+
+**① `raw_ffi_probe.rs` —— 绕开全部封装，手写裸 FFI 渲染路径**
+
+只用 loader 拿到的函数指针，手写渲染通道 / 帧缓冲 / 管线 / 命令缓冲 / 内存 / 栅栏 / 拷贝，
+完全不用 `RenderPass` / `Pipeline` / `OffscreenRenderer` 等封装。
+
+结果：**清屏 4096 个红像素正确，绘制 0 个绿像素。**
+
+⇒ **bug 不在 `deer-vk` 的封装里。**
+
+**② `vbo_probe.rs` —— 完全标准的 Vulkan 顶点路径**
+
+真实顶点缓冲（`VK_BUFFER_USAGE_VERTEX_BUFFER_BIT`）+ 真实顶点属性
+（`VkVertexInputBindingDescription` stride 8 + `VkVertexInputAttributeDescription`
+location 0 / `R32G32_SFLOAT`）+ 着色器从 `location 0` 读 `vec2`，
+**完全不依赖 `gl_VertexIndex` / `OpSelect` / 任何内置变量**。
+
+结果：**同样 0 个绿像素。**
+
+⇒ **问题不在顶点来源，而在更底层。**
 
 **下一步排查方向**（未做）：
-1. `VK_LAYER_KHRONOS_validation` 校验层输出 —— 本机没装 Vulkan SDK，拿不到；
-2. RenderDoc 抓帧看 draw call 的实际状态；
-3. 逐项试管线状态变量（拓扑换 `POINT_LIST`、关掉 alpha 混合、`rasterizerDiscardEnable` 等）。
+1. **装 Vulkan SDK 拿到 `VK_LAYER_KHRONOS_validation`** —— 这是最直接的路径。
+   本机没有 SDK（`C:\VulkanSDK` 等路径都不存在），注册表里只有 Steam/OBS 的层。
+2. RenderDoc 抓帧看 draw call 的实际状态。
+3. 逐项试管线状态变量（拓扑换 `POINT_LIST` / `LINE_LIST`、`rasterizerDiscardEnable` 反向验证等）。
+
+> **诚实边界**：以上两个探针都没有用「跳过」或「放宽断言」掩盖问题 ——
+> 它们**断言「当前确实 0 个绿像素」**。今天绿，而一旦修好就会变红，提醒更新文档。
 
 ## 2. 最小示例
 

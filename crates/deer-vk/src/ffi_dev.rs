@@ -393,10 +393,43 @@ pub struct PipelineVertexInputStateCreateInfo {
     pub p_next: *const c_void,
     pub flags: u32,
     pub vertex_binding_description_count: u32,
-    pub p_vertex_binding_descriptions: *const c_void,
+    pub p_vertex_binding_descriptions: *const VertexInputBindingDescription,
     pub vertex_attribute_description_count: u32,
-    pub p_vertex_attribute_descriptions: *const c_void,
+    pub p_vertex_attribute_descriptions: *const VertexInputAttributeDescription,
 }
+
+/// `VkVertexInputBindingDescription`
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VertexInputBindingDescription {
+    pub binding: u32,
+    pub stride: u32,
+    /// `VkVertexInputRate`
+    pub input_rate: i32,
+}
+
+/// `VkVertexInputAttributeDescription`
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VertexInputAttributeDescription {
+    pub location: u32,
+    pub binding: u32,
+    pub format: i32,
+    pub offset: u32,
+}
+
+/// `VkDeviceSize`
+pub type DeviceSize = u64;
+
+/// `VK_FORMAT_R32G32_SFLOAT`（顶点属性用的 vec2）
+pub const VK_FORMAT_R32G32_SFLOAT: i32 = 103;
+/// `VK_FORMAT_R32G32B32_SFLOAT`
+pub const VK_FORMAT_R32G32B32_SFLOAT: i32 = 106;
+/// `VK_FORMAT_R32G32B32A32_SFLOAT`
+pub const VK_FORMAT_R32G32B32A32_SFLOAT: i32 = 109;
+/// `VkVertexInputRate`
+pub const VK_VERTEX_INPUT_RATE_VERTEX: i32 = 0;
+pub const VK_VERTEX_INPUT_RATE_INSTANCE: i32 = 1;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -973,6 +1006,16 @@ pfn!(PfnCmdEndRenderPass, unsafe extern "system" fn(CommandBufferHandle));
 pfn!(
     PfnCmdBindPipeline,
     unsafe extern "system" fn(CommandBufferHandle, i32, PipelineHandle)
+);
+pfn!(
+    PfnCmdBindVertexBuffers,
+    unsafe extern "system" fn(
+        CommandBufferHandle,
+        u32,
+        u32,
+        *const BufferHandle,
+        *const DeviceSize,
+    )
 );
 pfn!(
     PfnCmdSetViewport,
