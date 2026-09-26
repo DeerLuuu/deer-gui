@@ -2,9 +2,11 @@
 **/*.rs.bk
 *.pdb
 
-# 示例的输出（渲染结果）
+# 示例的输出（渲染结果）。注意：文档里的插图**要入库**，所以为 docs/images 开例外。
 *.png
+!docs/images/*.png
 /out
+/render_out
 
 # 编辑器
 .vscode/

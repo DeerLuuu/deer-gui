@@ -7,6 +7,14 @@
 来源：`deer-ui` 的控件语义 + 一个 TypeScript 验证原型（V0，28 条断言）验证过的布局代数。
 **不是** web 项目的移植：DOM/CSS 全部丢弃，窗口、输入、渲染自己实现。
 
+> ### 🚀 第一次用？直接看 [**上手指南**](docs/GETTING-STARTED.md)
+> 假设你从没写过 Rust，从「跑出第一张图」讲到「建自己的项目」，每条命令都实测过。
+> 只想立刻看到结果：
+> ```sh
+> cd Z:\deer-gui
+> cargo run -p deer-gui --example tutorial     # → render_out/*.png
+> ```
+
 ## 现状（里程碑 M1 完成）
 
 | 项 | 状态 |

@@ -53,7 +53,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── ④ 渲染成像素 → PNG ──────────────────────────────────────────────
     let png = deer_gui::render_tree_to_png(&tree, w, h, theme)?;
-    let out = "render_to_png.png";
+    // 输出到 render_out/（示例产物集中放，不散落在仓库根）
+    std::fs::create_dir_all("render_out")?;
+    let out = "render_out/render_to_png.png";
     std::fs::write(out, &png)?;
 
     // 顺手做个自检：画出来的不能是纯背景色（否则「渲染成功」是假的）
