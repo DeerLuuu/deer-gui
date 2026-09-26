@@ -9,6 +9,7 @@
 
 use crate::draw::{Color, DrawCmd, DrawList, RectI};
 use crate::error::{GpuError, GpuResult};
+use crate::text::{GlyphPlacement, TextEngine};
 use crate::{
     AdapterInfo, AdapterKind, Backend, Device, Extent, Frame, PresentResult, RawWindowHandle, Swapchain,
     TargetFormat, TextureDesc, TextureId, TextureRegion,
@@ -256,16 +257,39 @@ impl Frame for CpuFrame {
 }
 
 /// CPU 渲染入口：把绘制列表渲染成帧缓冲。**无 GPU 环境下唯一需要的 API。**
+///
+/// 两种模式：
+/// - [`CpuRenderer::new`]：**没有字库**。文字按「等宽占位格」画（M1 的旧行为，便于验证布局）。
+/// - [`CpuRenderer::with_text`]：**有字库**。文字从 [`TextEngine`] 的字形图集里采样真实覆盖率。
+///
+/// 这条分界是刻意的：没有字库时**不假装**能画字，有字库时**必须**画真字 ——
+/// 两者行为都能被像素断言区分（见 `tests/text_pixels.rs`）。
 #[derive(Debug, Default)]
-pub struct CpuRenderer;
+pub struct CpuRenderer {
+    text: Option<TextEngine>,
+}
 
 impl CpuRenderer {
+    /// 无字库渲染器（文字走占位格）。
     pub fn new() -> CpuRenderer {
-        CpuRenderer
+        CpuRenderer { text: None }
+    }
+
+    /// 有字库渲染器（文字走真实字形）。
+    pub fn with_text(engine: TextEngine) -> CpuRenderer {
+        CpuRenderer { text: Some(engine) }
+    }
+
+    /// 取字库（诊断用）。
+    pub fn text(&self) -> Option<&TextEngine> {
+        self.text.as_ref()
     }
 
     /// 渲染一帧，返回帧缓冲。
-    pub fn render(&self, extent: Extent, list: &DrawList, clear: Color) -> GpuResult<Framebuffer> {
+    ///
+    /// 需要 `&mut self`：字符串里出现新字形时要**就地光栅化并入图集**（这是缓存填充，不是状态污染 ——
+    /// 同一份绘制列表重渲染仍是逐字节相同的，见 `tests/text_pixels.rs` 的确定性断言）。
+    pub fn render(&mut self, extent: Extent, list: &DrawList, clear: Color) -> GpuResult<Framebuffer> {
         if !list.clip_balanced() {
             return Err(GpuError::Driver {
                 code: -1,
@@ -273,13 +297,19 @@ impl CpuRenderer {
             });
         }
         let mut fb = Framebuffer::new(extent.width.max(1), extent.height.max(1), clear);
-        soft_rasterize(&mut fb, list)?;
+        soft_rasterize_with(&mut fb, list, self.text.as_mut())?;
         Ok(fb)
     }
 }
 
-/// 软件光栅化：矩形 / 描边 / 圆角 / 文字（字形格）/ 裁剪栈。
-fn soft_rasterize(fb: &mut Framebuffer, list: &DrawList) -> GpuResult<()> {
+/// 软件光栅化：矩形 / 描边 / 圆角 / 文字 / 裁剪栈。
+///
+/// `text` 决定文字走哪条路：`None` ⇒ 等宽占位格；`Some` ⇒ 真实字形（覆盖率采样）。
+fn soft_rasterize_with(
+    fb: &mut Framebuffer,
+    list: &DrawList,
+    mut text: Option<&mut TextEngine>,
+) -> GpuResult<()> {
     let full = RectI::new(0, 0, fb.width as i32, fb.height as i32);
     let mut clip = full;
     let mut stack: Vec<RectI> = Vec::new();
@@ -302,23 +332,50 @@ fn soft_rasterize(fb: &mut Framebuffer, list: &DrawList) -> GpuResult<()> {
             DrawCmd::StrokeRect { rect, color, width } => stroke(fb, *rect, *color, *width, &clip),
             DrawCmd::Text {
                 rect,
-                text,
+                text: s,
                 color,
                 size,
                 align,
-            } => draw_text(fb, *rect, text, *color, *size, *align, &clip),
+            } => {
+                let cmd = TextDraw {
+                    rect: *rect,
+                    text: s,
+                    color: *color,
+                    size: *size,
+                    align: *align,
+                };
+                match text.as_deref_mut() {
+                    Some(engine) => draw_text_real(engine, fb, &cmd, &clip),
+                    None => draw_text(fb, &cmd, &clip),
+                }
+            }
             DrawCmd::NodeHint { .. } => {}
         }
     }
     Ok(())
 }
 
+/// 不带字库的光栅化（占位字形格）。
+fn soft_rasterize(fb: &mut Framebuffer, list: &DrawList) -> GpuResult<()> {
+    soft_rasterize_with(fb, list, None)
+}
+
 fn blend(fb: &mut Framebuffer, x: i32, y: i32, c: Color, clip: &RectI) {
+    blend_cov(fb, x, y, c, 1.0, clip)
+}
+
+/// 带**覆盖率乘子**的混合：字形覆盖率 `c/255` 就从这里进来。
+///
+/// `cov = 1.0` 时与旧 `blend` 逐字节等价（既有像素断言因此不受影响）。
+fn blend_cov(fb: &mut Framebuffer, x: i32, y: i32, c: Color, cov: f32, clip: &RectI) {
     if !clip.contains(x, y) || x < 0 || y < 0 || x >= fb.width as i32 || y >= fb.height as i32 {
         return;
     }
+    let a = c.a.clamp(0.0, 1.0) * cov.clamp(0.0, 1.0);
+    if a <= 0.0 {
+        return;
+    }
     let i = ((y as usize) * (fb.width as usize) + (x as usize)) * 4;
-    let a = c.a.clamp(0.0, 1.0);
     let inv = 1.0 - a;
     fb.pixels[i] = (c.r as f32 * a + fb.pixels[i] as f32 * inv).round() as u8;
     fb.pixels[i + 1] = (c.g as f32 * a + fb.pixels[i + 1] as f32 * inv).round() as u8;
@@ -371,20 +428,31 @@ fn stroke(fb: &mut Framebuffer, rect: RectI, color: Color, width: i32, clip: &Re
     }
 }
 
-/// 文字绘制：**占位实现** —— 每个字符画一个等宽格。
+/// 一次文本绘制所需的全部参数（`DrawCmd::Text` 的字段打包）。
 ///
-/// 这不是排版：真实实现需要字形图集（GPU 侧）与字体解析。它的作用是让
-/// 「文字命令占据的像素区域」可被断言，从而验证布局 → 绘制列表 → 像素的对应关系。
-/// 字形图集落地后替换此函数，**绘制列表与调用方无需改动**。
-fn draw_text(
-    fb: &mut Framebuffer,
+/// 为什么要打包：内部函数本来会到 8 个参数，触发 clippy 的 `too_many_arguments`（上限 7）。
+/// 打包后签名更短，也让「占位路径」与「真实字形路径」拿到**完全相同**的一组输入。
+struct TextDraw<'a> {
     rect: RectI,
-    text: &str,
+    text: &'a str,
     color: Color,
     size: f32,
     align: u8,
-    clip: &RectI,
-) {
+}
+
+/// 文字绘制：**占位实现** —— 每个字符画一个等宽格。
+///
+/// 这是**没有字库**时的路径（`CpuRenderer::new()`），作用是让「文字命令占据的像素区域」
+/// 可被断言，从而验证布局 → 绘制列表 → 像素的对应关系。它有字库时会被
+/// [`draw_text_real`] 取代（绘制列表与调用方无需改动）。
+fn draw_text(fb: &mut Framebuffer, cmd: &TextDraw<'_>, clip: &RectI) {
+    let TextDraw {
+        rect,
+        text,
+        color,
+        size,
+        align,
+    } = *cmd;
     let count = text.chars().count() as i32;
     let advance = ((size * 0.6).round() as i32).max(1);
     let total = advance * count;
@@ -408,5 +476,79 @@ fn draw_text(
             }
         }
         x += advance;
+    }
+}
+
+/// 真实字形绘制（**有字库**时的路径）。
+///
+/// 数据流：字符 → [`TextEngine::glyph`]（命中缓存或光栅化入图集）→ 按 `GlyphPlacement`
+/// 算出目标像素 → 从图集覆盖率缓冲采样 → 按覆盖率混合颜色。
+///
+/// 三处关键语义：
+/// - **advance 是真实字体的**（不是 0.6em）：所以「画出来的文本宽度」与布局阶段
+///   `FontMeasure` 算的宽度一致 —— 这是按钮文字居中对齐正确的前提。
+/// - **`left`/`top` 是相对笔位置与基线的偏移**：`x = round(pen) + left`、`y = round(baseline) - top`。
+/// - **基线**：把「升部 + 降部」这块垂直居中放进 `rect`，与 `Theme::line_height` 无关
+///   （`rect` 已经是布局算好的盒子）。
+fn draw_text_real(engine: &mut TextEngine, fb: &mut Framebuffer, cmd: &TextDraw<'_>, clip: &RectI) {
+    let TextDraw {
+        rect,
+        text,
+        color,
+        size,
+        align,
+    } = *cmd;
+
+    // ① 解析字形（首次出现会光栅化并入图集）
+    let placements: Vec<Option<GlyphPlacement>> =
+        text.chars().map(|c| engine.glyph(c, size)).collect();
+    let total: f32 = placements.iter().flatten().map(|p| p.advance).sum();
+
+    // ② 起点（对齐方式与占位路径同一套语义）
+    let start_x = match align {
+        1 => rect.x as f32 + (rect.w as f32 - total) / 2.0,
+        2 => rect.right() as f32 - total,
+        _ => rect.x as f32,
+    };
+
+    // ③ 基线：升部/降部居中
+    let (ascent, descent) = {
+        let m = engine.measure();
+        (m.ascent(), m.descent())
+    };
+    let top_of_text_block = rect.y as f32 + ((rect.h as f32 - (ascent + descent)) / 2.0).round();
+    let baseline = (top_of_text_block + ascent.round()).round();
+
+    // ④ 采样图集贴图
+    let atlas = engine.atlas();
+    let (atlas_w, _atlas_h) = atlas.size();
+    let coverage = atlas.coverage();
+
+    let mut pen = start_x;
+    for p in placements.into_iter().flatten() {
+        if p.slot.w > 0 && p.slot.h > 0 {
+            let gx0 = pen.round() as i32 + p.left;
+            let gy0 = baseline as i32 - p.top;
+            for gy in 0..p.slot.h {
+                let row = ((p.slot.y + gy) as usize) * (atlas_w as usize);
+                for gx in 0..p.slot.w {
+                    let Some(&cov) = coverage.get(row + (p.slot.x + gx) as usize) else {
+                        continue;
+                    };
+                    if cov == 0 {
+                        continue;
+                    }
+                    blend_cov(
+                        fb,
+                        gx0 + gx as i32,
+                        gy0 + gy as i32,
+                        color,
+                        cov as f32 / 255.0,
+                        clip,
+                    );
+                }
+            }
+        }
+        pen += p.advance;
     }
 }

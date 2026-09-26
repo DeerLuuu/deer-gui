@@ -41,7 +41,7 @@ let png = deer_gui::render_tree_to_png(&tree, 300, 200, light)?;
 | `border` | `Color` | 容器边框；**禁用按钮的底色** |
 | `accent` | `Color` | 按钮底色（强调色） |
 | `on_accent` | `Color` | 按钮上的文字 |
-| `font_size` | `f32` | 字号（**会影响文本占位宽高** ⇒ 布局随之变化） |
+| `font_size` | `f32` | 字号（**影响文本度量宽高** ⇒ 布局随之变化）。真实字形渲染时，这个字号必须与 `TextEngine` 的字号一致，否则度量与绘制会漂（见 [`text-rendering.md`](text-rendering.md) 第 5 节；门面入口以 `font_size` 形参为准并覆盖本字段） |
 | `line_height` | `f32` | 行高（影响文本节点高度） |
 
 ### `Color`

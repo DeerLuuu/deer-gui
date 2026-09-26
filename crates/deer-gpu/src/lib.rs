@@ -22,17 +22,27 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]
 
+pub mod atlas;
 pub mod draw;
 pub mod error;
 pub mod font;
+pub mod glyph;
+pub mod measure;
 pub mod null;
 pub mod png;
+pub mod raster;
 pub mod render;
+pub mod text;
 
+pub use atlas::GlyphAtlas;
 pub use draw::{Color, DrawCmd, DrawList, RectI, TextureId};
 pub use error::{GpuError, GpuResult};
 pub use font::{Contour, Font, Glyph, Point, Segment};
+pub use glyph::{AtlasSlot, GlyphImage, GlyphKey};
+pub use measure::FontMeasure;
+pub use raster::Rasterizer;
 pub use render::{DefaultRenderer, NullRenderer, build_draw_list};
+pub use text::{GlyphPlacement, TextEngine};
 
 use deer_layout::Geometry;
 use deer_layout::node::Node;

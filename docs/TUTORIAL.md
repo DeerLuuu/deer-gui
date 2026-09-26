@@ -21,6 +21,7 @@
 | [8](#8-拿原始像素) | 拿原始像素 | 自己读/写像素 |
 | [9](#9-建你自己的项目) | 建你自己的项目 | 独立工程 |
 | [10](#10-现状与边界) | 现状与边界 | 知道什么还不能做 |
+| [11](#11-真实文字) | 真实文字 | 一张**真字形**的图 |
 
 ---
 
@@ -271,6 +272,9 @@ assert!(list.clip_balanced());    // 裁剪栈必须平衡
 - 你能在**不渲染**的情况下断言绘制行为（例如「禁用按钮必须用 border 色」）；
 - 命令数就是性能预算。
 
+> 这里的 `ApproxMeasure` 是「每字符 0.6em」的**占位度量**（确定性，便于断言）。
+> 要真实字体度量与真实字形，看第 11 章：`build_draw_list` 的最后一个参数换成 `engine.measure()`。
+
 > 对应示例：`cargo run -p deer-gui --example draw_list`
 
 ---
@@ -331,8 +335,8 @@ deer-gui = { path = "Z:/deer-gui/crates/deer-gui" }
 | 想做的事 | 现状 |
 |---|---|
 | 界面显示在**窗口**里 | ❌ M2b（要先定窗口方案） |
-| **GPU 渲染**出图 | ❌ M2a-3..6（Vulkan 只到「设备 + 着色器」） |
-| 图片里的字是**真字体** | ❌ M4（现在是等宽方块占位） |
+| **GPU 渲染**出图 | 🔄 离屏 Vulkan **已能画出正确像素**（M2a-6），但绘制仍有已知缺陷（见 `features/gpu-offscreen.md`）；**窗口呈现**做不到 |
+| 图片里的字是**真字体** | ✅ **离屏**已支持（第 11 章）；**GPU 侧文本**仍 ❌（M3） |
 | **鼠标点击 / 键盘输入** | ❌ M5（`hit_test` 有了，但没有事件派发） |
 | **Tab 焦点** / 方向键导航 | ❌ M5 |
 | **可停靠面板 dock** | ❌ M5 |
@@ -343,15 +347,64 @@ deer-gui = { path = "Z:/deer-gui/crates/deer-gui" }
 
 ---
 
+## 11. 真实文字
+
+**目标**：让图里的字是**真字形**（不再是等宽方块占位）。
+
+```rust
+use deer_gui::prelude::*;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let mut app = Builder::new(Kind::Column, "app").padding(12.0).gap(8.0);
+    app.text("Hello 你好");
+    app.button("确定");
+    let tree = app.build();
+
+    // 字体：consola → arial → segoeui；找不到返回 None（不静默降级）
+    let font = deer_gpu::measure::find_system_font().ok_or("找不到系统字体")?;
+
+    // 带字体的渲染：布局、绘制列表、光栅化用**同一个字号、同一个度量**
+    let png = deer_gui::render_tree_to_png_with_font(&tree, 360, 140, Theme::default(), &font, 16.0)?;
+    std::fs::write("render_out/text.png", png)?;
+    Ok(())
+}
+```
+
+> 对应示例：`cargo run -p deer-gui --example text_render`
+> （写真 `render_out/text_render.png` 与 `render_out/text_render_atlas.png` 字形图集，
+> 并断言墨迹像素、抗锯齿灰阶、确定性、以及「带字库与不带字库必须画出不同画面」）
+
+**这一章的关键概念**：
+- 不带字体的 `render_tree_to_png` 仍然用 `ApproxMeasure` + 占位方块 —— 这是**像素级可区分**的；
+  想确认真实字形那条路真的生效，就让两条路径各出一张图对比。
+- 最后那个参数 `16.0` 是**唯一**的字号来源：它同时决定 `TextEngine` 的字号和布局的
+  `TextStyle.font_size`，并**覆盖** `theme.font_size`。和第 4 章的提醒是一回事：**字号参与布局**。
+- **铁律**：布局、绘制列表、光栅化必须用同一个字号、同一个度量。违反的典型症状是
+  「文字和它的盒子错位、换行位置对不上」，而图看起来「差不多」，很难靠眼睛抓。
+- `.dui` 场景文件同样可用：字体是**渲染期**的事，与怎么建树无关
+  （`parse_scene` 出来的树直接传给 `render_tree_to_png_with_font`）。
+- 想复用同一个字库（例如 `TextEngine::from_system_font(16.0)?`）连渲染多张图，
+  用 `render_tree_to_rgba_with_engine(&tree, w, h, theme, font_size, engine)`。
+- 想深入底层（自己把字形打进图集）：`cargo run -p deer-gui --example glyph_atlas`，
+  配合 [`features/glyph-raster.md`](features/glyph-raster.md) 与 [`features/glyph-atlas.md`](features/glyph-atlas.md)。
+
+**仍然做不到**：GPU 侧文本（M3：Vulkan 还不消费 `DrawCmd::Text`）、窗口、子像素定位、多字体回退、
+富文本/图标字体、hinting、CFF 字体。完整边界见
+[`features/text-rendering.md`](features/text-rendering.md) 第 6 节。
+
+---
+
 ## 附：可运行示例一览
 
 | 示例 | 命令 | 你会看到 |
 |---|---|---|
-| 分步教程 | `cargo run -p deer-gui --example tutorial` | `render_out/01..06.png` |
+| 分步教程 | `cargo run -p deer-gui --example tutorial` | `render_out/01-hello.png` … `render_out/06-manual.png`（共 6 张） |
 | 最小出图 | `cargo run -p deer-gui --example render_to_png` | 一张完整界面图 |
 | 场景文件 | `cargo run -p deer-gui --example scene_file` | 设置面板 + 可编辑的 `.dui` |
 | 只看布局 | `cargo run -p deer-gui --example geometry` | 几何表 + 命中结果 |
 | 换主题 | `cargo run -p deer-gui --example theme` | 深/浅/暖三张图 |
 | 绘制命令 | `cargo run -p deer-gui --example draw_list` | 命令清单 + 统计 |
 | 原始像素 | `cargo run -p deer-gui --example pixels` | PNG + PPM |
+| 真实文字 | `cargo run -p deer-gui --example text_render` | 真字形界面图 + 度量/像素自检 |
+| 字形光栅化 + 图集 | `cargo run -p deer-gui --example glyph_atlas` | 图集 PNG + 覆盖率/利用率统计 |
 | Vulkan 现状 | `cargo run -p deer-gui --example vulkan_devices` | 本机 GPU + 着色器验收 |

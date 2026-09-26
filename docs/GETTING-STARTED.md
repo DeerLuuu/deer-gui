@@ -19,7 +19,7 @@
 |---|---|
 | 描述界面、算出布局、导出图片 | ✅ **行** |
 | 把界面渲染到窗口里显示、用鼠标点 | ❌ 不行（M2–M5） |
-| 图片上的字是真的字体 | ❌ 不行，现在是**方块占位**（M4） |
+| 图片上的字是真的字体 | ✅ **可以**（离屏 CPU）：带字体入口见[第 11 章](TUTORIAL.md#11-真实文字) / [`features/text-rendering.md`](features/text-rendering.md)。**不带字体的老入口仍是方块占位** |
 
 **所以它现在适合**：验证布局、生成界面设计稿/示意图、给文档配图、做布局算法的实验。
 **不适合**：做一个真正能用的桌面软件（那要等窗口和输入做完）。
@@ -146,7 +146,7 @@ cargo run
 | ② 算几何 | `render_tree_to_*` 内部自动做；想自己看就用 `deer_gui::layout_tree()` | nodeId → 矩形 `(x, y, 宽, 高)` |
 | ③ 渲染 | `render_tree_to_png()` / `render_tree_to_rgba()` | 绘制命令 → 像素 |
 
-**为什么这样设计**：① 和 ③ 之间是纯数学，所以布局能被测试钉死（这个库有 52 条断言），
+**为什么这样设计**：① 和 ③ 之间是纯数学，所以布局能被测试钉死（断言清单见 `cargo test --workspace` 输出），
 也让「同一棵界面树换一个渲染后端」变得可能（CPU 后端已有，Vulkan 在做）。
 
 ---
@@ -271,7 +271,7 @@ bad.dui:3: 未知属性 "nope"（可用：name/w/h/pad/gap/main/cross/grow/label
 | **3** | 改完 `.dui` 没反应 | 要重新 `cargo run`；程序启动时读一次文件 |
 | **4** | 图片全是一个颜色，什么都没画 | 常见的两个原因：① 画布太小，内容被挤到 0 尺寸；② 容器没给 `pad` ⇒ 按设计**不画底色**。用 `layout_tree()` 打印几何确认 |
 | **5** | `error: linker not found` / 各种链接错误 | 缺 MSVC 工具链。装 [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/)（勾「C++ 生成工具」） |
-| **6** | 图片里「文字」是方块 | **这是当前实现的真实状态，不是 bug**。字形资源（M4）还没做 |
+| **6** | 图片里「文字」是方块 | 你用的是**不带字体**的入口（`render_tree_to_png` / `CpuRenderer::new()`），它按设计画等宽占位格。要真字形：`cargo run -p deer-gui --example text_render`，或读[第 11 章](TUTORIAL.md#11-真实文字) |
 
 ---
 
@@ -282,7 +282,7 @@ bad.dui:3: 未知属性 "nope"（可用：name/w/h/pad/gap/main/cross/grow/label
 | `cargo build` | 只编译，看有没有语法/类型错误 |
 | `cargo run` | 编译并运行 |
 | `cargo run 2>&1 \| Select-Object -Last 30` | 只看输出末尾（报错通常在那） |
-| `cargo test --workspace` | 在 `Z:\deer-gui` 里跑库自己的 52 条断言（确认库没坏） |
+| `cargo test --workspace` | 在 `Z:\deer-gui` 里跑库自己的全部断言（数量见输出，随里程碑增长；确认库没坏） |
 | `cargo test -p deer-vk -- --nocapture` | 看这台机器枚举到了哪几块 GPU |
 
 **报错看不懂时**：Rust 的报错信息通常直接告诉你「哪一行、什么原因、怎么改」，
@@ -331,9 +331,17 @@ Theme {
 
 ### `prelude` 里有什么（`use deer_gui::prelude::*;` 之后可直接用）
 
-`Builder`、`L`、`Kind`、`Node`、`Rect`、`Size`、`Align`、`Theme`、`Color`、
-`ApproxMeasure`、`Measure`、`TextStyle`、`parse_scene`、`encode_scene`、
-`CpuRenderer`、`Framebuffer`、`DrawCmd`、`DrawList`、`hit_test`、`layout`、`Extent`、`RectI`。
+**构建/布局**：`Builder`、`L`、`Kind`、`Node`、`Rect`、`Size`、`Align`、`Theme`、`Color`、`RectI`、
+`Extent`、`ApproxMeasure`、`Measure`、`TextStyle`、`parse_scene`、`SceneError`、`encode_scene`、
+`hit_test`、`layout`、`measure_tree`。
+
+**渲染/绘制**：`CpuRenderer`、`Framebuffer`、`DrawCmd`、`DrawList`、`DefaultRenderer`、`build_draw_list`。
+
+**M4 文字（真实字形）**：`TextEngine`、`GlyphPlacement`、`FontMeasure`、`Rasterizer`、
+`GlyphImage`、`GlyphKey`、`GlyphAtlas`。
+
+> 唯一的完整清单是 `crates/deer-gui/src/lib.rs` 里的 `pub mod prelude` —— 本清单与它不一致时以它为准。
+> 用法见 [`TUTORIAL.md` §11](TUTORIAL.md#11-真实文字) 与 [`features/text-rendering.md`](features/text-rendering.md)。
 
 ---
 
@@ -343,10 +351,14 @@ Theme {
 |---|---|---|
 | 分步教程（6 步） | `cargo run -p deer-gui --example tutorial` | `render_out/*.png` |
 | 最小出图 | `cargo run -p deer-gui --example render_to_png` | `render_out/render_to_png.png` |
+| 真实文字（真字形） | `cargo run -p deer-gui --example text_render` | `render_out/text_render.png`（外加 `text_render_atlas.png` 字形图集） |
+| 字形光栅化 + 图集 | `cargo run -p deer-gui --example glyph_atlas` | `render_out/glyph_atlas.png` |
 
 代码分别在
-[`examples/tutorial.rs`](../crates/deer-gui/examples/tutorial.rs) 与
-[`examples/render_to_png.rs`](../crates/deer-gui/examples/render_to_png.rs)。
+[`examples/tutorial.rs`](../crates/deer-gui/examples/tutorial.rs)、
+[`examples/render_to_png.rs`](../crates/deer-gui/examples/render_to_png.rs)、
+[`examples/text_render.rs`](../crates/deer-gui/examples/text_render.rs) 与
+[`examples/glyph_atlas.rs`](../crates/deer-gui/examples/glyph_atlas.rs)。
 
 ---
 
@@ -355,4 +367,4 @@ Theme {
 - 想**动手**：先跑 `tutorial`，再改 `render_out/05-form.dui` 重新跑，观察布局变化。
 - 想**理解原理**：读 [`M1-report.md`](M1-report.md)（布局不变量与踩过的坑）。
 - 想**知道何时能开窗**：看 [`../ROADMAP.md`](../ROADMAP.md)——窗口是 M2–M3，
-  真实字形是 M4，鼠标键盘交互是 M5。
+  真实字形**本轮已落地**（离屏 CPU，见[第 11 章](TUTORIAL.md#11-真实文字)），鼠标键盘交互是 M5。

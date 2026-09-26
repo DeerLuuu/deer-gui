@@ -101,7 +101,7 @@ assert_eq!(a, b);
 - 命中测试：[`hit-testing.md`](hit-testing.md)（坐标 → 控件）
 - 主题（字号影响文本尺寸）：[`theme.md`](theme.md)
 - 内部原理：[`../M1-report.md`](../M1-report.md)（含 8 条布局不变量与踩过的坑）
-- **做不到**：没有「文本自动换行」（M4）、没有滚动容器、没有绝对定位、没有 z-index 层叠
+- **做不到**：没有**多行文本节点**（`deer_gpu::measure::FontMeasure::wrap` 有换行能力，但目前只用于**度量高度**；`DrawCmd::Text` 仍是单个字符串，不产生多行绘制）、没有滚动容器、没有绝对定位、没有 z-index 层叠
 
 ## 7. 检查清单
 

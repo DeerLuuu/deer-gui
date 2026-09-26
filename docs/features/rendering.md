@@ -90,7 +90,10 @@ let png = deer_gpu::png::encode_rgba(fb.width, fb.height, &fb.pixels)
 | `.to_rgba()` | 拿到 `&[u8]` |
 | `.width` / `.height` / `.pixels` | 字段 |
 
-支持的命令：矩形填充、圆角填充（四角圆心近似，**无抗锯齿**）、1px+ 描边、文字（**占位字形格**）、裁剪栈。
+支持的命令：矩形填充、圆角填充（四角圆心近似，**无抗锯齿**）、1px+ 描边、裁剪栈，
+以及文字 —— **无字库时**画等宽占位格（`CpuRenderer::new()`），
+**有字库时**从字形图集采样真实字形（`CpuRenderer::with_text(engine)`，
+见 [`text-rendering.md`](text-rendering.md)）。
 
 ## 4. 自检
 
@@ -116,7 +119,7 @@ assert_eq!(a, b);
 | 现象 | 原因 | 怎么改 |
 |---|---|---|
 | 图片只有一种纯色 | ① 画布太小，内容被压成 0 尺寸；② 容器没给 `pad` ⇒ 按设计不画底色 | 用 `layout_tree` 打印几何确认；给容器加 `pad` |
-| 图片里的「字」是方块 | **这是当前实现的真实状态，不是 bug**——字形资源在 M4 | 无解，等 M4 |
+| 图片里的「字」是方块 | 这个入口（`render_tree_to_png` / `CpuRenderer::new()`）**没有字库**，按设计画等宽占位格 —— 不是 bug | 要真实字形：用 `render_tree_to_png_with_font(...)` 或 `CpuRenderer::with_text(engine)`，见 [`text-rendering.md`](text-rendering.md) |
 | 内容挤在左上角，右边一大片空白 | 根节点**不撑满画布**（宿主给的盒子是上限，不是命令） | 给根显式 `size`，或给子节点 `grow` |
 | 圆角看起来是锯齿 | CPU 后端的圆角**不做抗锯齿** | 放大看会明显；抗锯齿属于后端能力，后续加 |
 | PNG 文件比预期大很多 | 编码器用 zlib 的 **stored（未压缩）** 块，文件 ≈ 原始像素 + 少量开销 | 正常现象，换来的是**零依赖**。要小就接 deflate 压缩 |
@@ -127,7 +130,7 @@ assert_eq!(a, b);
 - 像素处理：[`pixels.md`](pixels.md)
 - 绘制列表：[`draw-list.md`](draw-list.md)
 - 主题：[`theme.md`](theme.md)
-- **做不到**：渲染到窗口（M2b）、GPU 渲染出图（M2a 后续）、真实字形（M4）、抗锯齿
+- **做不到**：渲染到窗口（M2b）、**GPU 侧文本**（M3：Vulkan 还不消费 `DrawCmd::Text`）、圆角/字形之外的抗锯齿
 
 ## 7. 检查清单
 

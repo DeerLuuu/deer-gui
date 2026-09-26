@@ -10,8 +10,9 @@
 //! | 布局计算（几何表）、命中测试 | ✅ |
 //! | 树 + 几何 → 绘制列表 → **像素**（CPU 后端） | ✅ |
 //! | 把像素写成 PNG 文件 | ✅ |
-//! | **渲染到窗口 / 屏幕上** | ❌ 里程碑 M2–M3 |
-//! | 真实字形排版（现在是等宽格占位） | ❌ 里程碑 M4 |
+//! | **真实字体字形**（零依赖 TTF 解析 + 光栅化 + 图集 + 真实度量） | ✅ |
+//! | 渲染到窗口 / 屏幕上 | ❌ 里程碑 M2b |
+//! | GPU 侧文本（把字形图集上传给 Vulkan） | ❌ 里程碑 M3 |
 //! | 输入事件与焦点 | ❌ 里程碑 M5 |
 //!
 //! ## 最小用法
@@ -41,6 +42,8 @@ pub use deer_gpu::{self as gpu, DrawCmd, DrawList, GpuError, GpuResult, Theme};
 pub use deer_layout::{self as layout, Node};
 pub use deer_vk::{self as vk, VkBackend};
 
+use std::path::Path;
+
 use deer_layout::layout::{ApproxMeasure, TextStyle};
 
 /// 常用类型的集中导入。
@@ -48,6 +51,11 @@ pub mod prelude {
     pub use crate::gpu::render::{DefaultRenderer, build_draw_list};
     pub use crate::gpu::null::{CpuRenderer, Framebuffer};
     pub use crate::gpu::{Color, DrawCmd, DrawList, Extent, RectI, Theme};
+    pub use crate::gpu::atlas::GlyphAtlas;
+    pub use crate::gpu::glyph::{GlyphImage, GlyphKey};
+    pub use crate::gpu::measure::FontMeasure;
+    pub use crate::gpu::raster::Rasterizer;
+    pub use crate::gpu::text::{GlyphPlacement, TextEngine};
     pub use crate::layout::builder::{Builder, L};
     pub use crate::layout::layout::{ApproxMeasure, Measure, TextStyle, hit_test, layout, measure_tree};
     pub use crate::layout::node::{Align, Kind, Node, Rect, Size};
@@ -90,6 +98,74 @@ pub fn render_tree_to_png(
     theme: Theme,
 ) -> Result<Vec<u8>, String> {
     let (w, h, px) = render_tree_to_rgba(tree, width, height, theme.clone())
+        .map_err(|e| format!("渲染失败：{e}"))?;
+    gpu::png::encode_rgba(w, h, &px)
+}
+
+/// 把一棵树渲染成 RGBA8 像素，**用真实字体字形**（M4）。
+///
+/// 与 [`render_tree_to_rgba`] 的三点区别：
+///
+/// 1. 布局的文本度量用 [`gpu::FontMeasure`]（字体真实 advance），不是「每字符 0.6em」的近似；
+/// 2. 文字画成**真实字形**（从字形图集采样覆盖率），不是等宽占位格；
+/// 3. `font_size` **同时**决定引擎字号、布局的 `TextStyle.font_size` 与 `theme.font_size`
+///    —— 三者必须一致，否则「布局算出来的宽度」与「画出来的宽度」会漂。
+///
+/// `font_path` 指向一个 TrueType 字体文件（含 `glyf` 表，即 `.ttf`/`.ttc`）。
+/// **不支持 CFF/OTTO**（会明确报错，不静默给空白字形）。
+pub fn render_tree_to_rgba_with_font(
+    tree: &Node,
+    width: u32,
+    height: u32,
+    theme: Theme,
+    font_path: &Path,
+    font_size: f32,
+) -> GpuResult<(u32, u32, Vec<u8>)> {
+    let engine = gpu::TextEngine::from_font_file(font_path, font_size)?;
+    render_tree_to_rgba_with_engine(tree, width, height, theme, font_size, engine)
+}
+
+/// 同上，但由调用方给一个已经建好的 [`gpu::TextEngine`]
+/// （例如想复用已解析的字体、或用 `TextEngine::from_system_font`）。
+pub fn render_tree_to_rgba_with_engine(
+    tree: &Node,
+    width: u32,
+    height: u32,
+    mut theme: Theme,
+    font_size: f32,
+    engine: gpu::TextEngine,
+) -> GpuResult<(u32, u32, Vec<u8>)> {
+    // 字号一处定义：`theme.font_size` 就是绘制列表里 `DrawCmd::Text.size` 的来源，
+    // 所以要把它钉到与引擎/度量同一个值上。
+    theme.font_size = font_size;
+    let style = TextStyle {
+        font_size,
+        line_height: theme.line_height,
+    };
+
+    let geo = layout::layout::layout(
+        tree,
+        layout::node::Rect::new(0.0, 0.0, width as f32, height as f32),
+        style,
+        &engine.measure(),
+    );
+    let list = gpu::build_draw_list(tree, &geo, theme.clone(), &engine.measure());
+
+    let mut renderer = gpu::null::CpuRenderer::with_text(engine);
+    let fb = renderer.render(gpu::Extent { width, height }, &list, theme.surface)?;
+    Ok((fb.width, fb.height, fb.pixels))
+}
+
+/// 把一棵树用真实字体渲染成 PNG 字节流。
+pub fn render_tree_to_png_with_font(
+    tree: &Node,
+    width: u32,
+    height: u32,
+    theme: Theme,
+    font_path: &Path,
+    font_size: f32,
+) -> Result<Vec<u8>, String> {
+    let (w, h, px) = render_tree_to_rgba_with_font(tree, width, height, theme.clone(), font_path, font_size)
         .map_err(|e| format!("渲染失败：{e}"))?;
     gpu::png::encode_rgba(w, h, &px)
 }

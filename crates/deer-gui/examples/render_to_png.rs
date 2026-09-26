@@ -4,10 +4,11 @@
 //! cargo run -p deer-gui --example render_to_png
 //! ```
 //!
-//! 产物：`render_to_png.png`（当前目录）。
+//! 产物：`render_out/render_to_png.png`（相对于仓库根运行时的路径）。
 //!
-//! 说明：渲染是**离屏**的（CPU 软件光栅化），不涉及窗口。窗口渲染在里程碑 M2–M3。
-//! 字形目前是等宽格占位，不是真实排版（里程碑 M4）。
+//! 说明：渲染是**离屏**的（CPU 软件光栅化），不涉及窗口。窗口渲染在里程碑 M2b。
+//! 这条路径**不带字体**，所以文字仍是等宽格占位（`ApproxMeasure` 度量）；
+//! 要真实字形请看 `examples/text_render.rs`（里程碑 M4）。
 
 use deer_gui::prelude::*;
 

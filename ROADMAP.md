@@ -9,8 +9,8 @@
 |---|---|---|---|
 | **M1** | **核心 + HAL + Vulkan 设备枚举** | 节点树、布局代数、命中测试、`.dui` 解析；GPU HAL + CPU 参考后端；Vulkan 实例与物理设备枚举（自己声明符号 + 动态加载） | ✅ **完成** |
 | **M2** | Vulkan 逻辑设备 + 交换链 | 见下面的拆分 | 🔄 **进行中（M2a 已过半）** |
-| **M3** | 渲染器 + 管线（矩形/圆角/裁剪） | 顶点/片段着色器（SPIR-V 内嵌）、顶点缓冲、批处理、裁剪栈映射到 scissor、`DrawList` → GPU | ⬜ |
-| **M4** | 文本 | 字体解析（TTF/OTF）+ 字形光栅化 + 图集 + 文本度量（替换 `ApproxMeasure`）+ 换行 | ⬜ |
+| **M3** | 渲染器 + 管线（矩形/圆角/裁剪/文本） | 顶点/片段着色器（SPIR-V 内嵌）、顶点缓冲、批处理、裁剪栈映射到 scissor、`DrawList` → GPU（**含 `DrawCmd::Text`**，用 M4 交付的字形图集） | ⬜ |
+| **M4** | 文本 | 字体解析（TTF/OTF）+ 字形光栅化 + 图集 + 文本度量（替换 `ApproxMeasure`）+ 换行 | 🔄 **进行中（解析 / 光栅化 / 图集 / 度量与换行 / CPU 真实字形 ✅；hinting 与亚像素待做）** |
 | **M5** | 输入 + 焦点 + dock | 事件循环、命中测试路由（`hit_test` 已就位）、焦点系统（含方向键）、**可停靠面板布局**（拖动改位置 / 边缘折叠） | ⬜ |
 | **M6** | 控件族 | 从 `deer-ui` 迁移 12 个控件的**语义**：`Btn`/`ChipGroup`/`Segmented`/`TabBar`/`Switch`/`NumberField`/`ScrubNum`/`ColorField`/`Dialog`/`Overlay`/`DropMenu`/`HoverTip`/`Icon`/`Row`/`RowActions`/`Keep` | ⬜ |
 | **M7** | DX12 / Metal 后端 | 各自实现 HAL trait；用 `deer-gpu` 的 CPU 参考后端做像素级对照 | ⬜ |
@@ -37,13 +37,31 @@ M2 原本写成一条「设备 + 交换链 + 清屏出图」。但**交换链必
 | **M2a-5** | 离屏 `VkImage` + 渲染通道 + 回读像素 | ✅ 完成 | 四种清屏色的回读值**精确正确**；回读长度与确定性都对 |
 | **M2a-6** | **绘制几何 + 像素判据**（SPIR-V 段序修复） | ✅ **完成** | 根因是**自研 SPIR-V 汇编器的段序错误**（`OpEntryPoint` 排在类型之后、`OpFunction` 掉进类型段）—— 驱动**既不报错也不画**，靠官方 `spirv-val` 定位。现 GPU 画出正确像素（面积 33% vs 理论 32%、位置正确、逐帧确定）|
 
+### M4 的细步与状态
+
+M4 原来写成一条「字体解析 + 光栅化 + 图集 + 度量 + 换行」。实际按「**先让字变成像素**、
+再谈 GPU 侧」拆开做：前五步都已完成，且**全程零第三方依赖**（没有引 `ttf-parser`/`fontdue`）。
+
+| 步 | 交付 | 状态 | 说明 |
+|---|---|---|---|
+| **M4-1** | **零依赖 TrueType 解析**（`crates/deer-gpu/src/font.rs`） | ✅ 完成 | `head`/`hhea`/`hmtx`/`maxp`/`cmap`(0/4/6/12)/`loca`/`glyf`（简单 + 复合轮廓）；**CFF（`OTTO`）明确报错**，不静默给空轮廓 |
+| **M4-2** | **字形光栅化**（`raster.rs` 的 `Rasterizer`） | ✅ 完成 | 轮廓自适应展平 → **nonzero** 扫描填充 → 超采样抗锯齿；确定性 |
+| **M4-3** | **字形图集**（`atlas.rs` 的 `GlyphAtlas`） | ✅ 完成 | 货架打包 + 1px padding + **增高不搬动已有槽位** + 幂等 + 超限返回 `None` |
+| **M4-4** | **真实度量与换行**（`measure.rs` 的 `FontMeasure`） | ✅ 完成 | 用 `hmtx` 真实 advance + `hhea` 升降部替换「每字符 0.6em」；`ApproxMeasure` 保留作确定性测试用 |
+| **M4-5** | **CPU 后端真实字形**（`text.rs` + `null.rs` + 门面 + 示例） | ✅ 完成 | `TextEngine` 串起度量/光栅化/图集；`CpuRenderer::with_text` 贴真实字形，`CpuRenderer::new()` 旧占位行为不变 |
+| **M4-6** | **hinting 与亚像素定位** | ⬜ | 现在用**超采样抗锯齿** + **整数像素落位**代替；不做 `glyph` instructions、不做 LCD 子像素 |
+
+> **GPU 侧文本不在这张表里**：它属于 **M3**（把 `DrawList` 送上 GPU，其中包含 `DrawCmd::Text`）。
+> 本里程碑交付的**字形图集已就绪**，正是它的前置依赖 —— 参见 `FEATURES.md` 第四节。
+
 ## 依赖纪律（硬性）
 
 1. **不引图形抽象库**：无 `wgpu`、`ash`、`vulkano`、`glow`。
 2. **不引 GUI 框架**：无 `egui`、`iced`、`tauri`。
 3. **最小生态依赖**：目前 **零依赖**（`deer-layout`/`deer-gpu`/`deer-vk` 都没有 `[dependencies]` 之外的第三方）。
-   后续允许的例外必须逐条登记并说明理由（例如：字体解析可能需要 `ttf-parser`；窗口可能需要 `winit`，
-   但**窗口不在 M1–M4 的范围内**）。
+   后续允许的例外必须逐条登记并说明理由（例如：窗口可能需要 `winit`，
+   但**窗口不在 M1–M4 的范围内**）。字体解析原先预计可能需要 `ttf-parser`，
+   **实际未引**：M4-1 自研（见 `crates/deer-gpu/src/font.rs`）。
 
 ## 与 deer-ui 的关系
 
@@ -58,5 +76,5 @@ M2 原本写成一条「设备 + 交换链 + 清屏出图」。但**交换链必
 |---|---|---|
 | Q-1 | 窗口抽象 | `RawWindowHandle` 已定义，但 M2 需要决定：自己写 Win32（`CreateWindowExW`），还是允许 `winit`。**这条会显著影响工作量**，M1 未决。 |
 | Q-2 | ~~SPIR-V 来源~~ | ✅ **已解决（M2a-1）**：自写极简 SPIR-V 汇编器（`crates/deer-vk/src/spirv.rs`），**零外部依赖**，产物已被真机驱动接受（3 支着色器）。附带一条经验：`vkCreateShaderModule` **很宽容**（连 `bound=0` 都接受），所以「驱动接受」≠「SPIR-V 正确」，必须自己加结构护栏。 |
-| Q-3 | 文本度量与布局的耦合 | `Measure` trait 已留出注入点；M4 接真实字体后，`ApproxMeasure` 需保留为**确定性测试用**实现。 |
+| Q-3 | ~~文本度量与布局的耦合~~ | ✅ **已落实（M4-4/M4-5）**：`FontMeasure` 通过 `Measure` 注入点接入布局；`ApproxMeasure` 保留为**确定性测试用**实现（不带字体的 `render_tree_to_png` 仍用它）。**新纪律**：布局、绘制列表、光栅化必须用同一个字号、同一个度量。 |
 | Q-4 | 线程模型 | HAL 故意不实现 `Send`/`Sync`；M2 需要定「渲染线程 vs UI 线程」的边界。 |

@@ -54,15 +54,23 @@
 | **Vulkan 后端**（设备 + 着色器） | 🔄 | [vulkan](docs/features/vulkan.md) | `cargo run -p deer-gui --example vulkan_devices` |
 | **Vulkan 图形管线**（渲染通道 + 管线 + 绘制，像素经真机验证） | ✅ | [vulkan-pipeline](docs/features/vulkan-pipeline.md) | `cargo run -p deer-gui --example vulkan_pipeline` |
 | **Vulkan 离屏渲染 + 回读**（含**绘制几何**，已修复段序缺陷） | ✅ | [gpu-offscreen](docs/features/gpu-offscreen.md) | `cargo run -p deer-gui --example gpu_offscreen` |
+| **字形光栅化**（轮廓 → 覆盖率位图，超采样抗锯齿） | ✅ | [glyph-raster](docs/features/glyph-raster.md) | `cargo run -p deer-gui --example glyph_atlas` |
+| **字形图集**（货架打包 + 1px padding + 按需增高） | ✅ | [glyph-atlas](docs/features/glyph-atlas.md) | `cargo run -p deer-gui --example glyph_atlas` |
+| **真实字体度量与换行**（`FontMeasure` 替换「每字符 0.6em」近似） | ✅ | [text-rendering](docs/features/text-rendering.md) | `cargo run -p deer-gui --example text_render` |
+| **真实字形渲染**（CPU 后端贴真实字形，不再是方块占位） | ✅ | [text-rendering](docs/features/text-rendering.md) | `cargo run -p deer-gui --example text_render` |
 
 ## 四、还没做的（**不要以为能跑**）
 
 | 功能 | 里程碑 | 现状说明 |
 |---|---|---|
 | **渲染到窗口**（屏幕上显示） | M2b | 完全不能。需要先定窗口方案（`ROADMAP.md` Q-1） |
-| **GPU 渲染出图**（Vulkan 画像素） | M2a-4..6 | 清屏与回读**可用**；**绘制有已知缺陷**（`vkCmdDraw` 不产生像素，排查记录见 `docs/features/gpu-offscreen.md`） |
-| **真实字形**（现在图片里是方块占位） | M4 | 需要字体解析 + 字形光栅化 + 图集 |
-| **文字换行与文本度量** | M4 | 现在是「每字符 0.6em」的近似度量（确定性，但不是真实字体） |
+| **GPU 渲染真实界面**（Vulkan 后端消费 `DrawList`） | M3 | 离屏清屏 / 回读 / 绘制几何已在真机验证（M2a-6 修复了 SPIR-V 段序缺陷）；但 Vulkan 后端**还不消费 `DrawList`**，界面目前只能由 CPU 后端出图 |
+| **GPU 侧文本**（Vulkan 消费 `DrawCmd::Text` / 字形图集） | M3 | 依赖 M4 的字形图集（**已就绪**）；Vulkan 目前只到离屏清屏与绘制几何，**尚未消费 `DrawCmd::Text`** |
+| **字形 hinting**（小字号像素对齐） | M4 残余 | 不做 —— 不读 `glyf` 的 instructions，用超采样抗锯齿代替 |
+| **亚像素定位 / LCD 子像素渲染** | M4 残余 | 不做 —— 字形按**整数像素**落位 |
+| **字距与连字**（`kern` / `GSUB` / `GPOS`） | M4 残余 | 不做整形，`advance` 就是 `hmtx` 的原始值 |
+| **CFF / OpenType-CFF 字体**（`OTTO`） | M4 残余 | 解析层直接报错，不静默给空轮廓；只支持 `glyf` 轮廓 |
+| **竖排 / RTL / 复杂脚本整形** | M4 残余 | 完全没有；不读 `GSUB`/`GPOS` |
 | **输入事件**（鼠标/键盘点击回调） | M5 | `hit_test` 有了（能算命中），但没有事件派发 |
 | **焦点系统**（Tab / Enter / 方向键） | M5 | 完全没有 |
 | **可停靠面板 dock**（拖动改位置 / 边缘折叠） | M5 | 完全没有 |

@@ -81,6 +81,8 @@ LINK : fatal error LNK1181: 无法打开输入文件“vulkan-1.lib”
 
 ## 五、M1 **没有**验证的事（诚实边界）
 
+> 注（M4 之后）：本节描述的是 M1 当时的交付状态；现在离屏 CPU 路径已支持真实字形，见 [text-rendering](features/text-rendering.md)。
+
 - **没有出图**：`deer-vk` 只到实例与设备枚举；逻辑设备、交换链、管线、着色器全在 M2–M3。
 - **没有窗口**：`RawWindowHandle` 只是定义，没有 Win32/X11 实现（Q-1 未决）。
 - **CPU 后端能出像素，但不是「正确渲染」**：文字是**等宽字形格占位**，不是排版。
