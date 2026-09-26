@@ -25,9 +25,12 @@
 pub mod draw;
 pub mod error;
 pub mod null;
+pub mod png;
+pub mod render;
 
 pub use draw::{Color, DrawCmd, DrawList, RectI, TextureId};
 pub use error::{GpuError, GpuResult};
+pub use render::{DefaultRenderer, NullRenderer, build_draw_list};
 
 use deer_layout::Geometry;
 use deer_layout::node::Node;

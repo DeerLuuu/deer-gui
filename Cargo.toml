@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/deer-layout", "crates/deer-gpu", "crates/deer-vk"]
+members = [
+    "crates/deer-layout",
+    "crates/deer-gpu",
+    "crates/deer-vk",
+    "crates/deer-gui",
+]
 
 [workspace.package]
 version = "0.0.0"
@@ -12,6 +17,7 @@ rust-version = "1.85"
 deer-layout = { path = "crates/deer-layout" }
 deer-gpu = { path = "crates/deer-gpu" }
 deer-vk = { path = "crates/deer-vk" }
+deer-gui = { path = "crates/deer-gui" }
 
 [profile.release]
 lto = true

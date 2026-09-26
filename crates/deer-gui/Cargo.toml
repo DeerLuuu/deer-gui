@@ -1,0 +1,16 @@
+[package]
+name = "deer-gui"
+description = "deer-gui 门面 crate：一条 import 拿到运行时全部能力，并提供离屏渲染到 PNG 的便捷入口"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+deer-layout.workspace = true
+deer-gpu.workspace = true
+deer-vk.workspace = true
+
+[lib]
+name = "deer_gui"
+path = "src/lib.rs"

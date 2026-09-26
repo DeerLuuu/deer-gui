@@ -21,9 +21,54 @@
 ## 快速开始
 
 ```sh
-cargo test --workspace          # 全部断言
+cargo test --workspace          # 全部断言（52 条）
 cargo test -p deer-vk -- --nocapture   # 看本机枚举到的 GPU
+
+# 渲染一张图（现在唯一能「看见」东西的方式）
+cargo run -p deer-gui --example render_to_png
+# → 在当前目录写出 render_to_png.png
 ```
+
+### 自己写代码渲染
+
+```rust
+use deer_gui::prelude::*;
+use deer_gui::render_tree_to_png;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // ① 建树（也可用 .dui 场景文件：parse_scene(text, "ui.dui")?）
+    let mut app = Builder::new(Kind::Column, "app").padding(12.0).gap(8.0);
+    app.text("标题");
+    app.container_opts(Kind::Row, "bar", L::new().gap(8.0).to_props(), |r| {
+        r.button("确定");
+        r.button("取消");
+    });
+    let tree = app.build();
+
+    // ② 渲染成 PNG
+    std::fs::write("ui.png", render_tree_to_png(&tree, 320, 200, Theme::default())?)?;
+    Ok(())
+}
+```
+
+要拿到像素而不是文件：`render_tree_to_rgba(&tree, w, h, theme)` → `(宽, 高, RGBA8)`。
+
+要单独看布局：`deer_gui::layout_tree(&tree, w, h, theme)` → nodeId 到 `Rect` 的几何表。
+
+### ⚠️ 现在能渲染到什么程度
+
+| 能力 | 状态 |
+|---|---|
+| 建树（命令式 / `.dui` 场景文件） | ✅ |
+| 布局计算、命中测试 | ✅ |
+| 树 + 几何 → 绘制列表 → **像素**（CPU 软件光栅化） | ✅ |
+| 写 PNG 文件 | ✅ |
+| **渲染到窗口 / 屏幕上** | ❌ 里程碑 M2–M3 |
+| 真实字形排版（现在是**等宽格占位**） | ❌ 里程碑 M4 |
+| 输入事件与焦点 | ❌ 里程碑 M5 |
+
+**所以现在只能离屏出图**，不能像正常 GUI 那样开窗。上面那张示例图里的「字」是占位方块，
+不是字体渲染 —— 几何、层次、颜色是真的，字形不是。
 
 ## 架构
 
