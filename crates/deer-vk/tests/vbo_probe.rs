@@ -560,12 +560,21 @@ fn vertex_buffer_path() {
         println!("    {c:?} × {n}");
     }
     let green = counts.get(&[0u8, 255, 0, 255]).copied().unwrap_or(0);
-    println!("\n绿（绘制）{green} 个");
-    assert_eq!(
-        green, 0,
-        "**绘制缺陷已修复**（标准顶点缓冲路径画出了 {green} 个绿像素）！\
-         请把这条断言改成真正的像素校验，并更新文档"
+    let red = counts.get(&[255u8, 0, 0, 255]).copied().unwrap_or(0);
+    println!("\n红（清屏）{red} 个，绿（绘制）{green} 个");
+    assert!(
+        green > 0,
+        "**标准顶点缓冲路径画不出任何像素** —— 这是绘制缺陷的回归！\
+         根因见 crates/deer-vk/src/spirv.rs 的 Section 文档（SPIR-V 段序）"
     );
+    let ratio = green as f64 / (W * H) as f64;
+    println!("绿色占比 {:.1}%（理论与裸 FFI 路径一致，约 32%）", ratio * 100.0);
+    assert!(
+        (0.25..0.40).contains(&ratio),
+        "绿色占比 {:.1}% 偏离预期 —— 顶点缓冲的数据或属性描述有问题",
+        ratio * 100.0
+    );
+    println!("真实顶点缓冲路径同样正确 ✅");
 }
 
 /// 挑一个同时满足所有 `want` 位的可用内存类型。

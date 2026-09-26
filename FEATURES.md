@@ -52,8 +52,8 @@
 | **GPU HAL**（后端抽象：`Backend`/`Device`/`Frame`/`Renderer`） | 🔄 | [gpu-hal](docs/features/gpu-hal.md) | `cargo run -p deer-gui --example vulkan_devices` |
 | **CPU 参考后端**（软件光栅化） | ✅ | [rendering](docs/features/rendering.md#cpu-后端软件光栅化) | `cargo run -p deer-gui --example draw_list` |
 | **Vulkan 后端**（设备 + 着色器） | 🔄 | [vulkan](docs/features/vulkan.md) | `cargo run -p deer-gui --example vulkan_devices` |
-| **Vulkan 图形管线**（渲染通道 + 管线，**还画不出像素**） | 🔄 | [vulkan-pipeline](docs/features/vulkan-pipeline.md) | `cargo run -p deer-gui --example vulkan_pipeline` |
-| **Vulkan 离屏渲染 + 回读**（清屏/回读可用，**绘制有已知缺陷**） | 🔄 | [gpu-offscreen](docs/features/gpu-offscreen.md) | `cargo run -p deer-gui --example gpu_offscreen` |
+| **Vulkan 图形管线**（渲染通道 + 管线 + 绘制，像素经真机验证） | ✅ | [vulkan-pipeline](docs/features/vulkan-pipeline.md) | `cargo run -p deer-gui --example vulkan_pipeline` |
+| **Vulkan 离屏渲染 + 回读**（含**绘制几何**，已修复段序缺陷） | ✅ | [gpu-offscreen](docs/features/gpu-offscreen.md) | `cargo run -p deer-gui --example gpu_offscreen` |
 
 ## 四、还没做的（**不要以为能跑**）
 

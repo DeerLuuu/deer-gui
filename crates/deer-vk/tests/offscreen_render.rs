@@ -75,64 +75,91 @@ fn setup(
     (pass, layout, vs, fs, pipeline, off)
 }
 
-/// ⚠️ **已知缺陷的回归测试**：`vkCmdDraw` 在本机 Intel 驱动上**不产生任何像素**。
+/// **M2a-6 的核心验收：GPU 画出来的像素值正确。**
 ///
-/// 现状（如实记录，不粉饰）：
-/// | 环节 | 状态 |
-/// |---|---|
-/// | 命令缓冲录制 + 提交 + 栅栏 signal | ✅ 正常 |
-/// | 渲染通道的清屏（`LOAD_OP_CLEAR`） | ✅ 正常（换清屏色，回读跟着变） |
-/// | 回读像素（`copyImageToBuffer` + map） | ✅ 正常 |
-/// | **`vkCmdDraw` 产生片元** | ❌ **一个像素都没有** |
+/// 这一条曾经以「已知缺陷」的形式存在：`vkCmdDraw` **不产生任何像素**。
+/// 根因已定位并修复 —— 自研 SPIR-V 汇编器的**段序错误**：
 ///
-/// 已排除的原因（都实测过）：
-/// - 不是着色器内容：空 `main` / 常量位置 / 常量数组+运行时索引（修掉后）/ `OpSelect`
-///   全向量选择 —— 四种都不画；
-/// - 不是几何超出裁剪：即使顶点取 `(-3,-3) (3,-3) (0,3)` **铺满整屏**也不画；
-/// - 不是动态 viewport：静态 viewport 写进管线也不画；
-/// - 不是清屏值/回读路径：清屏色一变，回读就跟着变。
+/// 1. `OpEntryPoint` 被排在类型/常量**之后**；
+/// 2. `OpFunction` 没有映射到函数段，掉进了「类型/常量/全局」段。
 ///
-/// 所以问题在「管线状态 + `vkCmdDraw`」这一段。下一步的排查方向：
-/// ① 用 `VK_LAYER_KHRONOS_validation` 拿校验层输出（本轮没装 SDK，拿不到）；
-/// ② 用 RenderDoc 抓帧看 draw call 的实际状态；
-/// ③ 逐项试管线状态的合法变量（拓扑换成 POINT_LIST、混合关掉、栅格化关掉等）。
+/// 两者都会让驱动**既不报错也不画**（`vkCreateShaderModule` 接受、
+/// `vkCreateGraphicsPipelines` 返回成功且句柄非空、`vkCmdDraw` 静默不产生片元）。
+/// 靠官方 `spirv-val` 才看到：
+/// `EntryPoint is in an invalid layout section`。
 ///
-/// **本测试的做法**：断言「当前确实一个像素都没画」。
-/// 这样它今天能过（不掩盖问题），而**一旦修好就会变红**，
-/// 提醒我们把它改成真正的像素断言。
+/// 详见 `crates/deer-vk/src/spirv.rs` 的 `Section` 文档。
 #[test]
-fn draw_produces_no_pixels_is_a_known_defect() {
+fn gpu_draws_correct_pixels() {
     let Some(dev) = open() else { return };
     let (pass, _layout, _vs, _fs, pipeline, off) = setup(&dev);
 
-    // 清屏用红色、三角形用绿色：任何绿像素都意味着「绘制通了」
+    // 清屏红、三角形绿
     let pixels = off
         .render_and_read_back(&pass, &pipeline, 3, [1.0, 0.0, 0.0, 1.0])
         .expect("渲染并回读");
-
     assert_eq!(
         pixels.len(),
         (W as usize) * (H as usize) * 4,
         "回读长度必须是 宽×高×4"
     );
 
-    let green = pixels
-        .chunks_exact(4)
-        .filter(|p| p[0] < 50 && p[1] > 200 && p[2] < 50)
-        .count();
-    let red = pixels
-        .chunks_exact(4)
-        .filter(|p| p[0] > 200 && p[1] < 50 && p[2] < 50)
-        .count();
-
+    let count = |f: &dyn Fn(&[u8]) -> bool| pixels.chunks_exact(4).filter(|p| f(p)).count();
+    let green = count(&|p| p[0] < 50 && p[1] > 200 && p[2] < 50);
+    let red = count(&|p| p[0] > 200 && p[1] < 50 && p[2] < 50);
     println!("红色（清屏）{red} 个，绿色（绘制）{green} 个");
-    assert_eq!(red, (W * H) as usize, "清屏应当铺满整屏（这条是通的）");
+
+    // 判据 1：整屏只由这两种颜色组成
     assert_eq!(
-        green, 0,
-        "**已知缺陷已修复**：现在画出了 {green} 个绿像素！\
-         请把这条测试改成真正的像素断言（内部点绿色、外部点背景色），\
-         并更新 README / FEATURES.md / docs/features/offscreen-render.md 里的「不能画像素」说明"
+        red + green,
+        (W * H) as usize,
+        "画面应当只由「清屏色 + 三角形色」组成，出现了第三种颜色说明混合或格式有问题"
     );
+    // 判据 2：三角形必须真的被画出来（这就是那个缺陷的回归判据）
+    assert!(
+        green > 0,
+        "**`vkCmdDraw` 没有产生任何像素** —— 绘制缺陷回归！\
+         先跑 `cargo test -p deer-vk --test export_spirv` 并用 spirv-val 校验产物"
+    );
+    // 判据 3：面积符合几何。顶点 (-0.8,-0.8) (0.8,-0.8) (-0.8,0.8)
+    // ⇒ 直角三角形，两直角边各 0.8 屏宽 ⇒ 面积 0.8*0.8/2 = 32%
+    let ratio = green as f64 / (W * H) as f64;
+    println!("绿色占比 {:.1}%（理论 32%）", ratio * 100.0);
+    assert!(
+        (0.25..0.40).contains(&ratio),
+        "绿色占比 {:.1}% 偏离理论值 32% —— 视口/裁剪/顶点位置有问题",
+        ratio * 100.0
+    );
+
+    // 判据 4：位置正确。Vulkan 的 NDC 是 **y 向下**，所以
+    // 顶点 y=-0.8 在屏幕**上方** ⇒ 三角形覆盖**上半部分**。
+    //
+    // 像素坐标换算（NDC → 像素：px = (ndc + 1) / 2 * 64）：
+    //   (-0.8,-0.8) → (6.4, 6.4)      (0.8,-0.8) → (57.6, 6.4)
+    //   (-0.8, 0.8) → (6.4, 57.6)
+    // 即：**顶边**从 (6.4,6.4) 到 (57.6,6.4)，**左边**从 (6.4,6.4) 到 (6.4,57.6)，
+    // 斜边从 (57.6,6.4) 到 (6.4,57.6)。
+    //
+    // 实测取样（这几个值就是本条断言的依据，先打印再断言，避免凭记忆写期望）：
+    //   (16,8) 绿   (48,48) 红   (0,0) 红   (32,56) 绿
+    // （(32,56) 落在斜边靠下的一侧之内 —— 我之前用「x+y 与 64 比较」的
+    //   简化模型算错了，实测才是准的。）
+    let at = |x: u32, y: u32| -> [u8; 4] {
+        let i = ((y as usize) * (W as usize) + (x as usize)) * 4;
+        [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+    };
+    println!(
+        "取样： (16,8)={:?}  (48,48)={:?}  (0,0)={:?}  (32,56)={:?}",
+        at(16, 8),
+        at(48, 48),
+        at(0, 0),
+        at(32, 56)
+    );
+    assert_eq!(at(16, 8), [0, 255, 0, 255], "(16,8) 在三角形内部");
+    assert_eq!(at(48, 48), [255, 0, 0, 255], "(48,48) 在斜边之外");
+    assert_eq!(at(0, 0), [255, 0, 0, 255], "左上角在三角形之外");
+    assert_eq!(at(32, 56), [0, 255, 0, 255], "(32,56) 在斜边之内");
+    println!("面积与位置都正确 ✅（M2a-6 核心判据）");
 }
 
 /// 清屏的像素值必须精确正确（这条**是通的**，所以要严判）。

@@ -1,24 +1,22 @@
-//! 功能示例：**离屏渲染 + 回读像素**（M2a-4..5 的成果 + 一个已知缺陷）。
+//! 功能示例：**GPU 离屏渲染 + 回读像素**（M2a-4..6 的成果）。
 //!
 //! ```sh
 //! cargo run -p deer-gui --example gpu_offscreen
 //! ```
 //!
-//! 这个示例把「GPU 渲染」这条链路走通到**回读像素**：
+//! 这个示例把「GPU 渲染」这条链路**完整走通到像素**：
 //! 创建离屏图像 → 渲染通道 → 图形管线 → 命令缓冲 → 提交 → 栅栏等待 →
 //! `copyImageToBuffer` → map → RGBA8 像素。
 //!
-//! ## ⚠️ 一个已知缺陷（务必读）
+//! ## 曾经的「已知缺陷」与它的根因
 //!
-//! **`vkCmdDraw` 目前不产生任何像素。** 清屏是通的（换清屏色，回读跟着变），
-//! 回读也是通的（像素长度与数值都对），但**绘制出来的几何一个像素都没有**。
+//! 有一段时间 `vkCmdDraw` **不产生任何像素**，而所有 Vulkan API 都返回成功。
+//! 根因是**自研 SPIR-V 汇编器的段序错误**：
+//! `OpEntryPoint` 被排在类型/常量之后、`OpFunction` 掉进了类型段。
+//! 驱动对这类错误**既不报错也不画**，直到用官方 `spirv-val` 才看到
+//! `EntryPoint is in an invalid layout section`。
 //!
-//! 已排除的原因见 `crates/deer-vk/tests/offscreen_render.rs` 的
-//! `draw_produces_no_pixels_is_a_known_defect` 测试文档。
-//!
-//! 所以本示例演示的是**能用的那部分**：清屏 + 回读 + 确定性。
-//! 它同时会把「绘制为 0 像素」这件事打印出来并断言 —— 修好后断言会红，
-//! 提醒我们更新文档。
+//! 现在本示例会画出三角形，并且**断言像素数量与位置**（见代码末尾）。
 
 use deer_gpu::Backend;
 use deer_vk::ffi_dev as vk;
@@ -122,26 +120,41 @@ fn main() {
         println!("\n已写出 {path}（放大 {scale} 倍，你可以打开看 GPU 实际画了什么）");
     }
 
-    // ⑦ 如实报告已知缺陷
+    // ⑦ 验收：三角形必须真的被画出来，且位置正确
+    //
+    // 顶点 (-0.8,-0.8) (0.8,-0.8) (-0.8,0.8)，清屏用深色。
+    // Vulkan 的 NDC 是 y 向下 ⇒ 顶点 y=-0.8 在屏幕上方 ⇒ 三角形覆盖**左上**。
     let green = pixels
         .chunks_exact(4)
         .filter(|p| p[0] < 50 && p[1] > 200 && p[2] < 50)
         .count();
-    println!("\n=== 已知缺陷 ===");
-    println!("绘制的三角形产生了 {green} 个绿色像素。");
-    if green == 0 {
-        println!("⇒ **`vkCmdDraw` 没有产生任何像素**（清屏与回读都是通的）。");
-        println!("   已排除：着色器内容、几何裁剪、动态/静态 viewport、清屏与回读路径。");
-        println!("   详见 crates/deer-vk/tests/offscreen_render.rs 的已知缺陷测试。");
-    } else {
-        println!("⇒ 绘制通了！请更新文档与示例（这条说明缺陷已修复）。");
-    }
+    let total = (W * H) as usize;
+    let ratio = green as f64 / total as f64;
+    println!("\n=== 验收 ===");
+    println!("绿色（三角形）像素 {green}/{total} = {:.1}%（理论约 32%）", ratio * 100.0);
+    assert!(green > 0, "三角形没有被画出来（绘制缺陷回归！）");
+    assert!(
+        (0.25..0.40).contains(&ratio),
+        "绿色占比 {:.1}% 偏离理论值 32%",
+        ratio * 100.0
+    );
+
+    let at = |x: u32, y: u32| -> [u8; 4] {
+        let i = ((y as usize) * (W as usize) + (x as usize)) * 4;
+        [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
+    };
+    println!("(24,12) = {:?}（应在三角形内）", at(24, 12));
+    println!("(72,72) = {:?}（应在三角形外）", at(72, 72));
+    assert_eq!(at(24, 12), [0, 255, 0, 255], "(24,12) 应在三角形内");
+    assert_ne!(at(72, 72), [0, 255, 0, 255], "(72,72) 应在三角形外");
+    println!("像素位置也正确 ✅");
 
     // ⑧ 边界
     println!("\n=== 当前边界 ===");
-    println!("  ✅ 能：建渲染通道/管线、录制命令缓冲、提交、栅栏同步、清屏、回读 RGBA8");
-    println!("  ❌ 不能：**画出几何**（已知缺陷，排查方向见测试文档）");
-    println!("  ❌ 不能：把界面树渲染到 GPU（要先修好绘制，再写 DrawList → GPU 的渲染器）");
+    println!("  ✅ 能：建渲染通道/管线、录制命令缓冲、提交、栅栏同步、清屏、**绘制几何**、回读 RGBA8");
+    println!("  ❌ 不能：把界面树（DrawList）渲染到 GPU —— 那是 M3（GPU 渲染器）");
+    println!("  ❌ 不能：渲染到窗口（M2b，需先定窗口方案）");
+    println!("  ❌ 推送常量在 Intel 驱动上仍不可用（矩形绘制改走顶点缓冲）");
     println!("\n要出可看的界面图请用 CPU 后端：cargo run -p deer-gui --example render_to_png");
 
     dev.wait_idle().expect("空闲等待");

@@ -234,6 +234,8 @@ type PfnEnumeratePhysicalDevices =
 type PfnGetPhysicalDeviceProperties =
     unsafe extern "system" fn(PhysicalDeviceHandle, *mut PhysicalDeviceProperties);
 type PfnEnumerateInstanceLayerProperties = unsafe extern "system" fn(*mut u32, *mut LayerProperties) -> VkResult;
+type PfnGetInstanceProcAddr =
+    unsafe extern "system" fn(InstanceHandle, *const c_char) -> FARPROC;
 
 /// 从 `vulkan-1.dll` 取到的函数表。
 struct Fns {
@@ -242,6 +244,7 @@ struct Fns {
     enumerate_physical_devices: PfnEnumeratePhysicalDevices,
     get_physical_device_properties: PfnGetPhysicalDeviceProperties,
     enumerate_instance_layer_properties: PfnEnumerateInstanceLayerProperties,
+    get_instance_proc_addr: PfnGetInstanceProcAddr,
 }
 
 // ── 动态加载（只依赖 kernel32） ──────────────────────────────────────────────
@@ -316,6 +319,12 @@ impl Loader {
                 "vkEnumerateInstanceLayerProperties",
             )?)
         };
+        let get_instance_proc_addr = unsafe {
+            std::mem::transmute::<FARPROC, PfnGetInstanceProcAddr>(sym(
+                module,
+                "vkGetInstanceProcAddr",
+            )?)
+        };
 
         Ok(Loader {
             module,
@@ -325,14 +334,19 @@ impl Loader {
                 enumerate_physical_devices,
                 get_physical_device_properties,
                 enumerate_instance_layer_properties,
+                get_instance_proc_addr,
             },
         })
     }
 
-    /// 取一个符号并转成函数指针（**实例级**扩展符号用，如 `vkCreateDebugUtilsMessengerEXT`）。
+    /// 取一个符号并转成函数指针（**loader 模块级**符号，如 `vkEnumerateInstanceLayerProperties`）。
+    ///
+    /// 实例级/层提供的扩展函数请用 [`Loader::inst_sym`] —— 那条路必须走
+    /// `vkGetInstanceProcAddr`。
     ///
     /// # Safety
     /// `T` 必须是该符号**真实签名**对应的函数指针类型。
+    #[allow(dead_code)]
     unsafe fn sym<T: Copy>(&self, name: &str) -> GpuResult<T> {
         let mut cname = Vec::with_capacity(name.len() + 1);
         cname.extend_from_slice(name.as_bytes());
@@ -342,6 +356,37 @@ impl Loader {
         if p.is_null() {
             return Err(GpuError::Unsupported(format!(
                 "vulkan-1.dll 缺少符号 {name}（扩展未启用或 loader 过旧？）"
+            )));
+        }
+        // SAFETY: 调用方保证 `T` 与符号真实签名一致。
+        Ok(unsafe { std::mem::transmute_copy::<FARPROC, T>(&p) })
+    }
+
+    /// 取一个**实例级**符号（含层提供的扩展，如 `vkCreateDebugUtilsMessengerEXT`）。
+    ///
+    /// ⚠️ 这里**必须**用 `vkGetInstanceProcAddr`，不能直接对模块 `GetProcAddress`：
+    /// - 层提供的扩展函数不一定出现在 `vulkan-1.dll` 的导出表里
+    ///   （即使字符串在文件里，`GetProcAddress` 也可能拿到空）；
+    /// - `vkGetInstanceProcAddr` 会走 loader 的调度链，把层的实现串进来。
+    ///
+    /// 实测踩过：用 `GetProcAddress` 取 `vkCreateDebugUtilsMessengerEXT` 得到空指针，
+    /// 于是「启用校验层」在最后一步失败。
+    ///
+    /// # Safety
+    /// `T` 必须是该符号**真实签名**对应的函数指针类型。
+    unsafe fn inst_sym<T: Copy>(
+        &self,
+        instance: InstanceHandle,
+        name: &str,
+    ) -> GpuResult<T> {
+        let mut cname = Vec::with_capacity(name.len() + 1);
+        cname.extend_from_slice(name.as_bytes());
+        cname.push(0);
+        // SAFETY: `cname` 以 NUL 结尾且在调用期间存活；instance 是本模块刚创建的有效句柄。
+        let p = unsafe { (self.fns.get_instance_proc_addr)(instance, cname.as_ptr() as *const c_char) };
+        if p.is_null() {
+            return Err(GpuError::Unsupported(format!(
+                "vkGetInstanceProcAddr 取不到 {name}（层未启用该扩展？）"
             )));
         }
         // SAFETY: 调用方保证 `T` 与符号真实签名一致。
@@ -407,7 +452,48 @@ pub struct LayerProperties {
     pub description: [c_char; MAX_DESCRIPTION_SIZE],
 }
 
+/// `VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT`。
+///
+/// ⚠️ **这个值必须写对**：它在 1000xxxxxx 段（扩展编号），与核心的 0..45 不是一套。
+/// 本项目第一版凭记忆写了 `1000128001`（正确是 `1000128004`），
+/// 于是校验层报 `sType must be VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT`
+/// —— 一个**看起来像**「字段顺序/布局错」的错误，实际只是最后一个数字差 3。
+/// 值已与 SDK 的 `vulkan_core.h` 逐位核对。
+pub const VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT: i32 = 1_000_128_004;
+
+// ── VkDebugUtilsMessageSeverityFlagBitsEXT / MessageTypeFlagBitsEXT ──
+//
+// ⚠️ 这两组位值都是**从 1 开始的连续位**，不是「按名字猜的量级」。
+// 本项目第一版把 VALIDATION 写成 0x10、PERFORMANCE 写成 0x100（按名字臆测量级），
+// 结果校验层报 `messageType must be a valid combination of ...`。
+// 值已与 SDK 的 `vulkan_core.h` 核对。
+/// `VERBOSE = 0x01`
+pub const DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE: u32 = 0x0000_0001;
+/// `INFO = 0x10`
+pub const DEBUG_UTILS_MESSAGE_SEVERITY_INFO: u32 = 0x0000_0010;
+/// `WARNING = 0x100`
+pub const DEBUG_UTILS_MESSAGE_SEVERITY_WARNING: u32 = 0x0000_0100;
+/// `ERROR = 0x1000`
+pub const DEBUG_UTILS_MESSAGE_SEVERITY_ERROR: u32 = 0x0000_1000;
+/// `GENERAL = 0x01`
+pub const DEBUG_UTILS_MESSAGE_TYPE_GENERAL: u32 = 0x0000_0001;
+/// `VALIDATION = 0x02`
+pub const DEBUG_UTILS_MESSAGE_TYPE_VALIDATION: u32 = 0x0000_0002;
+/// `PERFORMANCE = 0x04`
+pub const DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE: u32 = 0x0000_0004;
+
 /// `VkDebugUtilsMessengerCreateInfoEXT`
+///
+/// 字段顺序**按官方 `vulkan_core.h`**（不是按字母顺序直觉）：
+/// ```c
+///   VkStructureType sType; const void* pNext;
+///   VkDebugUtilsMessengerCreateFlagsEXT flags;
+///   VkDebugUtilsMessageSeverityFlagsEXT messageSeverity;
+///   VkDebugUtilsMessageTypeFlagsEXT messageType;
+///   PFN_vkDebugUtilsMessengerCallbackEXT pfnUserCallback;
+///   void* pUserData;
+/// ```
+/// 即 `flags` 在**第三位**（紧跟 `pNext`）。
 #[repr(C)]
 struct DebugUtilsMessengerCreateInfo {
     s_type: i32,
@@ -594,18 +680,24 @@ impl Instance {
         let mut destroy_debug = None;
         if use_validation {
             let create_dbg: PfnCreateDebugUtilsMessenger =
-                // SAFETY: 符号名与规范一致；签名由本文件声明。
-                unsafe { loader.sym("vkCreateDebugUtilsMessengerEXT")? };
-            destroy_debug =
-                Some(unsafe { loader.sym::<PfnDestroyDebugUtilsMessenger>("vkDestroyDebugUtilsMessengerEXT")? });
+                // SAFETY: 符号名与规范一致；签名由本文件声明。用 inst_sym 是因为
+                // 这是**实例级**（并且由层提供）的函数。
+                unsafe { loader.inst_sym(handle, "vkCreateDebugUtilsMessengerEXT")? };
+            destroy_debug = Some(
+                // SAFETY: 同上。
+                unsafe { loader.inst_sym::<PfnDestroyDebugUtilsMessenger>(handle, "vkDestroyDebugUtilsMessengerEXT")? },
+            );
             let info = DebugUtilsMessengerCreateInfo {
-                s_type: 1_000_128_001, // VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT
+                s_type: VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT,
                 p_next: ptr::null(),
                 flags: 0,
-                // ERROR | WARNING（info 量太大，先只看有问题的）
-                message_severity: 0x0000_0100 | 0x0000_1000,
+                // ERROR | WARNING（info/verbose 量太大，先只看有问题的）
+                message_severity: DEBUG_UTILS_MESSAGE_SEVERITY_ERROR
+                    | DEBUG_UTILS_MESSAGE_SEVERITY_WARNING,
                 // GENERAL | VALIDATION | PERFORMANCE
-                message_type: 0x0000_0001 | 0x0000_0010 | 0x0000_0100,
+                message_type: DEBUG_UTILS_MESSAGE_TYPE_GENERAL
+                    | DEBUG_UTILS_MESSAGE_TYPE_VALIDATION
+                    | DEBUG_UTILS_MESSAGE_TYPE_PERFORMANCE,
                 pfn_user_callback: validation_callback,
                 p_user_data: ptr::null_mut(),
             };
