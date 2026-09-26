@@ -18,7 +18,13 @@
 
 #![deny(clippy::all)]
 
+pub mod device;
 pub mod ffi;
+pub mod ffi_dev;
+pub mod loader;
+pub mod spirv;
+
+pub use device::{ShaderModule, VkDevice};
 
 use deer_gpu::{AdapterInfo, AdapterKind, Backend, Device, GpuError, GpuResult};
 use ffi::PhysicalDeviceType;
