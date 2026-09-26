@@ -492,6 +492,86 @@ pub fn vertex_shader_reads_vertex_index() -> Vec<u8> {
     m.finish()
 }
 
+/// 诊断用：**三个顶点都用同一组常量位置**（不读 `gl_VertexIndex`、不用 `OpSelect`）。
+///
+/// 用途：隔离「顶点选择逻辑（`OpSelect`）有问题」还是「管线/光栅化有问题」。
+/// 位置取屏幕正中心 `(0,0,0,1)`；三个顶点同位置会退化成零面积 ⇒ 不产生像素，
+/// 所以它只用来验证「顶点着色器有没有被跑起来」（配合不同顶点数观察行为）。
+pub fn vertex_shader_hardcoded_position() -> Vec<u8> {
+    let mut m = Module::new();
+    m.shader_capability().memory_model_glsl450().source_unknown();
+    let void = m.type_void();
+    let f32_ty = m.type_float();
+    let v4 = m.type_vector(f32_ty, 4);
+    let ptr_out_v4 = m.type_pointer(SC_OUTPUT, v4);
+    let fn_ty = m.type_function(void, &[]);
+    let out_pos = m.variable(ptr_out_v4, SC_OUTPUT);
+    let fn_id = m.id();
+    let block = m.id();
+    m.entry_point(EXECUTION_MODEL_VERTEX, fn_id, "main", &[out_pos]);
+    m.debug_name(out_pos, "gl_Position");
+    m.decorate(out_pos, DECORATION_BUILT_IN, &[BUILTIN_POSITION]);
+    m.function(void, fn_id, fn_ty, block);
+    let x = m.constant_f32(f32_ty, 0.0);
+    let y = m.constant_f32(f32_ty, 0.0);
+    let z = m.constant_f32(f32_ty, 0.0);
+    let w = m.constant_f32(f32_ty, 1.0);
+    let pos = m.constant_composite(v4, &[x, y, z, w]);
+    m.store(out_pos, pos);
+    m.return_void();
+    m.function_end();
+    m.finish()
+}
+
+/// 诊断用：顶点位置来自**三个独立常量**，按 `gl_VertexIndex` 用 `OpSelect` 逐分量选。
+///
+/// 与 `vertex_shader_triangle` 的区别：这里 v4 的三个分量**全部**参与选择
+/// （不是先选 xy 再组 vec4），用来排查「先选标量再 `OpConstantComposite`」是否有问题。
+pub fn vertex_shader_select_full_vec4(positions: [[f32; 4]; 3]) -> Vec<u8> {
+    let mut m = Module::new();
+    m.shader_capability().memory_model_glsl450().source_unknown();
+    let void = m.type_void();
+    let f32_ty = m.type_float();
+    let u32_ty = m.type_uint();
+    let bool_ty = m.type_bool();
+    let v4 = m.type_vector(f32_ty, 4);
+    let ptr_out_v4 = m.type_pointer(SC_OUTPUT, v4);
+    let ptr_in_u32 = m.type_pointer(SC_INPUT, u32_ty);
+    let fn_ty = m.type_function(void, &[]);
+    let out_pos = m.variable(ptr_out_v4, SC_OUTPUT);
+    let in_index = m.variable(ptr_in_u32, SC_INPUT);
+
+    // 三个完整 vec4 常量
+    let mut consts = Vec::new();
+    for p in positions {
+        let mut parts = Vec::new();
+        for c in p {
+            parts.push(m.constant_f32(f32_ty, c));
+        }
+        consts.push(m.constant_composite(v4, &parts));
+    }
+    let k1 = m.constant_u32(u32_ty, 1);
+    let k2 = m.constant_u32(u32_ty, 2);
+
+    let fn_id = m.id();
+    let block = m.id();
+    m.entry_point(EXECUTION_MODEL_VERTEX, fn_id, "main", &[out_pos, in_index]);
+    m.debug_name(out_pos, "gl_Position");
+    m.decorate(out_pos, DECORATION_BUILT_IN, &[BUILTIN_POSITION]);
+    m.debug_name(in_index, "gl_VertexIndex");
+    m.decorate(in_index, DECORATION_BUILT_IN, &[BUILTIN_VERTEX_INDEX]);
+    m.function(void, fn_id, fn_ty, block);
+    let idx = m.load(u32_ty, in_index);
+    let c1 = m.op_i_equal(bool_ty, idx, k1);
+    let c2 = m.op_i_equal(bool_ty, idx, k2);
+    let a = m.op_select(v4, c1, consts[1], consts[0]);
+    let b = m.op_select(v4, c2, consts[2], a);
+    m.store(out_pos, b);
+    m.return_void();
+    m.function_end();
+    m.finish()
+}
+
 /// 顶点着色器（三角形）：把 3 个 NDC 顶点写进 `gl_Position`。
 ///
 /// ## ⚠️ 这里为什么不用常量数组索引（一个实测教训）

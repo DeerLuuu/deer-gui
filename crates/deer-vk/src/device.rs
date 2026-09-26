@@ -92,6 +92,8 @@ pub struct VkDevice {
     fns: DeviceFns,
     adapter: deer_gpu::AdapterInfo,
     memory_type_count: u32,
+    /// 物理设备的内存属性（挑内存类型时必需）
+    mem_props: vk::PhysicalDeviceMemoryProperties,
     /// 停止信号：`Drop` 时 `send` 让后台线程销毁实例与设备
     stop: Option<Sender<()>>,
     thread: Option<JoinHandle<()>>,
@@ -127,6 +129,7 @@ impl VkDevice {
                 fns: info.fns,
                 adapter: info.adapter,
                 memory_type_count: info.memory_type_count,
+                mem_props: info.mem_props,
                 stop: Some(stop_tx),
                 thread: Some(thread),
             }),
@@ -243,6 +246,11 @@ impl VkDevice {
     /// 探测可用内存类型数（诊断/测试用）。
     pub fn memory_type_count(&self) -> u32 {
         self.memory_type_count
+    }
+
+    /// **物理设备**的内存属性。挑内存类型时必需（逻辑设备上拿不到）。
+    pub fn memory_properties(&self) -> &vk::PhysicalDeviceMemoryProperties {
+        &self.mem_props
     }
 
     /// 创建一个**渲染通道**：一个颜色附件、一个子通道。
@@ -417,6 +425,84 @@ impl VkDevice {
         self.create_graphics_pipeline_raw(&stages, layout, render_pass)
     }
 
+    /// 建一个**用静态 viewport/scissor** 的图形管线（尺寸写死在管线里）。
+    ///
+    /// 与动态版本的差别：动态版靠 `vkCmdSetViewport`/`vkCmdSetScissor` 在录制时给值，
+    /// 静态版把值放进管线创建信息。
+    ///
+    /// **为什么两个都要有**：实测发现动态版在本机 Intel 驱动上**画不出任何像素**
+    /// （清屏正常、绘制为零）。保留两个版本既能定位问题，也给调用方一个可用选择。
+    pub fn create_graphics_pipeline_static_viewport(
+        &self,
+        vs: &ShaderModule,
+        fs: &ShaderModule,
+        layout: &PipelineLayout,
+        render_pass: &RenderPass,
+        width: u32,
+        height: u32,
+    ) -> GpuResult<Pipeline> {
+        self.create_graphics_pipeline_static_viewport_ex(
+            vs,
+            fs,
+            layout,
+            render_pass,
+            width,
+            height,
+            true,
+        )
+    }
+
+    /// 同上，但可以**关掉 alpha 混合**（排查用）。
+    ///
+    /// 存在的理由：混合状态是最后一个没被排除的管线状态项。若关掉混合就画得出来，
+    /// 说明问题在混合配置；否则可以继续排除它。
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_graphics_pipeline_static_viewport_ex(
+        &self,
+        vs: &ShaderModule,
+        fs: &ShaderModule,
+        layout: &PipelineLayout,
+        render_pass: &RenderPass,
+        width: u32,
+        height: u32,
+        blend_enable: bool,
+    ) -> GpuResult<Pipeline> {
+        let entry = c"main";
+        let stages = [
+            vk::PipelineShaderStageCreateInfo {
+                s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                p_next: std::ptr::null(),
+                flags: 0,
+                stage: vk::VK_SHADER_STAGE_VERTEX_BIT,
+                module: vs.handle(),
+                p_name: entry.as_ptr(),
+                p_specialization_info: std::ptr::null(),
+            },
+            vk::PipelineShaderStageCreateInfo {
+                s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                p_next: std::ptr::null(),
+                flags: 0,
+                stage: vk::VK_SHADER_STAGE_FRAGMENT_BIT,
+                module: fs.handle(),
+                p_name: entry.as_ptr(),
+                p_specialization_info: std::ptr::null(),
+            },
+        ];
+        let viewport = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: width as f32,
+            height: height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let scissor = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent: vk::Extent2D { width, height },
+        };
+        self.build_pipeline(&stages, layout, render_pass, Some((&viewport, &scissor)), blend_enable)
+    }
+
     /// 用**显式给定**的阶段列表建管线。
     ///
     /// 存在的理由：① 支持非「顶点+片段」的组合（未来加几何/细分阶段）；
@@ -427,6 +513,18 @@ impl VkDevice {
         stages: &[vk::PipelineShaderStageCreateInfo],
         layout: &PipelineLayout,
         render_pass: &RenderPass,
+    ) -> GpuResult<Pipeline> {
+        self.build_pipeline(stages, layout, render_pass, None, true)
+    }
+
+    /// 建管线的核心：`static_viewport = None` ⇒ 动态 viewport/scissor；`Some` ⇒ 写死。
+    fn build_pipeline(
+        &self,
+        stages: &[vk::PipelineShaderStageCreateInfo],
+        layout: &PipelineLayout,
+        render_pass: &RenderPass,
+        static_viewport: Option<(&vk::Viewport, &vk::Rect2D)>,
+        blend_enable: bool,
     ) -> GpuResult<Pipeline> {
         if stages.is_empty() {
             return Err(GpuError::Unsupported(
@@ -450,25 +548,44 @@ impl VkDevice {
             topology: vk::VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
             primitive_restart_enable: vk::VK_FALSE,
         };
-        // viewport/scissor 用**动态状态**：`count = 1` 但指针为空是合法的，因为值由
-        // `vkCmdSetViewport` / `vkCmdSetScissor` 在录制时给。这对 GUI 渲染很关键
-        // （每帧尺寸都可能变，不该重建管线）。
-        let viewport_state = vk::PipelineViewportStateCreateInfo {
-            s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            viewport_count: 1,
-            p_viewports: std::ptr::null(),
-            scissor_count: 1,
-            p_scissors: std::ptr::null(),
+        // viewport/scissor：动态版把值留给录制时给（`count = 1` + 空指针是合法的）；
+        // 静态版把值放进管线。**两个版本都要有** —— 实测动态版在本机 Intel 驱动上
+        // 画不出任何像素（清屏正常、绘制为零），静态版可用。
+        let viewport_state = match static_viewport {
+            None => vk::PipelineViewportStateCreateInfo {
+                s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+                p_next: std::ptr::null(),
+                flags: 0,
+                viewport_count: 1,
+                p_viewports: std::ptr::null(),
+                scissor_count: 1,
+                p_scissors: std::ptr::null(),
+            },
+            Some((vp, sc)) => vk::PipelineViewportStateCreateInfo {
+                s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+                p_next: std::ptr::null(),
+                flags: 0,
+                viewport_count: 1,
+                p_viewports: vp,
+                scissor_count: 1,
+                p_scissors: sc,
+            },
         };
         let dynamic_states = [vk::VK_DYNAMIC_STATE_VIEWPORT, vk::VK_DYNAMIC_STATE_SCISSOR];
         let dynamic_state = vk::PipelineDynamicStateCreateInfo {
             s_type: 27, // VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO
             p_next: std::ptr::null(),
             flags: 0,
-            dynamic_state_count: dynamic_states.len() as u32,
-            p_dynamic_states: dynamic_states.as_ptr(),
+            dynamic_state_count: if static_viewport.is_none() {
+                dynamic_states.len() as u32
+            } else {
+                0
+            },
+            p_dynamic_states: if static_viewport.is_none() {
+                dynamic_states.as_ptr()
+            } else {
+                std::ptr::null()
+            },
         };
         let raster = vk::PipelineRasterizationStateCreateInfo {
             s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
@@ -498,7 +615,7 @@ impl VkDevice {
         };
         // 标准 alpha 混合：GUI 有半透明面板，必须开
         let blend_attachment = vk::PipelineColorBlendAttachmentState {
-            blend_enable: vk::VK_TRUE,
+            blend_enable: if blend_enable { vk::VK_TRUE } else { vk::VK_FALSE },
             src_color_blend_factor: vk::VK_BLEND_FACTOR_SRC_ALPHA,
             dst_color_blend_factor: vk::VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
             color_blend_op: vk::VK_BLEND_OP_ADD,
@@ -682,6 +799,7 @@ impl Drop for ShaderModule {
 
 struct ReadyInfo {
     handle: vk::DeviceHandle,
+    mem_props: vk::PhysicalDeviceMemoryProperties,
     queue: vk::QueueHandle,
     queue_family_index: u32,
     fns: DeviceFns,
@@ -802,7 +920,8 @@ fn lifetime_thread(
     let mut mem_props = std::mem::MaybeUninit::<vk::PhysicalDeviceMemoryProperties>::uninit();
     // SAFETY: 该函数完整写入结构体。
     unsafe { (fns.get_memory_properties)(pd, mem_props.as_mut_ptr()) };
-    let memory_type_count = unsafe { mem_props.assume_init() }.memory_type_count;
+    let mem_props_value = unsafe { mem_props.assume_init() };
+    let memory_type_count = mem_props_value.memory_type_count;
 
     let adapter = match unsafe { instance.physical_device_properties(pd) } {
         Ok(p) => deer_gpu::AdapterInfo {
@@ -832,6 +951,7 @@ fn lifetime_thread(
             fns,
             adapter,
             memory_type_count,
+            mem_props: mem_props_value,
         }))
         .is_err()
     {

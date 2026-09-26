@@ -53,13 +53,14 @@
 | **CPU 参考后端**（软件光栅化） | ✅ | [rendering](docs/features/rendering.md#cpu-后端软件光栅化) | `cargo run -p deer-gui --example draw_list` |
 | **Vulkan 后端**（设备 + 着色器） | 🔄 | [vulkan](docs/features/vulkan.md) | `cargo run -p deer-gui --example vulkan_devices` |
 | **Vulkan 图形管线**（渲染通道 + 管线，**还画不出像素**） | 🔄 | [vulkan-pipeline](docs/features/vulkan-pipeline.md) | `cargo run -p deer-gui --example vulkan_pipeline` |
+| **Vulkan 离屏渲染 + 回读**（清屏/回读可用，**绘制有已知缺陷**） | 🔄 | [gpu-offscreen](docs/features/gpu-offscreen.md) | `cargo run -p deer-gui --example gpu_offscreen` |
 
 ## 四、还没做的（**不要以为能跑**）
 
 | 功能 | 里程碑 | 现状说明 |
 |---|---|---|
 | **渲染到窗口**（屏幕上显示） | M2b | 完全不能。需要先定窗口方案（`ROADMAP.md` Q-1） |
-| **GPU 渲染出图**（Vulkan 画像素） | M2a-4..6 | 管线已能建成功，但命令缓冲 / 离屏图像 / 回读还没做 |
+| **GPU 渲染出图**（Vulkan 画像素） | M2a-4..6 | 清屏与回读**可用**；**绘制有已知缺陷**（`vkCmdDraw` 不产生像素，排查记录见 `docs/features/gpu-offscreen.md`） |
 | **真实字形**（现在图片里是方块占位） | M4 | 需要字体解析 + 字形光栅化 + 图集 |
 | **文字换行与文本度量** | M4 | 现在是「每字符 0.6em」的近似度量（确定性，但不是真实字体） |
 | **输入事件**（鼠标/键盘点击回调） | M5 | `hit_test` 有了（能算命中），但没有事件派发 |

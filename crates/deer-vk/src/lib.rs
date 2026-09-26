@@ -22,9 +22,11 @@ pub mod device;
 pub mod ffi;
 pub mod ffi_dev;
 pub mod loader;
+pub mod offscreen;
 pub mod spirv;
 
-pub use device::{ShaderModule, VkDevice};
+pub use device::{Pipeline, PipelineLayout, RenderPass, ShaderModule, VkDevice};
+pub use offscreen::{Buffer, CommandPool, Fence, Framebuffer, Image, ImageView, Memory, OffscreenRenderer};
 
 use deer_gpu::{AdapterInfo, AdapterKind, Backend, Device, GpuError, GpuResult};
 use ffi::PhysicalDeviceType;
