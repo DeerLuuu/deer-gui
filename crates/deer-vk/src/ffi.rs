@@ -57,6 +57,11 @@ impl PhysicalDeviceType {
 
 pub const MAX_PHYSICAL_DEVICE_NAME_SIZE: usize = 256;
 pub const UUID_SIZE: usize = 16;
+pub const MAX_EXTENSION_NAME_SIZE: usize = 256;
+pub const MAX_DESCRIPTION_SIZE: usize = 256;
+
+/// Khronos 官方校验层的名字。装 Vulkan SDK 后可用。
+pub const VALIDATION_LAYER: &str = "VK_LAYER_KHRONOS_validation";
 
 /// `VkPhysicalDeviceLimits`（字段顺序按规范；本模块只真正读前几个）。
 #[repr(C)]
@@ -228,6 +233,7 @@ type PfnEnumeratePhysicalDevices =
     unsafe extern "system" fn(InstanceHandle, *mut u32, *mut PhysicalDeviceHandle) -> VkResult;
 type PfnGetPhysicalDeviceProperties =
     unsafe extern "system" fn(PhysicalDeviceHandle, *mut PhysicalDeviceProperties);
+type PfnEnumerateInstanceLayerProperties = unsafe extern "system" fn(*mut u32, *mut LayerProperties) -> VkResult;
 
 /// 从 `vulkan-1.dll` 取到的函数表。
 struct Fns {
@@ -235,6 +241,7 @@ struct Fns {
     destroy_instance: PfnDestroyInstance,
     enumerate_physical_devices: PfnEnumeratePhysicalDevices,
     get_physical_device_properties: PfnGetPhysicalDeviceProperties,
+    enumerate_instance_layer_properties: PfnEnumerateInstanceLayerProperties,
 }
 
 // ── 动态加载（只依赖 kernel32） ──────────────────────────────────────────────
@@ -303,6 +310,12 @@ impl Loader {
                 "vkGetPhysicalDeviceProperties",
             )?)
         };
+        let enumerate_instance_layer_properties = unsafe {
+            std::mem::transmute::<FARPROC, PfnEnumerateInstanceLayerProperties>(sym(
+                module,
+                "vkEnumerateInstanceLayerProperties",
+            )?)
+        };
 
         Ok(Loader {
             module,
@@ -311,8 +324,66 @@ impl Loader {
                 destroy_instance,
                 enumerate_physical_devices,
                 get_physical_device_properties,
+                enumerate_instance_layer_properties,
             },
         })
+    }
+
+    /// 取一个符号并转成函数指针（**实例级**扩展符号用，如 `vkCreateDebugUtilsMessengerEXT`）。
+    ///
+    /// # Safety
+    /// `T` 必须是该符号**真实签名**对应的函数指针类型。
+    unsafe fn sym<T: Copy>(&self, name: &str) -> GpuResult<T> {
+        let mut cname = Vec::with_capacity(name.len() + 1);
+        cname.extend_from_slice(name.as_bytes());
+        cname.push(0);
+        // SAFETY: `cname` 以 NUL 结尾且在调用期间存活；GetProcAddress 只读它。
+        let p = unsafe { GetProcAddress(self.module, cname.as_ptr() as *const c_char) };
+        if p.is_null() {
+            return Err(GpuError::Unsupported(format!(
+                "vulkan-1.dll 缺少符号 {name}（扩展未启用或 loader 过旧？）"
+            )));
+        }
+        // SAFETY: 调用方保证 `T` 与符号真实签名一致。
+        Ok(unsafe { std::mem::transmute_copy::<FARPROC, T>(&p) })
+    }
+
+    /// 列出本机已注册的**实例层**名字。
+    ///
+    /// 用途：`create_with_validation` 据此判断校验层是否可用（**不靠猜**）。
+    fn available_layers(&self) -> Vec<String> {
+        let mut count = 0u32;
+        // SAFETY: 传 null 数组 = Vulkan 规定的「只查数量」用法。
+        let rc = unsafe { (self.fns.enumerate_instance_layer_properties)(&mut count, ptr::null_mut()) };
+        if rc != VK_SUCCESS || count == 0 {
+            return Vec::new();
+        }
+        let mut props = vec![
+            LayerProperties {
+                layer_name: [0; MAX_EXTENSION_NAME_SIZE],
+                spec_version: 0,
+                implementation_version: 0,
+                description: [0; MAX_DESCRIPTION_SIZE],
+            };
+            count as usize
+        ];
+        // SAFETY: `props` 容量与 `count` 一致，驱动最多写入 `count` 项。
+        let rc = unsafe {
+            (self.fns.enumerate_instance_layer_properties)(&mut count, props.as_mut_ptr())
+        };
+        if rc != VK_SUCCESS && rc != VK_INCOMPLETE {
+            return Vec::new();
+        }
+        props.truncate(count as usize);
+        props
+            .into_iter()
+            .map(|p| {
+                // SAFETY: `layer_name` 是 NUL 结尾的 C 字符串（Vulkan 保证）。
+                unsafe { CStr::from_ptr(p.layer_name.as_ptr()) }
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect()
     }
 }
 
@@ -326,6 +397,83 @@ impl Drop for Loader {
     }
 }
 
+/// `VkLayerProperties`
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct LayerProperties {
+    pub layer_name: [c_char; MAX_EXTENSION_NAME_SIZE],
+    pub spec_version: u32,
+    pub implementation_version: u32,
+    pub description: [c_char; MAX_DESCRIPTION_SIZE],
+}
+
+/// `VkDebugUtilsMessengerCreateInfoEXT`
+#[repr(C)]
+struct DebugUtilsMessengerCreateInfo {
+    s_type: i32,
+    p_next: *const c_void,
+    flags: u32,
+    message_severity: u32,
+    message_type: u32,
+    pfn_user_callback: PfnDebugUtilsMessengerCallback,
+    p_user_data: *mut c_void,
+}
+
+/// `VkDebugUtilsMessengerCallbackDataEXT`（只需要第一个字段 `pMessage`）
+#[repr(C)]
+struct DebugUtilsMessengerCallbackData {
+    s_type: i32,
+    p_next: *const c_void,
+    flags: u32,
+    p_message_id_name: *const c_char,
+    message_id_number: i32,
+    p_message: *const c_char,
+    queue_label_count: u32,
+    p_queue_labels: *const c_void,
+    cmd_buf_label_count: u32,
+    p_cmd_buf_labels: *const c_void,
+    object_count: u32,
+    p_objects: *const c_void,
+}
+
+type PfnDebugUtilsMessengerCallback = unsafe extern "system" fn(
+    message_severity: u32,
+    message_type: u32,
+    p_callback_data: *const DebugUtilsMessengerCallbackData,
+    p_user_data: *mut c_void,
+) -> u32;
+
+/// 校验层回调：把消息打到 stderr（`[VALIDATION]`/`[VK ERROR]` 前缀便于筛选）。
+///
+/// 用 `eprintln!` 而非日志框架：零依赖约束下最简单，且校验消息本来就不该混进正常输出。
+unsafe extern "system" fn validation_callback(
+    severity: u32,
+    msg_type: u32,
+    data: *const DebugUtilsMessengerCallbackData,
+    _user: *mut c_void,
+) -> u32 {
+    if data.is_null() {
+        return 0;
+    }
+    // SAFETY: 驱动保证 `p_callback_data` 指向有效的回调数据结构，且 `p_message`
+    // 是 NUL 结尾字符串、在回调期间存活。
+    let msg = unsafe {
+        let p = (*data).p_message;
+        if p.is_null() {
+            return 0;
+        }
+        CStr::from_ptr(p).to_string_lossy().into_owned()
+    };
+    let kind = match (severity, msg_type) {
+        (0x0000_0100, _) => "VK ERROR",
+        (0x0000_1000, _) => "VALIDATION",
+        (0x0000_2000, _) => "VK WARN",
+        _ => "VK INFO",
+    };
+    eprintln!("[{kind}] {msg}");
+    0 // VK_FALSE：不中止
+}
+
 /// 一个已创建的 VkInstance。`Drop` 保证销毁。
 ///
 /// **故意不实现 `Send`/`Sync`** —— Vulkan 实例的线程语义需要显式同步，
@@ -333,13 +481,60 @@ impl Drop for Loader {
 pub struct Instance {
     handle: InstanceHandle,
     loader: Loader,
+    /// 校验层回调句柄（启用校验层时才有值），`Drop` 时销毁
+    debug_messenger: Option<DebugUtilsMessengerHandle>,
+    destroy_debug: Option<PfnDestroyDebugUtilsMessenger>,
+    /// 记录本次实例是否真的启用了校验层（供上层如实报告）
+    validation_enabled: bool,
 }
 
+type DebugUtilsMessengerHandle = *mut c_void;
+type PfnCreateDebugUtilsMessenger =
+    unsafe extern "system" fn(InstanceHandle, *const DebugUtilsMessengerCreateInfo, *const c_void, *mut DebugUtilsMessengerHandle) -> VkResult;
+type PfnDestroyDebugUtilsMessenger =
+    unsafe extern "system" fn(InstanceHandle, DebugUtilsMessengerHandle, *const c_void);
+
 impl Instance {
-    /// 创建实例（`apiVersion` 用 1.0，最大兼容）。
+    /// 创建实例（`apiVersion` 用 1.0，最大兼容；**不启用**校验层）。
     pub fn create() -> GpuResult<Instance> {
+        Instance::create_with_validation(false)
+    }
+
+    /// 创建实例，可选启用 **`VK_LAYER_KHRONOS_validation`** 校验层。
+    ///
+    /// 校验层是本项目最缺的诊断手段：驱动对本项目的错误 SPIR-V / 遗漏的管线状态
+    /// **不报错也不画**（例如 `vkCmdDraw` 完全不产生片元），而校验层会直接指出问题。
+    ///
+    /// 行为约定：
+    /// - `validate = true` 且层**存在** ⇒ 启用，并挂上 `VkDebugUtilsMessengerEXT`
+    ///   把消息打到 stderr；
+    /// - `validate = true` 但层**不存在** ⇒ 返回 `Err(Unsupported)` 并说明原因
+    ///   （**不静默降级** —— 静默不启用会让人误以为「校验通过」）。
+    pub fn create_with_validation(validate: bool) -> GpuResult<Instance> {
         const VK_API_VERSION_1_0: u32 = 1 << 22;
         let loader = Loader::load()?;
+
+        // 需要在 loader 存活期间解析校验层相关符号
+        let available = loader.available_layers();
+        let use_validation = if validate {
+            if available.iter().any(|n| n == VALIDATION_LAYER) {
+                true
+            } else {
+                return Err(GpuError::Unsupported(format!(
+                    "请求启用校验层 {VALIDATION_LAYER}，但本机未安装。\
+                     已注册的层有 {available:?}。\
+                     装 Vulkan SDK 后即可用（或把层 manifest 的目录加进 VK_LAYER_PATH）"
+                )));
+            }
+        } else {
+            false
+        };
+
+        // 层名（C 字符串）+ 调试扩展名，都要活到 vkCreateInstance 调用结束
+        let layer_name = c"VK_LAYER_KHRONOS_validation";
+        let ext_debug_utils = c"VK_EXT_debug_utils";
+        let layer_ptrs: [*const c_char; 1] = [layer_name.as_ptr()];
+        let ext_ptrs: [*const c_char; 1] = [ext_debug_utils.as_ptr()];
 
         let app_name = c"deer-gui";
         let engine_name = c"deer-gui";
@@ -357,20 +552,34 @@ impl Instance {
             p_next: ptr::null(),
             flags: 0,
             p_application_info: &app_info,
-            enabled_layer_count: 0,
-            pp_enabled_layer_names: ptr::null(),
-            enabled_extension_count: 0,
-            pp_enabled_extension_names: ptr::null(),
+            enabled_layer_count: if use_validation { 1 } else { 0 },
+            pp_enabled_layer_names: if use_validation {
+                layer_ptrs.as_ptr()
+            } else {
+                ptr::null()
+            },
+            enabled_extension_count: if use_validation { 1 } else { 0 },
+            pp_enabled_extension_names: if use_validation {
+                ext_ptrs.as_ptr()
+            } else {
+                ptr::null()
+            },
         };
 
         let mut handle: InstanceHandle = ptr::null_mut();
         // SAFETY: `create_info` 指向本栈帧已初始化、且在调用期间存活的结构体；
-        // `handle` 是可写输出参数；函数指针来自成功解析的 loader。
+        // 层名/扩展名数组同样在本栈帧存活；`handle` 是可写输出参数。
         let rc = unsafe { (loader.fns.create_instance)(&create_info, ptr::null(), &mut handle) };
         if rc != VK_SUCCESS {
+            // 启用了校验层却创建失败时，明确区分「层的问题」与一般失败
+            let hint = if use_validation {
+                "（注意：本次请求了校验层，失败可能是层与驱动不兼容）"
+            } else {
+                ""
+            };
             return Err(GpuError::Driver {
                 code: rc,
-                message: format!("vkCreateInstance 失败：{}", result_name(rc)),
+                message: format!("vkCreateInstance 失败：{}{hint}", result_name(rc)),
             });
         }
         if handle.is_null() {
@@ -379,7 +588,51 @@ impl Instance {
                 message: "vkCreateInstance 返回成功但句柄为空".to_string(),
             });
         }
-        Ok(Instance { handle, loader })
+
+        // 挂调试回调（只有启用校验层时才有意义）
+        let mut debug_messenger = None;
+        let mut destroy_debug = None;
+        if use_validation {
+            let create_dbg: PfnCreateDebugUtilsMessenger =
+                // SAFETY: 符号名与规范一致；签名由本文件声明。
+                unsafe { loader.sym("vkCreateDebugUtilsMessengerEXT")? };
+            destroy_debug =
+                Some(unsafe { loader.sym::<PfnDestroyDebugUtilsMessenger>("vkDestroyDebugUtilsMessengerEXT")? });
+            let info = DebugUtilsMessengerCreateInfo {
+                s_type: 1_000_128_001, // VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT
+                p_next: ptr::null(),
+                flags: 0,
+                // ERROR | WARNING（info 量太大，先只看有问题的）
+                message_severity: 0x0000_0100 | 0x0000_1000,
+                // GENERAL | VALIDATION | PERFORMANCE
+                message_type: 0x0000_0001 | 0x0000_0010 | 0x0000_0100,
+                pfn_user_callback: validation_callback,
+                p_user_data: ptr::null_mut(),
+            };
+            let mut m: DebugUtilsMessengerHandle = ptr::null_mut();
+            // SAFETY: 实例刚创建且有效；`info` 在栈上存活；`m` 是可写输出。
+            let rc = unsafe { create_dbg(handle, &info, ptr::null(), &mut m) };
+            if rc != VK_SUCCESS {
+                return Err(GpuError::Driver {
+                    code: rc,
+                    message: format!("vkCreateDebugUtilsMessengerEXT 失败：{}", result_name(rc)),
+                });
+            }
+            debug_messenger = Some(m);
+        }
+
+        Ok(Instance {
+            handle,
+            loader,
+            debug_messenger,
+            destroy_debug,
+            validation_enabled: use_validation,
+        })
+    }
+
+    /// 本次实例是否真的启用了校验层。
+    pub fn validation_enabled(&self) -> bool {
+        self.validation_enabled
     }
 
     pub fn handle(&self) -> InstanceHandle {
@@ -451,6 +704,12 @@ impl Instance {
 
 impl Drop for Instance {
     fn drop(&mut self) {
+        // 先销毁调试回调，再销毁实例（Vulkan 要求的顺序）
+        if let (Some(m), Some(destroy)) = (self.debug_messenger, self.destroy_debug) {
+            // SAFETY: 回调由本实例创建、尚未销毁；实例此时仍存活。
+            unsafe { destroy(self.handle, m, ptr::null()) };
+            self.debug_messenger = None;
+        }
         if !self.handle.is_null() {
             // SAFETY: 句柄由 `vkCreateInstance` 创建且未被销毁（`Drop` 只跑一次）。
             unsafe { (self.loader.fns.destroy_instance)(self.handle, ptr::null()) };

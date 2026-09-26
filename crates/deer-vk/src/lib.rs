@@ -43,8 +43,21 @@ pub struct VkBackend {
 
 impl VkBackend {
     /// 打开 Vulkan 实例并枚举设备。
+    ///
+    /// 若环境变量 **`DEER_VK_VALIDATION=1`** 被设置，则启用
+    /// `VK_LAYER_KHRONOS_validation` 并把消息打到 stderr。
+    ///
+    /// 为什么用环境变量而不是编译期 feature：本项目暂不引任何第三方依赖，
+    /// 也没有 feature 开关体系；环境变量能在**不改代码、不重编译**的情况下
+    /// 对同一个二进制开诊断 —— 这正是排查驱动「不报错也不画」这类问题时需要的。
     pub fn new() -> GpuResult<VkBackend> {
-        let instance = ffi::Instance::create()?;
+        let want_validation = std::env::var("DEER_VK_VALIDATION")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let instance = ffi::Instance::create_with_validation(want_validation)?;
+        if instance.validation_enabled() {
+            eprintln!("[deer-vk] 已启用 VK_LAYER_KHRONOS_validation（消息将打到 stderr）");
+        }
         let physical_devices = instance.enumerate_physical_devices()?;
         if physical_devices.is_empty() {
             return Err(GpuError::NoAdapter);
