@@ -7,8 +7,14 @@
 !docs/images/*.png
 /out
 /render_out
+
 # 示例工程自己的构建产物（它是独立项目，不在 workspace 里）
 /test_project/**/target
+
+# 测试生成的 SPIR-V 产物（由 `cargo test -p deer-vk --test export_spirv` 写出，
+# 用途是交给官方 spirv-val 做人工/脚本核查；不需要进仓库）
+spirv_probe/
+
 # 项目级 Cargo.lock 是**要入库**的（库仓库的根 lock 入库；示例工程的也留，
 # 这样 `cargo build` 的结果可复现）。这里只忽略它的 target/。
 
