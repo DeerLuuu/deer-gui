@@ -6,6 +6,11 @@ members = [
     "crates/deer-vk",
     "crates/deer-gui",
 ]
+# `test_project/deer-hello` 是「用本库建独立项目」的**示例工程**，刻意排除在 workspace 外：
+#   ① 它的 deer-gui 依赖用 path 指回本 workspace —— 留在成员里是自引用，脆弱；
+#   ② 它是给人 `cd test_project/deer-hello && cargo run` 用的，不属于库的构建图。
+# 验证它仍可编译：`cd test_project/deer-hello && cargo build`。
+exclude = ["test_project"]
 
 [workspace.package]
 version = "0.0.0"

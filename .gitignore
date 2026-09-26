@@ -7,6 +7,10 @@
 !docs/images/*.png
 /out
 /render_out
+# 示例工程自己的构建产物（它是独立项目，不在 workspace 里）
+/test_project/**/target
+# 项目级 Cargo.lock 是**要入库**的（库仓库的根 lock 入库；示例工程的也留，
+# 这样 `cargo build` 的结果可复现）。这里只忽略它的 target/。
 
 # 编辑器
 .vscode/

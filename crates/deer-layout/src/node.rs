@@ -19,10 +19,15 @@ use std::collections::BTreeMap;
 /// 节点类型。第一步只做够验证「容器 + 布局 + 交互」的最小集。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
+    /// 竖排容器（子节点从上往下排）
     Column,
+    /// 横排容器（子节点从左往右排）
     Row,
+    /// 纯文本
     Text,
+    /// 按钮
     Button,
+    /// 输入框
     Field,
 }
 
