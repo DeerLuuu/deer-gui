@@ -119,38 +119,65 @@ struct UiVertexBuffer {
     capacity: u64,
 }
 
-/// 界面树所需的**形状**管线资源（M3a 的顶点流 → 独立管线）。
+/// 界面树所需的全部**渲染器级**资源（M3c 建立；**M3+ B5-2 起是单管线**）。
 ///
-/// 界面树（形状 + 文本）的全部资源；`None` = 还没建（首次 `draw_and_present` 时惰性建）。
+/// 形状与文本**合流成一条统一顶点流 + 一条统一管线**（见
+/// [`crate::vertex_unify::unify`] 与 [`crate::spirv::vertex_shader_unified`]）
+/// ⇒ 这里只有**一块**顶点缓冲、**一条**界面管线、**一个**必绑的描述符集。
 ///
-/// **M3c 起两条管线来自共用层**（`pipelines::build_pipelines`）：着色器模块、管线布局、
-/// 文本的 `set 0` 布局与采样器都由 [`pipelines::PipelineSet`] 持有（各自的析构顺序由
-/// 那里的类型保证）。这里只补「**每个渲染器一份**」的东西：描述符集、图集纹理、两块顶点缓冲。
+/// ## 字段顺序（**是契约，不是风格**）
 ///
-/// ## 字段顺序
+/// 1. `set` 必须声明在 `pool` 之前 —— `DescriptorSet::drop` 会调
+///    `vkFreeDescriptorSets(device, pool, ..)` ⇒ **池必须比集活得久**，
+///    而 Rust 按声明顺序析构（先声明的先销毁）⇒ 集先销、池后销；
+/// 2. `vb` 是 `Option<UiVertexBuffer>`，其中 `buffer` 声明在 `memory` 之前
+///    （缓冲先销毁、内存后释放）。
 ///
-/// `set` 必须声明在 `pool` 之前 —— Rust 按声明顺序析构，而 `DescriptorSet::drop` 会调
-/// `vkFreeDescriptorSets(device, pool, ..)`，池必须在集之后才销毁。
+/// ⚠️ 第 1 条在 B5-2 期间**实测踩过**：顺序写反 ⇒ 测试逻辑全通过但进程在退出时
+/// `STATUS_ACCESS_VIOLATION`（`vkFreeDescriptorSets` 访问已销毁的池）。
+/// 校验层能说清（`descriptorPool Invalid VkDescriptorPool Object`），
+/// **但关掉校验层时这条消息不存在** ⇒ 症状像「测试框架自己崩了」。
 struct UiResources {
     pipes: pipelines::PipelineSet,
-    shape_vb: Option<UiVertexBuffer>,
-    text_vb: Option<UiVertexBuffer>,
+    /// **统一**顶点缓冲（形状 + 文本共用一条流）。
+    vb: Option<UiVertexBuffer>,
+    /// 统一界面管线（`vertex_shader_unified` / `fragment_shader_unified`，stride 52）。
+    unified: Pipeline,
+    /// 统一管线的两个着色器模块（**只为所有权**：必须比 `unified` 活得久）。
+    #[allow(dead_code)]
+    unified_vs: ShaderModule,
+    #[allow(dead_code)]
+    unified_fs: ShaderModule,
+    /// `set 0 / binding 0`：**恒有效**（统一 FS 无条件采样）。
+    ///
+    /// **必须在 `pool` 之前声明**（见类型文档的字段顺序契约）。
     set: DescriptorSet,
     /// 描述符池：**只为所有权而持有**（`set` 的 `Drop` 会调
     /// `vkFreeDescriptorSets(device, pool, ..)` ⇒ 池必须比集活得久）。
-    /// 声明在 `set` **之后** ⇒ 按声明顺序析构时「集先销、池后销」。
     #[allow(dead_code)]
     pool: DescriptorPool,
+    /// **1×1 全覆盖率哑纹理**：没有文本引擎（或那帧没有图集可传）时 `set` 指向它。
+    ///
+    /// 见 `gpu_render::DUMMY_COVERAGE` 的说明：统一片元着色器**无条件采样**
+    /// ⇒ 形状帧也必须有一个有效的 `COMBINED_IMAGE_SAMPLER`。
+    ///
+    /// ⚠️ 字段**从不被读取** —— 它存在只为**所有权**：`set` 的描述符指向它的
+    /// 图像视图，视图/图像/内存必须比那次描述符写入活得久（否则采样读到已释放的图像）。
+    /// 删掉它 = 采样悬垂视图。`#[allow(dead_code)]` 是这里的正确表达。
+    #[allow(dead_code)]
+    dummy_texture: Texture,
+    /// 当前已上传的**字形图集**（`None` = 还没传过 ⇒ `set` 指向 `dummy_texture`）。
     texture: Option<Texture>,
     /// 已上传图集的指纹 `(宽, 高, 已光栅化字形数)`；`None` = 还没传过。
+    ///
+    /// `Some` 的指纹**不可能**是 `(1,1,0)`：图集宽 = 字号 ≥ 2 ⇒ 不会与哑纹理混淆。
     uploaded: Option<(u32, u32, usize)>,
     /// **上一次实际上传的字节 + 当时那块缓冲的句柄**（M3+ B3）。
     ///
     /// ⚠️ **记句柄是关键（review I-1）**：跳过重传的条件是「**同一块缓冲** + 字节相同」；
     /// 缓冲一旦换新（容量增长、`release_ui_resources()` 之后重建），句柄就不匹配 ⇒
     /// **自动作废**，不依赖任何调用方记得清记录。
-    uploaded_shape: Option<(vk::BufferHandle, Vec<u8>)>,
-    uploaded_text: Option<(vk::BufferHandle, Vec<u8>)>,
+    uploaded_vertices: Option<(vk::BufferHandle, Vec<u8>)>,
 }
 
 /// 存活中的 [`UiResources`] 实例数（进程级）。
@@ -647,17 +674,24 @@ pub struct WindowedRenderer {
     ui_builds: u64,
     /// 渲染统计（M3+ B1；累计值，见 [`RenderStats`]）。三角形路径与界面路径都计入。
     stats: RenderStats,
-    /// 本帧是否**真的上传**了形状/文本顶点（M3+ B3）：决定要不要发 host→vertex 屏障。
-    ui_barriers: (bool, bool),
-    /// 累计发出的 host→vertex 屏障里，属于**形状**顶点缓冲的条数（review I-2 的护栏）。
-    shape_host_to_vertex_barriers: u64,
-    /// 累计发出的 host→vertex 屏障里，属于**文本**顶点缓冲的条数。
+    /// 本帧是否**真的上传**了统一顶点（M3+ B3）：决定要不要发 host→vertex 屏障。
+    ///
+    /// B5-2 之前是 `(形状, 文本)` 两个 bool（两块缓冲各一条屏障）；统一之后
+    /// **只有一块缓冲** ⇒ 一个 bool、一条屏障。
+    ui_barrier: bool,
+    /// 累计发出的 host→vertex 屏障条数。
     ///
     /// 为什么必须有（review I-2）：窗口路径的屏障一度**没有计数、没有测试** ——
     /// reviewer 变异「窗口从不发屏障」后 `window_parity` 与 `swapchain_smoke` **全绿**。
     /// 计数写在**发屏障的同一处**（`record_ui` 里的 `cmd_pipeline_barrier` 旁），
     /// 删掉发射就必然删掉计数。
-    text_host_to_vertex_barriers: u64,
+    ///
+    /// （B5-2 之前还分「形状 / 文本」两个分项，那是「两块缓冲」的产物；
+    ///   现在只有一块缓冲 ⇒ 分项没有意义，已删除。）
+    ui_host_to_vertex_barriers: u64,
+    /// **CPU 侧的顶点转换成本口径**（B5-2）：`unify` 的调用次数与累计输出顶点数。
+    unify_calls: u64,
+    unify_output_vertices: u64,
 }
 
 impl WindowedRenderer {
@@ -767,9 +801,10 @@ impl WindowedRenderer {
             ui_viewport_is_dynamic: true,
             ui_builds: 0,
             stats: RenderStats::default(),
-            ui_barriers: (false, false),
-            shape_host_to_vertex_barriers: 0,
-            text_host_to_vertex_barriers: 0,
+            ui_barrier: false,
+            ui_host_to_vertex_barriers: 0,
+            unify_calls: 0,
+            unify_output_vertices: 0,
         })
     }
 
@@ -1168,14 +1203,39 @@ impl WindowedRenderer {
         self.stats
     }
 
-    /// 累计发出的 host→vertex 屏障里属于**形状**顶点缓冲的条数（review I-2 的护栏）。
-    pub fn shape_host_to_vertex_barrier_count(&self) -> u64 {
-        self.shape_host_to_vertex_barriers
+    /// 累计发出的 host→vertex 屏障条数（review I-2 的护栏）。
+    ///
+    /// B5-2 之前分「形状 / 文本」两个计数（两块顶点缓冲各一条）；统一之后只有**一块**
+    /// 顶点缓冲 ⇒ 一帧最多一条 ⇒ 分项没有意义，已合并成一个。
+    pub fn ui_host_to_vertex_barrier_count(&self) -> u64 {
+        self.ui_host_to_vertex_barriers
     }
 
-    /// 累计发出的 host→vertex 屏障里属于**文本**顶点缓冲的条数（review I-2 的护栏）。
-    pub fn text_host_to_vertex_barrier_count(&self) -> u64 {
-        self.text_host_to_vertex_barriers
+    /// **统一顶点转换的 CPU 成本口径**（B5-2）：`unify` 的调用次数（累计）。
+    ///
+    /// 与 [`Self::unify_output_vertex_count`] 配对 ⇒「画了 N 帧调了 N 次、搬了 Σ 个顶点」。
+    /// 本项目口径：**不许只说「可忽略」**。
+    pub fn unify_call_count(&self) -> u64 {
+        self.unify_calls
+    }
+
+    /// `unify` 累计输出的统一顶点数（= 段表声明的顶点数之和）。
+    pub fn unify_output_vertex_count(&self) -> u64 {
+        self.unify_output_vertices
+    }
+
+    /// **本帧绑定并采样的纹理尺寸**（宽, 高）—— B5-2 哑纹理护栏的读数口
+    /// （与 `GpuGeometryRenderer::bound_texture_size` 同一语义）。
+    pub fn bound_texture_size(&self) -> (u32, u32) {
+        match self.ui.as_ref() {
+            // 传过图集 ⇒ 那才是 `set` 指着的纹理
+            Some(u) => match u.texture.as_ref() {
+                Some(t) => (t.width(), t.height()),
+                None => (1, 1),
+            },
+            // 界面资源还没建 ⇒ 下一帧建的时候会绑 1×1 哑纹理
+            None => (1, 1),
+        }
     }
 
     /// **主动释放**界面资源（两条管线 + 描述符集 + 图集纹理 + 两块顶点缓冲）；
@@ -1333,88 +1393,62 @@ impl WindowedRenderer {
         }
         self.ui_text_skipped = skipped;
 
-        // ③ 上传：形状与文本各有独立缓冲（**内容变化才重传**；容量不足才重建）
+        // ③ **合流**（B5-2）：两路顶点 + 段表 ⇒ **一条**统一顶点流（顺序即 z 序）。
+        self.unify_calls += 1;
+        let unified: Vec<crate::vertex_unify::UnifiedVertex> =
+            crate::vertex_unify::unify(&shape_verts, &text_verts, &calls);
+        self.unify_output_vertices += unified.len() as u64;
+
+        // ④ 上传：**一块**统一顶点缓冲（**内容变化才重传**；容量不足才重建）
         //
         // 计数（`buffer_uploads` / `buffer_allocations`）在**被调用方**里自增，
         // 与真实调用同处 —— 删掉上传就必然删掉计数。
         // B3：内容逐字节相同的帧跳过重传（UI 帧的顶点数据通常与上一帧相同）。
-        let mut uploaded_shape_now = false;
-        let mut uploaded_text_now = false;
-        if !shape_verts.is_empty() {
-            let bytes = std::mem::size_of_val(shape_verts.as_slice());
+        let mut uploaded_now = false;
+        if !unified.is_empty() {
+            let bytes = std::mem::size_of_val(unified.as_slice());
             let dev = &self.device;
             let stats = &mut self.stats;
             let ui = self.ui.as_mut().expect("ensure_ui 之后必有资源");
-            ensure_ui_vertex_capacity(dev, &mut ui.shape_vb, bytes as u64, stats)?;
-            // SAFETY: `GpuVertex` 是 `#[repr(C)]` 纯 `f32`（无指针、无 Drop）⇒ 字节视图合法。
-            let src = unsafe {
-                std::slice::from_raw_parts(shape_verts.as_ptr() as *const u8, bytes)
-            };
-            let handle = ui
-                .shape_vb
-                .as_ref()
-                .expect("刚 ensure 过")
-                .buffer
-                .handle();
+            ensure_ui_vertex_capacity(dev, &mut ui.vb, bytes as u64, stats)?;
+            // SAFETY: `UnifiedVertex` 是 `#[repr(C)]` 纯 `f32`（无指针、无 Drop）⇒ 字节视图合法。
+            let src = unsafe { std::slice::from_raw_parts(unified.as_ptr() as *const u8, bytes) };
+            let handle = ui.vb.as_ref().expect("刚 ensure 过").buffer.handle();
             // 跳过条件：**同一块缓冲**（句柄相等）且字节相同 —— 句柄一变就自动作废（I-1）
-            let same = matches!(&ui.uploaded_shape, Some((h, b)) if *h == handle && b.as_slice() == src);
+            let same =
+                matches!(&ui.uploaded_vertices, Some((h, b)) if *h == handle && b.as_slice() == src);
             if !same {
-                let vb = ui.shape_vb.as_ref().expect("刚 ensure 过");
-                upload_ui_vertices(dev, vb, src, "vkMapMemory(窗口形状顶点)", stats)?;
-                ui.uploaded_shape = Some((handle, src.to_vec()));
-                uploaded_shape_now = true;
-            }
-        }
-        if !text_verts.is_empty() {
-            let bytes = std::mem::size_of_val(text_verts.as_slice());
-            let dev = &self.device;
-            let stats = &mut self.stats;
-            let ui = self.ui.as_mut().expect("ensure_ui 之后必有资源");
-            ensure_ui_vertex_capacity(dev, &mut ui.text_vb, bytes as u64, stats)?;
-            // SAFETY: `TextVertex` 是 `#[repr(C)]` 纯 `f32` ⇒ 字节视图合法。
-            let src = unsafe {
-                std::slice::from_raw_parts(text_verts.as_ptr() as *const u8, bytes)
-            };
-            let handle = ui
-                .text_vb
-                .as_ref()
-                .expect("刚 ensure 过")
-                .buffer
-                .handle();
-            let same = matches!(&ui.uploaded_text, Some((h, b)) if *h == handle && b.as_slice() == src);
-            if !same {
-                let vb = ui.text_vb.as_ref().expect("刚 ensure 过");
-                upload_ui_vertices(dev, vb, src, "vkMapMemory(窗口文本顶点)", stats)?;
-                ui.uploaded_text = Some((handle, src.to_vec()));
-                uploaded_text_now = true;
+                let vb = ui.vb.as_ref().expect("刚 ensure 过");
+                upload_ui_vertices(dev, vb, src, "vkMapMemory(窗口统一顶点)", stats)?;
+                ui.uploaded_vertices = Some((handle, src.to_vec()));
+                uploaded_now = true;
             }
         }
         // 屏障只在**这一帧真的上传了**时发（B3 收紧后的语义，与离屏一致）
-        self.ui_barriers = (uploaded_shape_now, uploaded_text_now);
+        self.ui_barrier = uploaded_now;
 
-        // ④ 图集纹理：指纹变化才重传（与离屏同一条契约）
+        // ⑤ 图集纹理：指纹变化才重传（与离屏同一条契约）
         if let Some(engine) = engine.as_deref() {
             self.refresh_ui_atlas_texture(engine)?;
         }
 
-        // ⑤ 帧舞蹈（取图 → 录制 → 提交 → 呈现）：与 `render_and_present` 共用同一段逻辑
+        // ⑥ 帧舞蹈（取图 → 录制 → 提交 → 呈现）：与 `render_and_present` 共用同一段逻辑
         //
-        // **B2 合段**：相邻同管线且区间连续的段合成一次 `vkCmdDraw`（像素等价，见
-        // `gpu_render::merge_adjacent_draw_calls` 的不变式）。放在录制之前 ⇒
-        // `stats.draw_calls` 记的是真实的 draw 次数。
-        let calls = crate::gpu_render::merge_adjacent_draw_calls(&calls);
-        self.present_frame(|s, slot, image_index| s.record_ui(slot, image_index, &calls))
+        // ⚠️ B5-2 起**不再需要** `merge_adjacent_draw_calls`：整帧只发一次 draw，
+        // 段划分对录制没有任何影响（与离屏同一条）。
+        self.present_frame(|s, slot, image_index| s.record_ui(slot, image_index, &unified))
     }
 
-    /// 惰性建界面资源（两条管线来自共用层 [`pipelines::build_pipelines`]）。
+    /// 惰性建界面资源（**统一管线**：B5-2 起形状与文本共用一条）。
     ///
-    /// ## 顶点着色器与片段着色器的接口由共用层保证
+    /// ## 顶点着色器与片段着色器的接口由共用层/统一对保证
     ///
     /// M3c 的 Step 1 曾在这里踩过一次：形状管线的 VS 写成 `vertex_shader_from_vertex_buffer`
     /// （M2a 探针用的那个），而形状 FS 声明了 location 0/1/2 的输入 —— **驱动照样建管线成功、
     /// 照样画出像素**，只有校验层报「FS 有 Input 但上一阶段没有对应 Output」。
-    /// 现在着色器**只有共用层这一个来源**（那里还有跨着色器的接口测试），
-    /// 窗口路径不再自己拼管线 ⇒ 这类错误在窗口路径上不可能再出现。
+    /// 现在着色器只有两个来源：`pipelines::build_pipelines`（两条旧管线）与
+    /// [`crate::gpu_render::build_unified_pipeline`]（界面路径真正用的那条），
+    /// 两者的接口一致性都有测试（`spirv_val.rs` 的 location 断言）。窗口路径不再自己拼管线。
     ///
     /// ## 颜色格式与 viewport 策略
     ///
@@ -1422,6 +1456,11 @@ impl WindowedRenderer {
     ///   M3c 已把 `pick_config` 改成**线性 `*_UNORM` 优先**（sRGB 附件连混合都在线性空间，
     ///   与 CPU 的字节空间混合对不上，半透明会差几十字节）；
     /// - `viewport` 由 [`viewport_strategy_from_env`] 决定（默认动态）。
+    ///
+    /// ## 统一管线需要的额外东西
+    ///
+    /// 统一 FS **无条件采样** ⇒ `set 0` 必须恒有效 ⇒ 这里同时建
+    /// **描述符集 + 1×1 哑纹理**并立刻绑上（有引擎时下一帧被图集替换）。
     fn ensure_ui(&mut self, want_text: bool) -> GpuResult<()> {
         if self.ui.is_none() {
             let viewport = match viewport_strategy_from_env() {
@@ -1433,6 +1472,9 @@ impl WindowedRenderer {
                 other => other,
             };
             self.ui_viewport_is_dynamic = viewport == pipelines::ViewportStrategy::Dynamic;
+            // 两条旧管线（形状/文本）：B5-2 起界面路径**不用**它们，但它们提供统一管线
+            // 需要的 `text_layout`（带 `set 0` 的布局）、`text_set_layout` 与 `sampler`。
+            // 是否删除属 B5-3（旧路清理）—— 那一步要连 `pipelines.rs` 的测试一起改。
             let pipes = pipelines::build_pipelines(
                 &self.device,
                 &self.render_pass,
@@ -1443,34 +1485,53 @@ impl WindowedRenderer {
                 std::mem::size_of::<TextVertex>() as u32,
                 &crate::gpu_render::text_attrs(),
             )?;
+            // ★ 统一管线：界面路径真正使用的那一条（stride 52，5 个 location）
+            let (unified, unified_vs, unified_fs) = crate::gpu_render::build_unified_pipeline(
+                &self.device,
+                &self.render_pass,
+                self.swapchain.format(),
+                viewport,
+                &pipes.text_layout,
+            )?;
             let pool = self.device.create_descriptor_pool(1)?;
             let set = self
                 .device
                 .allocate_descriptor_set(&pool, &pipes.text_set_layout)?;
+            let dummy_texture =
+                self.device
+                    .create_texture_r8(1, 1, &crate::gpu_render::DUMMY_COVERAGE)?;
+            self.device
+                .update_descriptor_texture(&set, &dummy_texture, &pipes.sampler)?;
             LIVE_UI_RESOURCES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.ui_builds += 1;
             self.ui = Some(UiResources {
                 pipes,
-                shape_vb: None,
-                text_vb: None,
-                // 顺序契约：`set` 在 `pool` 之前（见类型文档）
+                vb: None,
+                // 顺序契约（**是硬契约，不是风格**）：`set` 在 `pool` 之前 ⇒ 集先销、池后销
+                unified,
+                unified_vs,
+                unified_fs,
                 set,
                 pool,
+                dummy_texture,
                 texture: None,
                 uploaded: None,
-                uploaded_shape: None,
-                uploaded_text: None,
+                uploaded_vertices: None,
             });
         }
-        // `want_text = false` 时文本管线**依然存在**（共用层一次建两条）——
-        // 只是不会被 bind，也不会建它的顶点缓冲/纹理。这样 `ensure_ui` 不需要
-        // 「先形状、后补文本」的两段式（那一版在 resize 后要重建两次）。
+        // `want_text = false` 时也**照样**建全部资源（含哑纹理）：
+        // 统一片元着色器无条件采样 ⇒ 形状帧也必须有一个有效的 `set 0`。
         let _ = want_text;
         Ok(())
     }
 
-    /// 图集**指纹变化**才重传纹理（与 `gpu_render.rs` 同一契约：`create_texture_r8` 内部
-    /// `vkQueueWaitIdle`，只在出现新字形时付这个代价）。
+    /// 图集**指纹变化**才重传纹理，并把它**改指**到渲染器级的描述符集
+    /// （与 `gpu_render.rs` 同一契约：`create_texture_r8` 内部 `vkQueueWaitIdle`，
+    /// 只在出现新字形时付这个代价）。
+    ///
+    /// 描述符集是 `UiResources` 级的（不是文本专属）：统一片元着色器无条件采样 ⇒
+    /// 没有引擎时 `set` 指着 1×1 哑纹理，有引擎时指着字形图集 —— 两者**总有一个**。
+    /// 指纹 `(宽, 高, 已光栅化字形数)`；真图集的宽 = 字号 ≥ 2 ⇒ 不会与哑纹理的 `(1,1,0)` 混淆。
     fn refresh_ui_atlas_texture(&mut self, engine: &TextEngine) -> GpuResult<()> {
         let (w, h) = engine.atlas().size();
         let key = (w, h, engine.rasterized_glyphs());
@@ -1492,11 +1553,19 @@ impl WindowedRenderer {
         Ok(())
     }
 
-    /// 录制第 `slot` 个命令缓冲：清屏 + **按 z 序逐段**绘制界面（+ 可选回读复制）。
+    /// 录制第 `slot` 个命令缓冲：清屏 + **一次**绑定/绘制（+ 可选回读复制）。
+    ///
+    /// `unified` 是这一帧合流后的**全部**顶点（顺序即 z 序，由
+    /// [`crate::vertex_unify::unify`] 保证）—— 空 ⇒ 只清屏、不发 draw。
     ///
     /// 需要 `&mut self`（M3+ B1）：要在**发真实调用的地方**自增 `stats`
     /// （draw call / 管线切换）——计数与调用同处，删掉发射就必然删掉计数。
-    fn record_ui(&mut self, slot: usize, image_index: u32, calls: &[DrawCall]) -> GpuResult<()> {
+    fn record_ui(
+        &mut self,
+        slot: usize,
+        image_index: u32,
+        unified: &[crate::vertex_unify::UnifiedVertex],
+    ) -> GpuResult<()> {
         let fns = *self.device.fns();
         let cmd = self.command_buffers[slot];
         let ui = self.ui.as_ref().expect("draw_and_present 已 ensure_ui");
@@ -1524,56 +1593,40 @@ impl WindowedRenderer {
             });
         }
 
-        // ★ 主机刚写进顶点缓冲 → GPU 的 VERTEX_INPUT 要读它。**每块用到的缓冲各一条**
-        //   （形状与文本是两块独立缓冲），参数与离屏同一组语义：
-        //   `HOST/HOST_WRITE` → `VERTEX_INPUT/VERTEX_ATTRIBUTE_READ`。
-        let used = [
-            (
-                self.ui_barriers.0,
-                ui.shape_vb.as_ref().map(|v| v.buffer.handle()),
-                true,
-            ),
-            (
-                self.ui_barriers.1,
-                ui.text_vb.as_ref().map(|v| v.buffer.handle()),
-                false,
-            ),
-        ];
-        for (used, buffer, is_shape) in used {
-            let (true, Some(buffer)) = (used, buffer) else {
-                continue;
-            };
-            let barrier = vk::BufferMemoryBarrier {
-                s_type: vk::VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-                p_next: ptr::null(),
-                src_access_mask: VK_ACCESS_HOST_WRITE,
-                dst_access_mask: VK_ACCESS_VERTEX_ATTRIBUTE_READ,
-                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                buffer,
-                offset: 0,
-                size: vk::WHOLE_SIZE,
-            };
-            // SAFETY: 结构体在栈上存活；命令缓冲处于录制状态；句柄有效。
-            unsafe {
-                (fns.cmd_pipeline_barrier)(
-                    cmd,
-                    VK_PIPELINE_STAGE_HOST,
-                    VK_PIPELINE_STAGE_VERTEX_INPUT,
-                    0,
-                    0,
-                    ptr::null(),
-                    1,
-                    &barrier,
-                    0,
-                    ptr::null(),
-                );
-            }
-            // 计数与真实调用同处（review I-2）：删掉发射就必然删掉计数
-            if is_shape {
-                self.shape_host_to_vertex_barriers += 1;
-            } else {
-                self.text_host_to_vertex_barriers += 1;
+        // ★ 主机刚写进**统一**顶点缓冲 → GPU 的 VERTEX_INPUT 要读它。
+        //   **B5-2 起只有一块缓冲 ⇒ 一帧最多一条**（从前是两块各一条）。
+        //   参数与离屏同一组语义：`HOST/HOST_WRITE` → `VERTEX_INPUT/VERTEX_ATTRIBUTE_READ`。
+        if self.ui_barrier {
+            if let Some(vb) = ui.vb.as_ref() {
+                let buffer = vb.buffer.handle();
+                let barrier = vk::BufferMemoryBarrier {
+                    s_type: vk::VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                    p_next: ptr::null(),
+                    src_access_mask: VK_ACCESS_HOST_WRITE,
+                    dst_access_mask: VK_ACCESS_VERTEX_ATTRIBUTE_READ,
+                    src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                    buffer,
+                    offset: 0,
+                    size: vk::WHOLE_SIZE,
+                };
+                // SAFETY: 结构体在栈上存活；命令缓冲处于录制状态；句柄有效。
+                unsafe {
+                    (fns.cmd_pipeline_barrier)(
+                        cmd,
+                        VK_PIPELINE_STAGE_HOST,
+                        VK_PIPELINE_STAGE_VERTEX_INPUT,
+                        0,
+                        0,
+                        ptr::null(),
+                        1,
+                        &barrier,
+                        0,
+                        ptr::null(),
+                    );
+                }
+                // 计数与真实调用同处（review I-2）：删掉发射就必然删掉计数
+                self.ui_host_to_vertex_barriers += 1;
             }
         }
 
@@ -1628,48 +1681,34 @@ impl WindowedRenderer {
                 };
                 (fns.cmd_set_scissor)(cmd, 0, 1, &scissor);
             }
-            let mut bound: Option<PipelineKind> = None;
-            for call in calls {
-                if bound != Some(call.kind) {
-                    match call.kind {
-                        PipelineKind::Shape => {
-                            (fns.cmd_bind_pipeline)(
-                                cmd,
-                                vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                ui.pipes.shape.handle(),
-                            );
-                            // 计数与真实调用同处（B1）
-                            self.stats.pipeline_switches += 1;
-                            let vb = ui.shape_vb.as_ref().expect("形状段 ⇒ 缓冲已上传");
-                            let offset: vk::DeviceSize = 0;
-                            (fns.cmd_bind_vertex_buffers)(cmd, 0, 1, &vb.buffer.handle(), &offset);
-                        }
-                        PipelineKind::Text => {
-                            (fns.cmd_bind_pipeline)(
-                                cmd,
-                                vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                ui.pipes.text.handle(),
-                            );
-                            // 计数与真实调用同处（B1）
-                            self.stats.pipeline_switches += 1;
-                            let vb = ui.text_vb.as_ref().expect("文本段 ⇒ 缓冲已上传");
-                            let offset: vk::DeviceSize = 0;
-                            (fns.cmd_bind_vertex_buffers)(cmd, 0, 1, &vb.buffer.handle(), &offset);
-                            (fns.cmd_bind_descriptor_sets)(
-                                cmd,
-                                vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                ui.pipes.text_layout.handle(),
-                                0,
-                                1,
-                                &ui.set.handle(),
-                                0,
-                                ptr::null(),
-                            );
-                        }
-                    }
-                    bound = Some(call.kind);
-                }
-                (fns.cmd_draw)(cmd, call.count, 1, call.first, 0);
+            // ★ **B5-2：整帧一次 bind + 一次 draw**（从前按段在两条管线间来回切）。
+            //   形状与文本已合成一条顶点流 + 一条管线 ⇒ 绑定一次、一次 `vkCmdDraw`。
+            //   于是 `pipeline_switches` / `draw_calls` 对任何非空帧都恒为 **1**，
+            //   且计数都写在**发调用的同一处**（删掉发射必然删掉计数）。
+            if !unified.is_empty() {
+                (fns.cmd_bind_pipeline)(
+                    cmd,
+                    vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    ui.unified.handle(),
+                );
+                // 计数与真实调用同处（B1）
+                self.stats.pipeline_switches += 1;
+                let vb = ui.vb.as_ref().expect("有统一顶点 ⇒ 缓冲已上传");
+                let offset: vk::DeviceSize = 0;
+                (fns.cmd_bind_vertex_buffers)(cmd, 0, 1, &vb.buffer.handle(), &offset);
+                // `set 0 / binding 0`：**恒有**（字形图集或 1×1 哑纹理）。
+                // 统一片元着色器无条件采样 ⇒ 少了这条绑定就是未定义行为。
+                (fns.cmd_bind_descriptor_sets)(
+                    cmd,
+                    vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    ui.pipes.text_layout.handle(),
+                    0,
+                    1,
+                    &ui.set.handle(),
+                    0,
+                    ptr::null(),
+                );
+                (fns.cmd_draw)(cmd, unified.len() as u32, 1, 0, 0);
                 // 计数与真实调用同处（B1）
                 self.stats.draw_calls += 1;
             }

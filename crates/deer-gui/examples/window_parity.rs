@@ -486,8 +486,67 @@ impl App for Parity {
                 semi.max_diff, semi.at.0, semi.at.1, semi.gpu, semi.cpu
             ));
         }
+
+        // ★ **M3+ B5-2 的终局判据**：形状 + 文本合流 ⇒ 每帧 **1 draw + 1 switch**。
+        //
+        //   | 量 | 基线（两条管线） | 统一后（这里断言） |
+        //   |---|---|---|
+        //   | `draw_calls` | 8 | **1** |
+        //   | `pipeline_switches` | 8 | **1** |
+        //
+        //   ## 前置条件（**显式断言** —— 本项目纪律：前置不成立不会报错）
+        //
+        //   1. 这条语料必须**同时**含形状与文本，否则「1 draw」平凡成立；
+        //   2. 每帧的统计必须**是整数**：`compare()` 用「N 帧增量 ÷ N」算每帧值，
+        //      若顶点数据每帧都变（B3 不生效）会让 uploads 抖动，但 draw/switch 恒为 1；
+        //   3. `buffer_uploads` 只在**第一帧**是 1（之后内容不变 ⇒ 跳过），
+        //      所以这里**不**断言 uploads 的每帧值（它依赖帧数，不是本判据）。
+        let shapes_and_text = opaque_list.cmds.iter().any(|c| {
+            matches!(
+                c,
+                DrawCmd::FillRect { .. }
+                    | DrawCmd::FillRoundRect { .. }
+                    | DrawCmd::StrokeRect { .. }
+            )
+        }) && opaque_list
+            .cmds
+            .iter()
+            .any(|c| matches!(c, DrawCmd::Text { .. }));
+        if !shapes_and_text {
+            return Err(format!(
+                "前置条件不成立：`opaque-ui-tree` 语料必须**同时**含形状与文本命令\
+                 （实测形状={} 文本={}）—— 否则「1 draw + 1 switch」平凡成立，判据是空转的",
+                opaque_list
+                    .cmds
+                    .iter()
+                    .filter(|c| matches!(
+                        c,
+                        DrawCmd::FillRect { .. }
+                            | DrawCmd::FillRoundRect { .. }
+                            | DrawCmd::StrokeRect { .. }
+                    ))
+                    .count(),
+                opaque_list
+                    .cmds
+                    .iter()
+                    .filter(|c| matches!(c, DrawCmd::Text { .. }))
+                    .count()
+            ));
+        }
+        if opaque.stats_per_frame.draw_calls != 1 || opaque.stats_per_frame.pipeline_switches != 1 {
+            return Err(format!(
+                "`opaque-ui-tree` 每帧必须是 **1 draw + 1 switch**（B5-2 统一管线的收益；\
+                 基线是 8/8）：实测 draw_calls {} / pipeline_switches {}",
+                opaque.stats_per_frame.draw_calls, opaque.stats_per_frame.pipeline_switches
+            ));
+        }
         println!(
-            "窗口 parity 通过 ✅（不透明逐字节相同；半透明 ≤1 LSB；resize 重建无泄漏；校验零消息由外层命令核对）"
+            "统一管线计数 ✅：`opaque-ui-tree` 每帧 draw_calls {} / pipeline_switches {}（基线 8/8）",
+            opaque.stats_per_frame.draw_calls, opaque.stats_per_frame.pipeline_switches
+        );
+        println!(
+            "窗口 parity 通过 ✅（不透明逐字节相同；半透明 ≤1 LSB；统一管线 1 draw + 1 switch；\
+             resize 重建无泄漏；校验零消息由外层命令核对）"
         );
         Ok(Flow::Exit)
     }

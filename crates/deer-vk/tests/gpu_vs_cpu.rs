@@ -492,6 +492,36 @@ fn vertex_layout_matches_the_hand_written_attribute_offsets() {
     assert_eq!(std::mem::offset_of!(GpuVertex, color), 28, "location 3：vec4 color");
 }
 
+/// **统一顶点**的布局是给 `VkVertexInputAttributeDescription` 的硬契约（B5-2）：
+/// 这里钉**字面数字**（`gpu_render.rs::unified_attrs` 用 `offset_of!` 取偏移，两者必须一致）。
+///
+/// 与 [`vertex_layout_matches_the_hand_written_attribute_offsets`] 同一做法，
+/// 对象换成统一顶点：**stride 52 / 偏移 0 / 8 / 24 / 28 / 44**（与
+/// `spirv::vertex_shader_unified` 的 location 0..4 逐字段对应）。
+/// `vertex_unify.rs` 里另有一条同样的单元测试 —— 两处都留着是刻意的：
+/// 这条守「测试侧的字面数字」，那条守「实现侧的结构」。
+#[test]
+fn unified_vertex_layout_matches_the_unified_attribute_offsets() {
+    use deer_vk::UnifiedVertex;
+    assert_eq!(std::mem::size_of::<UnifiedVertex>(), 52, "stride");
+    assert_eq!(std::mem::align_of::<UnifiedVertex>(), 4, "全是 f32");
+    assert_eq!(std::mem::offset_of!(UnifiedVertex, pos), 0, "location 0：vec2 pos");
+    assert_eq!(std::mem::offset_of!(UnifiedVertex, rect), 8, "location 1：vec4 rect");
+    assert_eq!(
+        std::mem::offset_of!(UnifiedVertex, radius_kind),
+        24,
+        "location 2：float radius_kind"
+    );
+    assert_eq!(std::mem::offset_of!(UnifiedVertex, color), 28, "location 3：vec4 color");
+    assert_eq!(
+        std::mem::offset_of!(UnifiedVertex, uv),
+        44,
+        "location 4：vec2 uv（判别符：形状段 = (-1,-1)）"
+    );
+    // 判别符常量本身（形状段的约定值）
+    assert_eq!(deer_vk::SHAPE_UV_SENTINEL, [-1.0, -1.0]);
+}
+
 /// **R1-1（语义经 M3+ B3 收紧后的版本）**：**真的上传了**的帧才发 host→vertex 屏障。
 ///
 /// 为什么要有这条（而不是只靠 `vertex_barrier_params_pin_the_exact_masks` 那个单元测试）：
@@ -585,6 +615,11 @@ fn host_to_vertex_barrier_is_emitted_only_when_vertices_are_uploaded() {
 /// —— 顺序即语义（M3b 已实证 z 序能被变异抓住）。
 ///
 /// **计数是累计值** ⇒ 断言一律用差值。
+///
+/// ⚠️ **B5-2 之后这条用例的判别力变了（如实登记）**：整帧恒为「1 draw + 1 switch」
+/// （见 [`unified_pipeline_costs_one_draw_and_one_switch`]），所以它不再能分辨
+/// 「合段有没有生效」——「合段」在统一之后已无调用点。保留它是因为**像素判据**仍然有效
+/// （与 CPU 逐字节相同），而「计数 = 1」这条现在由统一管线保证。
 #[test]
 fn adjacent_same_pipeline_segments_are_merged_into_one_draw_call() {
     let extent = Extent {
@@ -620,10 +655,152 @@ fn adjacent_same_pipeline_segments_are_merged_into_one_draw_call() {
     assert_eq!(compare(&mut r, "merged-5-rects-vs-cpu", &l, 0), 0);
 }
 
-/// **B2 的「不合并」那一半**：相邻但**管线不同**的段必须各画一次（顺序即 z 序）。
+/// **B5-2 的终局判据（离屏）**：形状 + 文本合流后整帧 **1 draw + 1 switch**。
 ///
-/// 语料 `矩形, 文本, 矩形`：形状顶点 6+6 各自连续，但中间被文本隔开 ⇒
-/// 合段后仍是 **3** 次 draw、**3** 次切换；z 序不能为了少一次 draw 而被重排。
+/// | 量 | 基线（两条管线） | 统一后（本测试断言） |
+/// |---|---|---|
+/// | `draw_calls` | 8（段数） | **1** |
+/// | `pipeline_switches` | 8 | **1** |
+///
+/// 语料刻意让形状与文本**在像素上重叠**且**交替**（形状 → 文本 → 形状），
+/// 于是「为了少一次 draw 而重排顺序」会**同时**在计数与像素上露馅。
+///
+/// ## 前置条件（**显式断言**，本项目纪律）
+///
+/// - 渲染器必须**真的接上了文本引擎**（`text_enabled()`），否则文本整段进 `unsupported`
+///   ⇒ 语料退化成「只有形状」，这条用例就变成了空转（前任踩过「变异后仍绿」的假护栏）；
+/// - 文本必须**真的产出了顶点**（`unify_output_vertex_count` 的增量 > 形状段顶点数）
+///   —— 空串/被裁空的文本会让「1 draw」平凡成立。
+#[test]
+fn unified_pipeline_costs_one_draw_and_one_switch() {
+    let extent = Extent {
+        width: 96,
+        height: 40,
+    };
+    let Some(mut pair) = text_pair(extent, 20.0) else {
+        return;
+    };
+    // ★ 前置条件 ①：文本引擎真的接上了
+    assert!(
+        pair.0.text_enabled(),
+        "前置条件：这条用例必须跑在 `with_text` 之后的渲染器上（否则文本走 Unsupported，用例空转）"
+    );
+
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(0, 0, 96, 40),
+        color: Color::rgb(20, 60, 120),
+    });
+    l.push(text_cmd("Wg", RectI::new(4, 4, 88, 32), 20.0, 0));
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(10, 6, 40, 20),
+        color: Color::rgb(200, 30, 30),
+    });
+    let before = pair.0.render_stats();
+    let v_before = pair.0.unify_output_vertex_count();
+    let c_before = pair.0.unify_call_count();
+    pair.0.render(&l).expect("交错帧");
+    let after = pair.0.render_stats();
+    let verts = pair.0.unify_output_vertex_count() - v_before;
+    println!(
+        "  unified-1-draw: draw_calls {} / pipeline_switches {} / buffer_uploads {} / \
+         unify 调用 {} 次、输出顶点 {verts}（= CPU 转换 O(N) 口径）",
+        after.draw_calls - before.draw_calls,
+        after.pipeline_switches - before.pipeline_switches,
+        after.buffer_uploads - before.buffer_uploads,
+        pair.0.unify_call_count() - c_before,
+    );
+
+    // ★ 前置条件 ②：三种图元都真的产出了顶点（形状 6 + 文本 N + 形状 6 > 12）
+    assert!(
+        verts > 12,
+        "前置条件：这一帧必须同时含形状段与**非空**文本段（实测统一顶点数 {verts}）；\
+         若文本被跳过（空串/被裁空），这条用例对「1 draw」而言是空转"
+    );
+    // ★ 前置条件 ③：CPU 转换恰好被调用一次/帧
+    assert_eq!(
+        pair.0.unify_call_count() - c_before,
+        1,
+        "每帧恰好一次 `unify`（CPU 成本口径）"
+    );
+
+    assert_eq!(
+        after.draw_calls - before.draw_calls,
+        1,
+        "统一管线：整帧**一次** `vkCmdDraw(0, 全部顶点数)`（基线是段数 = 8）"
+    );
+    assert_eq!(
+        after.pipeline_switches - before.pipeline_switches,
+        1,
+        "统一管线：整帧**一次** `vkCmdBindPipeline`（基线是 8）"
+    );
+    assert_eq!(
+        after.buffer_uploads - before.buffer_uploads,
+        1,
+        "统一管线：只有**一块**顶点缓冲 ⇒ 一次上传（基线是两块各一次）"
+    );
+    // 像素判据：与 CPU 逐字节相同（z 序没被重排）
+    assert_eq!(
+        compare_text(&mut pair, "unified-1-draw-vs-cpu", &l, 0),
+        0,
+        "统一之后像素必须**一字不变**"
+    );
+}
+
+/// **哑纹理是真的绑定并且承重的**（B5-2 的隐式依赖，见 `gpu_render::DUMMY_COVERAGE`）。
+///
+/// 统一片元着色器**无条件采样** ⇒ 形状帧也必须绑一张有效纹理。本用例断言两件事：
+///
+/// 1. **没有 `TextEngine`** 的渲染器画形状帧时，绑的是 **1×1** 哑纹理
+///    （`bound_texture_size()`）——「反正不读」的假设不成立，这条依赖必须在；
+/// 2. 图形像素仍然与 CPU **逐字节相同**（哑纹理的覆盖率 255 不会污染形状那一支）。
+///
+/// 承重性由变异 **B**（把哑纹理换成 `cov=0` 的 `&[0]`）证明：形状帧必须变红。
+/// 本用例只钉住「绑了它 + 值是 255 时像素对」；变异 B 才证明**值**是承重的。
+#[test]
+fn a_shape_only_frame_binds_the_one_by_one_dummy_texture() {
+    let extent = Extent {
+        width: 32,
+        height: 24,
+    };
+    let Some(mut r) = renderer(extent) else {
+        return;
+    };
+    // ★ 前置条件：这个渲染器**没有**文本引擎（否则下面绑的是字形图集，用例空转）
+    assert!(
+        !r.text_enabled(),
+        "前置条件：本用例必须在**没有 TextEngine** 的渲染器上跑"
+    );
+    assert_eq!(
+        r.bound_texture_size(),
+        (1, 1),
+        "没有 TextEngine ⇒ `set 0` 必须绑 1×1 哑纹理（统一 FS 无条件采样）"
+    );
+
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(2, 2, 28, 20),
+        color: Color::rgb(180, 60, 20),
+    });
+    assert_eq!(compare(&mut r, "shape-only-with-dummy-texture", &l, 0), 0);
+    // 画完之后**仍然是** 1×1（没有文本 ⇒ 没有图集上传把它挤掉）
+    assert_eq!(
+        r.bound_texture_size(),
+        (1, 1),
+        "形状帧不得把哑纹理换成别的东西（那样 `set 0` 会指向未上传的图集）"
+    );
+}
+
+/// **B2 的「不合并」那一半（B5-2 更新后的语义）**：交错语料在统一之后是 **1 draw + 1 switch**，
+/// 但**顺序仍然是语义**（z 序不能为了少画而重排）。
+///
+/// ## 这条用例为什么从「3/3」改成「1/1」（**如实登记，不是把断言改松了**）
+///
+/// 从前形状与文本是两条管线 ⇒ `矩形, 文本, 矩形` 必须切管线 3 次、发 3 次 draw。
+/// B5-2 把两者合成**一条**管线 + **一条**顶点流 ⇒ 段数不再决定 draw 次数。
+/// 「不许为了少一次 draw 而重排」这条**不变式仍然有效**，但它现在由
+/// **像素**守护（`compare_text` 逐字节）而不是计数：
+/// 语料刻意让形状与文本**在像素上重叠**（矩形盖住文字），重排会红 255。
 #[test]
 fn interleaved_shapes_and_text_are_not_reordered_by_merging() {
     let extent = Extent {
@@ -654,22 +831,23 @@ fn interleaved_shapes_and_text_are_not_reordered_by_merging() {
     let after = pair.0.render_stats();
     assert_eq!(
         after.draw_calls - before.draw_calls,
-        3,
-        "管线交替 ⇒ 不许为了少画而重排顺序（z 序是语义）：形状 1 + 文本 1 + 形状 1 = 3"
+        1,
+        "统一管线：三段合流 ⇒ **一次** draw（B5-2 之前是 3）"
     );
     assert_eq!(
         after.pipeline_switches - before.pipeline_switches,
-        3,
-        "每次换管线都要重新绑定"
+        1,
+        "统一管线：只有一条管线 ⇒ **一次** bind（B5-2 之前是 3）"
     );
     let _ = gpu;
     // 像素判据：与 CPU 逐字节相同。
     //
-    // ⚠️ **诚实说明（review 覆盖漏洞）**：本用例的矩形在 `y∈[2,10)`、文本在 `y∈[12,30)`，
+    // ⚠️ **诚实说明（review 覆盖漏洞，仍然有效）**：本用例的矩形在 `y∈[2,10)`、文本在 `y∈[12,30)`，
     // **两者在像素上不重叠** ⇒ 就算实现把「形状全部提前、文本全部置后」这种重排做出来，
     // 这里的像素**也可能全绿** —— 所以本用例对 z 序而言**实质是计数护栏**
-    // （那句「顺序若改动这里会红」的旧注释与事实不符，已删）。
-    // **真正的像素级 z 序护栏是下面 `overlapping_shape_after_text_is_detected_by_pixels_*`**。
+    // （B5-2 之后连计数也不再分辨重排了 ⇒ 它现在**只是像素护栏的一个弱例**）。
+    // **真正的像素级 z 序护栏是 `overlapping_shape_after_text_is_detected_by_pixels_*`
+    //   与 `unified_pipeline_costs_one_draw_and_one_switch`（后者的语料是重叠的）。**
     assert_eq!(compare_text(&mut pair, "interleaved-not-reordered", &l, 0), 0);
 }
 
@@ -1085,13 +1263,28 @@ fn nested_clips_around_text_match_cpu() {
     assert_eq!(compare_text(&mut pair, "text-nested-3-with-shape", &l, 0), 0);
 }
 
-/// **M2 护栏**：文本顶点缓冲的 host→vertex 屏障**必须真的发出来**。
+/// **统一顶点缓冲的 host→vertex 屏障**（原 `text_barriers_are_emitted_per_buffer` 的 B5-2 版本）。
 ///
-/// 背景：文本路径引入了第二块顶点缓冲，而它那条屏障一度**只有实现、没有护栏** ——
-/// reviewer 把发射整体删掉，`cargo test -p deer-vk` **17 靶全绿**（总数计数器只有形状帧的
-/// 断言在驱动）。这条测试用**差值**断言三种帧各自的屏障增量。
+/// ## 为什么这条用例被改写（而不是删掉）—— **如实登记**
+///
+/// 原用例守的是「形状与文本**两块**顶点缓冲**各有**一条屏障」：交错帧断言总数 +2、
+/// 两个分项各 +1。B5-2 把两块缓冲合成**一块** ⇒ 那个断言**不可能**再成立
+/// （不是「太严」，而是它描述的结构已经不存在了）。所以这里按新结构重写：
+/// **只有一块缓冲 ⇒ 一帧最多一条屏障**，而「总计数器」就是唯一的判据
+/// （两个分项计数器已随字段一起删除，留两个恒等的数只会让人以为它们还分辨着什么）。
+///
+/// ## 覆盖的四种帧（每一种都断言确切增量）
+///
+/// | 帧 | 期望增量 |
+/// |---|---|
+/// | ① 文本帧（内容首次上传） | **+1** |
+/// | ② 形状+文本交错、内容变了 | **+1**（不是 +2：只有一块缓冲） |
+/// | ③ 同一份内容重复帧（B3 跳过上传） | **0** |
+/// | ④ 文本全被跳过（空串，没有顶点） | **0** |
+///
+/// 删掉发射 ⇒ ①② 不再增长 ⇒ 红。
 #[test]
-fn text_barriers_are_emitted_per_buffer() {
+fn unified_vertex_barrier_is_emitted_once_per_upload() {
     let extent = Extent {
         width: 64,
         height: 32,
@@ -1099,27 +1292,22 @@ fn text_barriers_are_emitted_per_buffer() {
     let Some(mut pair) = text_pair(extent, 16.0) else {
         return;
     };
-    let counters = |r: &GpuGeometryRenderer| {
-        (
-            r.host_to_vertex_barrier_count(),
-            r.shape_host_to_vertex_barrier_count(),
-            r.text_host_to_vertex_barrier_count(),
-        )
-    };
-    let t0 = counters(&pair.0);
+    assert!(
+        pair.0.text_enabled(),
+        "前置条件：本用例必须跑在真的接上文本引擎的渲染器上"
+    );
+    let count = |r: &GpuGeometryRenderer| r.host_to_vertex_barrier_count();
+    let t0 = count(&pair.0);
 
-    // ① 文本单管线帧 ⇒ 总数 +1 且**全部记在文本分项**上
+    // ① 文本帧 ⇒ 恰好 +1
     let mut l = DrawList::new();
     l.push(text_cmd("Bar", RectI::new(2, 2, 60, 28), 16.0, 0));
     pair.0.render(&l).expect("文本帧");
-    let t1 = counters(&pair.0);
-    assert_eq!(t1.0, t0.0 + 1, "文本帧应当发出 1 条屏障（总数）");
-    assert_eq!(t1.2, t0.2 + 1, "那条屏障必须记在**文本**分项上（review M2 的护栏）");
-    assert_eq!(t1.1, t0.1, "文本帧不该动形状分项");
+    let t1 = count(&pair.0);
+    assert_eq!(t1, t0 + 1, "文本帧应当发出 **1** 条屏障（只有一块统一缓冲）");
 
-    // ② 形状+文本交错、且**两者内容都变了** ⇒ 两块缓冲各一条 ⇒ 总数 +2，两个分项各 +1
-    //    （B3 之后屏障只在**真的上传**时发：这里刻意把文本从 "Bar" 换成 "Baz"，
-    //      否则文本内容没变、跳过上传 ⇒ 只有形状那一条屏障）
+    // ② 形状+文本交错、**两者内容都变了** ⇒ 仍然只有 1 条
+    //    （B5-2 之前这里是 +2：两块独立缓冲各一条）
     let mut l = DrawList::new();
     l.push(DrawCmd::FillRect {
         rect: RectI::new(0, 0, 64, 32),
@@ -1127,31 +1315,33 @@ fn text_barriers_are_emitted_per_buffer() {
     });
     l.push(text_cmd("Baz", RectI::new(2, 2, 60, 28), 16.0, 0));
     pair.0.render(&l).expect("交错帧");
-    let t2 = counters(&pair.0);
-    assert_eq!(t2.0, t1.0 + 2, "两块独立顶点缓冲各要一条屏障（两块内容都变了）");
-    assert_eq!(t2.1, t1.1 + 1, "形状分项 +1");
-    assert_eq!(t2.2, t1.2 + 1, "文本分项 +1");
+    let t2 = count(&pair.0);
+    assert_eq!(
+        t2,
+        t1 + 1,
+        "统一缓冲只有一块 ⇒ 交错帧也是 **1** 条（B5-2 之前是 2 条，那是两块缓冲的语义）"
+    );
 
-    // ②' **同一份内容再画一帧** ⇒ B3 跳过两块的重新上传 ⇒ 不发任何新屏障
+    // ③ 同一份内容再画一帧 ⇒ B3 跳过上传 ⇒ 不发新屏障
     let s = pair.0.render_stats();
     pair.0.render(&l).expect("重复帧");
     assert_eq!(
         pair.0.render_stats().buffer_uploads - s.buffer_uploads,
         0,
-        "B3：内容逐字节相同 ⇒ 两块缓冲都不重传"
+        "B3：内容逐字节相同 ⇒ 不重传"
     );
     assert_eq!(
-        counters(&pair.0),
+        count(&pair.0),
         t2,
         "没有上传 ⇒ 不需要新的 host→vertex 依赖（B3 收紧后的语义）"
     );
 
-    // ③ 文本全被跳过（没有顶点）⇒ 不该发文本屏障，也不该发形状屏障
+    // ④ 文本全被跳过（没有顶点）⇒ 没有上传 ⇒ 不发屏障
     let mut l = DrawList::new();
     l.push(text_cmd("", RectI::new(2, 2, 60, 28), 16.0, 0));
     pair.0.render(&l).expect("空串帧");
-    let t3 = counters(&pair.0);
-    assert_eq!(t3, t2, "没有顶点要画 ⇒ 屏障计数不该动（实测：{:?} vs {:?}）", t3, t2);
+    let t4 = count(&pair.0);
+    assert_eq!(t4, t2, "没有顶点要画 ⇒ 屏障计数不该动（实测：{:?} vs {:?}）", t4, t2);
 }
 
 /// **假阳性已修**：空串 / `size <= 0` / 被裁空的文本**不再报错**，而是被跳过并计数
