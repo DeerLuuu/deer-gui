@@ -183,8 +183,18 @@ pub fn live_ui_resource_count() -> usize {
 /// - **动态（默认）**：M2b 起窗口路径一直这么用，实测能上屏；尺寸变化不必重建管线；
 /// - **静态**：写进管线（`DEER_VK_WINDOW_VIEWPORT=static` 强制）。
 ///
-/// 两种都能跑出来，是为了**消解 M2a 留下的矛盾结论**（「动态在本机 Intel 上零像素」）：
-/// 那一版的真相见报告 —— 「声明了动态状态但**从未调** `vkCmdSetViewport`」，不是驱动的问题。
+/// 两种都能跑出来，是为了**把 M2a 留下的那句「动态在本机 Intel 上画不出像素」查清**。
+///
+/// **实现事实**（与那句结论不冲突）：管线一旦声明动态 viewport/scissor，**录制时必须**
+/// 调 `vkCmdSetViewport`/`vkCmdSetScissor` —— 否则是规范里的未定义行为。
+///
+/// **本轮的证据（只覆盖窗口路径）**：补上设置调用后，动态与静态**都能上屏**（各 30 帧、
+/// 界面像素完全相同）；而**去掉**设置调用会直接 `0xC000041D` 崩溃。
+///
+/// **存疑**：M2a 当时测的是**离屏 + 三角形管线**，症状是「零像素、不崩」而不是崩溃
+/// ⇒ **症状不同不能断定同因**。所以那句结论既不能照旧当硬前提，也还没到能宣布「已证实」
+/// 的时候 —— 离屏的复现是一件**文档待办**。
+///
 /// 环境变量只作为**诊断/实测开关**，默认值才是产品行为。
 pub fn viewport_strategy_from_env() -> pipelines::ViewportStrategy {
     match std::env::var("DEER_VK_WINDOW_VIEWPORT").ok().as_deref() {
@@ -1124,11 +1134,16 @@ impl WindowedRenderer {
     ///
     /// ## 必须先 `vkDeviceWaitIdle`（实测踩过：不等就 `VK_ERROR_DEVICE_LOST`）
     ///
+    /// **任何主动释放都必须等设备空闲，而不是等当前帧栅栏。**
+    ///
     /// `FRAMES_IN_FLIGHT = 2` ⇒ 「等当前槽的栅栏」**不等于**「上一帧的提交已经做完」：
     /// 另一个槽的命令缓冲可能还在跑，而它引用着这些管线/缓冲/纹理。
     /// 直接析构就是「正在被 GPU 使用的对象被销毁」—— 本机实测直接
     /// `VK_ERROR_DEVICE_LOST`（`vkQueueSubmit` 失败，随后连 `vkDeviceWaitIdle` 也失败）。
     /// `resize()` 换交换链时同样先等空闲，理由相同。
+    ///
+    /// ⚠️ 将来若加**第二个 in-flight 槽**或**第二个队列**，这条注释是唯一的护栏：
+    /// 那时「等当前帧栅栏」离「设备空闲」更远，而不是更近。
     ///
     /// ## 为什么需要这个入口（review I-2）
     ///
@@ -1170,8 +1185,11 @@ impl WindowedRenderer {
     ///
     /// 朝向两条策略**一致**：`(0, 0, w, h)`、`min_depth 0 / max_depth 1` ⇒ NDC `y = -1` 在**上**、
     /// 像素 y 从上往下 —— 正是形状片元着色器里 `gl_FragCoord`（`OriginUpperLeft`）判据要求的方向。
-    /// 实测（本机 Intel 集显）：两种策略**都能上屏且像素完全相同**；
-    /// 「声明动态却从不调 `vkCmdSetViewport`」会直接崩 —— 详见报告 §11.4。
+    ///
+    /// **本机 Intel 集显的实测**（窗口路径，各 30 帧）：两种策略都能上屏且像素完全相同；
+    /// 而「声明动态却从不调 `vkCmdSetViewport`」会直接 `0xC000041D` 崩溃
+    /// —— 所以那条「必须调」的规则是硬要求，**离屏若要用动态也一样**。
+    /// 复现方式与那句 M2a 旧结论的存疑之处，见 [`viewport_strategy_from_env`] 的文档。
     ///
     /// ## 报错策略（与离屏对齐）
     ///
@@ -1485,8 +1503,11 @@ impl WindowedRenderer {
             (fns.cmd_begin_render_pass)(cmd, &pass_begin, vk::VK_SUBPASS_CONTENTS_INLINE);
             // viewport/scissor：**按策略**给 —— 动态策略必须在录制时设（管线里只有
             // `count = 1` + 空指针）；静态策略下**不能**调，否则校验层报
-            // 「对静态状态发动态设置命令」。这正是 M2a 那次「动态零像素」的真相：
-            // 那样板声明了动态状态却从未调 `vkCmdSetViewport`。
+            // 「对静态状态发动态设置命令」。
+            //
+            // （「M2a 说动态在 Intel 上画不出像素」这句话的现状：**存疑**——本轮窗口路径的
+            //   证据是「不设会崩、设了能上屏」，与 M2a 的「零像素且不崩」症状不同，
+            //   **不能断定同因**；离屏复现仍待做。见 `viewport_strategy_from_env` 的文档。）
             if self.ui_viewport_is_dynamic {
                 let viewport = vk::Viewport {
                     x: 0.0,
