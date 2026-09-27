@@ -47,13 +47,14 @@ use deer_gpu::{
 };
 
 use crate::device::{
-    vk_result_name, DescriptorPool, DescriptorSet, DescriptorSetLayout, Pipeline, PipelineLayout,
-    RenderPass, Sampler, ShaderModule, Texture, VertexAttr, VkDevice,
+    vk_result_name, DescriptorPool, DescriptorSet, Pipeline, PipelineLayout, RenderPass,
+    ShaderModule, Texture, VkDevice,
 };
 use crate::ffi;
 use crate::ffi_dev as vk;
 use crate::gpu_geom::{self, GpuVertex};
 use crate::gpu_text::{self, TextVertex};
+use crate::pipelines;
 use crate::spirv;
 use crate::surface::{self, Surface};
 use crate::swapchain::{
@@ -64,11 +65,6 @@ use crate::swapchain::{
 /// （`ffi_dev.rs` 里没有它 —— M2a 的栅栏都是「不预设 signaled ⇒ 必须真的等 GPU」）。
 /// 这里需要「初始就 signaled」，否则第一帧的 `wait` 会白等一个超时。
 const VK_FENCE_CREATE_SIGNALED_BIT: u32 = 0x0000_0001;
-
-/// `VK_FORMAT_R32_SFLOAT`（单个 `float`）—— `GpuVertex::radius_kind` 用它。///
-/// `ffi_dev.rs` 只声明了本项目在 M2a/M3a 用到的那几个格式常量，`R32_SFLOAT` 不在其中
-/// （`gpu_render.rs` 里也是同名局部常量）。规范值 = **100**。
-const VK_FORMAT_R32_SFLOAT: i32 = 100;
 
 /// `VK_PIPELINE_STAGE_HOST_BIT`。`ffi_dev.rs` 里没有这个常量（M2a 只需要 PRESENT/COLOR 那几个），
 /// 而窗口路径的界面绘制要发一条 host→vertex 的缓冲区屏障 ⇒ 在这里具名钉住。
@@ -135,141 +131,78 @@ struct UiVertexBuffer {
 
 /// 界面树所需的**形状**管线资源（M3a 的顶点流 → 独立管线）。
 ///
-/// 与 [`WindowedRenderer::render_and_present`] 用的三角形管线**并存、互不干扰**：
-/// 那条是动态 viewport 的无顶点输入管线（M2b 的路径），这条是**静态 viewport**
-/// 的顶点输入管线 —— 见 [`WindowedRenderer::ensure_ui`] 里关于 viewport 的说明。
-struct UiShapePipeline {
-    pipeline: Pipeline,
-    /// 着色器模块：**只为「活得与管线一样久」而持有**（管线引用它们）。
-    #[allow(dead_code)]
-    vs: ShaderModule,
-    #[allow(dead_code)]
-    fs: ShaderModule,
-    vb: Option<UiVertexBuffer>,
-}
-
-/// 界面树所需的**文本**管线资源（M3b 的第二条管线，这里是窗口版）。
+/// 界面树（形状 + 文本）的全部资源；`None` = 还没建（首次 `draw_and_present` 时惰性建）。
 ///
-/// 字段顺序有契约：`set` **必须**声明在 `pool` 之前（Rust 按声明顺序析构 ⇒ 集先于池，
-/// 而 `Drop` 里要 `vkFreeDescriptorSets(device, pool, ..)`）。
-struct UiTextPipeline {
-    pipeline: Pipeline,
-    layout: PipelineLayout,
-    /// 着色器模块 / 描述符集布局 / 池：**只为所有权而持有** ——
-    /// 着色器模块与集布局必须在管线存活期间有效；池必须在集释放之后才销毁。
-    /// 删掉任何一个都会让对象提前销毁（所以这里 `allow(dead_code)`）。
-    #[allow(dead_code)]
-    vs: ShaderModule,
-    #[allow(dead_code)]
-    fs: ShaderModule,
-    #[allow(dead_code)]
-    set_layout: DescriptorSetLayout,
+/// **M3c 起两条管线来自共用层**（`pipelines::build_pipelines`）：着色器模块、管线布局、
+/// 文本的 `set 0` 布局与采样器都由 [`pipelines::PipelineSet`] 持有（各自的析构顺序由
+/// 那里的类型保证）。这里只补「**每个渲染器一份**」的东西：描述符集、图集纹理、两块顶点缓冲。
+///
+/// ## 字段顺序
+///
+/// `set` 必须声明在 `pool` 之前 —— Rust 按声明顺序析构，而 `DescriptorSet::drop` 会调
+/// `vkFreeDescriptorSets(device, pool, ..)`，池必须在集之后才销毁。
+struct UiResources {
+    pipes: pipelines::PipelineSet,
+    shape_vb: Option<UiVertexBuffer>,
+    text_vb: Option<UiVertexBuffer>,
     set: DescriptorSet,
+    /// 描述符池：**只为所有权而持有**（`set` 的 `Drop` 会调
+    /// `vkFreeDescriptorSets(device, pool, ..)` ⇒ 池必须比集活得久）。
+    /// 声明在 `set` **之后** ⇒ 按声明顺序析构时「集先销、池后销」。
     #[allow(dead_code)]
     pool: DescriptorPool,
-    sampler: Sampler,
-    vb: Option<UiVertexBuffer>,
     texture: Option<Texture>,
     /// 已上传图集的指纹 `(宽, 高, 已光栅化字形数)`；`None` = 还没传过。
     uploaded: Option<(u32, u32, usize)>,
 }
 
-/// 界面树（形状 + 文本）的全部资源；`None` = 还没建（首次 `draw_and_present` 时惰性建）。
+/// 存活中的 [`UiResources`] 实例数（进程级）。
 ///
-/// **resize 后会被整体丢弃并重建**：这两条管线用的是**静态** viewport（尺寸写死在管线里），
-/// 交换链尺寸一变就必须重建（这也是 `resize()` 里 `self.ui = None` 的原因）。
-struct UiResources {
-    shape: UiShapePipeline,
-    /// 形状管线的布局：**只为「活得与管线一样久」而持有**（管线引用它）。
-    #[allow(dead_code)]
-    shape_layout: PipelineLayout,
-    text: Option<UiTextPipeline>,
+/// ## 为什么需要这个计数器（控制者的要求：`resize` 失效重建**不能泄漏**）
+///
+/// `resize()` 会把 `self.ui` 置 `None` 让旧资源析构、下一帧再重建。这条路径不能泄漏
+/// 管线/描述符集/纹理 —— 但「代码看起来对」不是证据（本项目已经吃过「实现有、护栏没有」的亏）。
+/// 所以：构造时 +1、`Drop` 时 −1（记在**类型自己**身上，不靠调用方上报），
+/// 断言写成「反复 resize 之后：存活数**恒为 1**、构建次数**恰好 = 1 + 重建次数**」。
+/// 漏了 `Drop`、或旧资源被遗忘（没置 `None`）都会红。
+static LIVE_UI_RESOURCES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+impl Drop for UiResources {
+    fn drop(&mut self) {
+        LIVE_UI_RESOURCES.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// 当前存活的界面资源数（进程级；示例用它抓「rebuild 泄漏」）。
+pub fn live_ui_resource_count() -> usize {
+    LIVE_UI_RESOURCES.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// viewport/scissor 策略。
+///
+/// - **动态（默认）**：M2b 起窗口路径一直这么用，实测能上屏；尺寸变化不必重建管线；
+/// - **静态**：写进管线（`DEER_VK_WINDOW_VIEWPORT=static` 强制）。
+///
+/// 两种都能跑出来，是为了**消解 M2a 留下的矛盾结论**（「动态在本机 Intel 上零像素」）：
+/// 那一版的真相见报告 —— 「声明了动态状态但**从未调** `vkCmdSetViewport`」，不是驱动的问题。
+/// 环境变量只作为**诊断/实测开关**，默认值才是产品行为。
+pub fn viewport_strategy_from_env() -> pipelines::ViewportStrategy {
+    match std::env::var("DEER_VK_WINDOW_VIEWPORT").ok().as_deref() {
+        Some(v) if v.eq_ignore_ascii_case("static") => pipelines::ViewportStrategy::Static {
+            width: 1,
+            height: 1,
+        },
+        _ => pipelines::ViewportStrategy::Dynamic,
+    }
 }
 
 /// 把「当前生效的裁剪栈 + 这一条命令」组成一个临时 `DrawList`（**保 z 序**的关键）。
 ///
-/// ## 为什么逐条命令
-///
-/// 形状与文本走两条独立管线，而 z 序要求它们按 `DrawList` 原顺序交错绘制 ⇒ 必须逐条命令
-/// 决定「这条进哪条管线」。两条翻译层（`gpu_geom` / `gpu_text`）的公开入口都是「整个
-/// `DrawList`」，所以把**生效的 `PushClip` 序列原样重放**：翻译层内部算的是
-/// `full ∩ r1 ∩ r2 …`，与「完整列表」时**逐字相同** ⇒ 裁剪语义不因拆分而改变。
-///
-/// ⚠️ 与 `gpu_render.rs::single_command_in_clip` **是同一套做法**（那份在 `gpu_render.rs` 里，
-/// 属 `task-26` 的共用层范围，本轮不能改它）—— 两处将来应由共用层收敛成一处。
+/// **实现已收敛到共用的一份**（`gpu_render::single_command_in_clip`）：离屏与窗口两条渲染
+/// 路径的「逐命令翻译 + 裁剪栈重放」必须逐字相同 —— 复制两份就是「只改了一边」的温床。
+/// 这里保留一个薄别名，只为让窗口路径的调用点读起来直白。
 fn ui_single_command_in_clip(active_clip: &[RectI], cmd: &DrawCmd) -> DrawList {
-    let mut l = DrawList::new();
-    for r in active_clip {
-        l.push(DrawCmd::PushClip { rect: *r });
-    }
-    l.push(cmd.clone());
-    l
-}
-
-/// 形状管线的顶点属性表：`GpuVertex`（**stride 44**：pos 0 / rect 8 / radius_kind 24 / color 28）。
-///
-/// 与 `gpu_render.rs::vertex_attrs` 同源同义（那里是私有的，本轮不能改 `gpu_render.rs`）——
-/// 偏移一律用 `offset_of!` 取，所以两处不会与 `gpu_geom` 的 `#[repr(C)]` 布局漂移。
-fn ui_shape_attrs() -> [VertexAttr; 4] {
-    [
-        VertexAttr {
-            location: 0,
-            format: vk::VK_FORMAT_R32G32_SFLOAT,
-            offset: std::mem::offset_of!(GpuVertex, pos) as u32,
-        },
-        VertexAttr {
-            location: 1,
-            format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
-            offset: std::mem::offset_of!(GpuVertex, rect) as u32,
-        },
-        VertexAttr {
-            location: 2,
-            format: VK_FORMAT_R32_SFLOAT,
-            offset: std::mem::offset_of!(GpuVertex, radius_kind) as u32,
-        },
-        VertexAttr {
-            location: 3,
-            format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
-            offset: std::mem::offset_of!(GpuVertex, color) as u32,
-        },
-    ]
-}
-
-/// 文本管线的顶点属性表：`TextVertex`（**stride 32**：pos 0 / uv 8 / color 16）。
-fn ui_text_attrs() -> [VertexAttr; 3] {
-    [
-        VertexAttr {
-            location: 0,
-            format: vk::VK_FORMAT_R32G32_SFLOAT,
-            offset: std::mem::offset_of!(TextVertex, pos) as u32,
-        },
-        VertexAttr {
-            location: 1,
-            format: vk::VK_FORMAT_R32G32_SFLOAT,
-            offset: std::mem::offset_of!(TextVertex, uv) as u32,
-        },
-        VertexAttr {
-            location: 2,
-            format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
-            offset: std::mem::offset_of!(TextVertex, color) as u32,
-        },
-    ]
-}
-
-/// 一个图形管线的着色器阶段描述（两条界面管线共用；`p_name` 恒为 `"main"`）。
-///
-/// 抽出来只为少抄一遍 `VkPipelineShaderStageCreateInfo` 的 8 个字段 ——
-/// 抄第二遍最常见的错就是漏改 `stage`（于是两个阶段都当成同一个阶段）。
-fn graphics_stage(stage: u32, module: vk::ShaderModuleHandle) -> vk::PipelineShaderStageCreateInfo {
-    vk::PipelineShaderStageCreateInfo {
-        s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-        p_next: ptr::null(),
-        flags: 0,
-        stage,
-        module,
-        p_name: c"main".as_ptr(),
-        p_specialization_info: ptr::null(),
-    }
+    crate::gpu_render::single_command_in_clip(active_clip, cmd)
 }
 
 /// 建（或扩容）一个 host 可见的顶点缓冲。**先建新的、成功后再换**（失败不破坏旧状态）。
@@ -682,6 +615,17 @@ pub struct WindowedRenderer {
     last_presented_slot: usize,
     /// 上一帧 `draw_and_present` 里被跳过的文本命令数（诊断，见 [`WindowedRenderer::ui_text_skipped`]）。
     ui_text_skipped: usize,
+    /// 界面管线用的是**动态** viewport 吗（录制时据此决定要不要 `vkCmdSetViewport`）。
+    ///
+    /// **必须与建管线时用的策略一致** —— 不一致就是「对静态状态发动态设置命令」
+    /// （校验层报错）或「动态状态从没被设置」（画不出像素）。所以这个标志由
+    /// `ensure_ui` 在**同一次**策略解析里写入，不另外读 env。
+    ui_viewport_is_dynamic: bool,
+    /// 界面资源被**构建**过几次（每次 `ensure_ui` 真正建资源时 +1）。
+    ///
+    /// 与 [`live_ui_resource_count`] 配对使用：`resize` 反复发生时，
+    /// 「构建次数 = 1 + 重建次数」且「存活数恒为 1」才是「失效重建不泄漏」的证据。
+    ui_builds: u64,
 }
 
 impl WindowedRenderer {
@@ -788,6 +732,8 @@ impl WindowedRenderer {
             last_frame_readback: false,
             last_presented_slot: 0,
             ui_text_skipped: 0,
+            ui_viewport_is_dynamic: true,
+            ui_builds: 0,
         })
     }
 
@@ -1009,10 +955,13 @@ impl WindowedRenderer {
         }
         // 动态 viewport/scissor ⇒ 尺寸变化不需要重建三角形管线。
         //
-        // ⚠️ 但**界面管线**是静态 viewport（尺寸写死在管线里，见 `draw_and_present` 的说明）
-        // ⇒ 尺寸变了必须重建：这里把它们整体丢掉，下次 `draw_and_present` 按新 extent 惰性重建。
-        // 此刻上面已经 `wait_idle()` 过 ⇒ 旧管线不在使用中，可以安全销毁。
-        self.ui = None;
+        // 界面管线**只在静态策略下**才需要重建（静态 viewport 把尺寸写死在管线里）。
+        // 此刻上面已经 `wait_idle()` 过 ⇒ 旧管线不在使用中，可以安全销毁；
+        // 「销毁 + 下次重建」这条路径**不能泄漏**，由 `live_ui_resource_count()`
+        // 与 `ui_build_count()` 两个计数器在示例里断言（见 `window_parity.rs`）。
+        if !self.ui_viewport_is_dynamic {
+            self.ui = None;
+        }
 
         let framebuffers = create_framebuffers(
             &self.device,
@@ -1163,6 +1112,16 @@ impl WindowedRenderer {
         self.ui_text_skipped
     }
 
+    /// 界面资源被构建过几次（见 `ui_builds` 字段的文档；示例用它断言 `resize` 不泄漏）。
+    pub fn ui_build_count(&self) -> u64 {
+        self.ui_builds
+    }
+
+    /// 当前界面管线用的是动态 viewport 吗（实测/诊断用）。
+    pub fn ui_viewport_is_dynamic(&self) -> bool {
+        self.ui_viewport_is_dynamic
+    }
+
     /// **画一帧界面树并呈现**（M3c-T3）。
     ///
     /// ## 它做什么
@@ -1283,28 +1242,24 @@ impl WindowedRenderer {
             let bytes = std::mem::size_of_val(shape_verts.as_slice());
             let dev = &self.device;
             let ui = self.ui.as_mut().expect("ensure_ui 之后必有资源");
-            ensure_ui_vertex_capacity(dev, &mut ui.shape.vb, bytes as u64)?;
+            ensure_ui_vertex_capacity(dev, &mut ui.shape_vb, bytes as u64)?;
             // SAFETY: `GpuVertex` 是 `#[repr(C)]` 纯 `f32`（无指针、无 Drop）⇒ 字节视图合法。
             let src = unsafe {
                 std::slice::from_raw_parts(shape_verts.as_ptr() as *const u8, bytes)
             };
-            let vb = ui.shape.vb.as_ref().expect("刚 ensure 过");
+            let vb = ui.shape_vb.as_ref().expect("刚 ensure 过");
             upload_ui_vertices(dev, vb, src, "vkMapMemory(窗口形状顶点)")?;
         }
         if !text_verts.is_empty() {
             let bytes = std::mem::size_of_val(text_verts.as_slice());
             let dev = &self.device;
             let ui = self.ui.as_mut().expect("ensure_ui 之后必有资源");
-            let t = ui
-                .text
-                .as_mut()
-                .expect("有文本顶点 ⇒ 调用方给了 TextEngine ⇒ 文本管线已建");
-            ensure_ui_vertex_capacity(dev, &mut t.vb, bytes as u64)?;
+            ensure_ui_vertex_capacity(dev, &mut ui.text_vb, bytes as u64)?;
             // SAFETY: `TextVertex` 是 `#[repr(C)]` 纯 `f32` ⇒ 字节视图合法。
             let src = unsafe {
                 std::slice::from_raw_parts(text_verts.as_ptr() as *const u8, bytes)
             };
-            let vb = t.vb.as_ref().expect("刚 ensure 过");
+            let vb = ui.text_vb.as_ref().expect("刚 ensure 过");
             upload_ui_vertices(dev, vb, src, "vkMapMemory(窗口文本顶点)")?;
         }
 
@@ -1317,103 +1272,65 @@ impl WindowedRenderer {
         self.present_frame(|s, slot, image_index| s.record_ui(slot, image_index, &calls))
     }
 
-    /// 惰性建界面资源。`want_text = false` 时只建形状管线。
+    /// 惰性建界面资源（两条管线来自共用层 [`pipelines::build_pipelines`]）。
+    ///
+    /// ## 顶点着色器与片段着色器的接口由共用层保证
+    ///
+    /// M3c 的 Step 1 曾在这里踩过一次：形状管线的 VS 写成 `vertex_shader_from_vertex_buffer`
+    /// （M2a 探针用的那个），而形状 FS 声明了 location 0/1/2 的输入 —— **驱动照样建管线成功、
+    /// 照样画出像素**，只有校验层报「FS 有 Input 但上一阶段没有对应 Output」。
+    /// 现在着色器**只有共用层这一个来源**（那里还有跨着色器的接口测试），
+    /// 窗口路径不再自己拼管线 ⇒ 这类错误在窗口路径上不可能再出现。
+    ///
+    /// ## 颜色格式与 viewport 策略
+    ///
+    /// - `color_format` = **交换链的实际格式**（运行期事实，不写死）——
+    ///   M3c 已把 `pick_config` 改成**线性 `*_UNORM` 优先**（sRGB 附件连混合都在线性空间，
+    ///   与 CPU 的字节空间混合对不上，半透明会差几十字节）；
+    /// - `viewport` 由 [`viewport_strategy_from_env`] 决定（默认动态）。
     fn ensure_ui(&mut self, want_text: bool) -> GpuResult<()> {
         if self.ui.is_none() {
-            // ⚠️ 顶点着色器必须与片段着色器的输入**逐 location 对应**：
-            // 形状 FS（`fragment_shader_rect_shape`）声明了 location 0/1/2 的输入，
-            // 只有 `vertex_shader_rect_attrs` 输出它们。实测用错（例如
-            // `vertex_shader_from_vertex_buffer`）时**驱动照样建成功、照样画出像素**，
-            // 只有校验层报「FS 有 Input 但上一阶段没有对应 Output」——
-            // 正是这条验收（`DEER_VK_VALIDATION=1` 零消息）把它抓出来的。
-            let vs = self
-                .device
-                .create_shader_module(&spirv::vertex_shader_rect_attrs())?;
-            let fs = self
-                .device
-                .create_shader_module(&spirv::fragment_shader_rect_shape())?;
-            let layout = self.device.create_pipeline_layout(None)?;
-            let extent = vk::Extent2D {
-                width: self.extent.width,
-                height: self.extent.height,
-            };
-            let stages = [
-                graphics_stage(vk::VK_SHADER_STAGE_VERTEX_BIT, vs.handle()),
-                graphics_stage(vk::VK_SHADER_STAGE_FRAGMENT_BIT, fs.handle()),
-            ];
-            let pipeline = self.device.create_vertex_pipeline(
-                &stages,
-                &layout,
-                &self.render_pass,
-                extent,
-                std::mem::size_of::<GpuVertex>() as u32,
-                &ui_shape_attrs(),
-            )?;
-            self.ui = Some(UiResources {
-                shape: UiShapePipeline {
-                    pipeline,
-                    vs,
-                    fs,
-                    vb: None,
+            let viewport = match viewport_strategy_from_env() {
+                // 静态策略：把**当前交换链尺寸**写进管线（env 里的占位尺寸在这里被替换）
+                pipelines::ViewportStrategy::Static { .. } => pipelines::ViewportStrategy::Static {
+                    width: self.extent.width,
+                    height: self.extent.height,
                 },
-                shape_layout: layout,
-                text: None,
+                other => other,
+            };
+            self.ui_viewport_is_dynamic = viewport == pipelines::ViewportStrategy::Dynamic;
+            let pipes = pipelines::build_pipelines(
+                &self.device,
+                &self.render_pass,
+                self.swapchain.format(),
+                viewport,
+                std::mem::size_of::<GpuVertex>() as u32,
+                &crate::gpu_render::vertex_attrs(),
+                std::mem::size_of::<TextVertex>() as u32,
+                &crate::gpu_render::text_attrs(),
+            )?;
+            let pool = self.device.create_descriptor_pool(1)?;
+            let set = self
+                .device
+                .allocate_descriptor_set(&pool, &pipes.text_set_layout)?;
+            LIVE_UI_RESOURCES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.ui_builds += 1;
+            self.ui = Some(UiResources {
+                pipes,
+                shape_vb: None,
+                text_vb: None,
+                // 顺序契约：`set` 在 `pool` 之前（见类型文档）
+                set,
+                pool,
+                texture: None,
+                uploaded: None,
             });
         }
-        if want_text && self.ui.as_ref().is_some_and(|u| u.text.is_none()) {
-            let tp = self.create_ui_text_pipeline()?;
-            if let Some(ui) = self.ui.as_mut() {
-                ui.text = Some(tp);
-            }
-        }
+        // `want_text = false` 时文本管线**依然存在**（共用层一次建两条）——
+        // 只是不会被 bind，也不会建它的顶点缓冲/纹理。这样 `ensure_ui` 不需要
+        // 「先形状、后补文本」的两段式（那一版在 resize 后要重建两次）。
+        let _ = want_text;
         Ok(())
-    }
-
-    /// 建文本管线（独立顶点布局 stride 32 + `set 0` 组合图像采样器 + 最近邻采样器 + 描述符集）。
-    fn create_ui_text_pipeline(&mut self) -> GpuResult<UiTextPipeline> {
-        let vs = self
-            .device
-            .create_shader_module(&spirv::vertex_shader_text())?;
-        let fs = self
-            .device
-            .create_shader_module(&spirv::fragment_shader_text())?;
-        let set_layout = self.device.create_descriptor_set_layout_combined_sampler()?;
-        let layout = self
-            .device
-            .create_pipeline_layout_ex(None, Some(&set_layout))?;
-        let extent = vk::Extent2D {
-            width: self.extent.width,
-            height: self.extent.height,
-        };
-        let stages = [
-            graphics_stage(vk::VK_SHADER_STAGE_VERTEX_BIT, vs.handle()),
-            graphics_stage(vk::VK_SHADER_STAGE_FRAGMENT_BIT, fs.handle()),
-        ];
-        let pipeline = self.device.create_vertex_pipeline(
-            &stages,
-            &layout,
-            &self.render_pass,
-            extent,
-            std::mem::size_of::<TextVertex>() as u32,
-            &ui_text_attrs(),
-        )?;
-        let sampler = self.device.create_sampler()?;
-        let pool = self.device.create_descriptor_pool(1)?;
-        let set = self.device.allocate_descriptor_set(&pool, &set_layout)?;
-        Ok(UiTextPipeline {
-            pipeline,
-            layout,
-            vs,
-            fs,
-            set_layout,
-            // 顺序契约：`set` 在 `pool` 之前（见类型文档）
-            set,
-            pool,
-            sampler,
-            vb: None,
-            texture: None,
-            uploaded: None,
-        })
     }
 
     /// 图集**指纹变化**才重传纹理（与 `gpu_render.rs` 同一契约：`create_texture_r8` 内部
@@ -1424,18 +1341,17 @@ impl WindowedRenderer {
         let up_to_date = self
             .ui
             .as_ref()
-            .and_then(|u| u.text.as_ref())
-            .is_some_and(|t| t.uploaded == Some(key));
+            .is_some_and(|u| u.uploaded == Some(key));
         if up_to_date {
             return Ok(());
         }
         let data = engine.atlas().coverage().to_vec();
         let texture = self.device.create_texture_r8(w, h, &data)?;
-        if let Some(t) = self.ui.as_mut().and_then(|u| u.text.as_mut()) {
+        if let Some(u) = self.ui.as_mut() {
             self.device
-                .update_descriptor_texture(&t.set, &texture, &t.sampler)?;
-            t.texture = Some(texture);
-            t.uploaded = Some(key);
+                .update_descriptor_texture(&u.set, &texture, &u.pipes.sampler)?;
+            u.texture = Some(texture);
+            u.uploaded = Some(key);
         }
         Ok(())
     }
@@ -1475,14 +1391,11 @@ impl WindowedRenderer {
         let used = [
             (
                 calls.iter().any(|c| c.kind == UiPipeline::Shape),
-                ui.shape.vb.as_ref().map(|v| v.buffer.handle()),
+                ui.shape_vb.as_ref().map(|v| v.buffer.handle()),
             ),
             (
                 calls.iter().any(|c| c.kind == UiPipeline::Text),
-                ui.text
-                    .as_ref()
-                    .and_then(|t| t.vb.as_ref())
-                    .map(|v| v.buffer.handle()),
+                ui.text_vb.as_ref().map(|v| v.buffer.handle()),
             ),
         ];
         for (used, buffer) in used {
@@ -1542,8 +1455,29 @@ impl WindowedRenderer {
         // 都是本结构持有且还没有销毁。
         unsafe {
             (fns.cmd_begin_render_pass)(cmd, &pass_begin, vk::VK_SUBPASS_CONTENTS_INLINE);
-            // ⚠️ **不调** `vkCmdSetViewport`/`vkCmdSetScissor`：这两条管线的 viewport/scissor 是
-            // **静态**的（写死在管线里）。对静态状态发动态设置命令会触发校验层报错。
+            // viewport/scissor：**按策略**给 —— 动态策略必须在录制时设（管线里只有
+            // `count = 1` + 空指针）；静态策略下**不能**调，否则校验层报
+            // 「对静态状态发动态设置命令」。这正是 M2a 那次「动态零像素」的真相：
+            // 那样板声明了动态状态却从未调 `vkCmdSetViewport`。
+            if self.ui_viewport_is_dynamic {
+                let viewport = vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: self.extent.width as f32,
+                    height: self.extent.height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                };
+                (fns.cmd_set_viewport)(cmd, 0, 1, &viewport);
+                let scissor = vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D {
+                        width: self.extent.width,
+                        height: self.extent.height,
+                    },
+                };
+                (fns.cmd_set_scissor)(cmd, 0, 1, &scissor);
+            }
             let mut bound: Option<UiPipeline> = None;
             for call in calls {
                 if bound != Some(call.kind) {
@@ -1552,29 +1486,28 @@ impl WindowedRenderer {
                             (fns.cmd_bind_pipeline)(
                                 cmd,
                                 vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                ui.shape.pipeline.handle(),
+                                ui.pipes.shape.handle(),
                             );
-                            let vb = ui.shape.vb.as_ref().expect("形状段 ⇒ 缓冲已上传");
+                            let vb = ui.shape_vb.as_ref().expect("形状段 ⇒ 缓冲已上传");
                             let offset: vk::DeviceSize = 0;
                             (fns.cmd_bind_vertex_buffers)(cmd, 0, 1, &vb.buffer.handle(), &offset);
                         }
                         UiPipeline::Text => {
-                            let t = ui.text.as_ref().expect("文本段 ⇒ 文本管线已建");
                             (fns.cmd_bind_pipeline)(
                                 cmd,
                                 vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                t.pipeline.handle(),
+                                ui.pipes.text.handle(),
                             );
-                            let vb = t.vb.as_ref().expect("文本段 ⇒ 缓冲已上传");
+                            let vb = ui.text_vb.as_ref().expect("文本段 ⇒ 缓冲已上传");
                             let offset: vk::DeviceSize = 0;
                             (fns.cmd_bind_vertex_buffers)(cmd, 0, 1, &vb.buffer.handle(), &offset);
                             (fns.cmd_bind_descriptor_sets)(
                                 cmd,
                                 vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                t.layout.handle(),
+                                ui.pipes.text_layout.handle(),
                                 0,
                                 1,
-                                &t.set.handle(),
+                                &ui.set.handle(),
                                 0,
                                 ptr::null(),
                             );
@@ -2090,14 +2023,17 @@ mod tests {
             1 << 2,
             "dstAccessMask = VERTEX_ATTRIBUTE_READ = 0x4（**不是** 1<<5 的 SHADER_READ）"
         );
-        assert_eq!(VK_FORMAT_R32_SFLOAT, 100, "规范值：VK_FORMAT_R32_SFLOAT = 100");
     }
 
-    /// **形状管线的顶点属性表**：与 `GpuVertex` 的 `#[repr(C)]` 布局逐字节一致。
+    /// **形状管线的顶点属性表**（现在只有共用的一份：`gpu_render::vertex_attrs`）：
+    /// 与 `GpuVertex` 的 `#[repr(C)]` 布局逐字节一致。
+    ///
+    /// M3c 之前窗口路径自己抄了一份（`ui_shape_attrs`），已按控制者要求**收敛成一处**；
+    /// 这条测试现在直接钉**那一处**。
     #[test]
-    fn ui_shape_attrs_match_the_frozen_vertex_layout() {
-        let a = ui_shape_attrs();
-        assert_eq!(a.len(), 4, "四个 location");
+    fn shared_shape_attrs_match_the_frozen_vertex_layout() {
+        let a = crate::gpu_render::vertex_attrs();
+        assert_eq!(a.len(), 4, "四个 location（少了会报 Input-07904）");
         assert_eq!(
             (a[0].location, a[0].offset),
             (0, std::mem::offset_of!(GpuVertex, pos) as u32)
@@ -2117,12 +2053,13 @@ mod tests {
         // 冻结的布局：stride 44、偏移 0/8/24/28（M3a 契约）
         assert_eq!(std::mem::size_of::<GpuVertex>(), 44, "GpuVertex stride 已冻结");
         assert_eq!(a[3].offset, 28, "color 在偏移 28");
+        assert_eq!(a[2].format, 100, "radius_kind 是 R32_SFLOAT（规范值 100）");
     }
 
-    /// **文本管线的顶点属性表**：`TextVertex`（stride 32 / 偏移 0, 8, 16）。
+    /// **文本管线的顶点属性表**（同样只有共用的一份）：`TextVertex`（stride 32 / 偏移 0, 8, 16）。
     #[test]
-    fn ui_text_attrs_match_the_frozen_vertex_layout() {
-        let a = ui_text_attrs();
+    fn shared_text_attrs_match_the_frozen_vertex_layout() {
+        let a = crate::gpu_render::text_attrs();
         assert_eq!(a.len(), 3);
         assert_eq!((a[0].location, a[0].offset), (0, 0));
         assert_eq!((a[1].location, a[1].offset), (1, 8));

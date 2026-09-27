@@ -81,12 +81,17 @@ fn e(w: u32, h: u32) -> Extent {
     }
 }
 
-/// 优先 `B8G8R8A8_SRGB` + `FIFO` + 用 `currentExtent` + `minImageCount + 1`。
+/// **线性格式优先**（M3c 裁决）+ `FIFO` + 用 `currentExtent` + `minImageCount + 1`。
+///
+/// 为什么不是 sRGB：sRGB 附件连**混合**都在线性空间，而 CPU 参考实现按字节混合 ⇒
+/// 半透明像素差几十字节（实测 `src=0xC0,a=0.5,dst=0`：96 vs 140，差 44）。
+/// 那条实测与推导见 `pipelines.rs` 的模块文档。
 #[test]
-fn pick_config_prefers_bgra8_srgb_and_fifo() {
+fn pick_config_prefers_linear_bgra8_and_fifo() {
     let c = caps(2, 8, Some(e(960, 600)), e(1, 1), e(8192, 8192));
     let formats = [
         fmt(VK_FORMAT_R8G8B8A8_UNORM),
+        fmt(VK_FORMAT_B8G8R8A8_UNORM),
         fmt(VK_FORMAT_B8G8R8A8_SRGB),
         fmt(VK_FORMAT_R8G8B8A8_SRGB),
     ];
@@ -97,10 +102,32 @@ fn pick_config_prefers_bgra8_srgb_and_fifo() {
         VK_PRESENT_MODE_IMMEDIATE_KHR,
     ];
     let cfg = pick_config(&c, &formats, &modes, e(100, 100)).expect("应当挑得出来");
-    assert_eq!(cfg.format, VK_FORMAT_B8G8R8A8_SRGB);
+    assert_eq!(
+        cfg.format, VK_FORMAT_B8G8R8A8_UNORM,
+        "线性 BGRA 优先（其次线性 RGBA，再才是 sRGB）"
+    );
     assert_eq!(cfg.present_mode, VK_PRESENT_MODE_FIFO_KHR);
     assert_eq!(cfg.extent, e(960, 600), "currentExtent 有值时必须用它");
     assert_eq!(cfg.image_count, 3, "minImageCount + 1");
+}
+
+/// 只有线性 RGBA 时选它（而不是退回 sRGB）。
+#[test]
+fn pick_config_prefers_linear_rgba_when_no_bgra() {
+    let c = caps(2, 8, None, e(1, 1), e(4096, 4096));
+    let formats = [fmt(VK_FORMAT_R8G8B8A8_UNORM), fmt(VK_FORMAT_B8G8R8A8_SRGB)];
+    let cfg = pick_config(&c, &formats, &[VK_PRESENT_MODE_FIFO_KHR], e(640, 480)).unwrap();
+    assert_eq!(cfg.format, VK_FORMAT_R8G8B8A8_UNORM);
+}
+
+/// 只有 sRGB 时**如实退回**（此时窗口与 CPU 的混合空间不同 ⇒
+/// `window_parity` 会打印实际格式，不许悄悄按逐字节判）。
+#[test]
+fn pick_config_falls_back_to_srgb_only_when_no_linear_format() {
+    let c = caps(2, 8, None, e(1, 1), e(4096, 4096));
+    let formats = [fmt(VK_FORMAT_B8G8R8A8_SRGB), fmt(VK_FORMAT_R8G8B8A8_SRGB)];
+    let cfg = pick_config(&c, &formats, &[VK_PRESENT_MODE_FIFO_KHR], e(640, 480)).unwrap();
+    assert_eq!(cfg.format, VK_FORMAT_B8G8R8A8_SRGB);
 }
 
 /// 同样的输入必须给同样的输出（确定性 —— 配置漂移是「有时对有时错」的根源）。
@@ -124,13 +151,13 @@ fn pick_config_falls_back_when_no_srgb_format() {
     assert_eq!(cfg.format, VK_FORMAT_R8G8B8A8_UNORM);
 }
 
-/// 列表只有 `VK_FORMAT_UNDEFINED` ⇒ 规范含义是「任意格式都行」⇒ 用 `B8G8R8A8_SRGB`。
+/// 列表只有 `VK_FORMAT_UNDEFINED` ⇒ 规范含义是「任意格式都行」⇒ 用**线性** `B8G8R8A8_UNORM`。
 #[test]
 fn pick_config_handles_undefined_only_format() {
     let c = caps(2, 4, None, e(1, 1), e(4096, 4096));
     let formats = [fmt(VK_FORMAT_UNDEFINED)];
     let cfg = pick_config(&c, &formats, &[VK_PRESENT_MODE_FIFO_KHR], e(640, 480)).unwrap();
-    assert_eq!(cfg.format, VK_FORMAT_B8G8R8A8_SRGB);
+    assert_eq!(cfg.format, VK_FORMAT_B8G8R8A8_UNORM);
 }
 
 /// `want` 超出 `maxImageExtent` ⇒ 夹到上限。

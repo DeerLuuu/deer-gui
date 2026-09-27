@@ -133,7 +133,9 @@ const MIN_VERTEX_BYTES: u64 = 4096;
 ///
 /// `tests/gpu_vs_cpu.rs::vertex_layout_matches_the_hand_written_attribute_offsets`
 /// 另外钉住**字面数字**（stride 44 / 0 / 8 / 24 / 28）—— 布局若被改动，两个地方都会红。
-fn vertex_attrs() -> [VertexAttr; 4] {
+/// `pub(crate)`：窗口路径（`windowed.rs`）用**同一份** —— M3c 要求把「两处同源复制」
+/// 收敛成一处，所以这里是全仓库唯一的一份，`windowed.rs` 直接 `use` 它而不是再抄一遍。
+pub(crate) fn vertex_attrs() -> [VertexAttr; 4] {
     [
         VertexAttr {
             location: 0,
@@ -162,7 +164,8 @@ fn vertex_attrs() -> [VertexAttr; 4] {
 ///
 /// 与 `spirv::vertex_shader_text` 的 `location 0/1/2` 逐字段对应；偏移同样用 `offset_of!`
 /// 取（结构上不可能与 `gpu_text` 的 `#[repr(C)]` 布局漂移）。
-fn text_attrs() -> [VertexAttr; 3] {
+/// `pub(crate)`：与 [`vertex_attrs`] 同一理由（窗口路径共用这一份）。
+pub(crate) fn text_attrs() -> [VertexAttr; 3] {
     [
         VertexAttr {
             location: 0,
@@ -254,7 +257,9 @@ struct TextResources {
 ///
 /// 代价是每条命令一次小分配。GUI 一帧的命令数在几十~几百量级，可忽略；
 /// 真正的批处理优化（合并段、减少 draw call）属后续任务。
-fn single_command_in_clip(active_clip: &[RectI], cmd: &DrawCmd) -> DrawList {
+/// `pub(crate)`：窗口路径（`windowed.rs::draw_and_present`）用**同一份**实现 ——
+/// 两条渲染路径的「逐命令翻译 + 裁剪栈重放」必须逐字相同，复制两份就是「只改了一边」的温床。
+pub(crate) fn single_command_in_clip(active_clip: &[RectI], cmd: &DrawCmd) -> DrawList {
     let mut l = DrawList::new();
     for r in active_clip {
         l.push(DrawCmd::PushClip { rect: *r });

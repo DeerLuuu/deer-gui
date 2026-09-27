@@ -73,6 +73,8 @@ pub const VK_FORMAT_B8G8R8A8_SRGB: i32 = 50;
 pub const VK_FORMAT_B8G8R8A8_UNORM: i32 = 44;
 /// `VkFormat::VK_FORMAT_R8G8B8A8_SRGB`（**字节序就是 R,G,B,A**）。
 pub const VK_FORMAT_R8G8B8A8_SRGB: i32 = 43;
+/// `VkFormat::VK_FORMAT_R8G8B8A8_UNORM`（同上，线性）。
+pub const VK_FORMAT_R8G8B8A8_UNORM: i32 = 37;
 
 /// `VkSwapchainCreateInfoKHR`
 ///
@@ -235,9 +237,18 @@ pub enum Present {
 /// **纯逻辑**：挑一组确定性的合法交换链配置。
 ///
 /// 规则（顺序即优先级，全部可单测）：
-/// 1. **格式**：优先 `B8G8R8A8_SRGB`，其次 `R8G8B8A8_SRGB`；
-///    若列表只有 `VK_FORMAT_UNDEFINED`（规范：表示「任意格式都行」）⇒ 用 `B8G8R8A8_SRGB`；
-///    都没有 ⇒ 用第一个**非 UNDEFINED** 的（如实退回，不假装有 sRGB）。
+/// 1. **格式：优先线性 `*_UNORM`**（本机实测支持 `B8G8R8A8_UNORM = 0x2c` 与
+///    `R8G8B8A8_UNORM = 0x25`）。理由（M3c 的裁决，实测数字见 `docs`/报告）：
+///    **sRGB 附件不只在写入时编码，混合本身也发生在线性空间**，而 CPU 参考实现
+///    （`null.rs::blend_cov`）在**字节空间**混合 ⇒ 半透明像素两边对不上
+///    （实测 `src=0xC0, a=0.5, dst=0`：字节空间 **96** vs sRGB 线性 **140**，
+///    **差 44 字节**）；不透明像素两者一致。窗口要让「上屏像素 == CPU 像素」可判，
+///    就必须用线性附件。
+///    顺序：`B8G8R8A8_UNORM` → `R8G8B8A8_UNORM` → `B8G8R8A8_SRGB` → `R8G8B8A8_SRGB`
+///    （**退回 sRGB 是诚实退回**：这时混合空间与 CPU 不同，调用方必须自己知道，
+///    `window_parity` 会把实际选到的格式打印出来）。
+///    若列表只有 `VK_FORMAT_UNDEFINED`（规范：表示「任意格式都行」）⇒ 用线性 BGRA；
+///    都没有 ⇒ 用第一个**非 UNDEFINED** 的。
 /// 2. **呈现模式**：优先 `FIFO`（规范保证任何实现都支持），其次 `FIFO_RELAXED`，
 ///    再退回列表第一个。
 /// 3. **尺寸**：`currentExtent` 有值就**必须**用它（否则 `vkCreateSwapchainKHR`
@@ -261,8 +272,13 @@ pub fn pick_config(
         ));
     }
 
-    // ① 格式
-    let preferred = [VK_FORMAT_B8G8R8A8_SRGB, VK_FORMAT_R8G8B8A8_SRGB];
+    // ① 格式：**线性优先**（见上面第 1 条的实测理由），sRGB 只作为退回
+    let preferred = [
+        VK_FORMAT_B8G8R8A8_UNORM,
+        VK_FORMAT_R8G8B8A8_UNORM,
+        VK_FORMAT_B8G8R8A8_SRGB,
+        VK_FORMAT_R8G8B8A8_SRGB,
+    ];
     let chosen_format = preferred
         .iter()
         .find_map(|p| formats.iter().find(|f| f.format == *p).copied())
@@ -273,8 +289,8 @@ pub fn pick_config(
                 .copied()
         })
         .unwrap_or(SurfaceFormat {
-            // 全是 UNDEFINED ⇒ 规范允许任意格式，选 Windows 最常见的 sRGB BGRA
-            format: VK_FORMAT_B8G8R8A8_SRGB,
+            // 全是 UNDEFINED ⇒ 规范允许任意格式，选 Windows 最常见的**线性** BGRA
+            format: VK_FORMAT_B8G8R8A8_UNORM,
             color_space: formats[0].color_space,
         });
 

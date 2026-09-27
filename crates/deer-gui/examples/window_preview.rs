@@ -44,13 +44,19 @@ use deer_gui::layout::builder::{Builder, L};
 use deer_gui::layout::layout;
 use deer_gui::layout::layout::TextStyle;
 use deer_gui::layout::node::{Kind, Rect};
-use deer_gui::vk::windowed::{srgb_encoded_byte, FrameOutcome, WindowedRenderer};
+use deer_gui::vk::windowed::{FrameOutcome, WindowedRenderer};
 use deer_gui::window::{App, Flow, WindowConfig, WindowInfo, run};
 
 /// 清屏色：**界面没盖住的地方**就是这个颜色（界面树的根面板会盖住大部分窗口）。
 ///
-/// **sRGB 的坑**（M2b 已实测）：交换链格式是 `B8G8R8A8_SRGB`，写进去的线性值由驱动编码，
-/// 所以回读到的字节是 [`srgb_encoded_byte`] 编码后的值，不是原值。
+/// **颜色空间（M3c 定稿）**：交换链现在优先选**线性** `*_UNORM` 格式（本机实测
+/// `0x2c = B8G8R8A8_UNORM`）⇒ 写进去的字节**就是**回读到的字节，不再是 M2b 时代
+/// 「sRGB 编码后的值」。
+///
+/// 为什么必须改成线性：sRGB 附件连**混合**都发生在线性空间，而 CPU 参考实现
+/// （`null.rs::blend_cov`）按**字节空间**混合 ⇒ 半透明像素两边差几十字节
+/// （实测 `src=0xC0,a=0.5,dst=0`：96 vs 140，差 **44**），
+/// 「窗口像素 == CPU 像素」这条判据在 sRGB 附件上**根本不成立**。
 const CLEAR: Color = Color::rgb(0x08, 0x09, 0x0C);
 
 fn readback_enabled() -> bool {
@@ -177,13 +183,12 @@ impl Preview {
             let i = ((y as usize) * (w as usize) + (x as usize)) * 4;
             [px[i], px[i + 1], px[i + 2], px[i + 3]]
         };
-        // 基准 = 「界面没盖上时」应当看到的颜色（sRGB 编码后的清屏色）。
-        let clear = [
-            srgb_encoded_byte(CLEAR.r),
-            srgb_encoded_byte(CLEAR.g),
-            srgb_encoded_byte(CLEAR.b),
-            255,
-        ];
+        // 基准 = 「界面没盖上时」应当看到的颜色。
+        //
+        // 线性 `*_UNORM` 交换链 ⇒ 写入的字节原样出现在回读里（**不再** sRGB 编码）。
+        // 这是可断言的事实：格式若不是线性的，示例会在下面 `assert!(format_is_linear)` 处
+        // 明确报出来，而不是让基准悄悄错。
+        let clear = [CLEAR.r, CLEAR.g, CLEAR.b, 255];
         let non_clear = px
             .chunks_exact(4)
             .filter(|p| p[0] != clear[0] || p[1] != clear[1] || p[2] != clear[2])

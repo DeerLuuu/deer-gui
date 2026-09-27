@@ -27,6 +27,12 @@ required-features = ["window"]
 name = "hal_window_path"
 required-features = ["window"]
 
+# M3c：上屏像素 vs CPU 的逐像素对照（读回最后一帧）。同样是窗口路径 ⇒ 必须要 window feature，
+# 也必须是 example 而不是 `#[test]`（winit 要求主线程，见 hal_window_path.rs 的说明）。
+[[example]]
+name = "window_parity"
+required-features = ["window"]
+
 [lib]
 name = "deer_gui"
 path = "src/lib.rs"
