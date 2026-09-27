@@ -23,6 +23,7 @@
 | [10](#10-现状与边界) | 现状与边界 | 知道什么还不能做 |
 | [11](#11-真实文字) | 真实文字 | 一张**真字形**的图 |
 | [12](#12-在窗口里看到画面) | 在窗口里看到画面 | 一个**真窗口** |
+| [13](#13-用-gpu-画界面) | 用 GPU 画界面 | 一张 **GPU 画的**界面图 |
 
 ---
 
@@ -429,16 +430,72 @@ $env:DEER_WINDOW_HOLD='1'; cargo run -p deer-gui --features window --example win
 - **事件循环必须在主线程**：窗口与事件循环由 `deer_window::run(config, app)` 管，
   你实现 `App`（`init` 建渲染器 / `redraw` 画一帧 / 可选 `resized`）。
 - **窗口里还不是界面**：M2b 只保证「GPU 画的像素能出现在窗口上」——现在显示的是清屏色 + M2a
-  验证过的几何。把 `DrawList`（控件/文字/裁剪）送上 GPU 是 **M3**。
+  验证过的几何。**M3a 已能把非文本界面几何画到 GPU（离屏，见第 13 章）**，但把它呈到窗口里是 **M3c**、
+  文本上 GPU 是 **M3b**。
 - **交换链会过期**：`render_and_present()` 返回 `OutOfDate` 时**必须 resize 后重试**，不许当成功。
 - **第一帧会回读像素核对**（`read_back_last_frame()`）：终端里能看到
   `像素回读 : 四角 [71, 79, 105, 255] = sRGB 编码后的清屏色 rgb(0x10,0x14,0x24)` ——
   注意**不是** `[16,20,36]`（sRGB 附件的驱动编码）；回读**强制一次 GPU→CPU 同步**，所以只在第一帧做一次。
 - 目前**只有 Windows** 实现了窗口句柄的填充；非 Windows 会明确返回 `Err`。
 
-**仍然做不到**：鼠标/键盘输入（M5）、窗口里的界面（M3）、多窗口 / 全屏 / HDR / 帧率上限。
+**仍然做不到**：鼠标/键盘输入（M5）、窗口里的界面（M3c）、文本上 GPU（M3b）、
+多窗口 / 全屏 / HDR / 帧率上限。
 完整边界见 [`features/window.md`](features/window.md) 与
 [`features/vulkan-swapchain.md`](features/vulkan-swapchain.md) 第 6 节。
+
+---
+
+## 13. 用 GPU 画界面
+
+**目标**：让 **Vulkan** 画出界面树的几何（**不含文本**），并且与 CPU 参考实现**逐像素一致**（M3a）。
+
+```powershell
+cargo run -p deer-gui --example gpu_geometry
+```
+
+**你会看到**（本机实测）：
+
+```text
+画布        : 320×200
+绘制命令    : 14 条（填充 0 / 圆角 7 / 描边 7 / 裁剪 0 对 / 文本 0）
+顶点数      : 210（每帧一个顶点缓冲、一次 draw）
+非清屏色像素: 3152 / 64000
+最大通道差  : 0（要求 0，逐字节相同）
+额外场景    : 裁剪 + 嵌套裁剪 + 粗描边（带宽 > 边长）→ 最大通道差 0
+```
+
+产物：`render_out/gpu_geometry.png`（GPU 回读）与 `render_out/gpu_geometry_cpu.png`（CPU 基准）——
+两张图逐字节相同（可以直接用看图工具对比）。
+
+```rust
+// 片段（放在返回 Result<(), String> 的函数里）：extent / theme / list 见上一段
+use deer_gui::prelude::*;
+use deer_gui::vk::GpuGeometryRenderer;
+
+// 同一份 DrawList：GPU 画一遍，CPU 画一遍，再逐字节比
+let mut gpu = GpuGeometryRenderer::new(0, extent, theme.surface).map_err(|e| e.to_string())?;
+let gpu_px = gpu.render(&list).map_err(|e| e.to_string())?;
+let mut cpu_renderer = CpuRenderer::new();
+let cpu = cpu_renderer
+    .render(extent, &list, theme.surface)
+    .map_err(|e| e.to_string())?;
+assert_eq!(gpu_px, cpu.pixels, "不透明几何必须逐字节相同");
+```
+
+**这一章的关键概念**：
+- **这条链不含文本**：`DrawCmd::Text` 目前明确 `Unsupported`（文本上 GPU 是 **M3b**）。
+  示例的树只用带 `pad` 的容器 —— 它们只产生 `FillRoundRect` / `StrokeRect`。
+- **硬判据是与 CPU 逐字节相同**：不透明几何最大通道差 **0**；半透明场景实测最大差 **1 LSB**
+  （**实测上限，不是证明上界**），全量对照见 `crates/deer-vk/tests/gpu_vs_cpu.rs`。
+- **静态 viewport/scissor**：动态版在本机 Intel 核显上**画不出任何像素**（M2a 实测），
+  所以管线把 viewport/scissor 写死；**换画布尺寸要新建渲染器**。
+- **颜色附件是线性 `R8G8B8A8_UNORM`**（不是 `_SRGB`）：CPU 基准不做 gamma，用 SRGB 会系统性偏差。
+- **`DEER_VK_VALIDATION=1` 下 parity 零校验消息**是**观察性**结论（自动断言还在加固），
+  不要把它当成硬保证。
+- 当前**每帧一个顶点缓冲、一次 draw**（没有批处理优化），属性能项、不影响正确性。
+
+**仍然做不到**：文本/字形（M3b）、纹理、窗口里显示界面（M3c）、批处理优化、sRGB/色彩管理、MSAA。
+完整边界见 [`features/gpu-geometry.md`](features/gpu-geometry.md) 第 6 节。
 
 ---
 
@@ -456,4 +513,5 @@ $env:DEER_WINDOW_HOLD='1'; cargo run -p deer-gui --features window --example win
 | 真实文字 | `cargo run -p deer-gui --example text_render` | 真字形界面图 + 度量/像素自检 |
 | 字形光栅化 + 图集 | `cargo run -p deer-gui --example glyph_atlas` | 图集 PNG + 覆盖率/利用率统计 |
 | 真窗口预览 | `cargo run -p deer-gui --features window --example window_preview` | 一个真窗口（GPU 清屏色 + 几何）+ 帧数统计 |
+| GPU 画界面（非文本） | `cargo run -p deer-gui --example gpu_geometry` | GPU 出的界面图 + 与 CPU 逐字节对照 |
 | Vulkan 现状 | `cargo run -p deer-gui --example vulkan_devices` | 本机 GPU + 着色器验收 |
