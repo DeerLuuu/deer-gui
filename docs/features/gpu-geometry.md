@@ -157,7 +157,7 @@ assert_eq!(gpu.extent(), extent);
 ```
 
 本仓库的**权威判据**在 `crates/deer-vk/tests/gpu_vs_cpu.rs`（本机实跑：`cargo test -p deer-vk --test gpu_vs_cpu -- --list`
-→ **12 tests**；测试数/语料随加固增长，**以该命令输出为准**）：
+看用例清单；测试数/语料随加固增长，**一律以该命令输出为准**，本文不固化条数）：
 
 | 测试 | 判据 | 本机实测 |
 |---|---|---|
