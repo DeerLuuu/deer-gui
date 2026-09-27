@@ -136,6 +136,28 @@ State the precondition explicitly, right next to the assertion it protects:
 
 Corollary: for two-way mutations ("never emit" ⇒ red, "emit when it should not" ⇒ red), assert **both** the reaching condition and the count delta — one-sided guards hide exactly this class of failure.
 
+### Dump the real artifact before writing a bytecode- or encoding-level criterion
+
+When you guard a *generated* artifact (SPIR-V, bytecode, an encoded format), **print the real thing first** and write the matcher against what is actually there. Guessing from index memory produces criteria that match **something else** — and a criteria that matches something else **stays green**, so nothing tells you it is wrong.
+
+**Case (four versions, the first three refuted by measurement).** To pin down "the unified pipeline's discriminant is `uv.x < 0`": v1 — "some comparison with one side a component-0 extract of some `vec`" — was a **no-op**: it matched the *shape* criterion (`dl < 0`) instead, so it stayed green even after the discriminant was removed. v2/v3 matched either the sampling-coordinate `Id` or the `OpLoad` result of `uv`, **missing one `OpCompositeExtract` layer** (the comparison actually consumes `OpCompositeExtract(uv, 0)`). Dumping the real bytecode settled it: `var20=uv` / `29=OpLoad(var20)` / `165=Extract(29,0)` / `166=OpFOrdLessThan(165,24)` / four `OpSelect(166,…)`.
+
+⇒ Rules:
+
+- **Dump first** (`--nocapture`, `export_spirv`, an example that prints the bytes), **then** write the matcher against the dump.
+- **Give every artifact criterion a reverse self-check**: flip the threshold (e.g. `1.0` ⇒ must go red), or replace the operand with a constant (⇒ must go red). Without it, "matched the wrong thing" is indistinguishable from "correctly matched".
+
+### After restoring a file in place, clean the crate or prove a rebuild
+
+`git checkout --` / `Copy-Item` / any in-place restore can leave a **stale `target/`**: restored files may keep their old `mtime`, or incremental compilation may reuse the **mutated `.o`**. Your next measurement then tests the old artifact, not the restored source.
+
+**Case.** Restoring `spirv.rs` with `Copy-Item` from a backup **preserved the mtime**, so cargo did not rebuild; the resulting run led to the (completely wrong) conclusion that "the discriminant is not in the library", and a long detour. Sibling incident: a restore from backup left tests red because incremental compilation reused the mutated object file.
+
+⇒ Rules:
+
+- After any in-place restore, run **`cargo clean -p <crate>`**, or **confirm in the output that it really recompiled** (watch for `Compiling <crate>`).
+- **`git status` being clean does not mean `target/` is clean.** A clean worktree says nothing about what the compiler will reuse.
+
 ## Design constraints and known traps
 
 These are not suggestions. Each one exists because a defect was found, and each is guarded by a test. Read this section before changing layout, rendering, or text code.
