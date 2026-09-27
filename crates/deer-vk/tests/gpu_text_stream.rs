@@ -270,6 +270,143 @@ fn multi_char_advances_the_pen_glyph_by_glyph() {
     );
 }
 
+/// **`align = 2` + 文本宽于 `rect` ⇒ 起点为负，被画布裁掉**（「起点公式 × 裁剪」的交互）。
+///
+/// 这是控制者点名的边界（第 1 轮核查的 harness 里已验证过一次，这里把它变成长期回归）：
+/// - 首个可见顶点必须在画布左边界（NDC `-1`），**不能**是负起点映射出来的 `<-1`；
+/// - `uv` 必须跟着像素位置右移（裁掉多少列，`u` 就右移多少列）；
+/// - 所有顶点都必须落在画布内（`pos ∈ [-1, 1]`）—— 这条能抓住「裁剪漏了」的整类错误。
+#[test]
+fn align_2_with_text_wider_than_rect_clips_the_negative_start() {
+    let Some(mut e) = engine(20.0) else { return };
+    let extent = Extent {
+        width: 128,
+        height: 48,
+    };
+    let size = 20.0;
+    let rect = RectI::new(10, 5, 30, 30); // 窄到让右对齐的起点为负
+
+    // 前提自查：这个 rect 必须真的窄（否则本用例失去意义）
+    let total: f32 = {
+        let ps: Vec<Option<GlyphPlacement>> = "Align".chars().map(|c| e.glyph(c, size)).collect();
+        ps.iter().flatten().map(|p| p.advance).sum()
+    };
+    assert!(
+        rect.right() as f32 - total < 0.0,
+        "前提：文本宽 {total} 必须超过 rect 右边界 {} ⇒ 起点为负",
+        rect.right()
+    );
+
+    let quads = cpu_layout(&mut e, "Align", rect, size, 2);
+    assert!(quads[0].0 < 0, "首字形位图左边缘应当为负，实际 {}", quads[0].0);
+    let (gx0, _gy0, slot) = quads[0];
+    let (aw, _ah) = e.atlas().size();
+
+    let list = text_list("Align", rect, size, 2);
+    let s = gpu_text::build_text_stream(&list, extent, &mut e);
+    assert!(!s.vertices.is_empty(), "被裁掉左边之后仍应有可见字形");
+    assert_eq!(s.skipped, 0, "画出东西了 ⇒ 不算 skipped");
+
+    let v = s.vertices[0];
+    assert!(
+        close(v.pos[0], -1.0),
+        "首个可见顶点必须贴在画布左边界（NDC -1），实际 {:?}（起点 {gx0}）",
+        v.pos
+    );
+    assert!(
+        close(v.uv[0], (slot.x as f32 + (0 - gx0) as f32) / aw as f32),
+        "uv 必须跟着像素位置右移：裁掉 {} 列 ⇒ u 应右移同样多列",
+        -gx0
+    );
+    // 全部顶点都在画布内（裁剪没漏）
+    for (i, v) in s.vertices.iter().enumerate() {
+        assert!(
+            (-1.0..=1.0).contains(&v.pos[0]) && (-1.0..=1.0).contains(&v.pos[1]),
+            "顶点 {i} 越出画布：{:?}",
+            v.pos
+        );
+    }
+}
+
+/// **未定义的 `align` 值 ⇒ 左对齐兜底**（契约的一部分：CPU 是 `_ => rect.x as f32`）。
+///
+/// 也就是说 `align = 3 / 9 / 255` 必须与 `align = 0` 产出**完全相同**的顶点流 ——
+/// 将来若有人把 match 改成「1/2 之外报错或夹到最近值」，这条会红。
+#[test]
+fn unknown_align_values_fall_back_to_left_alignment() {
+    let Some(mut e) = engine(20.0) else { return };
+    let extent = Extent {
+        width: 160,
+        height: 48,
+    };
+    let rect = RectI::new(10, 5, 120, 30);
+    let size = 20.0;
+
+    let baseline = gpu_text::build_text_stream(&text_list("Align", rect, size, 0), extent, &mut e);
+    assert!(!baseline.vertices.is_empty());
+
+    for align in [3u8, 9, 255] {
+        let s = gpu_text::build_text_stream(&text_list("Align", rect, size, align), extent, &mut e);
+        assert_eq!(
+            s.vertices, baseline.vertices,
+            "align={align} 未定义 ⇒ 必须与 align=0（左对齐）产出完全相同的顶点流"
+        );
+        assert_eq!(s.skipped, baseline.skipped);
+    }
+}
+
+/// **越界 alpha 必须与 CPU 基线一样夹到 `[0,1]`**（`gpu_text` 侧的覆盖缺口，现已补上）。
+///
+/// CPU `null.rs::blend_cov` 第一步就是 `c.a.clamp(0.0, 1.0)`，而 `Color::rgba` 对 alpha 没有校验。
+/// 若不夹：`a = 1.5` 时 GPU 会按 `src*1.5 + dst*(-0.5)` 外推混合，而 CPU 按 `a = 1.0` —— 两边必然对不上。
+/// 这条用例与 `gpu_geom_stream::out_of_range_alpha_is_clamped_like_the_cpu_baseline` 对称；
+/// **它存在的意义**：将来把 `color_f32` 从 `gpu_geom` 提为 `pub(crate)` 共用时，缺口不会一起被继承。
+#[test]
+fn out_of_range_alpha_is_clamped_like_the_cpu_baseline() {
+    let Some(mut e) = engine(20.0) else { return };
+    let Some(e_cpu) = engine(20.0) else { return };
+    let extent = Extent {
+        width: 96,
+        height: 48,
+    };
+    let rect = RectI::new(4, 4, 80, 36);
+    let size = 20.0;
+    let mk = |a: f32| {
+        let mut l = DrawList::new();
+        l.push(DrawCmd::Text {
+            rect,
+            text: "Ag".into(),
+            color: Color::rgba(10, 20, 30, a),
+            size,
+            align: 0,
+        });
+        l
+    };
+
+    // ① a = 1.5 ⇒ 顶点 alpha 夹到 1.0
+    let s_hi = gpu_text::build_text_stream(&mk(1.5), extent, &mut e);
+    assert!(!s_hi.vertices.is_empty());
+    for (i, v) in s_hi.vertices.iter().enumerate() {
+        assert!(close(v.color[3], 1.0), "顶点 {i}：a=1.5 应夹到 1.0，实际 {}", v.color[3]);
+        assert!(close(v.color[0], 10.0 / 255.0), "RGB 不该被改动");
+    }
+    // ② a = -0.25 ⇒ 顶点 alpha 夹到 0.0；CPU 那边也一个像素都不写
+    let s_lo = gpu_text::build_text_stream(&mk(-0.25), extent, &mut e);
+    assert!(!s_lo.vertices.is_empty(), "几何照旧产出（裁剪/覆盖与颜色无关）");
+    for (i, v) in s_lo.vertices.iter().enumerate() {
+        assert!(close(v.color[3], 0.0), "顶点 {i}：a=-0.25 应夹到 0.0，实际 {}", v.color[3]);
+    }
+    let clear = Color::rgb(0, 0, 0);
+    let fb_lo = CpuRenderer::with_text(e_cpu)
+        .render(extent, &mk(-0.25), clear)
+        .expect("CPU 渲染");
+    let wrote = (0..extent.height as i32)
+        .flat_map(|y| (0..extent.width as i32).map(move |x| (x, y)))
+        .filter(|&(x, y)| fb_lo.pixel(x, y).map(|p| p[0..3] != [0, 0, 0]).unwrap_or(false))
+        .count();
+    assert_eq!(wrote, 0, "a 夹到 0 ⇒ CPU 不写任何像素（GPU 侧顶点 alpha = 0，语义一致）");
+}
+
 /// **假阳性修复**：空串 ⇒ 跳过并计入 `skipped`，**不报错**（这个 API 根本没有 Result 可报错）。
 #[test]
 fn empty_string_is_skipped_not_an_error() {

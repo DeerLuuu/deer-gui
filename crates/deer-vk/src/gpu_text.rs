@@ -21,7 +21,7 @@
 //! |---|---|
 //! | `placements = text.chars().map(\|c\| engine.glyph(c, size))` | 同（**首次出现会光栅化入图集**，缺字回退 `.notdef`） |
 //! | `total = Σ flatten(advance)` | 同 |
-//! | `start_x = match align { 1 => rect.x + (rect.w - total)/2, 2 => rect.right() - total, _ => rect.x }` | 同 |
+//! | `start_x = match align { 1 => rect.x + (rect.w - total)/2, 2 => rect.right() - total, _ => rect.x }` | 同。**注意 `align` 是 `u8`、只有 0/1/2 有定义**：未定义值（`>= 3`）与 CPU 一样走**左对齐**兜底 —— 这是契约的一部分，有测试 `unknown_align_values_fall_back_to_left_alignment` 钉住。另外这里是 **f32 `/ 2.0`**（真实字形路径），不是占位路径的 i32 截断除法 |
 //! | `baseline = rect.y + ((rect.h - (asc+desc))/2).round() + asc.round()`（再 `.round()`） | 同 |
 //! | `gx0 = pen.round() + left`、`gy0 = baseline - top` | 同 |
 //! | 逐 texel `coverage[slot] → blend_cov(cov/255)` | 四边形 + `uv`（**NEAREST** 采样后由片元着色器乘 `cov`） |
