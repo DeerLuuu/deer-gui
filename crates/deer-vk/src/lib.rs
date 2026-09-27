@@ -29,6 +29,7 @@
 pub mod device;
 pub mod ffi;
 pub mod ffi_dev;
+pub mod gpu_geom;
 pub mod hal;
 pub mod loader;
 pub mod offscreen;

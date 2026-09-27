@@ -1,0 +1,321 @@
+//! `DrawList` → GPU 顶点流的**纯逻辑**断言（不需要 GPU、不需要着色器）。
+//!
+//! 这一层要锁死三件事：
+//! 1. **像素 → NDC 的换算**（`y` 向下为正 ⇒ 像素 (0,0) 左上角映射到 `(-1,-1)`）；
+//! 2. **裁剪在 CPU 侧做几何裁剪**，且 `pos`（光栅化范围）与 `rect` 属性（圆角/描边判据）
+//!    必须**分开** —— `pos` 用裁剪后的矩形，`rect` 保持原始矩形（见 ledger Ruling 5）；
+//! 3. **文本不静默丢弃**：`DrawCmd::Text` 记入 `unsupported`，让调用方看得见。
+
+use deer_gpu::{Color, DrawCmd, DrawList, Extent, RectI};
+use deer_vk::gpu_geom;
+
+/// 浮点近似比较（NDC 是算出来的，不能指望逐位相等）。
+fn close(a: f32, b: f32) -> bool {
+    (a - b).abs() < 1e-6
+}
+
+#[test]
+fn fill_rect_becomes_two_triangles_in_ndc() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 8, 4), color: Color::WHITE });
+    let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 4 });
+    assert_eq!(s.vertices.len(), 6);
+    // (0,0) 像素中心 → NDC (-1,-1)（y 向下）
+    assert_eq!(s.vertices[0].pos, [-1.0, -1.0]);
+    assert_eq!(s.vertices[0].rect, [0.0, 0.0, 8.0, 4.0]);
+    assert_eq!(s.vertices[0].radius_kind, gpu_geom::RADIUS_FILL);
+    assert!(s.unsupported.is_empty());
+}
+
+#[test]
+fn text_is_reported_not_dropped() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::Text { rect: RectI::new(0,0,20,10), text: "hi".into(), color: Color::WHITE, size: 12.0, align: 0 });
+    let s = gpu_geom::build_stream(&l, Extent { width: 32, height: 16 });
+    assert_eq!(s.vertices.len(), 0);
+    assert_eq!(s.unsupported.len(), 1, "文本必须被**报告**，不能静默丢弃");
+}
+
+#[test]
+fn clip_is_intersected_on_the_cpu() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::PushClip { rect: RectI::new(2, 2, 4, 4) });
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 8, 8), color: Color::WHITE });
+    l.push(DrawCmd::PopClip);
+    let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 8 });
+    // **Ruling（见 ledger Ruling 5）**：`pos`（光栅化范围）用**裁剪后**的矩形；
+    // `rect` 属性（圆角/描边判据）用**原始**矩形 —— 两者必须分开，否则圆角会被裁剪挪位。
+    assert_eq!(s.vertices[0].rect, [0.0, 0.0, 8.0, 8.0], "rect 属性保持原始矩形");
+    let (x0, y0) = (s.vertices[0].pos[0], s.vertices[0].pos[1]);
+    // 裁剪后矩形 (2,2,4,4) 在 8×8 画布上的左上角 → NDC
+    assert!((x0 - (2.0 * 2.0 / 8.0 - 1.0)).abs() < 1e-6, "pos.x 应落在裁剪后矩形左边界");
+    assert!((y0 - (2.0 * 2.0 / 8.0 - 1.0)).abs() < 1e-6, "pos.y 同理（y 向下为正）");
+}
+
+// ---------------------------------------------------------------------------
+// 追加用例（brief 之外，用来钉住实现细节 —— 特别是 T3 消费顶点流时会依赖的部分）
+// ---------------------------------------------------------------------------
+
+/// 一个矩形展开成两个三角形 = 6 顶点，且 6 个顶点共享同一组属性（rect/radius_kind/颜色）。
+#[test]
+fn quad_is_two_triangles_with_shared_attributes() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect { rect: RectI::new(2, 1, 4, 2), color: Color::rgb(10, 20, 30) });
+    let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 8 });
+    assert_eq!(s.vertices.len(), 6);
+    let v0 = s.vertices[0];
+    for v in &s.vertices {
+        assert_eq!(v.rect, [2.0, 1.0, 4.0, 2.0], "同一四边形的 rect 属性必须一致");
+        assert_eq!(v.radius_kind, gpu_geom::RADIUS_FILL);
+        assert_eq!(v.color, v0.color);
+    }
+    // 左上 / 右上 / 右下 / 左上 / 右下 / 左下
+    let expect = [
+        [-0.5, -0.75],
+        [0.5, -0.75],
+        [0.5, -0.25],
+        [-0.5, -0.75],
+        [0.5, -0.25],
+        [-0.5, -0.25],
+    ];
+    for (v, e) in s.vertices.iter().zip(expect.iter()) {
+        assert!(close(v.pos[0], e[0]) && close(v.pos[1], e[1]), "顶点 {v:?} 应为 {e:?}");
+    }
+}
+
+/// 颜色按 `u8 / 255.0` 归一化（目标格式 `Rgba8Unorm` 的通道语义），alpha 直通。
+#[test]
+fn color_is_normalized_to_unit_range() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 2, 2), color: Color::rgba(255, 128, 0, 0.5) });
+    let s = gpu_geom::build_stream(&l, Extent { width: 2, height: 2 });
+    let c = s.vertices[0].color;
+    assert!(close(c[0], 1.0));
+    assert!(close(c[1], 128.0 / 255.0));
+    assert!(close(c[2], 0.0));
+    assert!(close(c[3], 0.5));
+}
+
+/// 圆角填充：`radius_kind` 携带**半径本身**（片元着色器据此复刻 CPU 的整数像素判据）。
+#[test]
+fn round_rect_carries_radius_in_radius_kind() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRoundRect { rect: RectI::new(0, 0, 10, 10), radius: 3, color: Color::WHITE });
+    let s = gpu_geom::build_stream(&l, Extent { width: 10, height: 10 });
+    assert_eq!(s.vertices.len(), 6);
+    assert_eq!(s.vertices[0].radius_kind, 3.0);
+    assert_eq!(s.vertices[0].rect, [0.0, 0.0, 10.0, 10.0]);
+}
+
+/// 负半径当作「无圆角」（与 CPU `fill(..., radius.max(0))` 一致）。
+#[test]
+fn negative_radius_falls_back_to_plain_fill() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRoundRect { rect: RectI::new(0, 0, 4, 4), radius: -2, color: Color::WHITE });
+    let s = gpu_geom::build_stream(&l, Extent { width: 4, height: 4 });
+    assert_eq!(s.vertices[0].radius_kind, gpu_geom::RADIUS_FILL);
+}
+
+/// `radius_kind_for_stroke`（Ruling 6）：1px ⇒ `RADIUS_STROKE`，更宽 ⇒ `-width`。
+#[test]
+fn radius_kind_for_stroke_encodes_band_width() {
+    assert_eq!(gpu_geom::radius_kind_for_stroke(1), gpu_geom::RADIUS_STROKE);
+    assert_eq!(gpu_geom::radius_kind_for_stroke(2), -2.0);
+    assert_eq!(gpu_geom::radius_kind_for_stroke(4), -4.0);
+}
+
+/// 描边展开为 CPU `stroke()` 的 **4 条边带**（每带 6 顶点 ⇒ 共 24），
+/// 每条厚度 = `width`，`radius_kind = radius_kind_for_stroke(width)`；
+/// `rect` 属性仍是**原始**矩形（描边判据的输入）。
+#[test]
+fn stroke_rect_expands_to_four_1px_bands() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 6, 4), color: Color::WHITE, width: 1 });
+    let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 8 });
+    assert_eq!(s.vertices.len(), 24, "4 条边带 × 6 顶点");
+    for v in &s.vertices {
+        assert_eq!(v.radius_kind, gpu_geom::RADIUS_STROKE);
+        assert_eq!(v.rect, [1.0, 1.0, 6.0, 4.0]);
+    }
+    // 顺序与 null.rs::stroke() 一致：上 / 下 / 左 / 右
+    let bands: [([f32; 2], [f32; 2]); 4] = [
+        ([-0.75, -0.75], [0.75, -0.5]),  // 上：y ∈ [1,2)
+        ([-0.75, 0.0], [0.75, 0.25]),    // 下：y ∈ [4,5)
+        ([-0.75, -0.75], [-0.5, 0.25]),  // 左：x ∈ [1,2)
+        ([0.5, -0.75], [0.75, 0.25]),    // 右：x ∈ [6,7)
+    ];
+    for (i, (tl, br)) in bands.iter().enumerate() {
+        let v = &s.vertices[i * 6];
+        assert!(close(v.pos[0], tl[0]) && close(v.pos[1], tl[1]), "边带 {i} 左上角 {:?}", v.pos);
+        let v = &s.vertices[i * 6 + 2];
+        assert!(close(v.pos[0], br[0]) && close(v.pos[1], br[1]), "边带 {i} 右下角 {:?}", v.pos);
+    }
+}
+
+/// 带宽 > 1（Ruling 6）：仍是 4 条边带，但每条**厚度 = width**，
+/// `radius_kind = -width`（片元着色器用 `-radius_kind` 当带宽）。
+#[test]
+fn thick_stroke_bands_have_width_thickness() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 6, 4), color: Color::WHITE, width: 2 });
+    let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 8 });
+    assert_eq!(s.vertices.len(), 24, "厚度变了，边带条数不变");
+    for v in &s.vertices {
+        assert_eq!(v.radius_kind, -2.0, "width=2 ⇒ radius_kind = -2.0");
+        assert_eq!(v.rect, [1.0, 1.0, 6.0, 4.0]);
+    }
+    // 上 (1,1,6,2) / 下 (1,3,6,2) / 左 (1,1,2,4) / 右 (5,1,2,4)
+    let bands: [([f32; 2], [f32; 2]); 4] = [
+        ([-0.75, -0.75], [0.75, -0.25]), // 上：y ∈ [1,3)
+        ([-0.75, -0.25], [0.75, 0.25]),  // 下：y ∈ [3,5)
+        ([-0.75, -0.75], [-0.25, 0.25]), // 左：x ∈ [1,3)
+        ([0.25, -0.75], [0.75, 0.25]),   // 右：x ∈ [5,7)
+    ];
+    for (i, (tl, br)) in bands.iter().enumerate() {
+        let v = &s.vertices[i * 6];
+        assert!(close(v.pos[0], tl[0]) && close(v.pos[1], tl[1]), "边带 {i} 左上角 {:?}", v.pos);
+        let v = &s.vertices[i * 6 + 2];
+        assert!(close(v.pos[0], br[0]) && close(v.pos[1], br[1]), "边带 {i} 右下角 {:?}", v.pos);
+    }
+}
+
+/// 每条边带**各自**与 clip 求交：被裁掉的带整条跳过，被裁一半的带只保留可见部分。
+#[test]
+fn stroke_bands_are_clipped_individually() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::PushClip { rect: RectI::new(0, 0, 8, 2) });
+    l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 6, 4), color: Color::WHITE, width: 1 });
+    l.push(DrawCmd::PopClip);
+    let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 8 });
+    // 上 (1,1,6,1) 可见；下带 y ∈ [4,5) 完全在 clip 之外 ⇒ 丢；左/右带被截到高 1
+    assert_eq!(s.vertices.len(), 18, "3 条可见边带 × 6 顶点");
+    assert!(close(s.vertices[0].pos[1], -0.75) && close(s.vertices[2].pos[1], -0.5), "上带");
+    // 左带 (1,1,1,1)：x ∈ [1,2)，y ∈ [1,2)
+    assert!(close(s.vertices[6].pos[0], -0.75) && close(s.vertices[8].pos[0], -0.5), "左带被截高");
+    // 右带 (6,1,1,1)
+    assert!(close(s.vertices[12].pos[0], 0.5) && close(s.vertices[12].pos[1], -0.75), "右带");
+}
+
+/// `width < 1` 按 1 处理（与 CPU `stroke()` 的 `width.max(1)` 一致）。
+#[test]
+fn non_positive_stroke_width_is_clamped_to_one_pixel() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 6, 4), color: Color::WHITE, width: 0 });
+    l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 6, 4), color: Color::WHITE, width: -3 });
+    let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 8 });
+    assert_eq!(s.vertices.len(), 48);
+    for v in &s.vertices {
+        assert_eq!(v.radius_kind, gpu_geom::RADIUS_STROKE, "负宽不能被当成圆角半径");
+    }
+}
+
+/// 裁剪后为空 ⇒ 整条命令跳过（不产出顶点，也不报 unsupported）。
+#[test]
+fn empty_intersection_drops_the_command() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::PushClip { rect: RectI::new(100, 100, 4, 4) });
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 8, 8), color: Color::WHITE });
+    l.push(DrawCmd::StrokeRect { rect: RectI::new(0, 0, 8, 8), color: Color::WHITE, width: 1 });
+    l.push(DrawCmd::PopClip);
+    let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 8 });
+    assert_eq!(s.vertices.len(), 0);
+    assert!(s.unsupported.is_empty(), "被裁剪掉的几何不是「不支持」");
+}
+
+/// 裁剪栈是**嵌套**的：内层 Pop 之后要回到外层裁剪，而不是回到全画布。
+#[test]
+fn nested_clip_restores_outer_clip() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::PushClip { rect: RectI::new(0, 0, 4, 8) });
+    l.push(DrawCmd::PushClip { rect: RectI::new(2, 2, 4, 4) });
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 8, 8), color: Color::WHITE });
+    l.push(DrawCmd::PopClip);
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 8, 8), color: Color::WHITE });
+    l.push(DrawCmd::PopClip);
+    let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 8 });
+    assert_eq!(s.vertices.len(), 12);
+    // 内层：(2,2,4,4) ∩ (2,2,4,4) = (2,2,4,4)
+    assert!(close(s.vertices[0].pos[0], -0.5) && close(s.vertices[0].pos[1], -0.5));
+    // 外层：(0,0,8,8) ∩ (0,0,4,8) = (0,0,4,8)
+    assert!(close(s.vertices[6].pos[0], -1.0) && close(s.vertices[6].pos[1], -1.0));
+    assert!(close(s.vertices[6 + 2].pos[0], 0.0) && close(s.vertices[6 + 2].pos[1], 1.0));
+}
+
+/// 原始矩形部分越出画布：`pos` 被画布边界夹住，`rect` 属性仍保留越界坐标
+/// （圆角圆心要按**原始**矩形算，夹过就错了）。
+#[test]
+fn partially_offscreen_rect_keeps_original_attributes() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRoundRect { rect: RectI::new(-4, -4, 8, 8), radius: 2, color: Color::WHITE });
+    let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 8 });
+    assert_eq!(s.vertices.len(), 6);
+    assert_eq!(s.vertices[0].pos, [-1.0, -1.0], "pos 被画布夹住");
+    assert_eq!(s.vertices[0].rect, [-4.0, -4.0, 8.0, 8.0], "rect 属性保持原始矩形");
+    assert_eq!(s.vertices[0].radius_kind, 2.0);
+}
+
+/// 零面积矩形：不产出顶点（与 CPU 的 `for y in y..bottom()` 空循环一致）。
+#[test]
+fn degenerate_rect_produces_nothing() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect { rect: RectI::new(3, 3, 0, 5), color: Color::WHITE });
+    l.push(DrawCmd::FillRect { rect: RectI::new(3, 3, 5, -1), color: Color::WHITE });
+    let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 8 });
+    assert_eq!(s.vertices.len(), 0);
+    assert!(s.unsupported.is_empty());
+}
+
+/// `NodeHint` 是诊断信息，必须被**安静忽略**（既不出顶点，也不算「不支持」）。
+#[test]
+fn node_hint_is_ignored_silently() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::NodeHint { rect: RectI::new(0, 0, 8, 8), node_id_len: 7 });
+    let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 8 });
+    assert_eq!(s.vertices.len(), 0);
+    assert!(s.unsupported.is_empty());
+}
+
+/// 文本夹在几何中间：只报告一次，且不影响前后几何的产出。
+#[test]
+fn text_between_geometry_does_not_break_the_stream() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 4, 4), color: Color::WHITE });
+    l.push(DrawCmd::Text { rect: RectI::new(0,0,20,10), text: "hi".into(), color: Color::WHITE, size: 12.0, align: 0 });
+    l.push(DrawCmd::FillRect { rect: RectI::new(4, 4, 4, 4), color: Color::WHITE });
+    let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 8 });
+    assert_eq!(s.vertices.len(), 12);
+    assert_eq!(s.unsupported.len(), 1);
+    assert_eq!(s.vertices[6].rect, [4.0, 4.0, 4.0, 4.0], "文本之后的几何照常产出");
+}
+
+/// 顶点布局是给 T3（`device.rs` 的顶点缓冲绑定）的**硬契约**：
+/// `VkVertexInputBindingDescription.stride` 与各属性的 `offset` 都是手写数字，
+/// 错一个字节就是「画出来是垃圾」而不是编译错误 —— 所以在这里钉死（同 `struct_layout.rs` 的思路）。
+#[test]
+fn vertex_layout_is_stable_for_the_vertex_buffer() {
+    assert_eq!(
+        std::mem::size_of::<gpu_geom::GpuVertex>(),
+        44,
+        "stride = 2 + 4 + 1 + 4 = 11 个 f32"
+    );
+    assert_eq!(std::mem::align_of::<gpu_geom::GpuVertex>(), 4, "全是 f32 ⇒ 不需要补齐");
+    assert_eq!(std::mem::offset_of!(gpu_geom::GpuVertex, pos), 0, "location 0：vec2");
+    assert_eq!(std::mem::offset_of!(gpu_geom::GpuVertex, rect), 8, "location 1：vec4");
+    assert_eq!(
+        std::mem::offset_of!(gpu_geom::GpuVertex, radius_kind),
+        24,
+        "location 2：float"
+    );
+    assert_eq!(std::mem::offset_of!(gpu_geom::GpuVertex, color), 28, "location 3：vec4");
+}
+
+/// `extent` 为 0 不能除零（CPU 后端把 0 尺寸当 1 —— 这里保持同一约定）。
+#[test]
+fn zero_extent_does_not_produce_nan() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 1, 1), color: Color::WHITE });
+    let s = gpu_geom::build_stream(&l, Extent { width: 0, height: 0 });
+    for v in &s.vertices {
+        assert!(v.pos[0].is_finite() && v.pos[1].is_finite(), "NDC 不得为 NaN/Inf：{:?}", v.pos);
+    }
+}
