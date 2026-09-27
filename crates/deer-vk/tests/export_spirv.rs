@@ -59,6 +59,9 @@ fn write_all_shaders_for_spirv_val() {
         // M3b（文本/字形管线）：采样器 + 描述符集（set 0 / binding 0）
         ("vs_text", spirv::vertex_shader_text()),
         ("fs_text", spirv::fragment_shader_text()),
+        // B5-1（统一管线）：5 个 location 顶点 + 无分支判别（形状/文本合成一条管线）
+        ("vs_unified", spirv::vertex_shader_unified()),
+        ("fs_unified", spirv::fragment_shader_unified()),
     ];
 
     println!("写出 {} 个 .spv 到 spirv_probe/", shaders.len());

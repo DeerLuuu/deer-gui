@@ -1720,55 +1720,81 @@ pub fn vertex_shader_rect_attrs() -> Vec<u8> {
 /// 片段着色器必须声明 `OriginUpperLeft`（已声明）—— 与 CPU 参考实现的
 /// 「y 向下、左上为原点」坐标系一致。`gl_FragCoord.xy` 在像素中心取值
 /// （`x.5`），`OpFloor` 之后正是整数像素坐标。
-pub fn fragment_shader_rect_shape() -> Vec<u8> {
-    let mut m = Module::new();
-    m.shader_capability().memory_model_glsl450().source_unknown();
-    // `glsl450` 是内存模型，**不是**扩展指令集；`OpFloor` 需要另外导入
-    // `GLSL.std.450`（见 GLSL_STD_450_FLOOR 的说明）。
-    let glsl = m.ext_inst_import_glsl_std_450();
-
-    let void = m.type_void();
-    let f32_ty = m.type_float();
-    let bool_ty = m.type_bool();
-    let v4 = m.type_vector(f32_ty, 4);
-    let ptr_in_v4 = m.type_pointer(SC_INPUT, v4);
-    let ptr_in_f32 = m.type_pointer(SC_INPUT, f32_ty);
-    let ptr_out_v4 = m.type_pointer(SC_OUTPUT, v4);
-    let fn_ty = m.type_function(void, &[]);
-
-    let out_color = m.variable(ptr_out_v4, SC_OUTPUT);
-    let in_rect = m.variable(ptr_in_v4, SC_INPUT);
-    let in_rk = m.variable(ptr_in_f32, SC_INPUT);
-    let in_color = m.variable(ptr_in_v4, SC_INPUT);
-    let in_frag = m.variable(ptr_in_v4, SC_INPUT);
-
-    let fn_id = m.id();
-    let block = m.id();
-    m.entry_point(
-        EXECUTION_MODEL_FRAGMENT,
-        fn_id,
-        "main",
-        &[out_color, in_rect, in_rk, in_color, in_frag],
-    );
-    m.execution_mode(fn_id, EXECUTION_MODE_ORIGIN_UPPER_LEFT, &[]);
-
-    // 输出 location 0
-    m.debug_name(out_color, "out_color");
-    m.decorate(out_color, DECORATION_LOCATION, &[0]);
-    // 输入 location 0/1/2（与顶点着色器的输出对齐）
-    m.debug_name(in_rect, "in_rect");
-    m.decorate(in_rect, DECORATION_LOCATION, &[0]);
-    m.debug_name(in_rk, "in_radius_kind");
-    m.decorate(in_rk, DECORATION_LOCATION, &[1]);
-    m.debug_name(in_color, "in_color");
-    m.decorate(in_color, DECORATION_LOCATION, &[2]);
-    // 内建输入：gl_FragCoord（**不能**同时有 Location 装饰）
-    m.debug_name(in_frag, "gl_FragCoord");
-    m.decorate(in_frag, DECORATION_BUILT_IN, &[BUILTIN_FRAG_COORD]);
-
-    m.function(void, fn_id, fn_ty, block);
-
+/// 形状片段判据（**规范中的唯一一份**）：`rect` / `radius_kind` / `gl_FragCoord`
+/// ⇒ 「这个片元是否落在形状里」。
+///
+/// ## 为什么把它提出来（B5-1）
+///
+/// 统一管线要在**同一支**片段着色器里同时算「形状」和「文本」两支输出，
+/// 而「形状」那一支必须与 [`fragment_shader_rect_shape`] **逐字相同** ——
+/// 那是 M3a 用 **20,663 个采样点**逐像素核对过、并被 207 条判据覆盖的冻结数学。
+/// 若在统一着色器里**再抄一遍**，就变成两份必须永远一致的实现
+/// （本项目已经吃过「两处复制、只改一处」的亏）。
+///
+/// 所以把判据**原样搬**到这里，[`fragment_shader_rect_shape`] 与
+/// [`fragment_shader_unified`] **都调它**。搬动时没有改任何运算顺序或形式：
+/// 调用方与原来传的是同样的 Id（`gl_FragCoord` 的 `OpLoad`、`in_rect` 的 `OpLoad`、
+/// `in_radius_kind` 的 `OpLoad`），所以**生成的字节码序列与搬动前一致**。
+///
+/// ## 判据本身（详见 [`fragment_shader_rect_shape`] 的注释，那里有完整推导）
+///
+/// - `fill_mask = !(out_rect | fail_tl | fail_tr | fail_bl | fail_br)`（圆角四角用圆外判定）
+/// - `stroke_mask` = 四条**被另一轴区间约束**的矩形边带的并集（`bw = -rk`）
+/// - `mask = select(rk < 0, stroke_mask, fill_mask)`，最后判 `mask > 0.5`
+///
+/// ⚠️ **别凭直觉改这段**：过程中先后有 5 个「看起来对」的候选公式被穷举推翻
+/// （半平面版、先裁矩形再算带宽版、blob 减内矩形版、两矩形并集版、带不互相约束版）。
+/// 改完必须重跑 `cargo test -p deer-vk --lib`（`cpu_reference_mask_matches_null_rs`）。
+///
+/// ## 为什么要**返回** `zero`、为什么 `load` 要传进来（两个「减少字节差异」的细节）
+///
+/// [`fragment_shader_rect_shape`] 的字节码是**冻结的**（M3a 的 20,663 点逐像素核对
+/// 与 207 条判据建立在它之上）⇒ 把它抽成共用函数时，字节差异越小越好。
+/// 下面两个细节都是被「逐字节比较」抓出来的：
+///
+/// 1. **常量只能发射一次。** `Module::constant_f32` **不做去重**（每次调用都新分配
+///    Id），所以若调用方与这里各造一个 `0.0`，就会多出一条 `OpConstant`（+8 字节）。
+///    ⇒ 由本函数发射，并把 `f0` 随 `hit` 一起返回。
+/// 2. **发射顺序尽量与原函数一致。** 原函数是「常量 → `OpLoad` 输入」；
+///    Id 按发射顺序分配，所以把 `OpLoad` 放在函数外先做会让**全部** Id 平移。
+///    ⇒ 把 5 个输入**指针**传进来，让本函数在发射完常量**之后**才 `OpLoad`。
+///
+/// ## ⚠️ 实测结论：**仍然不是逐字节相同**（别把这条文档读成「已字节相同」）
+///
+/// 上面两点把差异从 +16 字节/全部 Id 平移缩到了 **0 字节差异、但仍有 Id 重编号**：
+/// 实测重构前后各 3168 字节、**指令流逐条相同**（同为 164 条指令、各 opcode 计数一致），
+/// 但有 **111 个字节**不同 —— 全是 Id 编号差异（新着色器里少了一次早期的
+/// `f1` 分配，导致后续 Id 整体前移一位）。
+///
+/// **语义等价的保证来自别处，不来自字节比较**：
+/// - 判据本体是**同一个函数**（两条管线不可能各有一份而漂移）；
+/// - `cpu_reference_mask_matches_null_rs` 用 **20,663 个采样点**逐像素锁住纯逻辑版；
+/// - 全套 `cargo test`（含 M3a/M3b 的 GPU 逐像素对照）**241 条全绿**。
+///
+/// ## 返回
+///
+/// `(hit, zero, frag, rect, rk, color)`：
+/// - `hit`：`OpTypeBool`，`true` = 命中；
+/// - `zero`：那个 `0.0` 常量的 Id（给调用方的 `OpSelect` 复用）；
+/// - 后四个：本函数 `OpLoad` 出来的值（调用方因此**不重复 load**）。
+///
+/// 调用方负责把 `hit` 变成颜色（形状输出需要**逐分量** `OpSelect`，
+/// 见 [`fragment_shader_rect_shape`] 里那条 `spirv-val` 的实测教训）。
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+fn emit_shape_hit(
+    m: &mut Module,
+    f32_ty: u32,
+    bool_ty: u32,
+    v4_ty: u32,
+    glsl: u32,
+    p_frag: u32,
+    p_rect: u32,
+    p_rk: u32,
+    p_color: u32,
+) -> (u32, u32, u32, u32, u32, u32) {
     // ── 常量 ─────────────────────────────────────────────────────────────────
+    // 发射顺序**与原 `fragment_shader_rect_shape` 逐字相同**（0.0、1.0、true、false）
+    // —— 这是「重构后字节码不变」的一部分，别调换（见函数文档）。
     let f0 = m.constant_f32(f32_ty, 0.0);
     let f1 = m.constant_f32(f32_ty, 1.0);
     // `OpConstantTrue` / `OpConstantFalse`：给 `not_bool` 的两支用
@@ -1777,21 +1803,23 @@ pub fn fragment_shader_rect_shape() -> Vec<u8> {
     let b_false = m.id();
     m.op(OP_CONSTANT_FALSE, &[bool_ty, b_false]);
 
+    // ── 输入加载（**必须**在常量之后：Id 按发射顺序分配，见函数文档） ──────────
+    let frag = m.load(v4_ty, p_frag);
+    let rect = m.load(v4_ty, p_rect);
+    let rk = m.load(f32_ty, p_rk);
+    let color = m.load(v4_ty, p_color);
+
     // ── px / py ──────────────────────────────────────────────────────────────
-    let frag = m.load(v4, in_frag);
     let fx = m.composite_extract(f32_ty, frag, &[0]);
     let fy = m.composite_extract(f32_ty, frag, &[1]);
     let px = m.op_floor(f32_ty, glsl, fx);
     let py = m.op_floor(f32_ty, glsl, fy);
 
     // ── rect 属性 ────────────────────────────────────────────────────────────
-    let rect = m.load(v4, in_rect);
     let rx = m.composite_extract(f32_ty, rect, &[0]);
     let ry = m.composite_extract(f32_ty, rect, &[1]);
     let rw = m.composite_extract(f32_ty, rect, &[2]);
     let rh = m.composite_extract(f32_ty, rect, &[3]);
-    let rk = m.load(f32_ty, in_rk);
-    let color = m.load(v4, in_color);
 
     // ── 四边距离（与 CPU 的 right()-1 / bottom()-1 一致） ────────────────────
     let dl = m.f_sub(f32_ty, px, rx);
@@ -1858,7 +1886,12 @@ pub fn fragment_shader_rect_shape() -> Vec<u8> {
 
     // 逻辑非的小工具：`!b` = `OpSelect %bool b false true`（不引入 `OpLogicalNot`）。
     // 结果的类型必须是 `OpTypeBool`（与判据同类型）。
-    let not_bool = |m: &mut Module, b: u32| -> u32 { m.op_select(bool_ty, b, b_false, b_true) };
+    // 逻辑非的小工具：`!b` = `OpSelect %bool b false true`（不引入 `OpLogicalNot`）。
+    // 做成**自由函数**（不捕获 `m`）⇒ 调用处直接 `not_bool(&mut m, …)`，
+    // 不会与其它闭包（`corner_fail`）争同一个 `m` 的可变借用。
+    fn not_bool(m: &mut Module, bool_ty: u32, b: u32, b_true: u32, b_false: u32) -> u32 {
+        m.op_select(bool_ty, b, b_false, b_true)
+    }
 
     // ── 描边判据（rk < 0 ⇒ bw = -rk；Ruling 6：rk == -1 即 1px 带宽） ───────
     //
@@ -1919,14 +1952,14 @@ pub fn fragment_shader_rect_shape() -> Vec<u8> {
         // x_span = px ∈ [rx, right) ：`px >= rx` 用 `!(px < rx)` 表达（不引入 OpLogicalNot）
         let x_span = {
             let lt = m.op_ford_less_than(bool_ty, px, rx); // px < rx
-            let ge = not_bool(&mut m, lt); // px >= rx
+            let ge = not_bool(m, bool_ty, lt, b_true, b_false); // px >= rx
             let lt_r = m.op_ford_less_than(bool_ty, px, right); // px < right
             m.op_logical_and(bool_ty, ge, lt_r)
         };
         // y_span = py ∈ [ry, bottom)
         let y_span = {
             let lt = m.op_ford_less_than(bool_ty, py, ry);
-            let ge = not_bool(&mut m, lt);
+            let ge = not_bool(m, bool_ty, lt, b_true, b_false);
             let lt_b = m.op_ford_less_than(bool_ty, py, bottom);
             m.op_logical_and(bool_ty, ge, lt_b)
         };
@@ -1935,7 +1968,7 @@ pub fn fragment_shader_rect_shape() -> Vec<u8> {
         // 之外的 y_span 提供（x_span 只是 px 的区间；这里 y 的下界必须显式给）
         let band_top = {
             let lt_ry = m.op_ford_less_than(bool_ty, py, ry); // py < ry
-            let ge_ry = not_bool(&mut m, lt_ry); // py >= ry
+            let ge_ry = not_bool(m, bool_ty, lt_ry, b_true, b_false); // py >= ry
             let t = m.f_add(f32_ty, ry, bw);
             let lt_t = m.op_ford_less_than(bool_ty, py, t); // py < ry+bw
             let c = m.op_logical_and(bool_ty, ge_ry, lt_t);
@@ -1945,7 +1978,7 @@ pub fn fragment_shader_rect_shape() -> Vec<u8> {
         let band_bottom = {
             let t = m.f_sub(f32_ty, bottom, bw);
             let lt = m.op_ford_less_than(bool_ty, py, t); // py < bottom-bw
-            let ge = not_bool(&mut m, lt); // py >= bottom-bw
+            let ge = not_bool(m, bool_ty, lt, b_true, b_false); // py >= bottom-bw
             let lt_b = m.op_ford_less_than(bool_ty, py, bottom); // py < bottom
             let c = m.op_logical_and(bool_ty, ge, lt_b);
             m.op_logical_and(bool_ty, x_span, c)
@@ -1953,7 +1986,7 @@ pub fn fragment_shader_rect_shape() -> Vec<u8> {
         // 左带 = y_span & (px ∈ [rx, rx+bw))
         let band_left = {
             let lt_rx = m.op_ford_less_than(bool_ty, px, rx); // px < rx
-            let ge_rx = not_bool(&mut m, lt_rx); // px >= rx
+            let ge_rx = not_bool(m, bool_ty, lt_rx, b_true, b_false); // px >= rx
             let t = m.f_add(f32_ty, rx, bw);
             let lt_t = m.op_ford_less_than(bool_ty, px, t); // px < rx+bw
             let c = m.op_logical_and(bool_ty, ge_rx, lt_t);
@@ -1963,7 +1996,7 @@ pub fn fragment_shader_rect_shape() -> Vec<u8> {
         let band_right = {
             let t = m.f_sub(f32_ty, right, bw);
             let lt = m.op_ford_less_than(bool_ty, px, t); // px < right-bw
-            let ge = not_bool(&mut m, lt); // px >= right-bw
+            let ge = not_bool(m, bool_ty, lt, b_true, b_false); // px >= right-bw
             let lt_r = m.op_ford_less_than(bool_ty, px, right); // px < right
             let c = m.op_logical_and(bool_ty, ge, lt_r);
             m.op_logical_and(bool_ty, y_span, c)
@@ -1983,7 +2016,73 @@ pub fn fragment_shader_rect_shape() -> Vec<u8> {
     // `mask > 0.5`，省掉一次 bool 中转（也少一个出错面）。
     let mask = m.op_select(f32_ty, rk_neg, stroke_f, fill_mask);
     let half = m.constant_f32(f32_ty, 0.5);
-    let hit = m.op_ford_greater_than(bool_ty, mask, half);
+    (
+        m.op_ford_greater_than(bool_ty, mask, half),
+        f0,
+        frag,
+        rect,
+        rk,
+        color,
+    )
+}
+
+/// 片段着色器（**M3a：矩形/圆角/描边判据**）：形状管线的片元阶段。
+///
+/// 判据本体已提到 [`emit_shape_hit`]（B5-1 统一管线要复用它，避免两份必须
+/// 永远一致的实现）。本函数只负责「接口装配 + 把判据结果变成颜色」。
+pub fn fragment_shader_rect_shape() -> Vec<u8> {
+    let mut m = Module::new();
+    m.shader_capability().memory_model_glsl450().source_unknown();
+    // `glsl450` 是内存模型，**不是**扩展指令集；`OpFloor` 需要另外导入
+    // `GLSL.std.450`（见 GLSL_STD_450_FLOOR 的说明）。
+    let glsl = m.ext_inst_import_glsl_std_450();
+
+    let void = m.type_void();
+    let f32_ty = m.type_float();
+    let bool_ty = m.type_bool();
+    let v4 = m.type_vector(f32_ty, 4);
+    let ptr_in_v4 = m.type_pointer(SC_INPUT, v4);
+    let ptr_in_f32 = m.type_pointer(SC_INPUT, f32_ty);
+    let ptr_out_v4 = m.type_pointer(SC_OUTPUT, v4);
+    let fn_ty = m.type_function(void, &[]);
+
+    let out_color = m.variable(ptr_out_v4, SC_OUTPUT);
+    let in_rect = m.variable(ptr_in_v4, SC_INPUT);
+    let in_rk = m.variable(ptr_in_f32, SC_INPUT);
+    let in_color = m.variable(ptr_in_v4, SC_INPUT);
+    let in_frag = m.variable(ptr_in_v4, SC_INPUT);
+
+    let fn_id = m.id();
+    let block = m.id();
+    m.entry_point(
+        EXECUTION_MODEL_FRAGMENT,
+        fn_id,
+        "main",
+        &[out_color, in_rect, in_rk, in_color, in_frag],
+    );
+    m.execution_mode(fn_id, EXECUTION_MODE_ORIGIN_UPPER_LEFT, &[]);
+
+    // 输出 location 0
+    m.debug_name(out_color, "out_color");
+    m.decorate(out_color, DECORATION_LOCATION, &[0]);
+    // 输入 location 0/1/2（与顶点着色器的输出对齐）
+    m.debug_name(in_rect, "in_rect");
+    m.decorate(in_rect, DECORATION_LOCATION, &[0]);
+    m.debug_name(in_rk, "in_radius_kind");
+    m.decorate(in_rk, DECORATION_LOCATION, &[1]);
+    m.debug_name(in_color, "in_color");
+    m.decorate(in_color, DECORATION_LOCATION, &[2]);
+    // 内建输入：gl_FragCoord（**不能**同时有 Location 装饰）
+    m.debug_name(in_frag, "gl_FragCoord");
+    m.decorate(in_frag, DECORATION_BUILT_IN, &[BUILTIN_FRAG_COORD]);
+
+    m.function(void, fn_id, fn_ty, block);
+
+    // 判据本体（唯一实现）。常量与 `OpLoad` 都由它发射（顺序对字节码有影响，见其文档）；
+    // 后四个返回值就是它 load 出来的输入，这里直接用，**不要重复 load**。
+    let (hit, f0, _frag, _rect, _rk, color) = emit_shape_hit(
+        &mut m, f32_ty, bool_ty, v4, glsl, in_frag, in_rect, in_rk, in_color,
+    );
 
     // out_color = select(hit, color, vec4(0,0,0,0))
     //
@@ -2207,6 +2306,325 @@ pub fn fragment_shader_text() -> Vec<u8> {
     let a = m.composite_extract(f32_ty, color, &[3]);
     let a_scaled = m.f_mul(f32_ty, a, cov);
     let out = m.composite_construct(v4, &[rgb0, rgb1, rgb2, a_scaled]);    m.store(out_color, out);
+
+    m.return_void();
+    m.function_end();
+    m.finish()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// B5-1：**统一管线**的着色器对（形状与文本合成一条管线）
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// 顶点着色器（**统一管线**：形状与文本共用一个顶点流）。
+///
+/// ## 为什么要统一（收益）
+///
+/// 此前形状与文本是**两条管线**，交错语料（形状、文本、形状、文本…）每切换一次
+/// 就要重绑管线 + 描述符集 + 顶点缓冲 ⇒ 实测语料是 **8 次 draw + 8 次切换**。
+/// 把两者合成**一条**管线后同一份语料可以**一次 draw** 画完 ⇒ **1 draw + 1 切换**。
+///
+/// ## 接口（**冻结**，`UnifiedVertex` 必须与它逐字一致）
+///
+/// | location | 类型 | 含义 | 形状段取值 | 文本段取值 |
+/// |---|---|---|---|---|
+/// | 0 | `vec2` | 位置（NDC，y 向下） | 矩形顶点 | 字形四边形顶点 |
+/// | 1 | `vec4` | `rect`（`x, y, w, h`） | 真实矩形 | **未使用**（填 0） |
+/// | 2 | `float` | `radius_kind` | 真实值（负 = 描边带宽） | **未使用**（填 0） |
+/// | 3 | `vec4` | 颜色（**非预乘**） | 真实颜色 | 真实颜色 |
+/// | 4 | `vec2` | `uv`（**判别符**） | **负值**（约定 `(-1,-1)`） | 归一化图集坐标 `[0,1]` |
+///
+/// stride 52 = 8 + 16 + 4 + 16 + 8，偏移 0 / 8 / 24 / 28 / 44。
+///
+/// ## 判别符为什么用 `uv`
+///
+/// 需要一个「**两条路径都携带、且取值域天然不重叠**」的属性：
+/// - `uv.x < 0` ⇒ **形状**（形状段没有纹理，约定填负值）；
+/// - `uv.x >= 0` ⇒ **文本**（归一化图集坐标恒 `≥ 0`）。
+///
+/// 不能用 `radius_kind`：它的**负值已被「描边带宽」占用**（Ruling 6），
+/// 再借它表达「这是文本」就会破坏 M3a 冻结的契约（见 [`vertex_shader_text`] 的说明）。
+///
+/// ## 为什么不用控制流
+///
+/// 顶点阶段只是**透传**（`OpLoad` + `OpStore`），本来就没有分支。
+/// 判别发生在**片元**阶段，且那里也**不用** `OpBranchConditional` ——
+/// 只用 `OpSelect`（见 [`fragment_shader_unified`]），所以整支着色器
+/// 仍是**单基本块、零 `OpPhi`**（`unified_shaders_have_no_control_flow` 钉住）。
+///
+/// ## `gl_Position` 用 `OpCompositeConstruct` 而不是 `OpCompositeInsert`
+///
+/// `px`/`py` 是**运行时**值（从顶点缓冲 `OpLoad` 出来的），所以只能构造，
+/// 不能像 [`vertex_shader_hardcoded_position`] 那样把常量直接拼进字面量。
+/// `z = 0.0`、`w = 1.0` 是常量，但仍按构造走（与 [`vertex_shader_text`] 一致）。
+pub fn vertex_shader_unified() -> Vec<u8> {
+    let mut m = Module::new();
+    m.shader_capability().memory_model_glsl450().source_unknown();
+
+    let void = m.type_void();
+    let f32_ty = m.type_float();
+    let v2 = m.type_vector(f32_ty, 2);
+    let v4 = m.type_vector(f32_ty, 4);
+    let ptr_in_v2 = m.type_pointer(SC_INPUT, v2);
+    let ptr_in_f32 = m.type_pointer(SC_INPUT, f32_ty);
+    let ptr_in_v4 = m.type_pointer(SC_INPUT, v4);
+    let ptr_out_v4 = m.type_pointer(SC_OUTPUT, v4);
+    let ptr_out_f32 = m.type_pointer(SC_OUTPUT, f32_ty);
+    let ptr_out_v2 = m.type_pointer(SC_OUTPUT, v2);
+    let fn_ty = m.type_function(void, &[]);
+
+    // 5 个输入（location 0..4）
+    let in_pos = m.variable(ptr_in_v2, SC_INPUT);
+    let in_rect = m.variable(ptr_in_v4, SC_INPUT);
+    let in_rk = m.variable(ptr_in_f32, SC_INPUT);
+    let in_color = m.variable(ptr_in_v4, SC_INPUT);
+    let in_uv = m.variable(ptr_in_v2, SC_INPUT);
+
+    // 5 个输出（location 0..4）。`gl_Position` 是内建，不占 location。
+    let out_pos = m.variable(ptr_out_v4, SC_OUTPUT);
+    let out_rect = m.variable(ptr_out_v4, SC_OUTPUT);
+    let out_rk = m.variable(ptr_out_f32, SC_OUTPUT);
+    let out_color = m.variable(ptr_out_v4, SC_OUTPUT);
+    let out_uv = m.variable(ptr_out_v2, SC_OUTPUT);
+
+    let z = m.constant_f32(f32_ty, 0.0);
+    let w = m.constant_f32(f32_ty, 1.0);
+
+    let fn_id = m.id();
+    let block = m.id();
+    m.entry_point(
+        EXECUTION_MODEL_VERTEX,
+        fn_id,
+        "main",
+        &[
+            out_pos, out_rect, out_rk, out_color, out_uv, in_pos, in_rect, in_rk, in_color,
+            in_uv,
+        ],
+    );
+
+    // ── 输入 location 0..4 ───────────────────────────────────────────────────
+    m.debug_name(in_pos, "in_pos");
+    m.decorate(in_pos, DECORATION_LOCATION, &[0]);
+    m.debug_name(in_rect, "in_rect");
+    m.decorate(in_rect, DECORATION_LOCATION, &[1]);
+    m.debug_name(in_rk, "in_radius_kind");
+    m.decorate(in_rk, DECORATION_LOCATION, &[2]);
+    m.debug_name(in_color, "in_color");
+    m.decorate(in_color, DECORATION_LOCATION, &[3]);
+    m.debug_name(in_uv, "in_uv");
+    m.decorate(in_uv, DECORATION_LOCATION, &[4]);
+
+    // ── 内建输出 + 输出 location 0..4（与片元着色器的输入对齐） ──────────────
+    m.debug_name(out_pos, "gl_Position");
+    m.decorate(out_pos, DECORATION_BUILT_IN, &[BUILTIN_POSITION]);
+    m.debug_name(out_rect, "out_rect");
+    m.decorate(out_rect, DECORATION_LOCATION, &[0]);
+    m.debug_name(out_rk, "out_radius_kind");
+    m.decorate(out_rk, DECORATION_LOCATION, &[1]);
+    m.debug_name(out_color, "out_color");
+    m.decorate(out_color, DECORATION_LOCATION, &[2]);
+    m.debug_name(out_uv, "out_uv");
+    m.decorate(out_uv, DECORATION_LOCATION, &[3]);
+
+    m.function(void, fn_id, fn_ty, block);
+
+    // gl_Position = vec4(pos, 0, 1)
+    let p = m.load(v2, in_pos);
+    let px = m.composite_extract(f32_ty, p, &[0]);
+    let py = m.composite_extract(f32_ty, p, &[1]);
+    // px/py 是运行时值 ⇒ 必须 OpCompositeConstruct
+    let pos4 = m.composite_construct(v4, &[px, py, z, w]);
+    m.store(out_pos, pos4);
+
+    // 其余 4 个属性**透传**。逐分量 extract + construct 与直接 load/store 等价，
+    // 但这里统一走「构造」路径 —— 与 [`vertex_shader_text`] 的写法一致，
+    // 且不依赖「向量类型可直接 store」这种隐含前提。
+    for (src, dst, ty, n) in [
+        (in_rect, out_rect, v4, 4u32),
+        (in_color, out_color, v4, 4u32),
+        (in_uv, out_uv, v2, 2u32),
+    ] {
+        let v = m.load(ty, src);
+        let comps: Vec<u32> = (0..n)
+            .map(|c| m.composite_extract(f32_ty, v, &[c]))
+            .collect();
+        let out = m.composite_construct(ty, &comps);
+        m.store(dst, out);
+    }
+    // 标量属性（radius_kind）直接 load/store
+    let rk = m.load(f32_ty, in_rk);
+    m.store(out_rk, rk);
+
+    m.return_void();
+    m.function_end();
+    m.finish()
+}
+
+/// 片段着色器（**统一管线**：形状与文本各算一支，用 `OpSelect` 二选一）。
+///
+/// ## 判别符与两支
+///
+/// ```text
+///   is_shape = uv.x < 0.0                    // 形状段约定 uv = (-1,-1)
+///   shape_out = select(shape_hit, color, vec4(0))
+///   cov       = texture(atlas, uv).r
+///   text_out  = vec4(color.rgb, color.a * cov)     // **非预乘**
+///   out_color = select(is_shape, shape_out, text_out)
+/// ```
+///
+/// ## 无控制流
+///
+/// 单基本块、零 `OpBranch` / `OpPhi` / `OpSwitch` —— 判别只用 `OpSelect`。
+/// 这与 M3a/M3b 的既有契约一致（`unified_shaders_have_no_control_flow` 钉住）。
+///
+/// ## 形状那一支**逐字复用** M3a 的判据
+///
+/// 调的是 [`emit_shape_hit`]（与 [`fragment_shader_rect_shape`] **同一个函数**），
+/// 所以「统一之后形状像素会不会变」这个问题在**实现层**就没有第二种答案。
+/// 这里**没有**重写任何数学 —— 重写就等于制造第二份必须永远一致的实现。
+///
+/// ## ⚠️ 形状帧也会**采样**纹理（隐式依赖）
+///
+/// `text_out` 是无条件计算的（无分支的代价），所以**形状帧也会执行采样**。
+/// 形状段的 `uv = (-1,-1)` 会被采到图集**边缘**的某个值，但那一支的结果**不被采用**
+/// （`is_shape` 为真时选的是 `shape_out`）。
+///
+/// 这带来两条**必须满足**的前提（B5-2 负责，记在这里免得以后忘）：
+/// 1. 绑定的图集纹理**必须存在**（形状帧也要绑一个，没有 GlyphAtlas 时用 1×1 哑纹理）；
+/// 2. 采样器必须是 `ClampToEdge`（越界 uv 不能是未定义行为）。
+///
+/// 这两条不满足时的表现是**静默的**（复用上次绑定 / 采到未定义值），
+/// 所以 B5-2 要用**变异**（哑纹理换成 cov=0）证明它承重。
+///
+/// ## ⚠️ 逐分量 `OpSelect`（一次实测教训）
+///
+/// 与 [`fragment_shader_rect_shape`] 同样的原因：本机 `spirv-val`（SDK 1.4.357.0）
+/// **拒绝**「标量 `bool` 条件 + `vec4` 结果」的 `OpSelect`
+/// （`Expected vector sizes of Result Type and the condition to be equal`）。
+/// 所以两处 vec4 选择（形状输出、最终二选一）都写成
+/// 「逐分量 `OpSelect` + `OpCompositeConstruct`」。
+///
+/// ## 描述符
+///
+/// `set 0 / binding 0` = 字形覆盖率图集（`sampler2D`），与
+/// `create_descriptor_set_layout_combined_sampler()` 逐字一致。
+pub fn fragment_shader_unified() -> Vec<u8> {
+    let mut m = Module::new();
+    m.shader_capability().memory_model_glsl450().source_unknown();
+    // `OpFloor` 来自 GLSL.std.450（不是 core opcode），形状判据要用
+    let glsl = m.ext_inst_import_glsl_std_450();
+
+    let void = m.type_void();
+    let f32_ty = m.type_float();
+    let bool_ty = m.type_bool();
+    let v2 = m.type_vector(f32_ty, 2);
+    let v4 = m.type_vector(f32_ty, 4);
+    // 纹理类型链：OpTypeImage → OpTypeSampledImage → 指向它的指针（UniformConstant）
+    let img_ty = m.type_image_2d_unknown(f32_ty);
+    let sampled_ty = m.type_sampled_image(img_ty);
+    let ptr_tex = m.type_pointer(SC_UNIFORM_CONSTANT, sampled_ty);
+    let ptr_in_v2 = m.type_pointer(SC_INPUT, v2);
+    let ptr_in_f32 = m.type_pointer(SC_INPUT, f32_ty);
+    let ptr_in_v4 = m.type_pointer(SC_INPUT, v4);
+    let ptr_out_v4 = m.type_pointer(SC_OUTPUT, v4);
+    let fn_ty = m.type_function(void, &[]);
+
+    let tex = m.variable(ptr_tex, SC_UNIFORM_CONSTANT);
+    let out_color = m.variable(ptr_out_v4, SC_OUTPUT);
+    let in_rect = m.variable(ptr_in_v4, SC_INPUT);
+    let in_rk = m.variable(ptr_in_f32, SC_INPUT);
+    let in_color = m.variable(ptr_in_v4, SC_INPUT);
+    let in_uv = m.variable(ptr_in_v2, SC_INPUT);
+    let in_frag = m.variable(ptr_in_v4, SC_INPUT);
+
+    let fn_id = m.id();
+    let block = m.id();
+    // ⚠️ `interface` 必须包含所有静态使用的 Input/Output 变量。
+    // **UniformConstant 的纹理变量不在此列**（SPIR-V 1.0 的 OpEntryPoint
+    // interface 只列 Input/Output；把 UniformConstant 塞进去会被校验器拒绝）。
+    m.entry_point(
+        EXECUTION_MODEL_FRAGMENT,
+        fn_id,
+        "main",
+        &[out_color, in_rect, in_rk, in_color, in_uv, in_frag],
+    );
+    m.execution_mode(fn_id, EXECUTION_MODE_ORIGIN_UPPER_LEFT, &[]);
+
+    // 描述符接口：set 0 / binding 0
+    m.debug_name(tex, "glyph_atlas");
+    m.decorate(tex, DECORATION_DESCRIPTOR_SET, &[0]);
+    m.decorate(tex, DECORATION_BINDING, &[0]);
+
+    // 输出 location 0
+    m.debug_name(out_color, "out_color");
+    m.decorate(out_color, DECORATION_LOCATION, &[0]);
+    // 输入 location 0..3（与统一顶点着色器的输出对齐）
+    m.debug_name(in_rect, "in_rect");
+    m.decorate(in_rect, DECORATION_LOCATION, &[0]);
+    m.debug_name(in_rk, "in_radius_kind");
+    m.decorate(in_rk, DECORATION_LOCATION, &[1]);
+    m.debug_name(in_color, "in_color");
+    m.decorate(in_color, DECORATION_LOCATION, &[2]);
+    m.debug_name(in_uv, "in_uv");
+    m.decorate(in_uv, DECORATION_LOCATION, &[3]);
+    // 内建输入：gl_FragCoord（**不能**同时有 Location 装饰）
+    m.debug_name(in_frag, "gl_FragCoord");
+    m.decorate(in_frag, DECORATION_BUILT_IN, &[BUILTIN_FRAG_COORD]);
+
+    m.function(void, fn_id, fn_ty, block);
+
+    // ── 公共输入 ─────────────────────────────────────────────────────────────
+    // `0.0` 只造一次，供判据、形状输出、判别符三处共用
+    // （`constant_f32` 不去重，多造会多一条 `OpConstant`）
+    // ── 形状那一支：判据**逐字复用**（同一个函数，不是抄一遍） ────────────────
+    // 常量与 rect/rk/color/frag 的 `OpLoad` 都由它发射；返回的 `f0` 是它的 `0.0` 常量
+    let (shape_hit, f0, _frag, _rect, _rk, color) = emit_shape_hit(
+        &mut m, f32_ty, bool_ty, v4, glsl, in_frag, in_rect, in_rk, in_color,
+    );
+    // `uv` 只在文本那一支用（采样 + 判别符），统一着色器自己 load
+    let uv = m.load(v2, in_uv);
+
+    // shape_out = select(shape_hit, color, vec4(0)) —— 逐分量（见上面的教训）
+    let shape_out = {
+        let mut comps = Vec::with_capacity(4);
+        for c in 0..4u32 {
+            let v = m.composite_extract(f32_ty, color, &[c]);
+            comps.push(m.op_select(f32_ty, shape_hit, v, f0));
+        }
+        m.composite_construct(v4, &comps)
+    };
+
+    // ── 文本那一支：cov = texture(tex, uv).r ────────────────────────────────
+    let sampled = m.load(sampled_ty, tex);
+    let rgba = m.op_image_sample_implicit_lod(v4, sampled, uv);
+    let cov = m.composite_extract(f32_ty, rgba, &[0]);
+
+    // text_out = vec4(color.rgb, color.a * cov) —— **非预乘**（覆盖率只进 alpha）
+    let text_out = {
+        let r = m.composite_extract(f32_ty, color, &[0]);
+        let g = m.composite_extract(f32_ty, color, &[1]);
+        let b = m.composite_extract(f32_ty, color, &[2]);
+        let a = m.composite_extract(f32_ty, color, &[3]);
+        let a_scaled = m.f_mul(f32_ty, a, cov);
+        m.composite_construct(v4, &[r, g, b, a_scaled])
+    };
+
+    // ── 二选一 ────────────────────────────────────────────────────────────────
+    // is_shape = uv.x < 0.0（形状段约定 uv = (-1,-1)）
+    let uv_x = m.composite_extract(f32_ty, uv, &[0]);
+    let is_shape = m.op_ford_less_than(bool_ty, uv_x, f0);
+
+    // out_color = select(is_shape, shape_out, text_out) —— 逐分量
+    let out = {
+        let mut comps = Vec::with_capacity(4);
+        for c in 0..4u32 {
+            let s = m.composite_extract(f32_ty, shape_out, &[c]);
+            let t = m.composite_extract(f32_ty, text_out, &[c]);
+            comps.push(m.op_select(f32_ty, is_shape, s, t));
+        }
+        m.composite_construct(v4, &comps)
+    };
+    m.store(out_color, out);
 
     m.return_void();
     m.function_end();

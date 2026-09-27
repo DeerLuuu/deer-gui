@@ -32,6 +32,67 @@ use deer_vk::spirv;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// SPIR-V `StorageClass` 值（解接口用）：`Input = 1`、`Output = 3`。
+const STORAGE_CLASS_INPUT: u32 = 1;
+const STORAGE_CLASS_OUTPUT: u32 = 3;
+
+fn word_vec(bytes: &[u8]) -> Vec<u32> {
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// 把 SPIR-V 拆成指令流：返回 `(opcode, 起始词下标)`，并断言词数自洽。
+fn instrs(bytes: &[u8], what: &str) -> Vec<(u16, usize)> {
+    let w = word_vec(bytes);
+    assert_eq!(w[0], 0x0723_0203, "{what}: 魔数必须是 0x07230203");
+    let mut out = Vec::new();
+    let mut i = 5usize;
+    while i < w.len() {
+        let wc = (w[i] >> 16) as usize;
+        assert!(wc >= 1, "{what}: 词 {i} 声明词数为 0");
+        assert!(i + wc <= w.len(), "{what}: 词 {i} 声明 {wc} 词但越界");
+        out.push(((w[i] & 0xffff) as u16, i));
+        i += wc;
+    }
+    assert_eq!(i, w.len(), "{what}: 指令流必须正好用完整份模块");
+    out
+}
+
+/// 找 `OpCompositeExtract(source, index)` 的 result-id。
+fn extract_of(bytes: &[u8], what: &str, source: u32, index: u32) -> Option<u32> {
+    const OP_COMPOSITE_EXTRACT: u16 = 81;
+    let w = word_vec(bytes);
+    for &(op, i) in &instrs(bytes, what) {
+        if op == OP_COMPOSITE_EXTRACT && w[i + 3] == source && w[i + 4] == index {
+            return Some(w[i + 2]);
+        }
+    }
+    None
+}
+
+/// 取「某个存储类的变量被装饰的 location 集合」（升序去重）。
+fn locations_of(bytes: &[u8], what: &str, storage_class: u32) -> Vec<u32> {
+    const OP_VARIABLE: u16 = 59;
+    const OP_DECORATE: u16 = 71;
+    const DECORATION_LOCATION: u32 = 30;
+    let w = word_vec(bytes);
+    let mut vars: std::collections::BTreeSet<u32> = Default::default();
+    for &(op, i) in &instrs(bytes, what) {
+        if op == OP_VARIABLE && w[i + 3] == storage_class {
+            vars.insert(w[i + 2]);
+        }
+    }
+    let mut locs: std::collections::BTreeSet<u32> = Default::default();
+    for &(op, i) in &instrs(bytes, what) {
+        if op == OP_DECORATE && w[i + 2] == DECORATION_LOCATION && vars.contains(&w[i + 1]) {
+            locs.insert(w[i + 3]);
+        }
+    }
+    locs.into_iter().collect()
+}
+
 /// M3a 新增的两支着色器（名字, 产物）。
 ///
 /// 单列成函数是为了让 `all_shaders()`（喂给官方 `spirv-val`）与
@@ -53,6 +114,14 @@ fn text_shaders() -> [(&'static str, Vec<u8>); 2] {
     [
         ("vs_text", spirv::vertex_shader_text()),
         ("fs_text", spirv::fragment_shader_text()),
+    ]
+}
+
+/// B5-1 新增的两支**统一管线**着色器（形状与文本合成一条管线）。
+fn unified_shaders() -> [(&'static str, Vec<u8>); 2] {
+    [
+        ("vs_unified", spirv::vertex_shader_unified()),
+        ("fs_unified", spirv::fragment_shader_unified()),
     ]
 }
 
@@ -134,6 +203,7 @@ fn all_shaders() -> Vec<(&'static str, Vec<u8>)> {
     .into_iter()
     .chain(rect_attrs_shaders())
     .chain(text_shaders())
+    .chain(unified_shaders())
     .collect()
 }
 
@@ -629,4 +699,382 @@ fn entry_point_precedes_types_in_wire_format() {
         }
     }
     println!("全部着色器的段序正确（OpEntryPoint 早于类型、全局变量早于函数）✅");
+}
+
+/// **B5-1 统一管线着色器的专项校验**（接口一致性 + 非预乘 + 判别符 + 无控制流）。
+///
+/// 统一着色器是本项目**第一次**把两条路径的判据合进同一支着色器，而且是
+/// **5 个 location**（分开时是 3 + 2）—— 属性越多，「接口对不上」的概率越高，
+/// 而这类缺陷**驱动不会报**：
+///
+/// | 检查 | 为什么非查不可 |
+/// |---|---|
+/// | ② **接口一致性** | M3c 抓到过一次：**驱动建管线成功、照样出像素，但 FS 的输入在上一阶段没有对应输出** |
+/// | ③ **非预乘** | M3b 已实证：**`spirv-val` 会放行预乘写法** —— 只有字节码级的锁能抓 |
+/// | ④ **判别符** | 判别符写死或没被用上，「统一」就只是名字统一，而驱动同样不报错 |
+#[test]
+fn unified_shaders_validate() {
+    const OP_COMPOSITE_CONSTRUCT: u16 = 80;
+    const OP_COMPOSITE_EXTRACT: u16 = 81;
+    const OP_IMAGE_SAMPLE_IMPLICIT_LOD: u16 = 87;
+    const OP_F_MUL: u16 = 133;
+    const OP_VECTOR_TIMES_SCALAR: u16 = 142;
+    const OP_SELECT: u16 = 169;
+    const OP_F_ORD_LESS_THAN: u16 = 184;
+    const OP_CONSTANT: u16 = 43;
+    const OP_CONSTANT_NULL: u16 = 46;
+    const OP_LOAD: u16 = 61;
+    const OP_DECORATE: u16 = 71;
+    const OP_BRANCH: u16 = 249;
+    const OP_BRANCH_CONDITIONAL: u16 = 250;
+    const OP_LOOP_MERGE: u16 = 246;
+    const OP_PHI: u16 = 245;
+    const OP_SWITCH: u16 = 247;
+    const OP_LABEL: u16 = 248;
+    const DECORATION_LOCATION: u32 = 30;
+    /// uv 在**片元输入**里的 location（冻结接口：0=rect, 1=rk, 2=color, 3=uv）
+    const UV_LOCATION: u32 = 3;
+    const N_VS: &str = "vs_unified";
+    const N_FS: &str = "fs_unified";
+
+    let vs = spirv::vertex_shader_unified();
+    let fs_bytes = spirv::fragment_shader_unified();
+    let w = word_vec(&fs_bytes);
+    let list = instrs(&fs_bytes, N_FS);
+
+    // ── ① 纯字节自检（任何机器都能跑） ───────────────────────────────────────
+    for (name, code) in unified_shaders() {
+        assert_eq!(code.len() % 4, 0, "{name}: SPIR-V 必须 4 字节对齐");
+        let hdr = word_vec(&code);
+        assert_eq!(hdr[0], 0x0723_0203, "{name}: magic");
+        assert!(hdr[3] > 0, "{name}: 头部 bound 必须 > 0");
+        assert!(!instrs(&code, name).is_empty(), "{name}: 必须有指令");
+    }
+
+    // ── ② 接口一致性：各类 location 集合**恰好**是那样，且 VS 输出 ⊇ FS 输入 ──
+    //
+    // 「5 个 location」在两个**不同作用域**上各有含义，别混：
+    //   · 顶点阶段 **输入** location 0..4 = 顶点属性（顶点缓冲 stride 52）
+    //   · 顶点阶段 **输出** location 0..3 = 传给片元的 4 个属性
+    //   · 片元阶段 **输入** location 0..3 = 必须与上一阶段输出**逐一对上**
+    // `gl_Position` / `gl_FragCoord` 是内建，走 `BuiltIn` 装饰、**不占 location**。
+    {
+        let vs_in = locations_of(&vs, N_VS, STORAGE_CLASS_INPUT);
+        let vs_out = locations_of(&vs, N_VS, STORAGE_CLASS_OUTPUT);
+        let fs_in = locations_of(&fs_bytes, N_FS, STORAGE_CLASS_INPUT);
+
+        assert_eq!(
+            vs_in,
+            vec![0, 1, 2, 3, 4],
+            "{N_VS}: 顶点**输入**必须**恰好 5 个** location 0..4（顶点属性）—— \
+             少一个就是「某个属性没接上」，多一个就是接口与 UnifiedVertex 不一致"
+        );
+        assert_eq!(
+            vs_out,
+            vec![0, 1, 2, 3],
+            "{N_VS}: 顶点**输出**必须是 4 个 location 0..3（gl_Position 走 BuiltIn 不占 location）"
+        );
+        assert_eq!(fs_in, vec![0, 1, 2, 3], "{N_FS}: 片元**输入**必须是 4 个 location 0..3");
+        for loc in &fs_in {
+            assert!(
+                vs_out.contains(loc),
+                "{N_FS} 在 location {loc} 有输入，但 {N_VS} 没有对应输出（接口不匹配）—— \
+                 这正是 M3c 那个「驱动建管线成功、照样出像素、但上一阶段没有对应输出」的\
+                 静默缺陷形态；VS 输出 {vs_out:?}、FS 输入 {fs_in:?}"
+            );
+        }
+
+        // 反向自检：判据必须**真的能**发现不匹配。用一支输出 location 不足的既有
+        // 着色器当反例：`vs_text` 输出 [0,1]，拿它去对 `fs_in`（含 3）必须不通过。
+        let vs_text_out =
+            locations_of(&spirv::vertex_shader_text(), "vs_text", STORAGE_CLASS_OUTPUT);
+        assert_eq!(vs_text_out, vec![0, 1], "vs_text 的输出集合（反例素材）");
+        assert!(
+            !fs_in.iter().all(|l| vs_text_out.contains(l)),
+            "反向自检失败：拿输出 location 不足的 vs_text（{vs_text_out:?}）去对 {N_FS} 的\
+             输入 {fs_in:?}，判据竟然**通过**了 ⇒ 这条护栏是空转的"
+        );
+    }
+
+    // ── ②b 兄弟着色器同样过一遍接口检查（防「只给新管线查、旧的漂移」） ──────
+    for (vs_name, vs_bytes, fs_name, fs_bytes, fs_expect) in [
+        (
+            "vs_rect_attrs",
+            spirv::vertex_shader_rect_attrs(),
+            "fs_rect_shape",
+            spirv::fragment_shader_rect_shape(),
+            vec![0, 1, 2],
+        ),
+        (
+            "vs_text",
+            spirv::vertex_shader_text(),
+            "fs_text",
+            spirv::fragment_shader_text(),
+            vec![0, 1],
+        ),
+    ] {
+        let vs_out = locations_of(&vs_bytes, vs_name, STORAGE_CLASS_OUTPUT);
+        let fs_in = locations_of(&fs_bytes, fs_name, STORAGE_CLASS_INPUT);
+        assert_eq!(fs_in, fs_expect, "{fs_name}: 输入 location 集合");
+        for loc in &fs_in {
+            assert!(
+                vs_out.contains(loc),
+                "{fs_name} 在 location {loc} 有输入，但 {vs_name} 没有对应输出；VS 输出 {vs_out:?}"
+            );
+        }
+    }
+
+    // ── ③ 非预乘回归锁（字节码级） ───────────────────────────────────────────
+    // 语义：`text_out = vec4(color.rgb, color.a * cov)`。M3b 已实证
+    // **`spirv-val` 会放行预乘** ⇒ 只有这把锁能抓。
+    let text_out_alpha;
+    {
+        let mut extract_map: std::collections::BTreeMap<u32, (u32, u32)> = Default::default();
+        let mut fmul_of: std::collections::BTreeMap<u32, (u32, u32)> = Default::default();
+        let mut fmul_results: std::collections::BTreeSet<u32> = Default::default();
+        let mut constructs: Vec<(u32, Vec<u32>)> = Vec::new();
+        let mut sample_result: Option<u32> = None;
+        let mut vector_times_scalar = 0usize;
+
+        for &(op, i) in &list {
+            match op {
+                OP_VECTOR_TIMES_SCALAR => vector_times_scalar += 1,
+                OP_F_MUL => {
+                    fmul_results.insert(w[i + 2]);
+                    fmul_of.insert(w[i + 2], (w[i + 3], w[i + 4]));
+                }
+                OP_COMPOSITE_EXTRACT => {
+                    let wc = (w[i] >> 16) as usize;
+                    if wc >= 5 {
+                        extract_map.insert(w[i + 2], (w[i + 3], w[i + 4]));
+                    }
+                }
+                OP_COMPOSITE_CONSTRUCT => {
+                    let wc = (w[i] >> 16) as usize;
+                    constructs.push((w[i + 2], w[i + 3..i + wc].to_vec()));
+                }
+                OP_IMAGE_SAMPLE_IMPLICIT_LOD => sample_result = Some(w[i + 2]),
+                _ => {}
+            }
+        }
+
+        assert_eq!(
+            vector_times_scalar, 0,
+            "{N_FS} 里不允许出现 OpVectorTimesScalar —— 它是「预乘」写法的标志，\
+             而本管线混合是 SRC_ALPHA/ONE_MINUS_SRC_ALPHA（预乘会让 RGB 被乘两次 alpha）"
+        );
+
+        let sampled = sample_result.expect("fs_unified 必须有一次纹理采样（文本那一支）");
+        let is_cov = |id: u32| extract_map.get(&id) == Some(&(sampled, 0));
+
+        let (cov_mul_id, (ma, mb)) = fmul_of
+            .iter()
+            .find(|(_, (a, b))| is_cov(*a) || is_cov(*b))
+            .map(|(r, ab)| (*r, *ab))
+            .expect(
+                "fs_unified 必须有一条 OpFMul 把**采样覆盖率**（%sample 的 0 号分量）乘进去 \
+                 —— 否则覆盖率没参与运算（文本边缘会是硬边）",
+            );
+        let alpha_side = if is_cov(ma) { mb } else { ma };
+        match extract_map.get(&alpha_side) {
+            Some((_, 3)) => {}
+            other => panic!(
+                "{N_FS}: 覆盖率乘法的另一侧（Id {alpha_side}）必须是「某个 vec4 的 3 号分量」\
+                 的抽取（= color.a）；实得 {other:?}"
+            ),
+        }
+        text_out_alpha = cov_mul_id;
+
+        let text_out = constructs
+            .iter()
+            .find(|(_, parts)| parts.len() == 4 && parts[3] == cov_mul_id)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{N_FS}: 找不到「以 alpha = cov 的乘法结果(Id {cov_mul_id}) 为第 4 分量」的 \
+                     4 分量 `OpCompositeConstruct`（= text_out `vec4(color.rgb, a*cov)`）；\
+                     现有 construct：{constructs:?}"
+                )
+            });
+
+        // **非预乘的核心**：该 vec4 的 rgb 不得是任何乘法结果，且必须原样来自 color
+        for (n, part) in text_out.1[..3].iter().enumerate() {
+            assert!(
+                !fmul_results.contains(part),
+                "{N_FS}: text_out 的 rgb 分量 #{n}（Id {part}）是**乘法结果** —— \
+                 非预乘要求 rgb 原样输出，覆盖率只乘进 alpha。\
+                 （改成预乘时 `spirv-val` 会照样放行：M3b 已实证 —— 只有这把锁能抓）"
+            );
+            match extract_map.get(part) {
+                Some((_, c)) if *c == n as u32 => {}
+                other => panic!(
+                    "{N_FS}: text_out 的 rgb 分量 #{n}（Id {part}）应当是 color 的第 {n} 号分量的\
+                     抽取（非预乘 = rgb 原样透传）；实得 {other:?}"
+                ),
+            }
+        }
+    }
+
+    // ── ④ 判别符：`uv < 0.0`，且其结果**真的驱动**最终二选一 ─────────────────
+    //
+    // ## 这条护栏改了四版，最终版由**实测字节码**定形（留档：它是同型陷阱的标本）
+    //
+    // | 版本 | 判据 | 实测结果 |
+    // |---|---|---|
+    // | 1 | 「存在某条 `OpFOrdLessThan`，一侧是某个 vec 的 0 号分量抽取」 | **空转**：匹配到形状判据里的 `dl < 0`（`dl = px - rx`）⇒ 判别符写死成 `OpConstantTrue` 后**照样绿** |
+    // | 2/3 | 拿「采样坐标 Id」或「uv 的 `OpLoad` 结果」直接匹配 | **少穿透一层抽取**：比较用的是 `OpLoad` 结果的 `.x` 抽取 ⇒ 实测 0 条命中（红） |
+    // | 4（本版） | **语义锚点 + 穿透一层抽取**：`Location=3` 的输入 = uv → 它的 `OpLoad` 结果及其 `.x` 抽取 → 找「它与 **0.0** 常量比较」的 `OpFOrdLessThan` → 并要求其结果驱动 **≥4 条 `OpSelect`** | 绿（正确）/ 红（写死或阈值改过）✅ |
+    //
+    // **实测事实**（981 词）：
+    // ```text
+    //   var 20 = 输入，Location = 3          ⇒ uv
+    //   29     = OpLoad var20                ⇒ uv 的值（**不被比较直接用**）
+    //   165    = OpCompositeExtract(29, 0)   ⇒ uv.x
+    //   166    = OpFOrdLessThan(165, 24)     ⇒ 判别符（24 = OpConstant 0.0）
+    //   …4 条 OpSelect(166, shape_i, text_i) ⇒ 逐分量最终二选一
+    // ```
+    // **教训**：写字节码级判据前，先把真实字节码打印出来 —— 靠记忆猜编码、或
+    // 少穿透一层 `OpCompositeExtract`，都会写出**空转**或**过严**的护栏。
+    {
+        // ① 值为 0.0 的常量 Id
+        let mut zero_consts: std::collections::BTreeSet<u32> = Default::default();
+        for &(op, i) in &list {
+            match op {
+                OP_CONSTANT => {
+                    let wc = (w[i] >> 16) as usize;
+                    if wc >= 4 && w[i + 3] == 0 {
+                        zero_consts.insert(w[i + 2]);
+                    }
+                }
+                OP_CONSTANT_NULL => {
+                    zero_consts.insert(w[i + 2]);
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            !zero_consts.is_empty(),
+            "{N_FS}: 没找到值为 0.0 的常量 —— 判别符 `uv < 0` 必然要有一个"
+        );
+
+        // ② 语义锚点：`Location = 3` 的片元输入就是 uv
+        let mut uv_var: Option<u32> = None;
+        for &(op, i) in &list {
+            if op == OP_DECORATE && w[i + 2] == DECORATION_LOCATION && w[i + 3] == UV_LOCATION {
+                uv_var = Some(w[i + 1]);
+            }
+        }
+        let uv_var = uv_var.unwrap_or_else(|| {
+            panic!("{N_FS}: 找不到 Location = {UV_LOCATION} 的输入变量（冻结接口里那是 uv）")
+        });
+
+        // ③ 由 uv 变量 `OpLoad` 出来的值
+        let mut uv_loads: std::collections::BTreeSet<u32> = Default::default();
+        for &(op, i) in &list {
+            if op == OP_LOAD && w[i + 3] == uv_var {
+                uv_loads.insert(w[i + 2]);
+            }
+        }
+        assert!(
+            !uv_loads.is_empty(),
+            "{N_FS}: uv 变量（Id {uv_var}）没有被 `OpLoad` 过 —— 判别符不可能成立"
+        );
+
+        // ④ 穿透一层抽取：比较用的可能是 load 结果，也可能是它的 `.x` 抽取
+        let uv_parts: std::collections::BTreeSet<u32> = uv_loads
+            .iter()
+            .flat_map(|l| {
+                std::iter::once(*l).chain(extract_of(&fs_bytes, N_FS, *l, 0))
+            })
+            .collect();
+
+        let mut disc: Vec<u32> = Vec::new();
+        for &(op, i) in &list {
+            if op != OP_F_ORD_LESS_THAN {
+                continue;
+            }
+            let (a, b) = (w[i + 3], w[i + 4]);
+            if (uv_parts.contains(&a) && zero_consts.contains(&b))
+                || (uv_parts.contains(&b) && zero_consts.contains(&a))
+            {
+                disc.push(w[i + 2]);
+            }
+        }
+        assert_eq!(
+            disc.len(),
+            1,
+            "{N_FS}: 必须**恰好有 1 条** `OpFOrdLessThan` 把「uv 的值或它的 0 号分量\
+             （Id {uv_parts:?}，其中 {uv_loads:?} 是 uv 的 `OpLoad` 结果）」与 \
+             「**值为 0.0 的**常量（Id {zero_consts:?}）」相比 —— 那一条就是判别符 `uv.x < 0`。\
+             实得 {} 条（Id {disc:?}）。0 条 ⇒ 判别符被写死成常量、换了别的属性、\
+             或把阈值从 0.0 改成了别的数 ⇒ 两条路径中的一条会渲染错，而驱动**不会**报错。",
+            disc.len()
+        );
+
+        // ⑤ 判别符的结果必须**真的被用上**：以它（或它经一次抽取后的标量）为条件的
+        //    `OpSelect` 至少 4 条（逐分量构造最终 vec4）。
+        let disc_scalars: std::collections::BTreeSet<u32> =
+            std::iter::once(disc[0]).chain(extract_of(&fs_bytes, N_FS, disc[0], 0)).collect();
+        let selects_using = list
+            .iter()
+            .filter(|(op, _)| *op == OP_SELECT)
+            .filter(|(_, i)| disc_scalars.contains(&w[i + 3]))
+            .count();
+        assert!(
+            selects_using >= 4,
+            "{N_FS}: 判别符（Id {}，标量形式 {disc_scalars:?}）必须至少做 4 条 `OpSelect` 的\
+             条件（逐分量二选一）；实得 {selects_using} 条。0 条 ⇒ 判别符算了但**没被用上**，\
+             即「统一只是名字统一」。",
+            disc[0]
+        );
+
+        println!(
+            "fs_unified 判别符 ✅：`uv`(Id {uv_loads:?}) < `0.0` ⇒ 比较结果 Id {}，\
+             驱动 {selects_using} 条 OpSelect 做逐分量二选一",
+            disc[0]
+        );
+    }
+
+    println!(
+        "fs_unified 非预乘 ✅（alpha = cov × color.a，Id {text_out_alpha}；rgb 原样；\
+         零 OpVectorTimesScalar）—— 与 SRC_ALPHA/ONE_MINUS_SRC_ALPHA 混合相容"
+    );
+
+    // ── ⑤ 无控制流（统一不等于引入分支） ─────────────────────────────────────
+    for (name, bytes) in unified_shaders() {
+        let mut labels = 0usize;
+        for (op, _) in instrs(&bytes, name) {
+            assert!(
+                !matches!(
+                    op,
+                    OP_BRANCH | OP_BRANCH_CONDITIONAL | OP_LOOP_MERGE | OP_PHI | OP_SWITCH
+                ),
+                "{name}: 不允许控制流指令（opcode {op}）—— 判别必须用 OpSelect 而不是分支"
+            );
+            if op == OP_LABEL {
+                labels += 1;
+            }
+        }
+        assert_eq!(labels, 1, "{name}: 必须是单基本块（实得 {labels} 个 OpLabel）");
+    }
+
+    // ── ⑥ 官方 spirv-val（与 all_shaders 同一条流程、同一个 find_spirv_val） ──
+    let Some(val) = find_spirv_val() else {
+        println!("跳过官方 spirv-val（未找到可执行文件）—— 上面的纯字节自检仍然有效");
+        return;
+    };
+    for (name, bytes) in unified_shaders() {
+        let path = std::env::temp_dir().join(format!("deer_b5_{name}.spv"));
+        std::fs::write(&path, &bytes).unwrap_or_else(|e| panic!("写 {name} 失败：{e}"));
+        let out = Command::new(&val)
+            .arg(&path)
+            .output()
+            .unwrap_or_else(|e| panic!("跑 spirv-val 失败：{e}"));
+        assert!(
+            out.status.success(),
+            "{name} 未通过官方 spirv-val：\nstdout={}\nstderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        println!("  {name}: 通过官方 spirv-val ✅");
+    }
 }
