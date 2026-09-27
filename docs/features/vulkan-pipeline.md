@@ -69,7 +69,7 @@ assert!(!pipeline.handle().is_null());
 
 | 参数 | 常用值 | 含义 |
 |---|---|---|
-| `format` | `VK_FORMAT_R8G8B8A8_UNORM`（离屏）/ `..._SRGB`（屏幕）/ `B8G8R8A8_SRGB`（Windows 交换链） | 附件格式 |
+| `format` | 离屏 `VK_FORMAT_R8G8B8A8_UNORM`；**上屏优先线性 `*_UNORM`**（`B8G8R8A8_UNORM` → `R8G8B8A8_UNORM` → 才退 `_SRGB`，M3c 起；理由：sRGB 附件的混合在线性空间，与 CPU 字节空间差 44 字节） | 附件格式 |
 | `load_op` | `VK_ATTACHMENT_LOAD_OP_CLEAR`（每帧清屏）/ `..._LOAD`（保留上一帧） | 开始时做什么 |
 | `final_layout` | `VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL`（要回读）/ `..._PRESENT_SRC_KHR`（要呈现） | 结束时布局 |
 

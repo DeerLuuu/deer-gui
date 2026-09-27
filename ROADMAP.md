@@ -10,7 +10,7 @@
 |---|---|---|---|
 | **M1** | **核心 + HAL + Vulkan 设备枚举** | 节点树、布局代数、命中测试、`.dui` 解析；GPU HAL + CPU 参考后端；Vulkan 实例与物理设备枚举（自己声明符号 + 动态加载） | ✅ **完成** |
 | **M2** | Vulkan 逻辑设备 + 交换链 | M2a：逻辑设备/管线/命令/离屏回读；M2b：窗口 + `VkSurfaceKHR` + 交换链 + 帧同步 + 呈现 | ✅ **完成（M2a + M2b）** |
-| **M3** | 渲染器 + 管线（矩形/圆角/裁剪/文本） | M3a：形状的 `DrawList` → GPU（顶点缓冲 + 静态管线 + 与 CPU 逐像素对照）；M3b：文本/字形 → GPU（第二条管线 + 图集纹理 + 逐像素对照）；M3c：窗口里显示界面；还欠批处理优化 | 🔄 **进行中（M3a + M3b 完成，M3c/M3+ 未做）** |
+| **M3** | 渲染器 + 管线（矩形/圆角/裁剪/文本） | M3a：形状的 `DrawList` → GPU（顶点缓冲 + 静态管线 + 与 CPU 逐像素对照）；M3b：文本/字形 → GPU（第二条管线 + 图集纹理 + 逐像素对照）；M3c：把界面**呈到窗口**（共用管线层 + 线性交换链 + 上屏 parity）；还欠批处理优化 | 🔄 **进行中（M3a + M3b + M3c 完成，仅剩 M3+ 批处理优化）** |
 | **M4** | 文本 | 字体解析（TTF/OTF）+ 字形光栅化 + 图集 + 文本度量（替换 `ApproxMeasure`）+ 换行 | 🔄 **进行中（解析 / 光栅化 / 图集 / 度量与换行 / CPU 真实字形 ✅；hinting 与亚像素待做）** |
 | **M5** | 输入 + 焦点 + dock | 事件循环、命中测试路由（`hit_test` 已就位）、焦点系统（含方向键）、**可停靠面板布局**（拖动改位置 / 边缘折叠） | ⬜ |
 | **M6** | 控件族 | 从 `deer-ui` 迁移 12 个控件的**语义**：`Btn`/`ChipGroup`/`Segmented`/`TabBar`/`Switch`/`NumberField`/`ScrubNum`/`ColorField`/`Dialog`/`Overlay`/`DropMenu`/`HoverTip`/`Icon`/`Row`/`RowActions`/`Keep` | ⬜ |
@@ -44,9 +44,9 @@ M2b 拿到窗口后接上 surface/交换链/呈现（Q-1 已决：引 `winit`）
 | 部分 | 交付 | 状态 | 验收判据 |
 |---|---|---|---|
 | **窗口层** | `crates/deer-window`：`WindowConfig` / `WindowInfo` / `App` / `Flow` / `run()`（**唯一引入 winit 的 crate**，见依赖例外登记） | ✅ 完成 | 真窗口可建（320×200）；`Resized` / `RedrawRequested` 到达；`DEER_WINDOW_HOLD=1` 能留窗观察；非 Windows 明确 `Err` |
-| **Vulkan 上屏** | `crates/deer-vk`：`surface.rs` / `swapchain.rs` / `windowed.rs`（`VkSurfaceKHR` + 交换链 + 信号量/栅栏 + 呈现） | ✅ 完成 | `choose_config` 确定性（FIFO、sRGB、extent 夹取）；`OutOfDate`/`Suboptimal` 正确映射；真机呈现 |
+| **Vulkan 上屏** | `crates/deer-vk`：`surface.rs` / `swapchain.rs` / `windowed.rs`（`VkSurfaceKHR` + 交换链 + 信号量/栅栏 + 呈现） | ✅ 完成 | `pick_config` 确定性（FIFO、**线性 `*_UNORM` 优先**、extent 夹取；M3c 起格式优先级改为线性，理由见 M3c 行）；`OutOfDate`/`Suboptimal` 正确映射；真机呈现 |
 | **接入 + 示例** | `deer-gui` 的 `window` feature + `window_preview` 示例（`deer-vk` 的 HAL 接线同步完成） | ✅ 完成 | `cargo run -p deer-gui --features window --example window_preview` → 真窗口、自检全过、`exit=0` |
-| **HAL 路径真实覆盖** | `crates/deer-gui/examples/hal_window_path.rs`：真窗口下走 `VkBackend::open(0)` → `create_swapchain` → `begin_frame/record/submit_and_present` → `wait_idle`，并断言 `record(含绘制命令)` ⇒ `Unsupported(M3)` | ✅ 完成 | `DEER_VK_WINDOW_TESTS=1 DEER_VK_VALIDATION=1 cargo run -q -p deer-gui --features window --example hal_window_path` → `exit=0`、640×480 / `Bgra8Srgb`、校验层零消息 |
+| **HAL 路径真实覆盖** | `crates/deer-gui/examples/hal_window_path.rs`：真窗口下走 `VkBackend::open(0)` → `create_swapchain` → `begin_frame/record/submit_and_present` → `wait_idle`，并断言 `record(含绘制命令)` ⇒ `Unsupported(M3)` | ✅ 完成 | `DEER_VK_WINDOW_TESTS=1 DEER_VK_VALIDATION=1 cargo run -q -p deer-gui --features window --example hal_window_path` → `exit=0`、640×480 / `Rgba8Unorm`（M3c 前是 `Bgra8Srgb`，因格式优先级已改为线性）、校验层零消息 |
 
 **M2b 的完整门禁命令**（真窗口 e2e **默认跳过**，必须显式打开）：
 
@@ -58,9 +58,9 @@ $env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo test -p deer-v
 > （验证者实测：把 `windowed.rs::resize` 改成空操作后，不设该变量时 25/25 全绿、设了才 1 failed）。
 > HAL 路径的真人肉验收是上面的 `hal_window_path` 示例（`DEER_HAL_FRAMES` 可改帧数，默认 30）。
 
-> **M2b 的边界**：它只保证「GPU 画的像素能出现在窗口上」—— 窗口里是清屏色 + M2a 验证过的几何。
-> 把 `DrawList` 送上 GPU 属于 **M3**：**M3a（形状）与 M3b（文本）都已完成**（离屏、与 CPU 逐像素对齐）；
-> 窗口里显示界面是 **M3c**；输入事件属于 **M5**。
+> **M2b 的边界**：它只保证「GPU 画的像素能出现在窗口上」—— 当窗口里是清屏色 + M2a 验证过的几何。
+> 把 `DrawList` 送上 GPU 属于 **M3**：**M3a（形状）、M3b（文本）、M3c（呈到窗口）都已完成**，
+> 三条都能与 CPU 逐像素对照；输入事件属于 **M5**。
 
 ### M3 的子步与状态
 
@@ -68,7 +68,7 @@ M3 原写成一条「渲染器 + 管线（矩形/圆角/裁剪/文本）」。�
 
 | 子步 | 交付 | 状态 | 验收判据 / 说明 |
 |---|---|---|---|
-| **M3a-1** | **顶点流 + 着色器**：`gpu_geom.rs`（`DrawList` → `GpuVertex` 流，CPU 侧几何裁剪）、`spirv.rs` 的矩形属性 VS/FS | ✅ 完成 | 顶点布局 `#[repr(C)]` stride 44（`pos`/`rect`/`radius_kind`/`color`）；**静态** viewport/scissor；着色器经 `spirv-val` |
+| **M3a-1** | **顶点流 + 着色器**：`gpu_geom.rs`（`DrawList` → `GpuVertex` 流，CPU 侧几何裁剪）、`spirv.rs` 的矩形属性 VS/FS | ✅ 完成 | 顶点布局 `#[repr(C)]` stride 44（`pos`/`rect`/`radius_kind`/`color`）；**静态** viewport/scissor（**当前实现事实**；当年「动态画不出像素」那条理由已标为**存疑**，见下方前提 1）；着色器经 `spirv-val` |
 | **M3a-2** | **离屏 GPU 几何渲染器**：`gpu_render.rs` 的 `GpuGeometryRenderer`（顶点缓冲 + 静态管线 + 回读） | ✅ 完成 | `cargo run -p deer-gui --example gpu_geometry` → `exit=0`；与 CPU **逐字节相同** |
 | **M3a-3** | **与 CPU 逐像素对照**：`crates/deer-vk/tests/gpu_vs_cpu.rs` | ✅ 完成 | 不透明语料**最大通道差 0**（逐字节相同）；半透明语料**最大差 1 LSB**（实测仅 `alpha-clip` 非 0，**是实测上限不是证明上界**）；覆盖矩形/圆角（含超大半径）/描边（含带宽 > 边长）/裁剪/**嵌套裁剪**/退化 extent/清屏/连续多帧；`DEER_VK_VALIDATION=1` 下 parity **零校验消息**（**「层确实在跑」与「消息为零」都是可回归断言** —— 进程级计数 + parity 用例里的 `assert_no_validation_messages`，当前覆盖单帧/不透明/半透明/越界 alpha；但 VVL 不做通用同步验证 ⇒ 零消息**不能**证明内存域依赖正确） |
 | **M3b-1** | **文本顶点流**：`gpu_text.rs`（`DrawCmd::Text` → `TextVertex` 四边形流，图集 `uv` + 屏幕 `pos` + 颜色） | ✅ 完成 | 顶点布局 `#[repr(C)]` **stride 32**（`pos`/`uv`/`color`）；空串 / `size <= 0` / 被裁空 / 图集放不下 ⇒ **跳过并计入 `skipped`，不报错**（修掉 M3a 的假阳性） |
@@ -76,14 +76,27 @@ M3 原写成一条「渲染器 + 管线（矩形/圆角/裁剪/文本）」。�
 | **M3b-3** | **第二条管线 + 单次遍历保 z 序**（`gpu_render.rs::with_text`） | ✅ 完成 | 独立顶点缓冲/管线/描述符集；文本与形状**交错**时按命令顺序绘制；图集只在**指纹变化**时重传（指纹 = `(图集宽, 图集高, 已光栅化字形数)`） |
 | **M3b-4** | **文本与 CPU 逐像素对照**（`tests/gpu_vs_cpu.rs`） | ✅ 完成 | 不透明文本**逐字节相同（最大通道差 0）**、半透明文本 **≤ 1 LSB**；语料含单/多字符、`align=0/1/2`、超大 size、空串、零面积、被裁空、局部裁剪、缺字豆腐、z 序、连续 4 帧；**假阳性三类 ⇒ 跳过并计数**；图集零重传有护栏 |
 | **M3b-5** | **文档 + 示例**（本指南 + `gpu_geometry` 示例扩成含文本） | ✅ 完成 | `cargo run -p deer-gui --example gpu_geometry` → `exit=0`（形状 + 文本仍与 CPU 逐字节相同） |
-| **M3c** | **窗口里显示界面** | ⬜ | M2b 能上屏、M3a/M3b 能**离屏**画出形状与文本，但两者还没接起来（窗口里仍只有清屏色 + M2a 几何） |
+| **M3c** | **窗口里显示界面**（上屏路径：共用管线层 + 线性交换链 + 上屏 parity） | ✅ 完成 | `DEER_VK_WINDOW_TESTS=1 cargo run -q -p deer-gui --features window --example window_parity` → 不透明像素**逐字节相同（0）**、半透明 **≤1 LSB**；交换链改**线性 `*_UNORM`**（sRGB 附件的**混合在线性空间**，与 CPU 字节空间 `blend_cov` 实测差 **44 字节**：`src=0xC0,a=0.5,dst=0` ⇒ 96 vs 140）；resize×4 无泄漏（存活资源恒 1）；**动态与静态 viewport 都实测能上屏**（各 30 帧、93900 像素；见下方前提 1 的证据与边界） |
 | **M3+** | **批处理优化** | ⬜ | 形状与文本**各自**每帧一个顶点缓冲、一次 draw；属性能项，不影响正确性 |
 
 **M3 的不可回退前提**（细节见 [`docs/features/gpu-geometry.md`](docs/features/gpu-geometry.md) 第 3 节）：
 
-1. **静态 viewport/scissor** —— 动态版在本机 Intel 核显上**画不出任何像素**（M2a 实测），
-   故管线写死静态状态、录制时不调 `vkCmdSetViewport`/`vkCmdSetScissor`；换 extent 就新建渲染器。
+1. **viewport/scissor：离屏用「静态」是当前实现事实；而「动态画不出像素」是一条**存疑的旧结论**（未证实）**。
+   旧说法（`~~动态版在本机 Intel 核显上画不出任何像素~~`）**既没被证实、也没被推翻**，M3c 的对照实验只是**动摇了它**：
+   - **支持「可用」的证据**：同一台 Intel 集显（RaptorLake-S，index 0）上**动态与静态各跑 30 帧都出
+     93900 界面像素，且完全相同**（窗口路径，`DEER_VK_FRAMES=30 … window_preview` / `DEER_VK_WINDOW_VIEWPORT=static`）；
+   - **新发现的失败模式**：「管线**声明**了动态状态却**从不调** `vkCmdSetViewport`」⇒ 规范未定义行为，
+     本机驱动**崩**：窗口路径 `0xC000041D`（一帧都没呈现），**离屏路径 `0xC0000005`（0/21 跑完）**；
+   - **⚠️ 为什么不能定为「M2a 是误诊」**：M2a 当年记录的症状是「**画不出任何像素**」（清屏正常、绘制为零），
+     而上面两次复现出的症状都是「**崩溃**」—— **症状不同**，不能据此断定同一个根因。⇒ 定性：**高度可能**，不是已证实。
+   - **可执行的待办**：要复现/推翻 M2a 的原始症状，需要**重跑当年的场景**：**离屏 + 三角形管线 + 动态状态**，
+     并按「清屏像素 / 绘制像素 / 是否崩溃」逐格记录（这是唯一能把这条旧结论钉死或钉倒的实验）。
+   - **现状**：离屏沿用静态（已够用、不必每帧设置、不必因 resize 重建管线）；**窗口路径用动态**（每帧真的设置，
+     `DEER_VK_WINDOW_VIEWPORT=static|dynamic` 只是诊断开关，**默认 `dynamic` 才是产品行为**）。
+     若将来把离屏改成动态，判据：**必须每帧真的调用** `vkCmdSetViewport`/`vkCmdSetScissor`（否则就是上面那种崩溃）。
 2. **颜色附件必须 `R8G8B8A8_UNORM`（不是 `_SRGB`）** —— CPU 基准不做 gamma，用 SRGB 会系统性偏差。
+   **上屏交换链同理**（M3c）：sRGB 附件的**混合在线性空间**，与 CPU 字节空间 `blend_cov` 实测差
+   **44 字节** ⇒ `pick_config` 改成**线性 `*_UNORM` 优先**（sRGB 只作退回）。
 3. **「零校验消息」是可回归断言，但有明确覆盖边界** —— 「层确实在跑」由
    `validation_layer_state_matches_the_request` 钉住；「消息为零」由 `ffi::validation_message_count()`
    （进程级计数）配合 parity 用例里的 `assert_no_validation_messages`（单帧/不透明/半透明/越界 alpha/文本）钉住（不再靠人眼看 stderr）。

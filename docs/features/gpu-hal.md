@@ -50,7 +50,7 @@ let fb = deer_gpu::null::CpuRenderer::new()
 | HAL 调用 | 现状 |
 |---|---|
 | `VkBackend::open(0)` | ✅ 返回**真设备**（M1 时是「未实现」，现在不是了）；越界索引返回 `Err` |
-| `Device::create_swapchain(...)` | ✅ 真能建出可呈现的交换链（真机 `B8G8R8A8_SRGB` / FIFO / 3 张图） |
+| `Device::create_swapchain(...)` | ✅ 真能建出可呈现的交换链（真机 **线性 `*_UNORM`** / FIFO / 3 张图；M3c 前是 `_SRGB`，格式优先级已改） |
 | `Device::begin_frame()` | ⚠️ **还没建交换链时明确报错**（错误信息带「交换链」），不给空帧 |
 | `Frame::record(&DrawList)` | 空列表 / 只有 `NodeHint` ✅；**含真实绘制命令 ⇒ `Unsupported`**（文案指明「送上 GPU 是 M3」），**不静默忽略** |
 | `Frame::read_pixels()` | ❌ `Unsupported`：HAL 在**提交前**调用，而交换链图像的回读数据只有**呈现之后**才有效 ⇒ 错误信息指向 `WindowedRenderer::read_back_last_frame()`；离屏回读用 `OffscreenRenderer`（见 [`gpu-offscreen.md`](gpu-offscreen.md)） |
@@ -65,7 +65,7 @@ let fb = deer_gpu::null::CpuRenderer::new()
 
 ```powershell
 $env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo run -q -p deer-gui --features window --example hal_window_path
-# 本机实测 exit=0、640×480 / Bgra8Srgb、边界检查通过、校验层零消息（DEER_HAL_FRAMES 可改帧数，默认 30）
+# 本机实测 exit=0、640×480 / Rgba8Unorm（M3c 起交换链优先线性）、边界检查通过、校验层零消息（DEER_HAL_FRAMES 可改帧数，默认 30）
 ```
 
 > **为什么这是示例而不是 `#[test]`**：winit 要求事件循环在**主线程**，而 `cargo test` 的 harness
@@ -157,7 +157,7 @@ $env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo run -q -p deer
   **`deer-vk` 的 `Frame::read_pixels()` 明确 `Unsupported`** —— 不是「以后再补」而是语义选择：
   HAL 在提交前调用，回读数据只有呈现后才有效，所以请用 `WindowedRenderer::read_back_last_frame()`
   （见 [`vulkan-swapchain.md`](vulkan-swapchain.md)）。
-  窗口/交换链**已有平台实现并真机验证**（Windows：`B8G8R8A8_SRGB` / FIFO / 3 张图，
+  窗口/交换链**已有平台实现并真机验证**（Windows：**线性 `*_UNORM`** / FIFO / 3 张图，
   30 帧、校验层零消息、呈现帧像素已回读核对、`exit=0`），`Frame` 的 GPU 绘制路径**有明确边界**（非空 `DrawList` ⇒ `Unsupported`），
   只是「真的把命令画出来」还属于 M3。
 

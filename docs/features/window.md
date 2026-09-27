@@ -1,6 +1,8 @@
 # 功能指南：窗口（window）
 
-> 状态 ✅（**仅 Windows**）· 示例 `cargo run -p deer-gui --features window --example window_preview` ·
+> 状态 ✅（**仅 Windows**；M2b 开窗上屏 → **M3c 窗口里显示真实界面**）·
+> 示例 `cargo run -p deer-gui --features window --example window_preview` ·
+> 上屏 parity `DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example window_parity` ·
 > 清单条目见 [`FEATURES.md`](../../FEATURES.md)
 
 ## 1. 这是什么 / 什么时候用它
@@ -12,8 +14,8 @@
 的 surface / 交换链接一个真窗口句柄。
 
 **什么时候不该用它**：只想出图/做断言（用 [`rendering.md`](rendering.md) 的
-`render_tree_to_png`，无窗口、CI 友好）；想用鼠标键盘交互（**输入事件是 M5**，见第 6 节）；
-想要窗口里显示**界面**（现在窗口里是 GPU 清屏色 + M2a 验证过的几何，**把 `DrawList` 送上 GPU 是 M3**）。
+`render_tree_to_png`，无窗口、CI 友好）；想用鼠标键盘交互（**输入事件是 M5**，见第 7 节）；
+需要无人值守的 CI（真窗口链只能在有桌面的机器上跑，且默认跳过 —— 见第 5 节的门槛）。
 
 > ⚠️ **窗口层是本项目唯一引入第三方依赖的地方**（`winit`，登记在
 > [`ROADMAP.md`](../../ROADMAP.md) 的 Q-1）。`deer-layout` / `deer-gpu` / `deer-vk`
@@ -69,19 +71,24 @@ cargo run -p deer-gui --features window --example window_preview
 [deer-window] 窗口已建：title="deer-gui — M2b 窗口预览（GPU 清屏 + 几何）" extent=960x600 platform=Windows handle(HWND)=0xFE0BA8 display(HINSTANCE)=0x7FF7514D0000
 [deer-vk] 窗口路径已启用 VK_LAYER_KHRONOS_validation（消息打到 stderr）
 适配器      : Intel(R) RaptorLake-S Mobile Graphics Controller（index=0）
-交换链      : 960×600 / format 0x00000032 / present mode 2 / 3 张图
+交换链      : 960×600 / format 0x0000002c / present mode 2 / 3 张图
 
 呈现帧数    : 30
 交换链过期  : 0 次（过期必须重建后重试，不能当成功）
-像素回读    : 四角 [71, 79, 105, 255] = sRGB 编码后的清屏色 rgb(0x10,0x14,0x24)
-              中心 [160, 206, 255, 255]；非清屏色像素 99360 / 576000（17.25%）
-自检通过 ✅（帧数达标、交换链未持续过期、**呈现帧像素已核对**、事件循环正常退出）
+像素回读    : 左上角 [42, 47, 63, 255]
+              非清屏色像素 93900 / 576000（16.30%）；界面底色 [8, 9, 12, 255]
+自检通过 ✅（帧数达标、**界面树已上屏**：非清屏色 93900 个像素是形状与字形）
 [deer-window] 事件循环结束：frames=30 extent=960x600 result=ok
 ```
 
-> **像素回读 + sRGB 坑**：示例第一帧会用 `WindowedRenderer::read_back_last_frame()` 取样一次
-> （会**强制一次 GPU→CPU 同步**，所以别每帧调）。注意回读到的**不是** `rgb(0x10,0x14,0x24)` 而是
-> **`[71,79,105]`** —— sRGB 附件的驱动编码，详见 [`vulkan-swapchain.md`](vulkan-swapchain.md) 第 5 节。
+（数字随机器/主题而变，**以你自己的输出为准**。`format 0x0000002c = B8G8R8A8_UNORM` = **线性**，
+所以回读到的字节**就是**写进去的字节。）
+
+> **像素回读**：示例第一帧会用 `WindowedRenderer::read_back_last_frame()` 取样一次
+> （会**强制一次 GPU→CPU 同步**，所以别每帧调），用来证明「界面真的上了屏」而不是只有清屏色。
+> M3c 起交换链是**线性** `*_UNORM` ⇒ 回读**不做** sRGB 编码/解码，字节直通；
+> 只有当驱动把这个 surface 的线性格式全排除、退回到 sRGB 格式时，才会看到
+> 「回读值 ≠ 写入值」（那时的算法见 [`vulkan-swapchain.md`](vulkan-swapchain.md) 第 5 节）。
 
 （窗口尺寸/适配器帧率随机器而变，**以你自己的输出为准**。）
 
@@ -90,7 +97,7 @@ cargo run -p deer-gui --features window --example window_preview
 
 ```powershell
 $env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo run -q -p deer-gui --features window --example hal_window_path
-# 本机实测：exit=0、640×480 / Bgra8Srgb、边界检查通过、校验层零消息
+# 本机实测：exit=0、640×480 / Rgba8Unorm（M3c 起交换链优先线性格式）、边界检查通过、校验层零消息
 # 帧数用 DEER_HAL_FRAMES 改（默认 30）；不设 DEER_VK_WINDOW_TESTS 时会**显式跳过并说明「这不是通过」**
 ```
 
@@ -201,8 +208,8 @@ $env:DEER_WINDOW_FRAMES='10'; cargo run -p deer-gui --features window --example 
 ```
 
 示例自己还会断言「呈现帧数 ≥ `DEER_WINDOW_FRAMES`」「耗时/帧率为正」，并在第一帧用
-`read_back_last_frame()` **核对呈现帧的像素**（几何真的画上去了、清屏色是 sRGB 编码后的已知值）——
-所以「跑了但一帧都没呈现」或「只有清屏色没有几何」都会直接失败，而不是静默成功。
+`read_back_last_frame()` **核对呈现帧的像素**（界面真的画上去了、清屏色就是线性 UNORM 的字节值）——
+所以「跑了但一帧都没呈现」或「只有清屏色没有界面」都会直接失败，而不是静默成功。
 
 **「HAL 路径」为什么是示例而不是 `#[test]`**：winit 要求事件循环在**主线程**，
 而 `cargo test` 的 harness 在**子线程**里跑每个测试 ⇒ 真窗口那条链只能在示例里驱动。
@@ -213,7 +220,71 @@ $env:DEER_WINDOW_FRAMES='10'; cargo run -p deer-gui --features window --example 
 | **映射契约**（`OutOfDate` 绝不当成功） | `deer-vk/src/hal.rs` 的纯函数单测 `present_outcome_mapping_never_treats_out_of_date_as_success` | 在 `cargo test` 里；把 `OutOfDate` 映成 `Presented` 会立刻变红 |
 | **真实路径**（真窗口 + 真交换链 + 真提交/呈现 + `wait_idle`） | 示例 `hal_window_path`（本仓库门禁里跑） | `DEER_VK_WINDOW_TESTS=1` 打开；不设时示例会打印「这不是通过」 |
 
-## 5. 常见坑
+## 5. 窗口里显示真实界面（M3c 上屏路径）
+
+M3c 之后，窗口里显示的是**真的界面树**（形状 + 真实字形文本），而不是 M2a 那个硬编码三角形。
+它复用了离屏路径的**同一批**顶点流构造与**同一套**管线状态（共用层），两条路径只允许在
+**颜色格式**与 **viewport 策略**上不同。
+
+```powershell
+# ① 真窗口里看到界面树（30 帧后退出；DEER_WINDOW_HOLD=1 可留窗观察）
+DEER_VK_FRAMES=30 cargo run -q -p deer-gui --features window --example window_preview
+
+# ② 上屏 parity：把**窗口里真实的像素**读回来与 CPU 后端逐像素对照（需要真窗口，必须到第 3 节的门槛）
+DEER_VK_WINDOW_TESTS=1 cargo run -q -p deer-gui --features window --example window_parity
+```
+
+| 语料 | 判据 |
+|---|---|
+| **不透明**界面树（形状 + 真实字形） | **逐字节相同（最大通道差 0）** |
+| **半透明**（`α=0.5` 的矩形 / 文字 / 圆角，叠在不透明底上） | **≤ 1 LSB**（CPU `round()` vs GPU UNORM 定点混合） |
+
+两者都要带 `--features window`；`window_parity` 不设 `DEER_VK_WINDOW_TESTS=1` 时会打印
+「**这不是通过，是被跳过**」并 `exit=0`（跳过不算证据）。
+
+### 5.1 交换链是**线性** `*_UNORM`（不是 sRGB）
+
+`swapchain::pick_config` 现在按 **线性优先** 选格式：
+`B8G8R8A8_UNORM` → `R8G8B8A8_UNORM` → `B8G8R8A8_SRGB` → `R8G8B8A8_SRGB`
+（格式列表只有 `VK_FORMAT_UNDEFINED` 时按规范「任意格式」处理 ⇒ 取线性 BGRA）。
+
+**为什么不能用 sRGB 附件**：sRGB 附件不只在写入时编码，**混合本身也发生在线性空间**；
+而 CPU 参考实现（`null.rs::blend_cov`）是在**字节空间**混合的。实测同一半透明像素
+（`src=0xC0, a=0.5, dst=0`）：字节空间 `96` vs sRGB 线性 `140`，**差 44**——
+「窗口像素 == CPU 像素」这条判据在 sRGB 附件上**根本不成立**。改线性后，同一个半透明语料
+从「差几十」变成 **≤1 LSB**（只剩舍入），而**不透明仍然要求 0**（判据没有放宽）。
+`window_parity` 会**先把实际拿到的格式打印出来并断言它是线性的**。
+
+### 5.2 viewport 策略：窗口用**动态**（默认）；「动态画不出像素」是一条**存疑的旧结论**（未证实）
+
+窗口路径**每帧显式设置** `vkCmdSetViewport`/`vkCmdSetScissor`（动态，产品行为）。
+早期文档写过「动态 viewport/scissor 在本机 Intel 核显上**画不出任何像素**」——
+M3c 的对照实验**动摇了它，但不足以推翻它**：
+
+| 实验（同一台 Intel 集显 RaptorLake-S，窗口路径各跑 30 帧） | 结果 |
+|---|---|
+| **动态**（默认） | `exit=0`，界面像素 **93900/576000** |
+| **静态**（`DEER_VK_WINDOW_VIEWPORT=static`） | `exit=0`，界面像素 **93900/576000**（与动态**完全相同**） |
+| 动态但**从不调** `vkCmdSetViewport`（复现 M2a 的代码形状） | **进程崩 `0xC000041D`**（`STATUS_FATAL_USER_CALLBACK_EXCEPTION`），**一帧都没呈现** |
+| 同上，**离屏路径** | **进程崩 `0xC0000005`**，**0/21 用例跑完** |
+
+**⚠️ 为什么只能定级「高度可能」，不能说「已证实是误诊」**：M2a 当年记录的症状是
+**「画不出任何像素」**（清屏正常、绘制为零），而上面两次复现出的症状都是**「崩溃」** ——
+**症状不同，不能据此断定同一个根因**。⇒ 措辞必须是「**高度可能**」+「**待复现**」，不能写成已证实。
+
+**可执行的待办（把这条旧结论钉死或钉倒的唯一实验）**：**重跑当年的场景** ——
+**离屏 + 三角形管线 + 动态状态**，按「清屏像素 / 绘制像素 / 是否崩溃」逐格记录。
+在那之前，文档既不宣称「驱动不支持动态」，也不宣称「M2a 一定是漏调 `vkCmdSetViewport`」。
+
+**当前实现事实**：离屏沿用**静态**（已够用、不必每帧设置、不必因 resize 重建管线）；
+窗口路径用**动态**（`resize` 时不必重建管线）。**动态本身是能用的**（窗口路径就是动态），
+前提是**每帧真的设置它**；反过来，对**静态**管线发这两个命令会报校验错（声明与调用必须一致）。
+
+**诊断开关**：`DEER_VK_WINDOW_VIEWPORT=static|dynamic`（默认 `dynamic`；**只作实测/诊断**，
+产品行为以默认值为准）。静态是「写进管线」的策略，所以尺寸一变就必须重建管线 ——
+实测 4 次 resize：动态**重建 0 次**、静态**重建 4 次**，而**存活界面资源恒为 1**（无泄漏）。
+
+## 6. 常见坑
 
 | 现象 | 原因 | 怎么改 |
 |---|---|---|
@@ -222,11 +293,14 @@ $env:DEER_WINDOW_FRAMES='10'; cargo run -p deer-gui --features window --example 
 | 在子线程里调 `run()` 失败 | 事件循环**必须在主线程**（winit 的硬要求） | 把 `run()` 放在 `main`；渲染/计算可以另开线程 |
 | 窗口拉大后画面拉伸/报 swapchain 过期 | 尺寸变化没重建交换链 | 在 `App::resized` 里 `WindowedRenderer::resize`；`render_and_present` 返回 `OutOfDate` 时也是 resize 后重试（见 [`vulkan-swapchain.md`](vulkan-swapchain.md)） |
 | 窗口一闪就没了 | `redraw` 第一帧就返回了 `Flow::Exit` | 用 `DEER_WINDOW_HOLD=1` 先看窗口，再决定退出条件 |
-| 窗口里没有「界面」，只有纯色/三角形 | **这是 M2b 的真实状态**：把 `DrawList` 送上 GPU 是 M3 | 现在想看界面用离屏出图；M3 之后窗口才会有界面 |
+| 窗口里没有「界面」，只有纯色/三角形 | **旧状态**（M2a/M2b 时代）。M3c 已把界面呈到窗口；若仍只看到纯色，多半是没跑对示例或用了旧二进制 | 跑 `DEER_VK_FRAMES=30 cargo run -q -p deer-gui --features window --example window_preview`；要判据就跑 `window_parity`（见第 5 节） |
+| 上屏像素与 CPU 对不上、半透明差几十个字节 | 交换链是 **sRGB** 附件：混合发生在线性空间，而 CPU 按字节混合（`blend_cov`） | 让 `pick_config` 选到**线性 `*_UNORM`**（第 5.1 节）；`window_parity` 会断言拿到的格式是线性的 |
+| 以为「动态 viewport 在本机 Intel 上不可用」 | 旧结论，**存疑未证实**：实验显示动态/静态各 30 帧结果相同，而「声明动态却从不设置」会崩 —— 但 M2a 当年记的是「无像素」而非崩溃，症状不同 | 用动态就**每帧真的设置**；别把这条当硬前提（证据与待办见第 5.2 节） |
+| 反复 resize 后内存/资源涨 | 静态 viewport 策略下尺寸变化要重建管线与交换链相关资源 | 用默认的**动态**策略（重建 0 次）；静态只作诊断，重建期间要保证旧资源被 `Drop`（存活计数恒 1） |
 | 帧率不受控、风扇狂转 | 事件循环是「请求重绘就画」，**没有帧率上限** | 自己数帧 / 加节流；本项目没有内置 vsync 之外的限帧 |
 | 以为 `cargo test -p deer-vk` 已经验过真窗口链 | 真窗口 e2e **默认跳过**（要 `DEER_VK_WINDOW_TESTS=1`），而**跳过也算 pass** | 门禁用完整形式 `$env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo test -p deer-vk`；HAL 路径另跑 `--example hal_window_path` |
 
-## 6. 相关
+## 7. 相关
 
 - 上屏原理（surface / 交换链 / 呈现）：[`vulkan-swapchain.md`](vulkan-swapchain.md)
 - HAL 路径示例（真窗口 + 真交换链 + 真呈现）：`crates/deer-gui/examples/hal_window_path.rs`
@@ -235,13 +309,15 @@ $env:DEER_WINDOW_FRAMES='10'; cargo run -p deer-gui --features window --example 
 - **做不到**（本模块的边界）：
   - **只有 Windows 的句柄映射**：winit 在别的平台也能开窗，但「原生句柄 → HAL 句柄」未实现 ⇒ `run()` 明确返回 `Err`（不静默填 0）。
   - **没有输入事件**：键盘 / 鼠标 / 焦点是 **M5**，现在窗口不派发任何事件。
-  - **窗口里还没有界面**：`DrawList` 上屏属于 **M3**；现在显示的是 GPU 清屏色 + M2a 验证过的几何。
+  - **窗口里显示的界面**：**已支持**（M3c，见第 5 节）——窗口里是真实的形状 + 文本，且上屏像素与 CPU 逐像素对照过
+    （不透明 0、半透明 ≤1 LSB）。仍在窗口里画着的是**当前帧的界面快照**：还没有输入事件（M5）、没有滚动/动画系统。
   - **不支持多窗口、全屏 / 无边框、HDR**，也**没有帧率上限**。
   - **DPI**：`Resized` 给的是物理像素，直接透传；不做额外的缩放换算。
 
-## 7. 检查清单（发布前过一遍）
+## 8. 检查清单（发布前过一遍）
 
-- [x] 示例能跑：`cargo run -p deer-gui --features window --example window_preview` → `exit=0`
+- [x] 示例能跑：`cargo run -p deer-gui --features window --example window_preview` → `exit=0`（窗口里是真实界面树）
+- [x] 上屏 parity 示例能跑：`DEER_VK_WINDOW_TESTS=1 cargo run -q -p deer-gui --features window --example window_parity` → `exit=0`（不透明 0 / 半透明 ≤1 LSB）
 - [x] HAL 路径示例能跑：`DEER_VK_WINDOW_TESTS=1 DEER_VK_VALIDATION=1 cargo run -q -p deer-gui --features window --example hal_window_path` → `exit=0`
 - [x] 示例有自检断言（帧数达标 + 句柄非 0 + 退出干净）
 - [x] `FEATURES.md` 已登记（状态 / 指南链接 / 示例命令都对）

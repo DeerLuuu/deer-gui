@@ -137,8 +137,13 @@ pub enum Present { Presented, OutOfDate, Suboptimal }
 
 **`choose_config` 的确定性策略**（同一台机器同样的能力列表 ⇒ 同样的结果）：
 
-1. **格式**：优先 `B8G8R8A8_SRGB`，其次 `R8G8B8A8_SRGB`；都没有就取第一个非 `UNDEFINED` 的格式；
-   全是 `UNDEFINED`（规范允许任意格式）时用 `B8G8R8A8_SRGB` + 驱动报的 color space；
+1. **格式：优先线性 `*_UNORM`**（M3c 裁决）—— 顺序 `B8G8R8A8_UNORM` → `R8G8B8A8_UNORM` →
+   `B8G8R8A8_SRGB` → `R8G8B8A8_SRGB`；四个都没有就取第一个非 `UNDEFINED` 的；
+   全是 `UNDEFINED`（规范允许任意格式）时用**线性** `B8G8R8A8_UNORM` + 驱动报的 color space。
+   **为什么线性优先**：sRGB 附件**连混合都发生在线性空间**，而 CPU 参考实现（`null.rs::blend_cov`）
+   在**字节空间**混合 ⇒ 半透明像素两边对不上（实测 `src=0xC0, a=0.5, dst=0`：字节空间 **96**
+   vs sRGB 线性 **140**，**差 44 字节**）。退回 sRGB 是**诚实退回**：那时「上屏像素 == CPU 像素」
+   这条判据不成立（`window_parity` 会打印实际格式并断言它是线性的）；
 2. **present mode**：优先 **FIFO**（规范保证支持）；没有 FIFO 就 `FIFO_RELAXED`；再没有就取驱动报的**第一个**。
    **不做** mailbox / 立即模式的自适应选择；
 3. **extent**：驱动给了 `currentExtent` 就用它（仍会夹取），否则把 `want` **夹到**
@@ -183,7 +188,7 @@ pub enum Present { Presented, OutOfDate, Suboptimal }
 | `read_back_last_frame() -> GpuResult<Vec<u8>>` | 取回**刚呈现那帧**的像素：**RGBA8**，长度 = `宽 × 高 × 4`（`B8G8R8A8_*` 会自动换成 R/B 顺序）。**必须在 `render_and_present()` 之后**、且中间没 `resize` 过；**会强制一次 GPU→CPU 同步**（等最近一帧的 in-flight 栅栏，5 秒有限超时）⇒ 适合验收/截图，**不适合每帧调**。关掉回读或 resize 之后调用会**明确报错，绝不用陈旧数据冒充** |
 | `set_readback_enabled(bool) -> GpuResult<()>` / `readback_enabled()` / `readback_available()` | 回读开关（**默认开**）。关掉可省每帧一次全屏 `image → buffer` 复制（`宽×高×4` 字节带宽 + barrier 往返），代价是 `read_back_last_frame()` 明确报错 |
 | `clear_color_value(color) -> [f32; 4]`（模块级纯函数） | HAL 颜色 → Vulkan 清屏值，**不做 sRGB 变换、不换通道、不 clamp** —— 「传进去什么色就清什么色」能被逐位断言 |
-| `srgb_encoded_byte(linear: u8) -> u8`（模块级纯函数） | 线性字节 → **sRGB 编码字节**（sRGB 传输函数：阈值 `0.0031308` 分段）。回读断言的**正确参考值**，见第 5 节的 sRGB 坑 |
+| `srgb_encoded_byte(linear: u8) -> u8`（模块级纯函数） | 线性字节 → **sRGB 编码字节**（sRGB 传输函数：阈值 `0.0031308` 分段）。**只在交换链退回 sRGB 格式时**才是回读断言的参考值（M3c 起优先线性 ⇒ 通常用不到）；见第 5 节的 sRGB 坑 |
 
 公开常量 `FRAMES_IN_FLIGHT = 2`：每帧 in-flight 的槽位数（命令缓冲/信号量/栅栏按它分配）。
 
@@ -255,21 +260,22 @@ $env:DEER_WINDOW_FRAMES='30'; cargo run -p deer-gui --features window --example 
 # 期望：打印窗口尺寸 / 适配器 / 交换链格式 / present mode / 图像数 / 呈现帧数 / 过期次数 / 帧率，退出码 0
 ```
 
-**本机实测**（Windows / Intel RaptorLake-S 集显 / `DEER_VK_VALIDATION=1` + `DEER_WINDOW_FRAMES=30`，`exit=0`）：
+**本机实测**（Windows / Intel RaptorLake-S 集显 / `DEER_VK_FRAMES=30`，`exit=0`；M3c 之后窗口里显示**真实界面树**）：
 
 ```text
-[deer-window] 窗口已建：title="deer-gui — M2b 窗口预览（GPU 清屏 + 几何）" extent=960x600 platform=Windows handle(HWND)=0xFE0BA8 display(HINSTANCE)=0x7FF7514D0000
+[deer-window] 窗口已建：title="deer-gui — M3c 窗口预览（真实界面树：形状 + 文本）" extent=960x600 platform=Windows handle(HWND)=0x6B0A0C display(HINSTANCE)=0x7FF7D6670000
 适配器      : Intel(R) RaptorLake-S Mobile Graphics Controller（index=0）
-交换链      : 960×600 / format 0x00000032 / present mode 2 / 3 张图
-呈现帧数    : 30 ｜ 交换链过期 : 0 次 ｜ 耗时 : 0.66 s（45.1 帧/秒）
-像素回读    : 四角 [71, 79, 105, 255] = sRGB 编码后的清屏色 rgb(0x10,0x14,0x24)
-              中心 [160, 206, 255, 255]；非清屏色像素 99360 / 576000（17.25%）
-自检通过 ✅（帧数达标、交换链未持续过期、**呈现帧像素已核对**、事件循环正常退出）
+交换链      : 960×600 / format 0x0000002c / present mode 2 / 3 张图
+绘制列表    : 15 条命令（形状 7 / 文本 8）
+呈现帧数    : 30 ｜ 交换链过期 : 0 次 ｜ 耗时 : 0.61 s（48.9 帧/秒）
+像素回读    : 左上角 [42, 47, 63, 255]
+              非清屏色像素 93900 / 576000（16.30%）；界面底色 [8, 9, 12, 255]
+自检通过 ✅（帧数达标、**界面树已上屏**：非清屏色 93900 个像素是形状与字形）
 ```
 
-`format 0x32 = 50 = VK_FORMAT_B8G8R8A8_SRGB`、`present mode 2 = VK_PRESENT_MODE_FIFO_KHR`、
-`3 张图 = minImageCount(2) + 1` —— 与上面的确定性策略逐条对得上。
-（显示设备/帧率不同会有不同数值，**以你自己的输出为准**。）
+`format 0x2c = 44 = VK_FORMAT_B8G8R8A8_UNORM`（**线性**；M3c 前是 `0x32 = B8G8R8A8_SRGB`）、
+`present mode 2 = VK_PRESENT_MODE_FIFO_KHR`、`3 张图 = minImageCount(2) + 1` —— 与上面的确定性策略逐条对得上。
+（显示设备/帧率/主题不同会有不同数值，**以你自己的输出为准**。）
 
 带 Vulkan 校验层再跑（t13 的验收项）：
 
@@ -291,19 +297,29 @@ $env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo test -p deer-v
 >
 > ```powershell
 > $env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo run -q -p deer-gui --features window --example hal_window_path
-> # 本机实测 exit=0、640×480 / Bgra8Srgb、校验层零消息
+> # 本机实测 exit=0、640×480 / Rgba8Unorm（M3c：格式优先级已改线性，M2b 时是 Bgra8Srgb）、校验层零消息
 > ```
 
 示例还认这几个环境变量：`DEER_WINDOW_ADAPTER`（选显卡，默认 0）、`DEER_WINDOW_HOLD=1`
 （留窗观察，不做帧数断言）、`DEER_VK_VALIDATION=1`（开校验层）、`DEER_WINDOW_READBACK=0`
-（关掉第一帧的像素回读，自检随之**显式降级**、不再给像素级证据）。
+（关掉第一帧的像素回读，自检随之**显式降级**、不再给像素级证据）、
+**`DEER_VK_WINDOW_VIEWPORT=static|dynamic`**（M3c：viewport 策略诊断开关；**默认 `dynamic` 才是产品行为**，
+见 [`window.md`](window.md) 第 5.2 节）。
+
+**上屏像素判据（M3c）**：窗口路径的最终判据是 `window_parity` 示例 ——
+把**呈现出去的像素**读回来与 CPU 后端逐像素对照（不透明 **0**、半透明 **≤1 LSB**）：
+
+```powershell
+DEER_VK_WINDOW_TESTS=1 cargo run -q -p deer-gui --features window --example window_parity
+# 不设 DEER_VK_WINDOW_TESTS 时会打印「这不是通过，是被跳过」并 exit=0 —— 跳过不算证据
+```
 
 ## 5. 常见坑
 
 | 现象 | 原因 | 怎么改 |
 |---|---|---|
-| **回读/截图的颜色比预期亮**（清屏 `rgb(0x10,0x14,0x24)` 回读成 `[71,79,105]` 而不是 `[16,20,36]`） | 交换链是 **`B8G8R8A8_SRGB`**：Vulkan 规定写进 sRGB 附件的**颜色值在线性空间、由驱动做 sRGB 编码**，所以回读到的字节是**编码后**的值。这是规范行为，不是 bug | 用公开纯函数 `deer_vk::windowed::srgb_encoded_byte()` 算期望值（`0x10→0x47`、`0x14→0x4F`、`0x24→0x69`，本机 Intel/NVIDIA 实测逐位一致）；想要「逐字节直通」就改用**线性格式**（`*_UNORM`）的交换链 |
-| 花大力气断言像素却和窗口上看到的不一样 | `read_back_last_frame()` 返回的是**图像里的字节**（sRGB 格式下即 sRGB 编码值），**不做线性化** —— 这样才和窗口/截图工具逐字节一致 | 按「编码值」断言（见上一行）；要线性值自己反编码 |
+| **回读/截图的颜色与写入不一致**（清屏写 `rgb(0x10,0x14,0x24)` 却回读成 `[71,79,105]`） | 交换链退回成了 **sRGB** 格式：Vulkan 规定写进 sRGB 附件的**值在线性空间混合、由驱动做 sRGB 编码**，所以回读的是**编码后**的字节（规范行为，不是 bug） | 用 `deer_vk::windowed::srgb_encoded_byte()` 算期望（`0x10→0x47`、`0x14→0x4F`、`0x24→0x69`）。**M3c 起默认不会踩到**：`pick_config` 优先线性 `*_UNORM`（本机实测 `format 0x2c`）⇒ 回读字节直通；若你的机器只有 sRGB 可选，就得按编码值断言 |
+| 花大力气断言像素却和窗口上看到的不一样 | `read_back_last_frame()` 返回的是**图像里的字节**，**不做线性化**（sRGB 格式下即编码值） | 线性格式下**直接比字节**；sRGB 格式下按「编码值」断言（见上一行）；`window_parity` 会先断言格式是线性的 |
 | 每帧都调 `read_back_last_frame()` 后帧率掉 | 回读**强制一次 GPU→CPU 同步**（等最近一帧的 in-flight 栅栏），外加每帧一次 `宽×高×4` 的 image→buffer copy | **只在需要证据的那一帧调一次**（示例只在第一帧）；不需要就 `set_readback_enabled(false)` 省掉每帧 copy |
 | 关掉回读后 `read_back_last_frame()` 报错 | 这是**刻意的**：宁可用错也不返回陈旧数据 | 先 `set_readback_enabled(true)`，再 `render_and_present()`，然后才回读 |
 | 窗口一拉大就崩 / 花屏 | 把 `OutOfDate` 当成功继续用了 | `OutOfDate` ⇒ `resize` 重建后重试；`Suboptimal` 尽快重建（见上表） |

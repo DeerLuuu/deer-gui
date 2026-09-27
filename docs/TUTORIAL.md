@@ -337,8 +337,8 @@ deer-gui = { path = "Z:/deer-gui/crates/deer-gui" }
 
 | 想做的事 | 现状 |
 |---|---|
-| 界面显示在**窗口**里 | ✅ **能开窗**（M2b，**仅 Windows**）：窗口里是 GPU 清屏色 + 几何；**界面（控件/文字）上屏是 M3** |
-| **GPU 渲染**出图 | ✅ 离屏 Vulkan 已画出正确像素（M2a-6 修复了 SPIR-V 段序缺陷）；✅ 窗口呈现已打通（M2b）；✅ **消费 `DrawList`（形状 M3a + 文本 M3b）**：离屏、与 CPU 逐像素对照（第 13 章）；❌ 把它呈到窗口里是 M3c |
+| 界面显示在**窗口**里 | ✅ **窗口里就是真实界面**（M3c，**仅 Windows**）：形状 + 文本呈现到窗口，且上屏像素与 CPU 逐像素对照（不透明 0 / 半透明 ≤1 LSB）；跑 `--example window_parity` 看判据 |
+| **GPU 渲染**出图 | ✅ 离屏 Vulkan 已画出正确像素（M2a-6 修复了 SPIR-V 段序缺陷）；✅ 窗口呈现已打通（M2b）；✅ **消费 `DrawList`（形状 M3a + 文本 M3b + 上屏 M3c）**：三种路径都能与 CPU 逐像素对照（第 13 章） |
 | 图片里的字是**真字体** | ✅ **离屏**已支持（第 11 章 CPU 侧、第 13 章 **GPU 侧 M3b**）：GPU 画真字形与 CPU 逐字节相同 |
 | **鼠标点击 / 键盘输入** | ❌ M5（`hit_test` 有了，但没有事件派发） |
 | **Tab 焦点** / 方向键导航 | ❌ M5 |
@@ -399,14 +399,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## 12. 在窗口里看到画面
 
-**目标**：弹出一个**真窗口**，用 GPU 把画面呈现上去（M2b）。
+**目标**：弹出一个**真窗口**，用 GPU 把**界面树**呈现上去（M2b 打通呈现链 → M3c 把界面接上去）。
 
 ```powershell
 cargo run -p deer-gui --features window --example window_preview
 ```
 
-**你会看到**：弹出一个窗口（标题带 `deer-gui` 前缀），里面是 GPU 画的清屏色 + 一块几何三角形，
-连续呈现若干帧后**自动退出**（退出码 0），终端里打印适配器 / 交换链格式 / present mode / 图像数 / 帧数。
+**你会看到**：弹出一个窗口（标题带 `deer-gui` 前缀），里面是 **GPU 画的真实界面树**（形状 + 真实字形文本），
+连续呈现若干帧后**自动退出**（退出码 0），终端里打印适配器 / 交换链格式（**线性 `*_UNORM`**）/
+present mode / 图像数 / 帧数 / 像素证据（界面底色 + 非底色像素数）。
+
+> 本机实测（`DEER_VK_FRAMES=30`，960×600）：`format 0x0000002c = B8G8R8A8_UNORM`、
+> 绘制列表 15 条（形状 7 / 文本 8）、呈现 30 帧、交换链过期 0 次、非清屏色像素 **93900 / 576000**、
+> `exit=0`（**以你自己的输出为准**）。
 
 | 环境变量 | 作用 |
 |---|---|
@@ -415,6 +420,7 @@ cargo run -p deer-gui --features window --example window_preview
 | `DEER_WINDOW_ADAPTER` | 用第几张显卡（默认 `0`；示例会打印实际适配器名） |
 | `DEER_WINDOW_READBACK` | 设为 `0` 关掉第一帧的像素回读（自检显式降级，不再给像素级证据） |
 | `DEER_VK_VALIDATION` | 设为 `1` 打开 Vulkan 校验层（诊断用） |
+| `DEER_VK_WINDOW_VIEWPORT` | 设为 `static` 可强制**静态** viewport（诊断/对照实验；**默认 `dynamic` 才是产品行为**，见 [`features/window.md`](features/window.md) 第 5.2 节） |
 
 ```powershell
 # 只看 10 帧（适合快速自检）
@@ -429,19 +435,21 @@ $env:DEER_WINDOW_HOLD='1'; cargo run -p deer-gui --features window --example win
   `target ... requires the features: window`。
 - **事件循环必须在主线程**：窗口与事件循环由 `deer_window::run(config, app)` 管，
   你实现 `App`（`init` 建渲染器 / `redraw` 画一帧 / 可选 `resized`）。
-- **窗口里还不是界面**：M2b 只保证「GPU 画的像素能出现在窗口上」——现在显示的是清屏色 + M2a
-  验证过的几何。**M3a（形状）与 M3b（文本）都已能把界面画到 GPU（离屏，见第 13 章）**，
-  但把它呈到窗口里仍是 **M3c**。
+- **窗口里现在就是界面**：M2b 打开了窗、M3a/M3b 把形状与文本画到 GPU，
+  **M3c 把两者接起来** —— `DEER_VK_FRAMES=30 cargo run -p deer-gui --features window --example window_preview`
+  就能在真窗口里看到界面树；要判据跑 `DEER_VK_WINDOW_TESTS=1 … --example window_parity`
+  （不透明逐字节相同、半透明 ≤1 LSB）。详见 [`features/window.md`](features/window.md) 第 5 节。
 - **交换链会过期**：`render_and_present()` 返回 `OutOfDate` 时**必须 resize 后重试**，不许当成功。
-- **第一帧会回读像素核对**（`read_back_last_frame()`）：终端里能看到
-  `像素回读 : 四角 [71, 79, 105, 255] = sRGB 编码后的清屏色 rgb(0x10,0x14,0x24)` ——
-  注意**不是** `[16,20,36]`（sRGB 附件的驱动编码）；回读**强制一次 GPU→CPU 同步**，所以只在第一帧做一次。
+- **第一帧会回读像素核对**（`read_back_last_frame()`）：M3c 起交换链是**线性 `*_UNORM`**
+  （本机实测 `format 0x0000002c = B8G8R8A8_UNORM`）⇒ 回读到的字节**就是**写进去的字节
+  （本机实测左上角 `[42, 47, 63, 255]`）——不再是 M2b 时代「sRGB 编码后的值」那种偏移。
+  回读**强制一次 GPU→CPU 同步**，所以只在第一帧做一次。
 - 目前**只有 Windows** 实现了窗口句柄的填充；非 Windows 会明确返回 `Err`。
 
-**仍然做不到**：鼠标/键盘输入（M5）、窗口里的界面（M3c）、文本上 GPU（M3b）、
-多窗口 / 全屏 / HDR / 帧率上限。
+**仍然做不到**：鼠标/键盘输入（M5）、多窗口 / 全屏 / HDR / 帧率上限、
+`size <= 0` 的文本与 CPU 一致（见第 13 章）。
 完整边界见 [`features/window.md`](features/window.md) 与
-[`features/vulkan-swapchain.md`](features/vulkan-swapchain.md) 第 6 节。
+[`features/vulkan-swapchain.md`](features/vulkan-swapchain.md) 第 7 节。
 
 ---
 
@@ -502,10 +510,18 @@ assert_eq!(gpu_px, cpu.pixels, "不透明内容（形状 + 文本）必须逐字
   —— 这修掉了 M3a 那条「无条件 `Unsupported`」的假阳性。
 - **有一条有意差异**：`size <= 0` 的文本 GPU **跳过**，而 CPU 会把字号夹到 `>= 1` **画出 1px 字形** ⇒
   这种场景两边**不会**逐字节相同（parity 语料刻意不含它）。见 [`features/gpu-geometry.md`](features/gpu-geometry.md) 第 6 节。
-- **静态 viewport/scissor**：动态版在本机 Intel 核显上**画不出任何像素**（M2a 实测），
-  所以管线把 viewport/scissor 写死；**换画布尺寸要新建渲染器**。
+- **viewport/scissor：离屏静态、窗口动态；而「动态画不出像素」是一条存疑的旧结论（未证实）**：
+  离屏管线把 viewport/scissor 写死（**换画布尺寸要新建渲染器**）；窗口路径用**动态**（每帧显式设置）。
+  早期文档写「动态版在本机 Intel 核显上画不出任何像素」——**至今既没被证实也没被推翻**：
+  实测同一台 Intel 集显上动态与静态各跑 30 帧结果**完全相同**（各 93900 界面像素），
+  而「**声明**动态却**从不调** `vkCmdSetViewport`」会让进程**崩**（窗口 `0xC000041D`、
+  **离屏 `0xC0000005` / 0-21 跑完**）。**但 M2a 当年记的症状是「无像素」而不是崩溃 —— 症状不同，
+  不能断定同因**（定性：高度可能）。要钉死它需重跑**当年的离屏 + 三角形 + 动态**场景。详见
+  [`features/window.md`](features/window.md) 第 5.2 节。
 - **颜色附件是线性 `R8G8B8A8_UNORM`**（不是 `_SRGB`）：CPU 基准不做 gamma，用 SRGB 会系统性偏差；
-  字形图集是 **`R8_UNORM`**、**NEAREST + ClampToEdge**、`mip_levels = 1`，且**只在图集指纹变化时重传**。
+  **上屏交换链也改成了线性 `*_UNORM`**（sRGB 附件的**混合在线性空间**，与 CPU 字节空间
+  `blend_cov` 实测差 **44 字节**）；字形图集是 **`R8_UNORM`**、**NEAREST + ClampToEdge**、
+  `mip_levels = 1`，且**只在图集指纹变化时重传**。
 - **`align` 未定义值（`>= 3`）⇒ 左对齐**（与 CPU 相同的契约）。
 - **`DEER_VK_VALIDATION=1` 下 parity 零校验消息是「可回归断言」**：「层确实在跑」与「消息为零」
   都有断言（`validation_layer_state_matches_the_request` + `ffi::validation_message_count()` 配合
@@ -531,6 +547,7 @@ assert_eq!(gpu_px, cpu.pixels, "不透明内容（形状 + 文本）必须逐字
 | 原始像素 | `cargo run -p deer-gui --example pixels` | PNG + PPM |
 | 真实文字 | `cargo run -p deer-gui --example text_render` | 真字形界面图 + 度量/像素自检 |
 | 字形光栅化 + 图集 | `cargo run -p deer-gui --example glyph_atlas` | 图集 PNG + 覆盖率/利用率统计 |
-| 真窗口预览 | `cargo run -p deer-gui --features window --example window_preview` | 一个真窗口（GPU 清屏色 + 几何）+ 帧数统计 |
+| 真窗口预览 | `cargo run -p deer-gui --features window --example window_preview` | 真窗口里的**界面树**（形状 + 文本）+ 帧数/像素统计 |
+| 上屏 parity（需门槛） | `DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example window_parity` | 窗口像素 vs CPU：不透明 0、半透明 ≤1 LSB |
 | GPU 画界面（形状 + 文本） | `cargo run -p deer-gui --example gpu_geometry` | GPU 出的界面图 + 与 CPU 逐字节对照 |
 | Vulkan 现状 | `cargo run -p deer-gui --example vulkan_devices` | 本机 GPU + 着色器验收 |

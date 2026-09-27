@@ -4,7 +4,13 @@
 
 **Goal:** 让 `DrawCmd` 的**非文本**命令由 Vulkan 真正画出来，并且与 CPU 参考后端的像素结果一致（不透明绘制逐字节相同；半透明叠加最大通道差 ≤1）。
 
-**Architecture:** 一条**静态 viewport/scissor** 的图形管线；每个顶点携带矩形元数据（`rect`、`radius_kind`、`color`），圆角/描边的**逐像素判据在片元着色器里复刻 CPU 的整数像素判据**（`gl_FragCoord` → `floor` 得到整数像素）；**裁剪在 CPU 侧做几何裁剪**（避开 M2a 实测的「动态 viewport/scissor 在本机 Intel 上画不出像素」）。文本（`DrawCmd::Text`）本计划**不实现**，命中即返回 `Unsupported`。
+**Architecture:** 一条**静态 viewport/scissor** 的图形管线；每个顶点携带矩形元数据（`rect`、`radius_kind`、`color`），圆角/描边的**逐像素判据在片元着色器里复刻 CPU 的整数像素判据**（`gl_FragCoord` → `floor` 得到整数像素）；**裁剪在 CPU 侧做几何裁剪**（原计划写「避开 M2a 实测的『动态 viewport/scissor 在本机 Intel 上画不出像素』」）。
+> **Ruling（M3c 更正，2026-09-27）**：括号里那条理由是**存疑的旧结论**（未证实）：对照实验显示
+> 同一台 Intel 集显上**动态与静态各跑 30 帧结果相同**（各 93900 界面像素），而「**声明**动态却**从不调**
+> `vkCmdSetViewport`」会让进程**崩溃**（窗口 `0xC000041D`；**离屏 `0xC0000005`，0/21 跑完**）；
+> 但 M2a 记的是「无像素」而非崩溃，**症状不同 ⇒ 不能断定同因**（定性：高度可能）。
+> **待办**：重跑**当年的离屏 + 三角形 + 动态**场景才能钉死它。**实现不变**：离屏仍用静态（已够用）。
+文本（`DrawCmd::Text`）本计划**不实现**，命中即返回 `Unsupported`（**已在 M3b 实现**，见 M3b 计划）。
 
 **Tech Stack:** Rust 2024 / 自研 SPIR-V 汇编器（`crates/deer-vk/src/spirv.rs`）/ `deer-vk` 既有离屏 image + staging 回读 / `deer_gpu::null::CpuRenderer` 作为像素基准。
 

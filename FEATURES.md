@@ -62,12 +62,12 @@
 | **Vulkan 上屏**（`VkSurfaceKHR` + 交换链 + 帧同步 + 呈现） | ✅ | [vulkan-swapchain](docs/features/vulkan-swapchain.md) | `cargo run -p deer-gui --features window --example window_preview` |
 | **GPU 几何渲染**（`DrawList` 形状命令 → GPU，与 CPU **逐像素对照**） | ✅ | [gpu-geometry](docs/features/gpu-geometry.md) | `cargo run -p deer-gui --example gpu_geometry` |
 | **GPU 文本渲染**（字形四边形 + 图集纹理 + 最近邻采样，与 CPU **逐字节对照**） | ✅ | [gpu-geometry](docs/features/gpu-geometry.md#3-完整-api) | `cargo run -p deer-gui --example gpu_geometry` |
+| **窗口里显示界面**（把 `DrawList` 的形状与文本**呈到窗口**，上屏像素与 CPU 逐像素对照） | ✅ | [window](docs/features/window.md) | `DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example window_parity` |
 
 ## 四、还没做的（**不要以为能跑**）
 
 | 功能 | 里程碑 | 现状说明 |
 |---|---|---|
-| **窗口里显示界面**（把 GPU 画好的界面呈到窗口） | M3c | M2b 已能上屏；M3a/M3b 已能**离屏**把形状与文本画成像素（与 CPU 逐字节一致）；但两者还没接起来 —— 窗口里仍只有清屏色 + M2a 几何 |
 | **批处理优化**（按命令合批 / 跨帧复用顶点缓冲） | M3+ | 形状与文本**各自**每帧一个顶点缓冲、一次 draw；这是性能问题，不影响正确性 |
 | **通用图像 / RGBA 纹理**（`create_texture`/`upload_texture` 的 HAL 路径） | M3+ | 目前只有**字形图集**这一条专用 `R8_UNORM` 覆盖率纹理；通用纹理仍未实现 |
 | **推送常量矩形着色器**（`spirv.rs::vertex_shader_rect_pushconstant`） | M3 | **这支 SPIR-V 是损坏的**（校验层 `VUID-StandaloneSpirv-PushConstant-06808`）；请求校验层时会让进程 `0xc0000005` 崩溃，所以 `device_smoke` / `pipeline_smoke` 里涉及它的测试在**校验层下显式跳过**（t15）。**task-18 后三条路径（`VkBackend::new` / 设备·离屏 / 窗口）都读 `DEER_VK_VALIDATION`**（当时 offscreen 的 3 个真缺陷已修）；实测 `DEER_VK_VALIDATION=1 cargo test -p deer-vk` → **全部通过 / 0 failed**、零校验消息（**具体条数以运行输出为准**，本仓库不在文档里固化测试条数）。矩形改**顶点缓冲**即可修（M3a 的新几何路径已用顶点缓冲，不再走这支着色器） |

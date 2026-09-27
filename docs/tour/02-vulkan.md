@@ -523,10 +523,19 @@ CPU 语义里根本不存在「0 宽描边」，所以夹到 1 是**复刻**不�
    （圆角圆心、描边边带都要按原始矩形算，否则会被裁剪挪位）—— 见 ledger Ruling 5（`:20-22`）。
 3. **描边带宽编码在 `radius_kind` 里** —— 见 ledger Ruling 6（`:23-24`）。
 
-**底层理由（写在 `gpu_render.rs`）**：本模块用**静态** viewport/scissor，因为
-**动态版在本机 Intel 驱动上画不出任何像素**；而对着静态状态的管线发动态设置命令会触发校验层
-报错（`src/gpu_render.rs:24-31`，实测记录在 `tests/vbo_probe.rs`）。
-`docs/TUTORIAL.md:490`、`docs/features/gpu-geometry.md:118-119` 同述。
+**底层理由（写在 `gpu_render.rs`）**：本模块用**静态** viewport/scissor。
+⚠️ **这里的原始理由（「动态版在本机 Intel 驱动上画不出任何像素」）应标为「存疑的旧结论、未证实」**：
+M3c 的对照实验**动摇了它**但**不足以推翻它** ——
+① 同一台 Intel 集显上**动态与静态各跑 30 帧都出 93900 界面像素，且完全相同**；
+② 但「**声明**动态状态却**从不调** `vkCmdSetViewport`」会让进程**崩溃**
+（窗口 `0xC000041D`；**离屏 `0xC0000005`，0/21 用例跑完**）。
+**边界**：M2a 当年记的症状是「**画不出任何像素**」（清屏正常、绘制为零），而这两次复现出的症状是「**崩溃**」——
+**症状不同 ⇒ 不能断定同一个根因**（定性：**高度可能**，不是已证实）。
+**可执行待办**：重跑**当年的离屏 + 三角形管线 + 动态状态**场景，按「清屏像素 / 绘制像素 / 是否崩溃」逐格记录。
+**当前事实**：动态在窗口路径上就是产品行为（每帧真的设置）；离屏用静态只是**已够用**；
+另一半理由仍然成立：**对着静态状态的管线发动态设置命令会触发校验层报错**
+（`src/gpu_render.rs:24-31`，实测记录在 `tests/vbo_probe.rs`）—— 声明了静态就不能设，声明了动态就必须设。
+详见 [`docs/features/window.md`](../features/window.md) 第 5.2 节与 `docs/features/gpu-geometry.md` 第 3 节前提 1。
 
 裁剪栈语义（`src/gpu_geom.rs:105-121`）：初始为全画布，`PushClip` 求交、`PopClip` 出栈
 （越界即退回全画布，`:153`）；与裁剪区求交后为空的几何**整条跳过**（`emit_quad` 的
@@ -890,22 +899,28 @@ cargo test -p deer-vk --test spirv_val
 
 ## 9. 已知坑 / 边界
 
-### 9.1 静态 viewport 的由来
+### 9.1 静态 viewport 的由来（**含一条存疑、未证实的旧结论**）
 
 - **事实**：`gpu_render.rs` 用的管线把 viewport/scissor **写死**在管线创建信息里，录制时
   **不调** `vkCmdSetViewport`/`vkCmdSetScissor`（`src/gpu_render.rs:1005-1007`，
   `device.rs::create_vertex_pipeline` 的静态分支在 `src/device.rs:542-561`）。
-- **为什么**（`src/gpu_render.rs:24-31`）：实测动态版在本机 Intel 驱动上**画不出任何像素**
-  （清屏正常、绘制为零）；而对着静态状态的管线发动态设置命令会触发校验层报错。
-- **实测记录**：`tests/vbo_probe.rs:465-467` —— 违反 `VUID-vkCmdDraw-None-08608`。
+- ⚠️ **旧理由存疑（M3c 对照实验，不足以推翻）**：本节原先写的「实测动态版在本机 Intel 驱动上**画不出
+  任何像素**（清屏正常、绘制为零）」目前**既没被证实、也没被推翻**：
+  - 支持「动态可用」：同一台 Intel 集显上**动态与静态各跑 30 帧都出 93900 界面像素，且完全相同**；
+  - 新失败模式：「**声明**动态状态却**从不调** `vkCmdSetViewport`」⇒ 规范未定义行为 ⇒ **崩溃**
+    （窗口 `0xC000041D`；**离屏 `0xC0000005`，0/21 用例跑完**）。
+  - **边界**：M2a 记的是「**无像素**」、复现出的是「**崩溃**」——**症状不同，不能断定同因** ⇒ 定性「高度可能」。
+  - **可执行待办**：重跑**当年的离屏 + 三角形 + 动态状态**场景，逐格记录「清屏像素 / 绘制像素 / 是否崩溃」。
+- **仍然成立的那一半理由**：对着**静态**状态的管线发动态设置命令会触发校验层报错
+  （`tests/vbo_probe.rs:465-467`，违反 `VUID-vkCmdDraw-None-08608`）—— 两条约束是一体两面。
 - **对照版本**：`device.rs` **同时**保留动态版（`create_graphics_pipeline` `:569`，
   `build_pipeline` 的 `None` 分支 `:729-738`），理由写在 `:600-606`
   「两个都要有：既能定位问题，也给调用方一个可用选择」。
-- **窗口路径反着来**：`WindowedRenderer` 用的是**动态** viewport/scissor
-  （`src/windowed.rs:870-887`，管线由 `create_graphics_pipeline` 建于 `:406`），
-  因为那里每帧都要按当前 extent 给值、resize 时不用重建管线（`:679`）。
-  **两条路径的 viewport 策略不同，这是刻意的。**
-- 文档侧同述：`docs/TUTORIAL.md:490`、`docs/features/gpu-geometry.md:118-119`。
+- **窗口路径用动态**：`WindowedRenderer` 每帧按当前 extent 设置 viewport/scissor，resize 不必重建管线
+  （M3c 之后管线由共用层 `pipelines::build_pipelines` 一次建两条；策略由 `DEER_VK_WINDOW_VIEWPORT`
+  选择，**默认 `dynamic` 才是产品行为**）。**两条路径的策略不同，这是刻意的。**
+- 文档侧同述：[`docs/features/window.md`](../features/window.md) 第 5.2 节（含对照实验表）、
+  [`docs/features/gpu-geometry.md`](../features/gpu-geometry.md) 第 3 节前提 1。
 
 ### 9.2 VVL（校验层）**不检查**哪些类别
 
