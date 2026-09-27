@@ -25,44 +25,94 @@ use crate::loader::Lib;
 /// SPIR-V 魔数（`MagicNumber`，固定值）。
 pub const SPIRV_MAGIC: u32 = 0x0723_0203;
 
-/// `create_texture_r8` 实际执行**上传**（图像 + staging + 两次屏障 + 拷贝）的次数。
-///
-/// ## 为什么这个计数器是必要的护栏（M3b review M-4）
-///
-/// 「图集纹理**只在指纹变化时**重传」是本项目一条**性能前提**
-/// （`create_texture_r8` 内部会 `vkQueueWaitIdle` —— 每帧重传会把 CPU 卡在每一帧的
-/// 同步上）。但它此前**只有实现、没有护栏**：reviewer 实测把
-/// `refresh_atlas_texture()` 的指纹判断删掉、改成每帧重传之后，
-/// `consecutive_text_frames_stay_in_sync` **依然全绿** —— 因为那个测试只看最终像素，
-/// 而「重传几次」对像素没有影响。
-///
-/// 「删掉实现、测试照样绿」正是本项目最在意的那类缺口，所以这里给出一个
-/// **可断言的可观测量**：测试用两次读取的差值断言「同一图集连续多帧只上传一次」。
-///
-/// ## 为什么是进程级 `AtomicUsize`（而不是渲染器上的字段）
-///
-/// 与 `ffi::validation_message_count()` 同一理由：调用点在
-/// `gpu_render.rs::refresh_atlas_texture`，而计数在**被调用方**（本函数）里自增 ——
-/// 于是无论调用方怎么改（删指纹、改判断条件、换调用点），只要真的走了上传路径，
-/// 计数就会动。若把计数器做成渲染器字段并要求调用方上报，护栏就退化成
-/// 「实现者在自证」，挡不住「把上报一起删掉」这种变异。
-///
-/// 代价（诚实说明）：它统计的是**本进程内所有** `VkDevice` 的上传总和，
-/// 所以测试必须用**差值**且同进程内不能有并发渲染（本项目的测试都是串行单线程）。
-static TEXTURE_R8_UPLOAD_COUNT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+// 上传次数计数器（**按线程**统计）。
+//
+// ⚠️ 这里用 `//` 而不是 `///`：`thread_local!` 是**宏调用**，rustdoc 不为宏调用
+// 生成文档（会报 `unused doc comment`）。面向使用者的说明都写在下面
+// [`texture_r8_upload_count`] 的文档里。
+//
+// ——— 为什么需要这个计数器（M3b review M-4）———
+//
+// 「图集纹理**只在指纹变化时**重传」是本项目一条**性能前提**（`create_texture_r8`
+// 内部会 `vkQueueWaitIdle` —— 每帧重传会把 CPU 卡在每一帧的同步上）。但它此前
+// **只有实现、没有护栏**：reviewer 实测把 `refresh_atlas_texture()` 的指纹判断
+// 删掉、改成每帧重传之后，`consecutive_text_frames_stay_in_sync` **依然全绿**
+// —— 因为那个测试只看最终像素，而「重传几次」对像素没有影响。
+//
+// 「删掉实现、测试照样绿」正是本项目最在意的那类缺口，所以这里给出一个可断言的
+// 可观测量：测试用两次读取的差值断言「同一图集连续多帧只上传一次」。
+//
+// ——— 为什么自增点在**被调用方**（本模块）而不是让调用方上报 ———
+//
+// 调用点在 `gpu_render.rs::refresh_atlas_texture`，而计数在 `create_texture_r8`
+// 内部自增 —— 于是无论调用方怎么改（删指纹、改判断条件、换调用点），只要真的走了
+// 上传路径，计数就会动。若做成「渲染器字段 + 调用方上报」，护栏就退化成
+// 「实现者在自证」，挡不住「把上报一起删掉」这种变异。
+//
+// ——— ⚠️ 为什么是 `thread_local!` 而不是进程级 `static`（一次真实的缺陷）———
+//
+// 第一版写成了进程级 `static AtomicUsize`。它**在默认的并行 `cargo test` 下是
+// flaky 的**：别的测试线程并行上传纹理 ⇒ 计数器被「外来上传」污染 ⇒ 本测试断言的
+// **帧间差值**变成非零。reviewer 实测：`cargo test -p deer-vk` **1/8 FAILED**
+// （重试偶发）、`--test gpu_vs_cpu` 并行 **2/20**、加 `--test-threads=1` 则 **0/15**；
+// 而失败信息恒为「触发了 1 次纹理上传」—— **把排查者指向
+// `refresh_atlas_texture`，可那里根本没有问题**。
+//
+// 更糟的是它的必然结局：假红 →「又是那个 flaky」→ **护栏被删掉**。也就是说
+// 一个 flaky 的护栏比没有护栏更危险 —— 它会亲手把刚补上的护栏送走。
+//
+// **结论（本项目的护栏纪律）**：护栏本身必须是**并行安全**的。任何
+// 「进程级可变状态 + 窗口差值」的断言在默认多线程测试下都会 flaky。
+// 这里改成 `thread_local!`，于是别的测试线程的上传**根本不会**进入本线程的计数。
+//
+// 对照：`ffi::validation_message_count()` 是进程级 `static` 且**没问题** ——
+// 因为它断言的是全局 `== 0`（「整个进程一条消息都没有」），本来就不受并发影响；
+// 而本计数器断言的是**窗口差值**，两者不是一回事（我先前把这个类比用错了）。
+// 仓库里 `GpuGeometryRenderer::host_to_vertex_barriers` 用的是「每实例字段」，
+// 那是另一种正确的免疫写法。
+//
+// ——— 使用约束（诚实说明）———
+//
+// 计数**只属于调用它的那个线程**，所以读取方必须在**同一个线程**上渲染后再读
+// —— 本项目的渲染是同步内联的（`GpuGeometryRenderer::render` 在调用者线程上执行），
+// 测试也是单线程内完成渲染与断言，因此满足这条约束。
+// 若将来换成专用渲染线程，这个计数器要改成「每设备」形态（reader 需要拿到
+// 设备句柄；`gpu_render.rs` 目前没有暴露 `device()`，所以本轮先用 TLS）。
+thread_local! {
+    static TEXTURE_R8_UPLOAD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
-/// 累计的 `create_texture_r8` 上传次数（进程级，从进程启动算起）。
+/// **本线程**累计的 `create_texture_r8` 上传路径次数。
 ///
 /// 测试用法：在两次渲染之间取**差值** ——
 /// ```ignore
 /// let before = deer_vk::device::texture_r8_upload_count();
-/// gpu.render(&list)?;                       // 同一图集
+/// gpu.render(&list)?;                       // 同一图集（未变化）
 /// assert_eq!(deer_vk::device::texture_r8_upload_count() - before, 0,
 ///            "同一图集不应重传");
 /// ```
+///
+/// ## 语义边界（review N-2）
+///
+/// 计的是「**进入了上传路径**」：自增点紧跟在 [`validate_texture_r8_args`]
+/// **之后**、**第一次驱动调用之前**。于是
+/// - 参数被拒的调用**不计**（它没碰驱动 —— 否则负例测试会让计数虚增，
+///   护栏就不可断言了）；
+/// - 「参数合法、但驱动随后失败」**计**（那确实是一次上传尝试，且失败会让调用方
+///   立刻拿到 `Err`，不影响本护栏的差值语义）。
+///
+/// 之所以**不**把自增移到「整个上传成功之后」：那样就不能放在函数开头，
+/// 得在函数末尾再加一处 —— 而 `create_texture_r8` 中间有多个 `?` 提前返回点，
+/// 「上传成功之后」这个点会被这些早退绕过，反而更容易漏计。
+/// 所以选择明确、单一、且**每一条路径都会经过**的位置。
+///
+/// ## 并行安全
+///
+/// 计数是 `thread_local` 的（见上面 `TEXTURE_R8_UPLOAD_COUNT` 的说明）：
+/// 别的测试线程并行上传**不会**污染本线程的窗口差值。
+/// 因此**必须在做渲染的那个线程上读**（本项目的渲染是同步内联的）。
 pub fn texture_r8_upload_count() -> usize {
-    TEXTURE_R8_UPLOAD_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+    TEXTURE_R8_UPLOAD_COUNT.with(|c| c.get())
 }
 
 /// 设备级函数表（在后台线程里解析；全是函数指针，故 `Send`）。
@@ -671,10 +721,12 @@ impl VkDevice {
     /// （M3b T4 的契约），不是每帧，所以可忽略。
     pub fn create_texture_r8(&self, w: u32, h: u32, data: &[u8]) -> GpuResult<Texture> {
         validate_texture_r8_args(w, h, data)?;
-        // 计数点放在**校验之后**：被拒的调用不算一次上传（它没碰驱动），
-        // 否则 `texture_r8_rejects_bad_args_before_touching_driver` 那类负例
-        // 会让计数虚增，护栏就变得不可断言。
-        TEXTURE_R8_UPLOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // 计数点紧跟在**校验之后**、第一次驱动调用**之前**：
+        // - 参数被拒的调用**不计**（它没碰驱动，否则负例测试会让计数虚增）；
+        // - 「参数合法但驱动随后失败」**计**（那确实是一次上传尝试）——见
+        //   `texture_r8_upload_count()` 的语义边界说明。
+        // 用 `thread_local` ⇒ 别的测试线程的并行上传污染不到本线程的差值断言。
+        TEXTURE_R8_UPLOAD_COUNT.with(|c| c.set(c.get() + 1));
         let fns = self.fns;
         let device = self.handle;
 

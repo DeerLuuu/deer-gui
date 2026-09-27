@@ -330,8 +330,80 @@ fn m3b_structure_type_constants_match_spec() {
         );
     }
 
-    // 与既有 M3a 结构体编号**不冲突**（挡住「复制粘贴忘了改」）
-    for (name, ty) in [
+    // 与**全部**既有常量比对编号是否撞车 —— 见下面 `m3b_constants_do_not_collide_with_any_existing_constant`。
+    // 原来这里内联了一小张「既有常量」名单（只挑 5 个比），reviewer 实测那个写法
+    // **抓不住**把编号改成 37/38/39 这类撞车（名单里正好没有这几个值）。
+    // 现在改成**从源码里解析出全部常量**，见下一条测试。
+}
+
+/// 直接从**源码文本**里解析出所有 `VK_STRUCTURE_TYPE_*` 常量，返回 `(名字, 值)`。
+///
+/// 为什么解析源码而不是维护一张硬编码名单（review N-3 的修法）：
+/// 硬编码名单会**悄悄过期** —— 有人加了新常量但没更新名单，护栏就漏了；
+/// 而「护栏漏了」这件事本身没有任何信号（测试照样绿）。解析源码时，
+/// 新常量自动进入比对范围，且 [#\[test\] `m3b_constants...`] 里那条
+/// 「既有常量必须无重复」的自检能反过来证明解析确实抓到了完整清单。
+///
+/// 用 `include_str!` 而不是运行期读文件：让「源码内容」成为**编译期依赖** ——
+/// 改了 `ffi_dev.rs` / `spirv.rs` 常量定义就会重新编译本测试，不会出现
+/// 「测试跑的是旧文件」的错觉。
+fn parse_structure_type_constants(src: &str) -> Vec<(String, i32)> {
+    let mut out = Vec::new();
+    for line in src.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("pub const VK_STRUCTURE_TYPE_") else {
+            continue;
+        };
+        let Some((name, rest)) = rest.split_once(':') else {
+            continue;
+        };
+        let Some((_, value)) = rest.split_once('=') else {
+            continue;
+        };
+        let value = value.trim().trim_end_matches(';').trim();
+        let Ok(value) = value.parse::<i32>() else {
+            // 非字面量（例如 `= SOMETHING + 1`）—— 本项目里没有，出现时应当显式处理，
+            // 所以这里静默跳过并在下面用「解析数量」断言兜住（见测试里的 >= 30）。
+            continue;
+        };
+        out.push((name.trim().to_string(), value));
+    }
+    out
+}
+
+/// **M3b 常量不得与任何既有 `VK_STRUCTURE_TYPE_*` 撞编号**（review N-3）。
+///
+/// 覆盖范围 = **源码里的全部常量**（当前 34 个 + M3b 的 5 个 = 39 个），
+/// 而不是先前那张 5 个的手写名单。
+#[test]
+fn m3b_constants_do_not_collide_with_any_existing_constant() {
+    let mut all = parse_structure_type_constants(include_str!("../src/ffi_dev.rs"));
+    all.extend(parse_structure_type_constants(include_str!("../src/spirv.rs")));
+
+    // ① 解析器自检：必须抓到足够多的常量，否则「零撞车」是假的
+    //    （解析失败会静默返回空列表 ⇒ 下面所有断言都平凡通过）
+    assert!(
+        all.len() >= 30,
+        "只从源码解析出 {} 个 VK_STRUCTURE_TYPE_* 常量 —— 解析器或源码结构变了，\
+         请先修解析器（否则这条最全撞车检查会静默失效）",
+        all.len()
+    );
+
+    // ② 既有常量之间也必须**无重复**：这同时证明了「解析确实抓到了完整清单」——
+    //    若解析漏掉了某些定义，这里未必能发现，但若两个不同名字共享同一个值，
+    //    强烈暗示某处复制粘贴没改。
+    for (i, (name_a, val_a)) in all.iter().enumerate() {
+        for (name_b, val_b) in all.iter().skip(i + 1) {
+            assert_ne!(
+                val_a, val_b,
+                "两个不同的 sType 常量共享同一个值：{name_a} 与 {name_b} 都是 {val_a} \
+                 —— 典型原因是复制粘贴没改常量（本项目已有 5 个 M3b 常量，容易再犯）"
+            );
+        }
+    }
+
+    // ③ M3b 的 5 个常量在**全量集合**里都能找到一样名字且一样的值
+    for (name, value) in [
         ("SAMPLER_CREATE_INFO", vk::VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO),
         (
             "DESCRIPTOR_SET_LAYOUT_CREATE_INFO",
@@ -347,23 +419,10 @@ fn m3b_structure_type_constants_match_spec() {
         ),
         ("WRITE_DESCRIPTOR_SET", vk::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET),
     ] {
-        for (other_name, other) in [
-            ("IMAGE_CREATE_INFO", vk::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO),
-            ("IMAGE_VIEW_CREATE_INFO", vk::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO),
-            ("BUFFER_CREATE_INFO", vk::VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO),
-            (
-                "PIPELINE_LAYOUT_CREATE_INFO",
-                vk::VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
-            ),
-            (
-                "GRAPHICS_PIPELINE_CREATE_INFO",
-                vk::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-            ),
-        ] {
-            assert_ne!(
-                ty, other,
-                "{name} 与既有的 {other_name} 编号撞了（典型原因是复制粘贴没改常量）"
-            );
-        }
+        let hit = all
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("源码里找不到 VK_STRUCTURE_TYPE_{name}（解析器漏了？）"));
+        assert_eq!(hit.1, value, "VK_STRUCTURE_TYPE_{name} 的解析值与编译值不一致");
     }
 }

@@ -21,6 +21,7 @@
 
 use deer_gpu::null::CpuRenderer;
 use deer_gpu::{Color, DrawCmd, DrawList, Extent, RectI};
+use deer_vk::device::VkDevice;
 use deer_vk::gpu_geom::GpuVertex;
 use deer_vk::GpuGeometryRenderer;
 
@@ -1089,4 +1090,79 @@ fn repeated_frames_with_unchanged_atlas_do_not_reupload_texture() {
     }
 
     println!("同一图集连续 3 帧：只上传 1 次（后续 2 帧零重传）✅");
+}
+
+/// **并行安全**：别的线程在疯狂上传纹理时，本线程的计数器差值**不受影响**。
+///
+/// ## 为什么要有这条（一个真实缺陷的回归锁，review 复审 I-1）
+///
+/// `texture_r8_upload_count()` 的第一版是**进程级 `static AtomicUsize`**，
+/// 而 [`repeated_frames_with_unchanged_atlas_do_not_reupload_texture`] 断言的是
+/// **帧间差值** —— 于是在 `cargo test` 的**默认多线程**下，别的测试并行上传
+/// 会让差值变成非零。reviewer 实测：`cargo test -p deer-vk` **1/8 FAILED**、
+/// `--test gpu_vs_cpu` 并行 **2/20**、`--test-threads=1` 则 **0/15**；
+/// 而报错恒为「触发了 1 次纹理上传」，**把排查者指向 `refresh_atlas_texture`，
+/// 可那里根本没有问题**。
+///
+/// 假红的必然结局是「又是那个 flaky」→ 护栏被删掉 —— 那比没有护栏更糟。
+/// 所以这条测试**主动制造**并行上传（起 4 个线程各上传 8 次），然后在主线程断言
+/// 「同一个窗口内本线程的差值仍为 0」。若有人把计数器改回进程级 `static`，
+/// 这条会**稳定**变红（而不是偶发）—— 它把 flaky 变成了确定性失败。
+#[test]
+fn upload_counter_is_thread_local_not_process_wide() {
+    let extent = Extent {
+        width: 128,
+        height: 48,
+    };
+    let Some(mut pair) = text_pair(extent, 20.0) else {
+        return;
+    };
+
+    // 先渲染一帧收干图集（这一帧的上传记在**本线程**的计数里）
+    let text = "local";
+    let mut l = DrawList::new();
+    l.push(text_cmd(text, RectI::new(4, 4, 120, 36), 20.0, 0));
+    assert_eq!(compare_text(&mut pair, "thread-local-warmup", &l, 0), 0);
+
+    // 在别的线程上并行做**大量真实上传**（各用自己打开的设备，互不干扰）
+    let workers: Vec<std::thread::JoinHandle<Result<usize, String>>> = (0..4)
+        .map(|_| {
+            std::thread::spawn(|| {
+                let d = VkDevice::open(0).map_err(|e| e.to_string())?;
+                for _ in 0..8 {
+                    // 8×2 覆盖率纹理；内容不重要，只要真的走上传路径
+                    d.create_texture_r8(8, 2, &[7u8; 16]).map_err(|e| e.to_string())?;
+                }
+                // 返回该**工作线程自己**看到的计数，作为「TLS 确实是按线程算」的证据
+                Ok(deer_vk::device::texture_r8_upload_count())
+            })
+        })
+        .collect();
+
+    // 主线程这边同时只做「同一图集、不重传」的渲染，并断言差值为 0
+    let mut window_max = 0usize;
+    for i in 0..8 {
+        let before = deer_vk::device::texture_r8_upload_count();
+        assert_eq!(compare_text(&mut pair, &format!("thread-local-{i}"), &l, 0), 0);
+        let after = deer_vk::device::texture_r8_upload_count();
+        window_max = window_max.max(after - before);
+    }
+    assert_eq!(
+        window_max, 0,
+        "主线程「同一图集」的差值出现了 {window_max} 次上传 —— \
+         若计数器是进程级 static，这里就会被别的线程的上传污染（review 复审 I-1）。\
+         它必须是 thread_local 或每设备字段。"
+    );
+
+    // 每个工作线程都必须看到**自己**的 8 次上传（证明 TLS 语义、而不是全局累加）
+    for (i, h) in workers.into_iter().enumerate() {
+        let seen = h.join().expect("上传线程 panic").expect("上传失败");
+        assert_eq!(
+            seen, 8,
+            "第 {i} 个工作线程应看到自己的 8 次上传，实得 {seen} —— \
+             计数器不是按线程隔离的（若为进程级 static，会看到远大于 8 的累计值）"
+        );
+    }
+
+    println!("并行上传下主线程差值恒为 0，且每个工作线程各看到自己的 8 次 ✅（TLS 免疫）");
 }
