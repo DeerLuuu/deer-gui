@@ -144,6 +144,13 @@ struct UiResources {
     texture: Option<Texture>,
     /// 已上传图集的指纹 `(宽, 高, 已光栅化字形数)`；`None` = 还没传过。
     uploaded: Option<(u32, u32, usize)>,
+    /// **上一次实际上传的顶点字节**（M3+ B3；`None` = 缓冲里没有可信数据）。
+    ///
+    /// 逐字节精确比较（不用哈希：那有碰撞概率）；缓冲被重建/资源被释放时随
+    /// `UiResources` 一起作废（释放 ⇒ 整个结构析构；重建 ⇒ 由 `ensure_ui_vertex_capacity`
+    /// 的返回值清空）。
+    uploaded_shape: Option<Vec<u8>>,
+    uploaded_text: Option<Vec<u8>>,
 }
 
 /// 存活中的 [`UiResources`] 实例数（进程级）。
@@ -214,9 +221,9 @@ fn ensure_ui_vertex_capacity(
     slot: &mut Option<UiVertexBuffer>,
     bytes: u64,
     stats: &mut RenderStats,
-) -> GpuResult<()> {
+) -> GpuResult<bool> {
     if slot.as_ref().is_some_and(|v| v.capacity >= bytes) {
-        return Ok(());
+        return Ok(false);
     }
     let capacity = bytes.next_power_of_two().max(4096);
     let (buffer, memory) = create_host_vertex_buffer(device, capacity)?;
@@ -227,7 +234,8 @@ fn ensure_ui_vertex_capacity(
     });
     // 与 `vkCreateBuffer` + `vkBindBufferMemory` 同处
     stats.buffer_allocations += 1;
-    Ok(())
+    // 返回「重建了」⇒ 调用方必须清掉"上次上传的字节"（新缓冲里没有可信数据）
+    Ok(true)
 }
 
 /// 建一个 DEVICE 无关的 host-visible/coherent 顶点缓冲（`VERTEX_BUFFER` 用法）。
@@ -639,6 +647,8 @@ pub struct WindowedRenderer {
     ui_builds: u64,
     /// 渲染统计（M3+ B1；累计值，见 [`RenderStats`]）。三角形路径与界面路径都计入。
     stats: RenderStats,
+    /// 本帧是否**真的上传**了形状/文本顶点（M3+ B3）：决定要不要发 host→vertex 屏障。
+    ui_barriers: (bool, bool),
 }
 
 impl WindowedRenderer {
@@ -748,6 +758,7 @@ impl WindowedRenderer {
             ui_viewport_is_dynamic: true,
             ui_builds: 0,
             stats: RenderStats::default(),
+            ui_barriers: (false, false),
         })
     }
 
@@ -1301,36 +1312,55 @@ impl WindowedRenderer {
         }
         self.ui_text_skipped = skipped;
 
-        // ③ 上传：形状与文本各有独立缓冲（每帧重传；容量不足才重建）
+        // ③ 上传：形状与文本各有独立缓冲（**内容变化才重传**；容量不足才重建）
         //
         // 计数（`buffer_uploads` / `buffer_allocations`）在**被调用方**里自增，
         // 与真实调用同处 —— 删掉上传就必然删掉计数。
+        // B3：内容逐字节相同的帧跳过重传（UI 帧的顶点数据通常与上一帧相同）。
+        let mut uploaded_shape_now = false;
+        let mut uploaded_text_now = false;
         if !shape_verts.is_empty() {
             let bytes = std::mem::size_of_val(shape_verts.as_slice());
             let dev = &self.device;
             let stats = &mut self.stats;
             let ui = self.ui.as_mut().expect("ensure_ui 之后必有资源");
-            ensure_ui_vertex_capacity(dev, &mut ui.shape_vb, bytes as u64, stats)?;
+            let created = ensure_ui_vertex_capacity(dev, &mut ui.shape_vb, bytes as u64, stats)?;
+            if created {
+                ui.uploaded_shape = None;
+            }
             // SAFETY: `GpuVertex` 是 `#[repr(C)]` 纯 `f32`（无指针、无 Drop）⇒ 字节视图合法。
             let src = unsafe {
                 std::slice::from_raw_parts(shape_verts.as_ptr() as *const u8, bytes)
             };
-            let vb = ui.shape_vb.as_ref().expect("刚 ensure 过");
-            upload_ui_vertices(dev, vb, src, "vkMapMemory(窗口形状顶点)", stats)?;
+            if ui.uploaded_shape.as_deref() != Some(src) {
+                let vb = ui.shape_vb.as_ref().expect("刚 ensure 过");
+                upload_ui_vertices(dev, vb, src, "vkMapMemory(窗口形状顶点)", stats)?;
+                ui.uploaded_shape = Some(src.to_vec());
+                uploaded_shape_now = true;
+            }
         }
         if !text_verts.is_empty() {
             let bytes = std::mem::size_of_val(text_verts.as_slice());
             let dev = &self.device;
             let stats = &mut self.stats;
             let ui = self.ui.as_mut().expect("ensure_ui 之后必有资源");
-            ensure_ui_vertex_capacity(dev, &mut ui.text_vb, bytes as u64, stats)?;
+            let created = ensure_ui_vertex_capacity(dev, &mut ui.text_vb, bytes as u64, stats)?;
+            if created {
+                ui.uploaded_text = None;
+            }
             // SAFETY: `TextVertex` 是 `#[repr(C)]` 纯 `f32` ⇒ 字节视图合法。
             let src = unsafe {
                 std::slice::from_raw_parts(text_verts.as_ptr() as *const u8, bytes)
             };
-            let vb = ui.text_vb.as_ref().expect("刚 ensure 过");
-            upload_ui_vertices(dev, vb, src, "vkMapMemory(窗口文本顶点)", stats)?;
+            if ui.uploaded_text.as_deref() != Some(src) {
+                let vb = ui.text_vb.as_ref().expect("刚 ensure 过");
+                upload_ui_vertices(dev, vb, src, "vkMapMemory(窗口文本顶点)", stats)?;
+                ui.uploaded_text = Some(src.to_vec());
+                uploaded_text_now = true;
+            }
         }
+        // 屏障只在**这一帧真的上传了**时发（B3 收紧后的语义，与离屏一致）
+        self.ui_barriers = (uploaded_shape_now, uploaded_text_now);
 
         // ④ 图集纹理：指纹变化才重传（与离屏同一条契约）
         if let Some(engine) = engine.as_deref() {
@@ -1338,6 +1368,11 @@ impl WindowedRenderer {
         }
 
         // ⑤ 帧舞蹈（取图 → 录制 → 提交 → 呈现）：与 `render_and_present` 共用同一段逻辑
+        //
+        // **B2 合段**：相邻同管线且区间连续的段合成一次 `vkCmdDraw`（像素等价，见
+        // `gpu_render::merge_adjacent_draw_calls` 的不变式）。放在录制之前 ⇒
+        // `stats.draw_calls` 记的是真实的 draw 次数。
+        let calls = crate::gpu_render::merge_adjacent_draw_calls(&calls);
         self.present_frame(|s, slot, image_index| s.record_ui(slot, image_index, &calls))
     }
 
@@ -1393,6 +1428,8 @@ impl WindowedRenderer {
                 pool,
                 texture: None,
                 uploaded: None,
+                uploaded_shape: None,
+                uploaded_text: None,
             });
         }
         // `want_text = false` 时文本管线**依然存在**（共用层一次建两条）——
@@ -1462,11 +1499,11 @@ impl WindowedRenderer {
         //   `HOST/HOST_WRITE` → `VERTEX_INPUT/VERTEX_ATTRIBUTE_READ`。
         let used = [
             (
-                calls.iter().any(|c| c.kind == PipelineKind::Shape),
+                self.ui_barriers.0,
                 ui.shape_vb.as_ref().map(|v| v.buffer.handle()),
             ),
             (
-                calls.iter().any(|c| c.kind == PipelineKind::Text),
+                self.ui_barriers.1,
                 ui.text_vb.as_ref().map(|v| v.buffer.handle()),
             ),
         ];

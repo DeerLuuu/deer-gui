@@ -492,14 +492,21 @@ fn vertex_layout_matches_the_hand_written_attribute_offsets() {
     assert_eq!(std::mem::offset_of!(GpuVertex, color), 28, "location 3：vec4 color");
 }
 
-/// **R1-1**：一个「有顶点」的帧必须发出**恰好一条** host→vertex 屏障；空帧不得发。
+/// **R1-1（语义经 M3+ B3 收紧后的版本）**：**真的上传了**的帧才发 host→vertex 屏障。
 ///
 /// 为什么要有这条（而不是只靠 `vertex_barrier_params_pin_the_exact_masks` 那个单元测试）：
 /// 单元测试只能钉「参数对不对」，钉不住「屏障有没有真的被发出来」。reviewer 的变异证明
 /// **把整段屏障删掉**（= 原始缺陷复原）在 16 个测试靶上**全绿** —— 本测试就是那条变异的判据：
 /// 删掉屏障 ⇒ 计数不再增长 ⇒ **变红**。
+///
+/// ## 与 M3a 版本的差别（B3 引入，**如实标注**）
+///
+/// B3 之前是「有顶点就每帧重传、因此每帧都发屏障」；B3 起**内容不变的帧跳过上传**
+/// ⇒ 没有主机写入 ⇒ **不需要**新的依赖（上一次那条已经给同一块缓冲建立过）。
+/// 所以语义从「有顶点就发」收紧为「**上传了**才发」——老断言「每帧都要发屏障」
+/// 在 B3 之后不再成立，这里按新语义重写（而不是把它删掉）。
 #[test]
-fn host_to_vertex_barrier_is_emitted_once_per_non_empty_frame() {
+fn host_to_vertex_barrier_is_emitted_only_when_vertices_are_uploaded() {
     let Some(mut r) = renderer(Extent { width: 8, height: 8 }) else {
         return;
     };
@@ -513,23 +520,151 @@ fn host_to_vertex_barrier_is_emitted_once_per_non_empty_frame() {
         "空帧没有顶点缓冲要读，不得发 host→vertex 屏障"
     );
 
-    // 有顶点 ⇒ 恰好 +1
+    // 有顶点且**首次上传** ⇒ 恰好 +1
     let mut l = DrawList::new();
-    l.push(DrawCmd::FillRect { rect: RectI::new(1, 1, 4, 4), color: Color::WHITE });
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(1, 1, 4, 4),
+        color: Color::WHITE,
+    });
+    let s0 = r.render_stats();
     r.render(&l).expect("有顶点的帧应当成功");
     assert_eq!(
         r.host_to_vertex_barrier_count(),
         base + 1,
-        "有顶点的帧必须发**且只发一条** host→vertex 屏障"
+        "首次上传必须发**且只发一条** host→vertex 屏障"
+    );
+    assert_eq!(
+        r.render_stats().buffer_uploads - s0.buffer_uploads,
+        1,
+        "首帧必须真的上传一次"
     );
 
-    // 每帧都重写顶点缓冲 ⇒ 每帧都要重新建立这条依赖
+    // **同一份顶点再画一帧**：B3 跳过上传 ⇒ 不发新屏障（没有新的主机写入）
+    let s1 = r.render_stats();
     r.render(&l).expect("第二帧应当成功");
+    assert_eq!(
+        r.render_stats().buffer_uploads - s1.buffer_uploads,
+        0,
+        "B3：内容逐字节相同 ⇒ 跳过重传（buffer_uploads 不增长）"
+    );
+    assert_eq!(
+        r.host_to_vertex_barrier_count(),
+        base + 1,
+        "没有上传就不需要新的 host→vertex 依赖（上一次那条仍然有效）"
+    );
+
+    // **内容变了** ⇒ 重新上传 ⇒ 屏障再次出现
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(2, 2, 4, 4),
+        color: Color::WHITE,
+    });
+    let s2 = r.render_stats();
+    r.render(&l).expect("内容变化后应当成功");
+    assert_eq!(
+        r.render_stats().buffer_uploads - s2.buffer_uploads,
+        1,
+        "内容变化 ⇒ 必须重新上传"
+    );
     assert_eq!(
         r.host_to_vertex_barrier_count(),
         base + 2,
-        "每帧重传顶点 ⇒ 每帧都要发屏障"
+        "重新上传 ⇒ 必须重新建立 host→vertex 依赖"
     );
+}
+
+/// **M3+ B2（合段）**：相邻同管线**且区间连续**的绘制段必须合成**一次** `vkCmdDraw`。
+///
+/// 语料：5 个相邻的 `FillRect` ⇒ 形状顶点 30 个**连续**。
+///
+/// | 量 | 合段前 | 合段后（本测试断言） |
+/// |---|---|---|
+/// | `draw_calls` | 5 | **1** |
+/// | `pipeline_switches` | 1 | **1**（切换 = 连续段数，本来就 1） |
+///
+/// 同时断言**像素判据不变**（与 CPU 逐字节比）：合段若改变了绘制顺序，这条会先红
+/// —— 顺序即语义（M3b 已实证 z 序能被变异抓住）。
+///
+/// **计数是累计值** ⇒ 断言一律用差值。
+#[test]
+fn adjacent_same_pipeline_segments_are_merged_into_one_draw_call() {
+    let extent = Extent {
+        width: 64,
+        height: 32,
+    };
+    let Some(mut r) = renderer(extent) else {
+        return;
+    };
+
+    let mut l = DrawList::new();
+    for x in [2, 12, 22, 32, 42] {
+        l.push(DrawCmd::FillRect {
+            rect: RectI::new(x, 2, 8, 8),
+            color: Color::WHITE,
+        });
+    }
+    let before = r.render_stats();
+    r.render(&l).expect("渲染 5 个相邻矩形");
+    let after = r.render_stats();
+    assert_eq!(
+        after.draw_calls - before.draw_calls,
+        1,
+        "5 个相邻同管线矩形 ⇒ 合段后应当只有 **1** 次 draw（合段前是 5），实际 {}",
+        after.draw_calls - before.draw_calls
+    );
+    assert_eq!(
+        after.pipeline_switches - before.pipeline_switches,
+        1,
+        "切换次数 = 形状/文本的连续段数（由 z 序决定），这里是 1"
+    );
+    // 像素判据：逐字节不变
+    assert_eq!(compare(&mut r, "merged-5-rects-vs-cpu", &l, 0), 0);
+}
+
+/// **B2 的「不合并」那一半**：相邻但**管线不同**的段必须各画一次（顺序即 z 序）。
+///
+/// 语料 `矩形, 文本, 矩形`：形状顶点 6+6 各自连续，但中间被文本隔开 ⇒
+/// 合段后仍是 **3** 次 draw、**3** 次切换；z 序不能为了少一次 draw 而被重排。
+#[test]
+fn interleaved_shapes_and_text_are_not_reordered_by_merging() {
+    let extent = Extent {
+        width: 96,
+        height: 32,
+    };
+    let Some(mut pair) = text_pair(extent, 16.0) else {
+        return;
+    };
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(2, 2, 8, 8),
+        color: Color::WHITE,
+    });
+    l.push(DrawCmd::Text {
+        rect: RectI::new(2, 12, 90, 18),
+        text: "M".into(),
+        color: Color::WHITE,
+        size: 16.0,
+        align: 0,
+    });
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(40, 2, 8, 8),
+        color: Color::WHITE,
+    });
+    let before = pair.0.render_stats();
+    let gpu = pair.0.render(&l).expect("渲染 矩形/文本/矩形");
+    let after = pair.0.render_stats();
+    assert_eq!(
+        after.draw_calls - before.draw_calls,
+        3,
+        "管线交替 ⇒ 不许为了少画而重排顺序（z 序是语义）：形状 1 + 文本 1 + 形状 1 = 3"
+    );
+    assert_eq!(
+        after.pipeline_switches - before.pipeline_switches,
+        3,
+        "每次换管线都要重新绑定"
+    );
+    let _ = gpu;
+    // 像素判据：与 CPU 逐字节相同（顺序若被改动，这里会红）
+    assert_eq!(compare_text(&mut pair, "interleaved-not-reordered", &l, 0), 0);
 }
 
 /// **R1-3**：「上次提交未确认完成」之后，`render` 必须**必定报错**，且不去碰任何资源。
@@ -938,18 +1073,34 @@ fn text_barriers_are_emitted_per_buffer() {
     assert_eq!(t1.2, t0.2 + 1, "那条屏障必须记在**文本**分项上（review M2 的护栏）");
     assert_eq!(t1.1, t0.1, "文本帧不该动形状分项");
 
-    // ② 形状+文本交错 ⇒ 两块缓冲各一条 ⇒ 总数 +2，两个分项各 +1
+    // ② 形状+文本交错、且**两者内容都变了** ⇒ 两块缓冲各一条 ⇒ 总数 +2，两个分项各 +1
+    //    （B3 之后屏障只在**真的上传**时发：这里刻意把文本从 "Bar" 换成 "Baz"，
+    //      否则文本内容没变、跳过上传 ⇒ 只有形状那一条屏障）
     let mut l = DrawList::new();
     l.push(DrawCmd::FillRect {
         rect: RectI::new(0, 0, 64, 32),
         color: Color::rgb(10, 10, 40),
     });
-    l.push(text_cmd("Bar", RectI::new(2, 2, 60, 28), 16.0, 0));
+    l.push(text_cmd("Baz", RectI::new(2, 2, 60, 28), 16.0, 0));
     pair.0.render(&l).expect("交错帧");
     let t2 = counters(&pair.0);
-    assert_eq!(t2.0, t1.0 + 2, "两块独立顶点缓冲各要一条屏障");
+    assert_eq!(t2.0, t1.0 + 2, "两块独立顶点缓冲各要一条屏障（两块内容都变了）");
     assert_eq!(t2.1, t1.1 + 1, "形状分项 +1");
     assert_eq!(t2.2, t1.2 + 1, "文本分项 +1");
+
+    // ②' **同一份内容再画一帧** ⇒ B3 跳过两块的重新上传 ⇒ 不发任何新屏障
+    let s = pair.0.render_stats();
+    pair.0.render(&l).expect("重复帧");
+    assert_eq!(
+        pair.0.render_stats().buffer_uploads - s.buffer_uploads,
+        0,
+        "B3：内容逐字节相同 ⇒ 两块缓冲都不重传"
+    );
+    assert_eq!(
+        counters(&pair.0),
+        t2,
+        "没有上传 ⇒ 不需要新的 host→vertex 依赖（B3 收紧后的语义）"
+    );
 
     // ③ 文本全被跳过（没有顶点）⇒ 不该发文本屏障，也不该发形状屏障
     let mut l = DrawList::new();

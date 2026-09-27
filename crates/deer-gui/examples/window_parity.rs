@@ -203,7 +203,10 @@ impl Parity {
         let w = extent.width.max(1);
         let px = (worst / 4) as u32;
         let delta = stats_delta(stats_before, r.render_stats());
-        let n = frames.max(1) as u64;
+        let n = frames;
+        if n == 0 {
+            return Err("帧数必须 ≥ 1".to_string());
+        }
         Ok(ParityResult {
             name,
             max_diff,

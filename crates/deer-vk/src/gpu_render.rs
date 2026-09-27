@@ -242,11 +242,6 @@ pub struct RenderStats {
 /// 区间不连续（中间被别的管线插过）⇒ 一次 draw 画不出来。
 ///
 /// 这是纯函数：**无 GPU 就能单测**（见本模块单测）。
-///
-/// ⚠️ **当前未被调用**（B1 只加统计；接上它是 B2 那一步）。加 `allow(dead_code)`
-/// 而不是等到 B2 再写：这段源码与它的单测是**同一条判据**，先落地才能让 B2 的 diff
-/// 只剩「调用它」这一处语义改动。
-#[allow(dead_code)]
 pub(crate) fn merge_adjacent_draw_calls(calls: &[DrawCall]) -> Vec<DrawCall> {
     let mut out: Vec<DrawCall> = Vec::with_capacity(calls.len());
     for c in calls {
@@ -743,6 +738,15 @@ pub struct GpuGeometryRenderer {
     text_host_to_vertex_barriers: u64,
     /// 渲染统计（M3+ B1；累计值，见 [`RenderStats`]）。
     stats: RenderStats,
+    /// **上一次实际上传进形状顶点缓冲的字节**（M3+ B3；`None` = 缓冲里没有可信数据）。
+    ///
+    /// 用途：连续多帧语料不变时**跳过重传**（UI 帧的顶点数据通常逐帧相同）。
+    /// 存整份副本（而不是哈希）是为了**精确**比较：哈希有碰撞概率，
+    /// 而这里"省一次 memcpy"换来的是"多一份顶点数据的内存"——顶点数据是几十 KB 量级，划算。
+    /// 缓冲被（重）创建或资源被释放时**必须清空**（见 `ensure_vertex_capacity` 的调用点）。
+    uploaded_shape: Option<Vec<u8>>,
+    /// 同上，文本顶点缓冲。
+    uploaded_text: Option<Vec<u8>>,
     /// **必须最后**（最后析构）。
     device: VkDevice,
 }
@@ -956,6 +960,8 @@ impl GpuGeometryRenderer {
             shape_host_to_vertex_barriers: 0,
             text_host_to_vertex_barriers: 0,
             stats: RenderStats::default(),
+            uploaded_shape: None,
+            uploaded_text: None,
             device,
         })
     }
@@ -1215,18 +1221,28 @@ impl GpuGeometryRenderer {
         unsupported_outcome(&self.unsupported)?;
 
         // ③④⑤⑥ 上传顶点/图集（按需）+ 录制 + 提交 + 回读
+        //
+        // **B2 合段**：相邻同管线且区间连续的段合成一次 `vkCmdDraw`（像素等价，
+        // 见 `merge_adjacent_draw_calls` 的不变式）。放在录制**之前** ⇒
+        // `draw_calls` 计的就是真实的 draw 次数。
+        let calls = merge_adjacent_draw_calls(&calls);
         self.record_and_submit(&shape_verts, &text_verts, &calls)?;
         self.read_back()
     }
 
     /// 确保某个顶点缓冲至少有 `bytes` 字节（不够就按 2 的幂重建），**先建后换**。
     ///
-    /// 两个缓冲（形状 stride 44 / 文本 stride 32）共用这段逻辑 —— 它们只在「容量」上不同。
-    fn ensure_vertex_capacity(&mut self, slot: &mut Option<VertexBuffer>, bytes: u64) -> GpuResult<()> {
+    /// 返回**是否重建了缓冲**：重建 ⇒ 缓冲内容不可信，调用方必须清掉"上次上传的字节"
+    /// 记录（M3+ B3 的跳过上传依赖它）。
+    fn ensure_vertex_capacity(
+        &mut self,
+        slot: &mut Option<VertexBuffer>,
+        bytes: u64,
+    ) -> GpuResult<bool> {
         // 破坏性操作（会销毁旧缓冲、分配新内存）⇒ 守卫放在这里（见 R1-3）。
         self.sync.ensure_reusable()?;
         if slot.as_ref().is_some_and(|v| v.capacity >= bytes) {
-            return Ok(());
+            return Ok(false);
         }
         let capacity = bytes.next_power_of_two().max(MIN_VERTEX_BYTES);
         // **先建新的、成功后再换**（T3 review F11）：失败时旧缓冲仍然可用、容量信息不丢。
@@ -1247,7 +1263,7 @@ impl GpuGeometryRenderer {
         });
         // 计数与真实调用同处（`vkCreateBuffer` + 绑定内存在上一行刚发生）
         self.stats.buffer_allocations += 1;
-        Ok(())
+        Ok(true)
     }
 
     /// 把一段**已经是 `#[repr(C)]` 纯 `f32`** 的顶点数据写进缓冲（map → memcpy → unmap）。
@@ -1356,25 +1372,40 @@ impl GpuGeometryRenderer {
         //   于是「Broken ⇒ 绝不去碰命令缓冲/栅栏」不依赖任何调用方的写法。
         self.sync.ensure_reusable()?;
 
-        // ① 上传：形状与文本各有独立缓冲，各自「按需扩容 + 每帧重传」
+        // ① 上传：形状与文本各有独立缓冲，各自「按需扩容 + **内容变化才重传**」
+        //
+        // **B3（跨帧复用）**：连续帧语料不变时顶点数据逐字节相同 ⇒ 跳过 map/memcpy/unmap
+        // （`buffer_uploads` 不增长）。缓冲区重建 / 资源释放时 `uploaded_*` 必须清空
+        // （重建 ⇒ 缓冲里没有可信数据）。
+        //
+        // 这两个 `*_now` 标志同时决定**屏障**要不要发：没有主机写入就不需要新的
+        // host→VERTEX_INPUT 依赖（上一次的那条已经给同一块缓冲建立过）。
+        let mut uploaded_shape_now = false;
+        let mut uploaded_text_now = false;
         if !shape_verts.is_empty() {
             let bytes = std::mem::size_of_val(shape_verts) as u64;
             let mut slot = self.vertex.take();
-            let r = self.ensure_vertex_capacity(&mut slot, bytes);
+            let created = self.ensure_vertex_capacity(&mut slot, bytes);
             self.vertex = slot;
-            r?;
+            if created? {
+                self.uploaded_shape = None;
+            }
             let bytes = std::mem::size_of_val(shape_verts);
             // SAFETY: `GpuVertex` 是 `#[repr(C)]` 纯 `f32`（无指针、无 Drop）⇒ 字节视图合法。
             let src = unsafe {
                 std::slice::from_raw_parts(shape_verts.as_ptr() as *const u8, bytes)
             };
-            let mem = self
-                .vertex
-                .as_ref()
-                .expect("ensure 之后必有缓冲")
-                .memory
-                .handle();
-            self.upload_vertices(mem, src, "vkMapMemory(shape vertex)")?;
+            if self.uploaded_shape.as_deref() != Some(src) {
+                let mem = self
+                    .vertex
+                    .as_ref()
+                    .expect("ensure 之后必有缓冲")
+                    .memory
+                    .handle();
+                self.upload_vertices(mem, src, "vkMapMemory(shape vertex)")?;
+                self.uploaded_shape = Some(src.to_vec());
+                uploaded_shape_now = true;
+            }
         }
         if !text_verts.is_empty() {
             let bytes = std::mem::size_of_val(text_verts) as u64;
@@ -1384,24 +1415,30 @@ impl GpuGeometryRenderer {
                 .expect("有文本顶点 ⇒ 文本资源存在")
                 .vertex
                 .take();
-            let r = self.ensure_vertex_capacity(&mut slot, bytes);
+            let created = self.ensure_vertex_capacity(&mut slot, bytes);
             if let Some(res) = self.text.as_mut() {
                 res.vertex = slot;
             }
-            r?;
+            if created? {
+                self.uploaded_text = None;
+            }
             let bytes = std::mem::size_of_val(text_verts);
             // SAFETY: `TextVertex` 是 `#[repr(C)]` 纯 `f32` ⇒ 字节视图合法。
             let src = unsafe {
                 std::slice::from_raw_parts(text_verts.as_ptr() as *const u8, bytes)
             };
-            let mem = self
-                .text
-                .as_ref()
-                .and_then(|r| r.vertex.as_ref())
-                .expect("ensure 之后必有缓冲")
-                .memory
-                .handle();
-            self.upload_vertices(mem, src, "vkMapMemory(text vertex)")?;
+            if self.uploaded_text.as_deref() != Some(src) {
+                let mem = self
+                    .text
+                    .as_ref()
+                    .and_then(|r| r.vertex.as_ref())
+                    .expect("ensure 之后必有缓冲")
+                    .memory
+                    .handle();
+                self.upload_vertices(mem, src, "vkMapMemory(text vertex)")?;
+                self.uploaded_text = Some(src.to_vec());
+                uploaded_text_now = true;
+            }
             // 图集若变了就重传纹理 + 更新描述符集（**必须在提交之前**）
             self.refresh_atlas_texture()?;
         }
@@ -1433,11 +1470,15 @@ impl GpuGeometryRenderer {
         //   历史：文本屏障曾经**只有实现、没有护栏** —— reviewer 把它整体删掉、17 靶仍然全绿。
         //   （放在渲染通道**之前**：缓冲区屏障在通道内也合法，但放在外面更简单、更不容易踩
         //     「通道内允许哪些屏障」的规则。）
-        if !shape_verts.is_empty() {
+        //
+        //   ★ B3 起：**只有这一帧真的上传了**才发（没上传 = 没有新的主机写入，
+        //     上一次那条屏障已经给同一块缓冲建立过依赖）。语义随之收紧到
+        //     「上传的帧才发屏障」，`gpu_vs_cpu` 的用例按新语义断言。
+        if uploaded_shape_now {
             let h = self.vertex.as_ref().expect("形状顶点已上传").buffer.handle();
             self.emit_host_to_vertex_barrier(h, PipelineKind::Shape);
         }
-        if !text_verts.is_empty() {
+        if uploaded_text_now {
             let h = self
                 .text
                 .as_ref()
