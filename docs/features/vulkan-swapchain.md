@@ -225,7 +225,7 @@ M2b 的真实状态是：
 > 推送常量矩形着色器是坏的（校验层报 `VUID-StandaloneSpirv-PushConstant-06808`，
 > **请求校验层时会让进程访问违例崩溃**，0xc0000005）—— 所以 `tests/device_smoke.rs` 与
 > `tests/pipeline_smoke.rs` 里涉及它的测试**在校验层下显式跳过**（t15，明确打印「不是通过，是被跳过」）。
-> 本机实测：`DEER_VK_VALIDATION=1 cargo test -p deer-vk` → **161 passed / 0 failed、零校验消息**（数字随测试增长）；
+> 本机实测：`DEER_VK_VALIDATION=1 cargo test -p deer-vk` → **167 passed / 0 failed、零校验消息**（数字随测试增减漂移，**以运行输出为准**）；
 > 窗口示例 30 帧 → 零消息、`exit=0`。修好那支着色器属于 **M3**（矩形改顶点缓冲），登记见
 > [`ROADMAP.md`](../../ROADMAP.md) 的 Q-5。
 
@@ -278,7 +278,7 @@ $env:DEER_VK_VALIDATION='1'; $env:DEER_WINDOW_FRAMES='30'; cargo run -p deer-gui
 # 会看到 [deer-vk] 窗口路径已启用 VK_LAYER_KHRONOS_validation；本机实测零条 VUID/Validation Error，exit=0
 
 $env:DEER_VK_VALIDATION='1'; cargo test -p deer-vk
-# 本机实测 161 passed / 0 failed、零条校验消息（设备/离屏/窗口三条路径都开了校验层，t18 起；数字随测试增长）
+# 本机实测 167 passed / 0 failed、零条校验消息（设备/离屏/窗口三条路径都开了校验层，t18 起；数字随测试增减漂移，以运行输出为准）
 
 # 真窗口 e2e（swapchain_smoke 里的那条）**默认跳过**，必须显式打开：
 $env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo test -p deer-vk
