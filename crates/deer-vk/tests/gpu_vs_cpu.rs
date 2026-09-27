@@ -554,3 +554,325 @@ fn render_is_refused_after_an_unconfirmed_submit() {
     // 空帧同样要复用命令缓冲/栅栏 ⇒ 也必须拒绝
     assert!(r.render(&DrawList::new()).is_err(), "空帧也要复用命令缓冲 ⇒ 同样拒绝");
 }
+
+// ===========================================================================
+// M3b-T4：**文本**的逐像素对照（GPU ↔ CPU）
+//
+// 三条硬前提（都是 T3 / M3a 的实证结论）：
+// ① **CPU 侧必须用 `CpuRenderer::with_text(engine)`** —— `CpuRenderer::new()` 走的是
+//    **占位格**模型（0.6em 等宽方块 + i32 截断除法），与真实字形**模型不同**，
+//    误用它会让文本对照全红且极难定位；
+// ② 片元着色器输出**非预乘** `vec4(rgb, a*cov)`，配管线的 `SRC_ALPHA/ONE_MINUS_SRC_ALPHA`
+//    —— 这正是 CPU `blend_cov` 的形式（顶点颜色也是非预乘的）；
+// ③ 采样 **NEAREST**：线性过滤会把邻居纹素混进来，与 CPU 的整数查表不一致。
+// ===========================================================================
+
+/// 系统字体引擎（拿不到就跳过并打印原因）。
+fn text_engine(font_size: f32) -> Option<deer_gpu::text::TextEngine> {
+    match deer_gpu::text::TextEngine::from_system_font(font_size) {
+        Ok(e) => Some(e),
+        Err(e) => {
+            eprintln!("跳过：这台机器上拿不到系统字体（{e}）");
+            None
+        }
+    }
+}
+
+/// GPU（文本管线）+ CPU（真实字形路径）这一对，**各自持有一个同源引擎**。
+///
+/// 两个引擎由同一个系统字体、按**完全相同的命令顺序**填充图集 ⇒ 槽位布局逐字节相同
+/// （`atlas.rs` 的确定性不变式），所以两边的像素可直接比较。
+type TextPair = (GpuGeometryRenderer, CpuRenderer);
+
+fn text_pair(extent: Extent, font_size: f32) -> Option<TextPair> {
+    let base = renderer(extent)?;
+    let e_gpu = text_engine(font_size)?;
+    let e_cpu = text_engine(font_size)?;
+    let gpu = base
+        .with_text(e_gpu)
+        .unwrap_or_else(|e| panic!("with_text 失败（文本管线建不起来）：{e}"));
+    // ★ 必须 `with_text`：占位格模型与真实字形对不上（见本节开头的 ①）
+    Some((gpu, CpuRenderer::with_text(e_cpu)))
+}
+
+/// 对照一帧**文本**：返回最大通道差（`max_allowed = 0` ⇒ 额外断言逐字节相同）。
+fn compare_text(pair: &mut TextPair, name: &str, list: &DrawList, max_allowed: u8) -> u8 {
+    let extent = pair.0.extent();
+    let gpu = pair
+        .0
+        .render(list)
+        .unwrap_or_else(|e| panic!("{name}: GPU 渲染失败：{e}"));
+    assert!(
+        pair.0.unsupported().is_empty(),
+        "{name}: 文本已被接管 ⇒ 不该有 unsupported（{:?}）",
+        pair.0.unsupported()
+    );
+    let cpu = pair
+        .1
+        .render(extent, list, CLEAR)
+        .expect("CPU 渲染失败");
+    let cpu = cpu.to_rgba();
+    assert_eq!(gpu.len(), cpu.len(), "{name}: 回读长度必须等于 CPU 帧缓冲长度");
+
+    let mut worst = 0u8;
+    let mut at = 0usize;
+    for (i, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+        let d = g.abs_diff(*c);
+        if d > worst {
+            worst = d;
+            at = i;
+        }
+    }
+    let w = extent.width.max(1) as usize;
+    println!("  {name}: 最大通道差 {worst}（允许 {max_allowed}）");
+    assert!(
+        worst <= max_allowed,
+        "{name}: 最大通道差 {worst} > 允许的 {max_allowed}；最差处像素 ({}, {})：GPU={:?} CPU={:?}",
+        (at / 4) % w,
+        (at / 4) / w,
+        &gpu[at - at % 4..at - at % 4 + 4],
+        &cpu[at - at % 4..at - at % 4 + 4]
+    );
+    if max_allowed == 0 {
+        assert_eq!(gpu, cpu, "{name}: 不透明文本必须逐字节相同");
+    }
+    worst
+}
+
+/// 一条文本命令（不透明白字，便于与清屏色区分）。
+fn text_cmd(text: &str, rect: RectI, size: f32, align: u8) -> DrawCmd {
+    DrawCmd::Text {
+        rect,
+        text: text.to_string(),
+        color: Color::WHITE,
+        size,
+        align,
+    }
+}
+
+/// **文本对照的语料**：单字符 / 多字符 / 超大 size / `align=0,1,2` / 空串 / 零面积 /
+/// 被 clip 裁空 / 缺字（豆腐）/ 形状与文本交错（z 序）。
+#[test]
+fn text_drawings_match_cpu_pixel_for_pixel() {
+    let extent = Extent {
+        width: 128,
+        height: 48,
+    };
+    let Some(mut pair) = text_pair(extent, 20.0) else {
+        return;
+    };
+    let mut worst = 0u8;
+
+    // ① 单字符 / ② 多字符
+    let mut l = DrawList::new();
+    l.push(text_cmd("A", RectI::new(4, 4, 60, 30), 24.0, 0));
+    worst = worst.max(compare_text(&mut pair, "text-single", &l, 0));
+
+    let mut l = DrawList::new();
+    l.push(text_cmd("Hello, GPU!", RectI::new(2, 2, 124, 40), 20.0, 0));
+    worst = worst.max(compare_text(&mut pair, "text-multi", &l, 0));
+
+    // ③ 三种对齐（align=1/2 在 T3 才第一次有覆盖）
+    for align in [0u8, 1, 2] {
+        let mut l = DrawList::new();
+        l.push(text_cmd("Align", RectI::new(4, 4, 110, 36), 20.0, align));
+        worst = worst.max(compare_text(
+            &mut pair,
+            &format!("text-align-{align}"),
+            &l,
+            0,
+        ));
+    }
+
+    // ④ 超大 size：放不进图集 ⇒ 两边都什么都不画（不该报错）
+    let mut l = DrawList::new();
+    l.push(text_cmd("W", RectI::new(0, 0, 128, 48), 1500.0, 0));
+    worst = worst.max(compare_text(&mut pair, "text-huge-size", &l, 0));
+
+    // ⑤ 空串 / ⑥ 零面积 rect（CPU 侧仍会画：rect 只决定起点与基线）
+    let mut l = DrawList::new();
+    l.push(text_cmd("", RectI::new(4, 4, 60, 30), 20.0, 0));
+    worst = worst.max(compare_text(&mut pair, "text-empty", &l, 0));
+
+    let mut l = DrawList::new();
+    l.push(text_cmd("L", RectI::new(6, 6, 0, 30), 20.0, 0));
+    worst = worst.max(compare_text(&mut pair, "text-zero-area", &l, 0));
+
+    // ⑦ 被 clip 完全裁空 / ⑧ 局部裁剪
+    let mut l = DrawList::new();
+    l.push(DrawCmd::PushClip {
+        rect: RectI::new(200, 200, 8, 8),
+    });
+    l.push(text_cmd("Clipped", RectI::new(4, 4, 110, 36), 20.0, 0));
+    l.push(DrawCmd::PopClip);
+    worst = worst.max(compare_text(&mut pair, "text-clipped-away", &l, 0));
+
+    let mut l = DrawList::new();
+    l.push(DrawCmd::PushClip {
+        rect: RectI::new(20, 8, 60, 32),
+    });
+    l.push(text_cmd("Clipped", RectI::new(4, 4, 110, 36), 20.0, 0));
+    l.push(DrawCmd::PopClip);
+    worst = worst.max(compare_text(&mut pair, "text-clipped-partial", &l, 0));
+
+    // ⑨ 缺字（私用区字符 ⇒ 走 `.notdef` 豆腐）
+    let mut l = DrawList::new();
+    l.push(text_cmd("A\u{E123}B", RectI::new(4, 4, 110, 36), 20.0, 0));
+    worst = worst.max(compare_text(&mut pair, "text-missing-glyph", &l, 0));
+
+    println!("文本语料最大通道差 = {worst}（要求 0）");
+    assert_eq!(worst, 0, "不透明文本必须逐字节相同");
+    assert_no_validation_messages("文本语料");
+}
+
+/// **z 序**：文本与形状按 `DrawList` 顺序交错，后画的必须盖住先画的。
+///
+/// 这是本任务最容易做错的一条：如果把绘制段排成「先所有形状、再所有文本」，
+/// 下面 `text-under-shape` 那条会红（矩形本该盖住文字），而单看文本对照是看不出来的。
+#[test]
+fn text_and_shapes_keep_z_order() {
+    let extent = Extent {
+        width: 128,
+        height: 48,
+    };
+    let Some(mut pair) = text_pair(extent, 20.0) else {
+        return;
+    };
+
+    // 文字在形状**之下**：矩形后画 ⇒ 必须把文字盖住
+    let mut l = DrawList::new();
+    l.push(text_cmd("Covered", RectI::new(4, 4, 110, 36), 20.0, 0));
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(0, 0, 60, 48),
+        color: Color::rgb(200, 30, 30),
+    });
+    assert_eq!(compare_text(&mut pair, "text-under-shape", &l, 0), 0);
+
+    // 文字在形状**之上**
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(0, 0, 128, 48),
+        color: Color::rgb(20, 60, 120),
+    });
+    l.push(text_cmd("Over", RectI::new(4, 4, 110, 36), 20.0, 0));
+    assert_eq!(compare_text(&mut pair, "text-over-shape", &l, 0), 0);
+
+    // 交替：矩形 → 文字 → 矩形 → 文字（形状与文本各两段，z 序交错四处）
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(0, 0, 128, 24),
+        color: Color::rgb(20, 60, 120),
+    });
+    l.push(text_cmd("First", RectI::new(2, 0, 60, 24), 18.0, 0));
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(0, 20, 128, 28),
+        color: Color::rgb(200, 30, 30),
+    });
+    l.push(text_cmd("Second", RectI::new(2, 20, 124, 28), 18.0, 0));
+    assert_eq!(compare_text(&mut pair, "text-interleaved", &l, 0), 0);
+}
+
+/// 半透明文本：与 M3a 同样的口径 —— **≤1 LSB**（CPU `round()` vs GPU UNORM 舍入）。
+#[test]
+fn semi_transparent_text_matches_cpu_within_one_lsb() {
+    let extent = Extent {
+        width: 128,
+        height: 48,
+    };
+    let Some(mut pair) = text_pair(extent, 20.0) else {
+        return;
+    };
+    let mut l = DrawList::new();
+    l.push(DrawCmd::Text {
+        rect: RectI::new(4, 4, 110, 36),
+        text: "Fade".into(),
+        color: Color::rgba(255, 80, 0, 0.5),
+        size: 20.0,
+        align: 0,
+    });
+    let worst = compare_text(&mut pair, "text-semi-transparent", &l, 1);
+    println!("半透明文本最大通道差 = {worst}（要求 ≤1）");
+    assert!(worst <= 1, "半透明文本最大通道差 {worst} 超过 1 LSB");
+}
+
+/// **假阳性已修**：空串 / `size <= 0` / 被裁空的文本**不再报错**，而是被跳过并计数
+/// （M3a 里它们会让整帧报 `Unsupported`；M3b 只记 `text_skipped`）。
+///
+/// ⚠️ 这里**只断言「不报错 + 计数正确」**，不做像素对照：`size <= 0` 与 CPU **有意不同**
+/// （CPU 把字号夹到 `>= 1` ⇒ 会画 1px 的字形；本模块按 M3b 计划跳过）——
+/// **parity 语料不含 `size <= 0`** 是控制者裁定的硬约束。
+/// 而「空串 / 被裁空」这两类是 CPU 也不画的，所以另有一条逐字节对照（下面第二个块）。
+#[test]
+fn text_false_positives_are_skipped_and_counted_not_errors() {
+    let extent = Extent {
+        width: 128,
+        height: 48,
+    };
+    let Some(mut pair) = text_pair(extent, 20.0) else {
+        return;
+    };
+    let mut l = DrawList::new();
+    l.push(text_cmd("", RectI::new(4, 4, 60, 30), 20.0, 0)); // 空串
+    l.push(text_cmd("Hi", RectI::new(4, 4, 60, 30), 0.0, 0)); // size = 0
+    l.push(text_cmd("Hi", RectI::new(4, 4, 60, 30), -5.0, 0)); // size < 0
+    l.push(DrawCmd::PushClip {
+        rect: RectI::new(200, 200, 4, 4), // 裁空
+    });
+    l.push(text_cmd("Hi", RectI::new(4, 4, 60, 30), 20.0, 0));
+    l.push(DrawCmd::PopClip);
+
+    let gpu = pair.0.render(&l).expect("这些文本不该再让整帧报错");
+    assert!(
+        pair.0.unsupported().is_empty(),
+        "文本已被接管 ⇒ 这些「画不出东西」的命令不该进 unsupported"
+    );
+    // 四条都被跳过 ⇒ 这一帧除了清屏色什么都没有
+    let clear = [CLEAR.r, CLEAR.g, CLEAR.b, 255];
+    let mut painted = 0usize;
+    for px in gpu.chunks_exact(4) {
+        if px != clear {
+            painted += 1;
+        }
+    }
+    assert_eq!(painted, 0, "四条全被跳过 ⇒ 帧里不该有任何被画过的像素");
+    assert_eq!(
+        pair.0.text_skipped(),
+        4,
+        "空串 / size=0 / size<0 / 被裁空 四条都应被计数（而不是报错）"
+    );
+    assert_no_validation_messages("文本假阳性");
+
+    // 只有「CPU 也不画」的两类做像素对照 ⇒ 必须逐字节相同（含清屏色）
+    let mut l = DrawList::new();
+    l.push(text_cmd("", RectI::new(4, 4, 60, 30), 20.0, 0));
+    l.push(DrawCmd::PushClip {
+        rect: RectI::new(200, 200, 4, 4),
+    });
+    l.push(text_cmd("Hi", RectI::new(4, 4, 60, 30), 20.0, 0));
+    l.push(DrawCmd::PopClip);
+    assert_eq!(
+        compare_text(&mut pair, "text-empty-and-clipped-away", &l, 0),
+        0
+    );
+}
+
+/// 连续多帧：同一渲染器反复渲染不同文本 —— 图集增长时纹理**只在变化时重传**，
+/// 且每帧结果仍与 CPU 一致（覆盖「图集指纹」那条路径）。
+#[test]
+fn consecutive_text_frames_stay_in_sync() {
+    let extent = Extent {
+        width: 128,
+        height: 48,
+    };
+    let Some(mut pair) = text_pair(extent, 20.0) else {
+        return;
+    };
+    for (i, text) in ["one", "two", "three", "one"].iter().enumerate() {
+        let mut l = DrawList::new();
+        l.push(text_cmd(text, RectI::new(4, 4, 120, 36), 20.0, 0));
+        assert_eq!(
+            compare_text(&mut pair, &format!("text-frame-{i}-{text}"), &l, 0),
+            0
+        );
+    }
+}

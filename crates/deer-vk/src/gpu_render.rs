@@ -79,14 +79,16 @@
 
 use std::ffi::c_void;
 
-use deer_gpu::{Color, DrawList, Extent, GpuError, GpuResult};
+use deer_gpu::{Color, DrawCmd, DrawList, Extent, GpuError, GpuResult, RectI, TextEngine};
 
 use crate::device::{
-    vk_result_name, DeviceFns, Pipeline, PipelineLayout, RenderPass, ShaderModule, VertexAttr, VkDevice,
+    vk_result_name, DescriptorPool, DescriptorSet, DescriptorSetLayout, DeviceFns, Pipeline,
+    PipelineLayout, RenderPass, Sampler, ShaderModule, Texture, VertexAttr, VkDevice,
 };
 use crate::ffi;
 use crate::ffi_dev as vk;
 use crate::gpu_geom::{self, GpuVertex};
+use crate::gpu_text::{self, TextVertex};
 use crate::spirv;
 
 /// `VK_FORMAT_R32_SFLOAT`（单个 `float`）——`radius_kind` 用它。
@@ -155,6 +157,109 @@ fn vertex_attrs() -> [VertexAttr; 4] {
             offset: std::mem::offset_of!(GpuVertex, color) as u32,
         },
     ]
+}
+
+/// 文本管线的顶点属性表：`TextVertex`（**stride 32**：`pos` 0 / `uv` 8 / `color` 16）。
+///
+/// 与 `spirv::vertex_shader_text` 的 `location 0/1/2` 逐字段对应；偏移同样用 `offset_of!`
+/// 取（结构上不可能与 `gpu_text` 的 `#[repr(C)]` 布局漂移）。
+fn text_attrs() -> [VertexAttr; 3] {
+    [
+        VertexAttr {
+            location: 0,
+            format: vk::VK_FORMAT_R32G32_SFLOAT,
+            offset: std::mem::offset_of!(crate::gpu_text::TextVertex, pos) as u32,
+        },
+        VertexAttr {
+            location: 1,
+            format: vk::VK_FORMAT_R32G32_SFLOAT,
+            offset: std::mem::offset_of!(crate::gpu_text::TextVertex, uv) as u32,
+        },
+        VertexAttr {
+            location: 2,
+            format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
+            offset: std::mem::offset_of!(crate::gpu_text::TextVertex, color) as u32,
+        },
+    ]
+}
+
+/// 一条绘制段属于哪条管线。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PipelineKind {
+    Shape,
+    Text,
+}
+
+/// 一帧里的一段绘制：**顺序即 z 序**。
+///
+/// `first`/`count` 是**各自顶点缓冲内**的区间（形状与文本各有一块缓冲）——
+/// 两条管线不共用顶点布局，所以用「段」而不是「同一条 `vkCmdDraw` 的偏移」来表达顺序。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DrawCall {
+    kind: PipelineKind,
+    first: u32,
+    count: u32,
+}
+
+/// 文本管线的全部资源（渲染器以 `Option` 持有：不调 [`GpuGeometryRenderer::with_text`]
+/// 就没有它，`Text` 命令保持 M3a 的 `Unsupported` 行为）。
+///
+/// ## 字段顺序（**不要重排**）
+///
+/// Rust **按声明顺序析构**（先声明的先 drop）。这里的契约是
+/// **`DescriptorSet` 必须先于 `DescriptorPool` 释放**（集是从池里分配的，它的 `Drop` 会调
+/// `vkFreeDescriptorSets(device, pool, ..)`）⇒ **`pool` 必须声明在 `set` 之后**。
+/// 这与 `device.rs::allocate_descriptor_set` 的类型文档一致（那份文档是对的）。
+///
+/// ## 为什么允许 `dead_code`
+///
+/// `vs` / `fs` / `set_layout` / `pool` **从不被读取** —— 它们存在只为**所有权**：
+/// 着色器模块与描述符集布局必须在管线存活期间有效，池必须在集释放之后才销毁。
+/// 删掉任何一个都会让对象提前销毁。`allow(dead_code)` 是这里的正确表达。
+#[allow(dead_code)]
+struct TextResources {
+    engine: TextEngine,
+    pipeline: Pipeline,
+    layout: PipelineLayout,
+    vs: ShaderModule,
+    fs: ShaderModule,
+    set_layout: DescriptorSetLayout,
+    /// 描述符集（**必须在 `pool` 之前声明** ⇒ 先于池析构，见上面的说明）。
+    set: DescriptorSet,
+    pool: DescriptorPool,
+    sampler: Sampler,
+    /// 文本顶点缓冲（**独立于形状的**：两者顶点布局不同，不能共用）。
+    vertex: Option<VertexBuffer>,
+    /// 当前已上传的图集纹理（`None` = 还没传过）。
+    texture: Option<Texture>,
+    /// 已上传图集的指纹 `(宽, 高, 已光栅化字形数)`：三者任一变化就重传。
+    ///
+    /// 依据：`GlyphAtlas` 只**追加/增高**、不淘汰，内容只在「新字形入图集」时改变，
+    /// 而那只会让 `rasterized_glyphs()` 增加 ⇒ 这个三元组是充分的。
+    uploaded: Option<(u32, u32, usize)>,
+    /// 上一帧被跳过的文本命令数（诊断，见 [`GpuGeometryRenderer::text_skipped`]）。
+    skipped: usize,
+}
+
+/// 把「当前生效的裁剪栈 + 这一条命令」组成一个临时 `DrawList`。
+///
+/// ## 为什么逐条命令，而不是整份列表一次
+///
+/// 形状与文本走**两条独立管线**，而 z 序要求它们按 `DrawList` 的原顺序交错绘制
+/// ⇒ 必须逐条命令决定「这条进哪条管线」。两条翻译层（`gpu_geom` / `gpu_text`）的公开入口
+/// 都是「整个 `DrawList`」，所以我们把**生效的 `PushClip` 序列原样重放**：
+/// 翻译层内部算的是 `full ∩ r1 ∩ r2 …`，与「完整列表」时**逐字相同**
+/// （同一个初始全画布 + 同一顺序的求交），裁剪语义不会因为拆分而改变。
+///
+/// 代价是每条命令一次小分配。GUI 一帧的命令数在几十~几百量级，可忽略；
+/// 真正的批处理优化（合并段、减少 draw call）属后续任务。
+fn single_command_in_clip(active_clip: &[RectI], cmd: &DrawCmd) -> DrawList {
+    let mut l = DrawList::new();
+    for r in active_clip {
+        l.push(DrawCmd::PushClip { rect: *r });
+    }
+    l.push(cmd.clone());
+    l
 }
 
 /// 对象销毁/内存释放的函数形态。
@@ -515,6 +620,10 @@ pub struct GpuGeometryRenderer {
     unsupported: Vec<String>,
     /// 提交同步状态：栅栏等待失败后置为 [`SubmitState::Broken`]，此后**拒绝复用**。
     sync: SubmitState,
+    /// 文本管线资源；`None` = 没调 `with_text` ⇒ `Text` 命令报 `Unsupported`（M3a 行为）。
+    ///
+    /// **必须声明在 `device` 之前**（所有 Vulkan 子对象都在 `device` 之前析构）。
+    text: Option<TextResources>,
     /// 累计发出的 host→vertex 屏障条数（诊断 + 回归，见
     /// [`GpuGeometryRenderer::host_to_vertex_barrier_count`]）。
     host_to_vertex_barriers: u64,
@@ -752,6 +861,7 @@ impl GpuGeometryRenderer {
             ],
             unsupported: Vec::new(),
             sync: SubmitState::Idle,
+            text: None,
             host_to_vertex_barriers: 0,
             device,
         })
@@ -760,6 +870,95 @@ impl GpuGeometryRenderer {
     /// **实际**渲染尺寸（请求 0 尺寸时是 1×1，见 [`GpuGeometryRenderer::new`]）。
     pub fn extent(&self) -> Extent {
         self.extent
+    }
+
+    /// **让本渲染器支持文本**：接管一个 [`TextEngine`]（字体 + 字形图集 + 排版缓存）。
+    ///
+    /// 不调用它的渲染器保持 **M3a 行为不变**：`DrawCmd::Text` ⇒ `Unsupported`
+    /// （不会静默丢弃）。调用之后，文本命令由**第二条管线**绘制（独立顶点缓冲、独立管线、
+    /// 一条 `set 0 / binding 0` 的组合图像采样器指向字形图集）。
+    ///
+    /// ## 资源与生命周期
+    ///
+    /// - 文本管线用**独立**的顶点布局（`TextVertex`，stride 32）—— M3a 的 `GpuVertex`
+    ///   （stride 44）已冻结，两者不共用顶点缓冲；
+    /// - 管线布局带一个描述符集布局（`set 0`）—— 文本的片元着色器声明了
+    ///   `OpTypeSampledImage`，布局里没有对应 set 的话 `vkCreateGraphicsPipelines` 会拒绝；
+    /// - 图集纹理**不在这里上传**：改为在 [`Self::render`] 里按「图集指纹」惰性重传
+    ///   （图集只在出现新字形时变化，见 [`TextResources::uploaded`]）。
+    pub fn with_text(mut self, engine: TextEngine) -> GpuResult<Self> {
+        // 与 M3a 的 shape 管线完全独立：不同顶点布局、不同着色器、多一条描述符集
+        let vs = self.device.create_shader_module(&spirv::vertex_shader_text())?;
+        let fs = self.device.create_shader_module(&spirv::fragment_shader_text())?;
+        let set_layout = self.device.create_descriptor_set_layout_combined_sampler()?;
+        let layout = self
+            .device
+            .create_pipeline_layout_ex(None, Some(&set_layout))?;
+        let stages = [
+            vk::PipelineShaderStageCreateInfo {
+                s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                p_next: std::ptr::null(),
+                flags: 0,
+                stage: vk::VK_SHADER_STAGE_VERTEX_BIT,
+                module: vs.handle(),
+                p_name: c"main".as_ptr(),
+                p_specialization_info: std::ptr::null(),
+            },
+            vk::PipelineShaderStageCreateInfo {
+                s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                p_next: std::ptr::null(),
+                flags: 0,
+                stage: vk::VK_SHADER_STAGE_FRAGMENT_BIT,
+                module: fs.handle(),
+                p_name: c"main".as_ptr(),
+                p_specialization_info: std::ptr::null(),
+            },
+        ];
+        let pipeline = self.device.create_vertex_pipeline(
+            &stages,
+            &layout,
+            &self.pass,
+            vk::Extent2D {
+                width: self.extent.width,
+                height: self.extent.height,
+            },
+            std::mem::size_of::<TextVertex>() as u32,
+            &text_attrs(),
+        )?;
+        let sampler = self.device.create_sampler()?;
+        let pool = self.device.create_descriptor_pool(1)?;
+        let set = self.device.allocate_descriptor_set(&pool, &set_layout)?;
+
+        self.text = Some(TextResources {
+            engine,
+            pipeline,
+            layout,
+            vs,
+            fs,
+            set_layout,
+            // 字段顺序有契约：`set` 必须在 `pool` 之前（见 `TextResources` 的文档）
+            set,
+            pool,
+            sampler,
+            vertex: None,
+            texture: None,
+            uploaded: None,
+            skipped: 0,
+        });
+        Ok(self)
+    }
+
+    /// 上一帧被**跳过**的文本命令数（== [`crate::gpu_text::TextStream::skipped`]）。
+    ///
+    /// 与 M3a 的假阳性相关：空串 / `size <= 0` / 被裁空的文本**不再报错**，但也不该
+    /// 无声无息 —— 想知道「这一帧有几条文本什么都没画」就查这里。
+    pub fn text_skipped(&self) -> usize {
+        self.text.as_ref().map_or(0, |t| t.skipped)
+    }
+
+    /// 文本管线是否已接管（即是否调过 [`GpuGeometryRenderer::with_text`]）。
+    pub fn text_enabled(&self) -> bool {
+        self.text.is_some()
     }
 
     /// **校验层是否真的启用**（不是「是否请求」）—— 见 [`VkDevice::validation_enabled`]。
@@ -829,44 +1028,105 @@ impl GpuGeometryRenderer {
             ));
         }
 
-        // ② 翻译成顶点流（CPU 侧已裁剪）
-        let stream = gpu_geom::build_stream(list, self.extent);
-        if !stream.unsupported.is_empty() {
-            self.unsupported = stream.unsupported.clone();
+        // ② **单次遍历**：按 `DrawList` 的原顺序把每条命令送进对应的翻译层，
+        //    同时记录绘制段（`DrawCall`）—— 这样形状与文本的**交错顺序**被完整保留
+        //    （z 序），而不是「先画所有形状、再画所有文本」。
+        let mut shape_verts: Vec<GpuVertex> = Vec::new();
+        let mut text_verts: Vec<TextVertex> = Vec::new();
+        let mut calls: Vec<DrawCall> = Vec::new();
+        let mut active_clip: Vec<RectI> = Vec::new();
+        let mut text_skipped = 0usize;
+        // 借出文本资源：避免在循环里同时可变借用 `self.text` 与读 `self.unsupported` 等字段
+        let mut text_res = self.text.take();
+
+        for cmd in &list.cmds {
+            match cmd {
+                DrawCmd::PushClip { rect } => active_clip.push(*rect),
+                DrawCmd::PopClip => {
+                    active_clip.pop();
+                }
+                // 诊断提示：忽略（与两条翻译层一致）
+                DrawCmd::NodeHint { .. } => {}
+                // 文本：有引擎就翻译；没引擎时走下面那个分支（M3a 行为不变）
+                DrawCmd::Text { rect, text, .. } if text_res.is_some() => {
+                    let res = text_res.as_mut().expect("刚判过 is_some");
+                    let one = single_command_in_clip(&active_clip, cmd);
+                    let s = gpu_text::build_text_stream(&one, self.extent, &mut res.engine);
+                    text_skipped += s.skipped;
+                    if !s.vertices.is_empty() {
+                        let first = u32::try_from(text_verts.len()).map_err(|_| {
+                            GpuError::Unsupported("文本顶点数超出 u32".to_string())
+                        })?;
+                        let count = u32::try_from(s.vertices.len()).map_err(|_| {
+                            GpuError::Unsupported("文本顶点数超出 u32".to_string())
+                        })?;
+                        text_verts.extend_from_slice(&s.vertices);
+                        calls.push(DrawCall {
+                            kind: PipelineKind::Text,
+                            first,
+                            count,
+                        });
+                    }
+                    let _ = (rect, text);
+                }
+                DrawCmd::Text { rect, text, .. } => {
+                    // 没有 `TextEngine` ⇒ M3a 行为：**报告**而不是静默丢弃
+                    self.unsupported.push(format!(
+                        "DrawCmd::Text(rect=({}, {}, {}×{}), {} 字符)：GPU 后端尚未实现文本绘制",
+                        rect.x,
+                        rect.y,
+                        rect.w,
+                        rect.h,
+                        text.chars().count()
+                    ));
+                }
+                // 其余（形状命令）：走 M3a 的翻译层
+                other => {
+                    let one = single_command_in_clip(&active_clip, other);
+                    let s = gpu_geom::build_stream(&one, self.extent);
+                    if !s.vertices.is_empty() {
+                        let first = u32::try_from(shape_verts.len()).map_err(|_| {
+                            GpuError::Unsupported("形状顶点数超出 u32".to_string())
+                        })?;
+                        let count = u32::try_from(s.vertices.len()).map_err(|_| {
+                            GpuError::Unsupported("形状顶点数超出 u32".to_string())
+                        })?;
+                        shape_verts.extend_from_slice(&s.vertices);
+                        calls.push(DrawCall {
+                            kind: PipelineKind::Shape,
+                            first,
+                            count,
+                        });
+                    }
+                }
+            }
+        }
+
+        if let Some(res) = text_res.as_mut() {
+            res.skipped = text_skipped;
+        }
+        self.text = text_res;
+
+        if !self.unsupported.is_empty() {
             return Err(GpuError::Unsupported(self.unsupported.join("；")));
         }
 
-        // ③ 上传顶点（每帧重传；容量不足时重建缓冲）
-        let count = stream.vertices.len();
-        let count_u32 = u32::try_from(count).map_err(|_| {
-            GpuError::Unsupported(format!("顶点数 {count} 超出 u32（一帧画不了这么多）"))
-        })?;
-        if count > 0 {
-            let bytes = (count * std::mem::size_of::<GpuVertex>()) as u64;
-            self.ensure_vertex_capacity(bytes)?;
-            self.upload_vertices(&stream.vertices)?;
-        }
-
-        // ④⑤ 录制、提交、等栅栏
-        self.record_and_submit(count_u32)?;
-
-        // ⑥ 回读
+        // ③④⑤⑥ 上传顶点/图集（按需）+ 录制 + 提交 + 回读
+        self.record_and_submit(&shape_verts, &text_verts, &calls)?;
         self.read_back()
     }
 
-    /// 确保顶点缓冲至少有 `bytes` 字节（不够就按 2 的幂重建）。
-    fn ensure_vertex_capacity(&mut self, bytes: u64) -> GpuResult<()> {
-        // 同样是破坏性操作（会销毁旧缓冲、分配新内存）⇒ 守卫也放在这里（见 R1-3）。
+    /// 确保某个顶点缓冲至少有 `bytes` 字节（不够就按 2 的幂重建），**先建后换**。
+    ///
+    /// 两个缓冲（形状 stride 44 / 文本 stride 32）共用这段逻辑 —— 它们只在「容量」上不同。
+    fn ensure_vertex_capacity(&mut self, slot: &mut Option<VertexBuffer>, bytes: u64) -> GpuResult<()> {
+        // 破坏性操作（会销毁旧缓冲、分配新内存）⇒ 守卫放在这里（见 R1-3）。
         self.sync.ensure_reusable()?;
-        if self.vertex.as_ref().is_some_and(|v| v.capacity >= bytes) {
+        if slot.as_ref().is_some_and(|v| v.capacity >= bytes) {
             return Ok(());
         }
         let capacity = bytes.next_power_of_two().max(MIN_VERTEX_BYTES);
-        // **先建新的、成功后再换**（T3 review F11）：旧代码先 `self.vertex = None` 再建，
-        // 于是「新建失败」会留下「缓冲没了、容量也没了」的半残状态（下次还得从最小尺寸重来，
-        // 而且旧缓冲白白销毁）。这里把新对象建在局部变量里，失败就原样返回 ——
-        // 旧的仍然可用，`self.vertex` 不会被改坏。
-        //
+        // **先建新的、成功后再换**（T3 review F11）：失败时旧缓冲仍然可用、容量信息不丢。
         // 析构顺序仍然正确：`VertexBuffer` 的字段顺序保证「先缓冲、后内存」；
         // 赋值时旧值被 drop，此刻上一帧的提交已经等过栅栏 ⇒ 缓冲不在使用中。
         let (buffer, memory) = create_host_buffer(
@@ -877,7 +1137,7 @@ impl GpuGeometryRenderer {
             capacity,
             vk::VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
         )?;
-        self.vertex = Some(VertexBuffer {
+        *slot = Some(VertexBuffer {
             buffer,
             memory,
             capacity,
@@ -885,36 +1145,139 @@ impl GpuGeometryRenderer {
         Ok(())
     }
 
-    /// 把顶点写进顶点缓冲（map → memcpy → unmap；HOST_COHERENT 所以不用 flush）。
-    fn upload_vertices(&self, verts: &[GpuVertex]) -> GpuResult<()> {
-        let vb = self
-            .vertex
-            .as_ref()
-            .expect("调用方保证了「有顶点」⇒ 缓冲已建");
-        let bytes = std::mem::size_of_val(verts);
-        // SAFETY: `GpuVertex` 是 `#[repr(C)]` 的纯 `f32` 结构（无指针、无 Drop），
-        // 按字节视图读它是定义良好的。
-        let src = unsafe { std::slice::from_raw_parts(verts.as_ptr() as *const u8, bytes) };
-        // map 的守卫：**任何**提前返回都会 unmap（F9）。
-        let mapped = map_memory("vkMapMemory(vertex)", &self.fns, self.device_handle, vb.memory.handle())?;
-        // SAFETY: 映射了整块缓冲（≥ bytes，由 `ensure_vertex_capacity` 保证）；源与目标不重叠。
+    /// 把一段**已经是 `#[repr(C)]` 纯 `f32`** 的顶点数据写进缓冲（map → memcpy → unmap）。
+    ///
+    /// `what` 只用于报错里指认是哪个缓冲（形状 / 文本）。
+    fn upload_vertices(&self, vb: &VertexBuffer, src: &[u8], what: &str) -> GpuResult<()> {
+        // map 的守卫：**任何**提前返回都会 unmap（T3 review F9）。
+        let mapped = map_memory(what, &self.fns, self.device_handle, vb.memory.handle())?;
+        // SAFETY: 映射了整块缓冲（≥ src.len()，由 `ensure_vertex_capacity` 保证）；源与目标不重叠。
         unsafe {
-            std::ptr::copy_nonoverlapping(src.as_ptr(), mapped.as_mut_ptr() as *mut u8, bytes);
+            std::ptr::copy_nonoverlapping(src.as_ptr(), mapped.as_mut_ptr() as *mut u8, src.len());
         }
-        // `mapped` 在此 drop ⇒ unmap。之后才提交（提交时主机写入已经发生 ——
-        // 「提交前的 host 写入对被提交的命令可见」这条由 `vkQueueSubmit` 保证；
-        // 而**显式**的缓冲区屏障在 `record_and_submit` 里发，见模块文档「同步」）。
         Ok(())
     }
 
-    /// 录制一帧（清屏 + 绑定管线/顶点缓冲 + 绘制 + 屏障 + 拷贝），提交并等栅栏。
+    /// 图集**变化时**才重传纹理，并把新纹理写进描述符集。
+    ///
+    /// 指纹 = `(图集宽, 图集高, 已光栅化字形数)`（见 [`TextResources::uploaded`]）。
+    /// 上传走 `create_texture_r8`（一次性路径，内部 `vkQueueWaitIdle`）——
+    /// **只在图集变化时发生**（新字形首次出现），所以那次等空闲被摊薄；
+    /// 若将来改成每帧重传，就必须改异步上传 + 栅栏（`device.rs` 的文档里写着这条前提）。
+    fn refresh_atlas_texture(&mut self) -> GpuResult<()> {
+        let (key, data) = {
+            let res = self.text.as_ref().expect("调用方保证了文本资源存在");
+            let (w, h) = res.engine.atlas().size();
+            let key = (w, h, res.engine.rasterized_glyphs());
+            if res.uploaded == Some(key) {
+                return Ok(());
+            }
+            (key, res.engine.atlas().coverage().to_vec())
+        };
+        let (w, h, glyphs) = key;
+        let texture = self.device.create_texture_r8(w, h, &data)?;
+        {
+            let res = self.text.as_mut().expect("同上");
+            self.device
+                .update_descriptor_texture(&res.set, &texture, &res.sampler)?;
+            res.texture = Some(texture);
+            res.uploaded = Some((w, h, glyphs));
+        }
+        Ok(())
+    }
+
+    /// 为某块顶点缓冲发一条「主机写 → 顶点取数」屏障（参数见 [`vertex_buffer_barrier_params`]）。
+    ///
+    /// 收**句柄**而不是 `&VertexBuffer`：调用点通常正持有 `self.vertex` / `self.text` 的借用，
+    /// 传引用会和 `&mut self`（要自增计数器）撞借用检查 —— 句柄是 `Copy` 的普通值。
+    fn emit_host_to_vertex_barrier(&mut self, buffer: vk::BufferHandle) {
+        let p = vertex_buffer_barrier_params();
+        let host_to_vertex = vk::BufferMemoryBarrier {
+            s_type: vk::VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+            p_next: std::ptr::null(),
+            src_access_mask: p.src_access,
+            dst_access_mask: p.dst_access,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            buffer,
+            offset: 0,
+            size: vk::WHOLE_SIZE,
+        };
+        // SAFETY: 结构体在栈上存活；命令缓冲处于录制状态；`buffer` 是本结构持有的有效句柄。
+        unsafe {
+            (self.fns.cmd_pipeline_barrier)(
+                self.cmd,
+                p.src_stage,
+                p.dst_stage,
+                0,
+                0,
+                std::ptr::null(),
+                1,
+                &host_to_vertex,
+                0,
+                std::ptr::null(),
+            );
+        }
+        self.host_to_vertex_barriers += 1;
+    }
+
+    /// 录制一帧（清屏 + 按 z 序逐段绑定管线/顶点缓冲 + 绘制 + 屏障 + 拷贝），提交并等栅栏。
     ///
     /// 需要 `&mut self`：等待失败时要把 [`SubmitState`] 置为 `Broken`（见模块文档「同步②」）。
-    fn record_and_submit(&mut self, vertex_count: u32) -> GpuResult<()> {
+    fn record_and_submit(
+        &mut self,
+        shape_verts: &[GpuVertex],
+        text_verts: &[TextVertex],
+        calls: &[DrawCall],
+    ) -> GpuResult<()> {
         // ★ **守卫就放在破坏性操作本身**（fix round 2 / R1-3）：`render` 开头那句检查可能
         //   因为调用方漏写 `?` 而失效（reviewer 的变异 C 就是这么全绿的）。这里再查一次，
         //   于是「Broken ⇒ 绝不去碰命令缓冲/栅栏」不依赖任何调用方的写法。
         self.sync.ensure_reusable()?;
+
+        // ① 上传：形状与文本各有独立缓冲，各自「按需扩容 + 每帧重传」
+        if !shape_verts.is_empty() {
+            let bytes = std::mem::size_of_val(shape_verts) as u64;
+            let mut slot = self.vertex.take();
+            let r = self.ensure_vertex_capacity(&mut slot, bytes);
+            self.vertex = slot;
+            r?;
+            let bytes = std::mem::size_of_val(shape_verts);
+            // SAFETY: `GpuVertex` 是 `#[repr(C)]` 纯 `f32`（无指针、无 Drop）⇒ 字节视图合法。
+            let src = unsafe {
+                std::slice::from_raw_parts(shape_verts.as_ptr() as *const u8, bytes)
+            };
+            let vb = self.vertex.as_ref().expect("ensure 之后必有缓冲");
+            self.upload_vertices(vb, src, "vkMapMemory(shape vertex)")?;
+        }
+        if !text_verts.is_empty() {
+            let bytes = std::mem::size_of_val(text_verts) as u64;
+            let mut slot = self
+                .text
+                .as_mut()
+                .expect("有文本顶点 ⇒ 文本资源存在")
+                .vertex
+                .take();
+            let r = self.ensure_vertex_capacity(&mut slot, bytes);
+            if let Some(res) = self.text.as_mut() {
+                res.vertex = slot;
+            }
+            r?;
+            let bytes = std::mem::size_of_val(text_verts);
+            // SAFETY: `TextVertex` 是 `#[repr(C)]` 纯 `f32` ⇒ 字节视图合法。
+            let src = unsafe {
+                std::slice::from_raw_parts(text_verts.as_ptr() as *const u8, bytes)
+            };
+            let vb = self
+                .text
+                .as_ref()
+                .and_then(|r| r.vertex.as_ref())
+                .expect("ensure 之后必有缓冲");
+            self.upload_vertices(vb, src, "vkMapMemory(text vertex)")?;
+            // 图集若变了就重传纹理 + 更新描述符集（**必须在提交之前**）
+            self.refresh_atlas_texture()?;
+        }
+
         // SAFETY: `self.cmd` 是 `new()` 里从本结构的命令池分配出来的主命令缓冲句柄，仍然有效；
         // 上一次使用它的提交已经在 `record_and_submit` 末尾等到栅栏（或已被判为 Broken ⇒ 上面
         // 那行守卫已经返回 Err），所以此刻它**不在**执行中，可以重置。函数指针来自成功解析的
@@ -935,43 +1298,24 @@ impl GpuGeometryRenderer {
         })?;
 
         // ★ 主机刚写进顶点缓冲（map/memcpy/unmap）→ GPU 的 VERTEX_INPUT 要读它。
-        //   参数来自纯函数（可被单元测试钉常量）；**依赖是否真的被发出**由计数器断言
+        //   **每个本帧用到的缓冲各一条**（形状与文本是两块独立缓冲）。
+        //   参数来自纯函数（可被单元测试钉常量）；「屏障是否真的发出」由计数器断言
         //   （`host_to_vertex_barrier_count`）—— 两者合起来才让这条屏障**可回归**。
         //   （放在渲染通道**之前**：缓冲区屏障在通道内也合法，但放在外面更简单、更不容易踩
         //     「通道内允许哪些屏障」的规则。）
-        if vertex_count > 0 {
-            let vb = self
-                .vertex
+        if !shape_verts.is_empty() {
+            let h = self.vertex.as_ref().expect("形状顶点已上传").buffer.handle();
+            self.emit_host_to_vertex_barrier(h);
+        }
+        if !text_verts.is_empty() {
+            let h = self
+                .text
                 .as_ref()
-                .expect("非空顶点数 ⇒ 缓冲已建（`render` 里先 ensure 再录）");
-            let p = vertex_buffer_barrier_params();
-            let host_to_vertex = vk::BufferMemoryBarrier {
-                s_type: vk::VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
-                p_next: std::ptr::null(),
-                src_access_mask: p.src_access,
-                dst_access_mask: p.dst_access,
-                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
-                buffer: vb.buffer.handle(),
-                offset: 0,
-                size: vk::WHOLE_SIZE,
-            };
-            // SAFETY: 结构体在栈上存活；句柄有效。
-            unsafe {
-                (self.fns.cmd_pipeline_barrier)(
-                    self.cmd,
-                    p.src_stage,
-                    p.dst_stage,
-                    0,
-                    0,
-                    std::ptr::null(),
-                    1,
-                    &host_to_vertex,
-                    0,
-                    std::ptr::null(),
-                );
-            }
-            self.host_to_vertex_barriers += 1;
+                .and_then(|r| r.vertex.as_ref())
+                .expect("文本顶点已上传")
+                .buffer
+                .handle();
+            self.emit_host_to_vertex_barrier(h);
         }
 
         let clear_value = vk::ClearValue {
@@ -997,22 +1341,64 @@ impl GpuGeometryRenderer {
         // SAFETY: 上述结构体都在本栈帧存活；句柄都是本结构持有的有效句柄。
         unsafe {
             (self.fns.cmd_begin_render_pass)(self.cmd, &begin_pass, vk::VK_SUBPASS_CONTENTS_INLINE);
-            (self.fns.cmd_bind_pipeline)(
-                self.cmd,
-                vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
-                self.pipeline.handle(),
-            );
             // ⚠️ **不调** `vkCmdSetViewport`/`vkCmdSetScissor`：本管线的 viewport/scissor 是
             // **静态**的（写死在管线里，见 `device.rs::create_vertex_pipeline`）。对静态状态
             // 发动态设置命令会触发校验层报错 —— `tests/vbo_probe.rs` 记着这条实测。
-            if vertex_count > 0 {
-                let vb = self
-                    .vertex
-                    .as_ref()
-                    .expect("非空顶点数 ⇒ 缓冲已建（`render` 里先 ensure 再录）");
-                let offset: vk::DeviceSize = 0;
-                (self.fns.cmd_bind_vertex_buffers)(self.cmd, 0, 1, &vb.buffer.handle(), &offset);
-                (self.fns.cmd_draw)(self.cmd, vertex_count, 1, 0, 0);
+            //
+            // **按 z 序逐段绘制**：只在「管线切换」时重新绑定管线/顶点缓冲/描述符集，
+            // 同一管线的连续段只更新 `vkCmdDraw` 的 `firstVertex`。
+            let mut bound: Option<PipelineKind> = None;
+            for call in calls {
+                if bound != Some(call.kind) {
+                    match call.kind {
+                        PipelineKind::Shape => {
+                            (self.fns.cmd_bind_pipeline)(
+                                self.cmd,
+                                vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                self.pipeline.handle(),
+                            );
+                            let vb = self.vertex.as_ref().expect("形状段 ⇒ 缓冲已上传");
+                            let offset: vk::DeviceSize = 0;
+                            (self.fns.cmd_bind_vertex_buffers)(
+                                self.cmd,
+                                0,
+                                1,
+                                &vb.buffer.handle(),
+                                &offset,
+                            );
+                        }
+                        PipelineKind::Text => {
+                            let res = self.text.as_ref().expect("文本段 ⇒ 文本资源存在");
+                            (self.fns.cmd_bind_pipeline)(
+                                self.cmd,
+                                vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                res.pipeline.handle(),
+                            );
+                            let vb = res.vertex.as_ref().expect("文本段 ⇒ 缓冲已上传");
+                            let offset: vk::DeviceSize = 0;
+                            (self.fns.cmd_bind_vertex_buffers)(
+                                self.cmd,
+                                0,
+                                1,
+                                &vb.buffer.handle(),
+                                &offset,
+                            );
+                            // 字形图集：set 0 / binding 0（与着色器的装饰逐字对应）
+                            (self.fns.cmd_bind_descriptor_sets)(
+                                self.cmd,
+                                vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                res.layout.handle(),
+                                0,
+                                1,
+                                &res.set.handle(),
+                                0,
+                                std::ptr::null(),
+                            );
+                        }
+                    }
+                    bound = Some(call.kind);
+                }
+                (self.fns.cmd_draw)(self.cmd, call.count, 1, call.first, 0);
             }
             (self.fns.cmd_end_render_pass)(self.cmd);
         }

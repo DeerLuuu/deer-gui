@@ -450,9 +450,34 @@ impl VkDevice {
     ///
     /// 推送常量的 `size` 必须是 4 的倍数。**注意范围大小与实际 push 的大小要一致** ——
     /// 不匹配是那种「能建成功但运行时行为诡异」的错误。
+    ///
+    /// 这是**薄包装**：等价于 [`VkDevice::create_pipeline_layout_ex`] 传
+    /// `descriptor_set_layout = None`。保留它是因为 M3a 的一批调用点（`windowed.rs` /
+    /// 示例 / 既有测试）都不需要描述符集，不该被文本管线的需求波及。
     pub fn create_pipeline_layout(
         &self,
         push_constant: Option<(u32, u32, u32)>,
+    ) -> GpuResult<PipelineLayout> {
+        self.create_pipeline_layout_ex(push_constant, None)
+    }
+
+    /// 创建管线布局（**可选带一个 `set 0` 的描述符集布局**）。
+    ///
+    /// ## 为什么需要它（M3b-T4）
+    ///
+    /// 文本的片元着色器里有一个 `UniformConstant` 的 `OpTypeSampledImage`，装饰为
+    /// `descriptor set 0 / binding 0`（见 `spirv::fragment_shader_text`）。SPIR-V 一旦声明了
+    /// 描述符，管线布局里就**必须**给出对应的 `VkDescriptorSetLayout` —— 否则
+    /// `vkCreateGraphicsPipelines` 会拒绝（「着色器用了 set 0 但布局里没有」）。
+    ///
+    /// ## 生命周期契约
+    ///
+    /// `descriptor_set_layout` 必须在管线布局的整个使用期内保持有效 —— 换句话说
+    /// **管线布局不得比描述符集布局活得久**。调用方按字段顺序保证（描述符集布局声明在前）。
+    pub fn create_pipeline_layout_ex(
+        &self,
+        push_constant: Option<(u32, u32, u32)>,
+        descriptor_set_layout: Option<&DescriptorSetLayout>,
     ) -> GpuResult<PipelineLayout> {
         let range = push_constant.map(|(stage_flags, offset, size)| vk::PushConstantRange {
             stage_flags,
@@ -467,12 +492,21 @@ impl VkDevice {
                 )));
             }
         }
+        let set_layouts: Vec<vk::DescriptorSetLayoutHandle> = descriptor_set_layout
+            .map(|l| vec![l.handle()])
+            .unwrap_or_default();
         let info = vk::PipelineLayoutCreateInfo {
             s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
             p_next: std::ptr::null(),
             flags: 0,
-            set_layout_count: 0,
-            p_set_layouts: std::ptr::null(),
+            set_layout_count: set_layouts.len() as u32,
+            p_set_layouts: if set_layouts.is_empty() {
+                std::ptr::null()
+            } else {
+                // `p_set_layouts` 在本项目的 ffi_dev 里声明为 `*const c_void`
+                // （Vulkan 头里是 `const VkDescriptorSetLayout*`）⇒ 显式转换。
+                set_layouts.as_ptr() as *const std::ffi::c_void
+            },
             push_constant_range_count: if range.is_some() { 1 } else { 0 },
             p_push_constant_ranges: range.as_ref().map_or(std::ptr::null(), |r| r),
         };
