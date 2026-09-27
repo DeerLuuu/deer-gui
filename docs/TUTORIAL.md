@@ -528,9 +528,9 @@ assert_eq!(gpu_px, cpu.pixels, "不透明内容（形状 + 文本）必须逐字
   都有断言（`validation_layer_state_matches_the_request` + `ffi::validation_message_count()` 配合
    `assert_no_validation_messages`）。但**它不能证明内存域依赖正确**：VVL 不做通用同步验证，
    删掉 host→vertex 屏障它也不报错（那条由 `host_to_vertex_barrier_is_emitted_once_per_non_empty_frame` 守）。
-- 当前形状与文本**各自**每帧一个顶点缓冲、一次 draw（没有批处理优化），属性能项、不影响正确性。
+- **批处理**：已有**合段 + 跨帧复用缓冲**（`RenderStats` 可复现：`DEER_VK_WINDOW_TESTS=1 cargo run -q -p deer-gui --features window --example window_parity`，**以运行输出为准**）；**管线切换次数仍未降**（由 z 序决定，不许重排），**统一管线 / 单缓冲两段式未做**（存在可行路径，留作后续）。像素判据不变。
 
-**仍然做不到**：通用 RGBA 图像/纹理、窗口里显示界面（M3c）、批处理优化、sRGB/色彩管理、MSAA，
+**仍然做不到**：通用 RGBA 图像/纹理、批处理的高级形态（统一管线 / 单缓冲两段式）、sRGB/色彩管理、MSAA，
 以及「`size <= 0` 与 CPU 一致」。完整边界见 [`features/gpu-geometry.md`](features/gpu-geometry.md) 第 7 节。
 
 ---

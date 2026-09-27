@@ -97,7 +97,7 @@ assert!(n.fill_round_rect + n.text < 100, "命令太多：{n:?}");
 
 - 渲染：[`rendering.md`](rendering.md)
 - GPU HAL（后端契约）：[`gpu-hal.md`](gpu-hal.md)
-- **做不到**：自定义着色（渲染器现在是固定的）；批处理优化（GPU 后端做，还没到）
+- **做不到**：自定义着色（渲染器现在是固定的）；**批处理的高级形态**（统一管线 / 单缓冲两段式 —— 合段与跨帧复用缓冲已落地，见 [`gpu-geometry.md`](gpu-geometry.md) 第 7 节）
 
 ## 7. 检查清单
 

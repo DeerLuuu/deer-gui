@@ -68,7 +68,7 @@
 
 | 功能 | 里程碑 | 现状说明 |
 |---|---|---|
-| **批处理优化**（按命令合批 / 跨帧复用顶点缓冲） | M3+ | 形状与文本**各自**每帧一个顶点缓冲、一次 draw；这是性能问题，不影响正确性 |
+| **批处理优化**（合段 + 跨帧复用顶点缓冲） | M3+ | **已落地**：相邻同管线的段合成一次 `vkCmdDraw`；持久缓冲按容量增长，语料不变时**不再每帧重建/重传**（`RenderStats` 可复现，跑 `window_parity`）。**仍未做**：**管线切换次数未降**（由 z 序决定，不许重排）、**统一管线** / **单缓冲两段式**（存在可行路径，留作后续）。性能项，**像素判据不变** |
 | **通用图像 / RGBA 纹理**（`create_texture`/`upload_texture` 的 HAL 路径） | M3+ | 目前只有**字形图集**这一条专用 `R8_UNORM` 覆盖率纹理；通用纹理仍未实现 |
 | **推送常量矩形着色器**（`spirv.rs::vertex_shader_rect_pushconstant`） | M3 | **这支 SPIR-V 是损坏的**（校验层 `VUID-StandaloneSpirv-PushConstant-06808`）；请求校验层时会让进程 `0xc0000005` 崩溃，所以 `device_smoke` / `pipeline_smoke` 里涉及它的测试在**校验层下显式跳过**（t15）。**task-18 后三条路径（`VkBackend::new` / 设备·离屏 / 窗口）都读 `DEER_VK_VALIDATION`**（当时 offscreen 的 3 个真缺陷已修）；实测 `DEER_VK_VALIDATION=1 cargo test -p deer-vk` → **全部通过 / 0 failed**、零校验消息（**具体条数以运行输出为准**，本仓库不在文档里固化测试条数）。矩形改**顶点缓冲**即可修（M3a 的新几何路径已用顶点缓冲，不再走这支着色器） |
 | **字形 hinting**（小字号像素对齐） | M4 残余 | 不做 —— 不读 `glyf` 的 instructions，用超采样抗锯齿代替 |
