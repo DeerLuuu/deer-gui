@@ -229,11 +229,11 @@ pub fn raw_handle_from_rwh06(raw: RwhRawWindowHandle) -> Result<deer_gpu::RawWin
 
 | 门禁 | 确切命令 | 本轮实测结果（2026-09-27，本机） | 数字来源 |
 |---|---|---|---|
-| **① workspace 测试** | `cmd /c "cargo test --workspace"` | **283 passed / 0 failed / 1 ignored**，跨 **35** 个二进制（含 doc-tests） | 本轮实跑 |
+| **① workspace 测试** | `cmd /c "cargo test --workspace"` | **321 passed / 0 failed / 2 ignored**，跨 **36** 个二进制（含 doc-tests） | 本轮实跑（M3b 冻结 HEAD；数字随测试增减漂移，**以运行输出为准**） |
 | **② clippy（带 window feature）** | `cmd /c "cargo clippy --workspace --all-targets --features deer-gui/window"` | `Finished dev profile …`，**0 warning / 0 error**，exit code 0 | 本轮实跑 |
 | **③ docs_consistency** | `cmd /c "cargo test -p deer-gui --test docs_consistency"` | **5 passed / 0 failed**（5 条测试全部列名通过） | 本轮实跑，与 `docs/superpowers/plans/2026-09-27-m3a-drawlist-to-gpu-geometry.md:279` 的 `→ 5 passed` 一致 |
 | **④ 示例全跑** | 13 个 `cmd /c "cargo run -q -p deer-gui --example <名>"` + 2 个 `--features window` 示例 + `cargo run -q -p deer-window --example window_smoke` | 15 个 deer-gui 示例**全部 exit=0**（其中 `hal_window_path` 未设 `DEER_VK_WINDOW_TESTS` 时是「显式跳过」，也 exit=0）；`window_smoke` 实测 `exit=0`（`frames=30 … result=ok`），`DEER_WINDOW_FAIL=1` 也 `exit=0`（预期错误路径） | 本轮实跑 |
-| **（附加）deer-vk 带校验层** | `$env:DEER_VK_VALIDATION='1'; cmd /c "cargo test -p deer-vk"` | **167 passed / 0 failed**，跨 16 个二进制 | 本轮实跑，与 `ROADMAP.md:176`、`FEATURES.md:73`、`docs/features/vulkan.md:35`、`docs/features/vulkan-swapchain.md:228` 记录的「167 passed / 0 failed」**一致** |
+| **（附加）deer-vk 带校验层** | `$env:DEER_VK_VALIDATION='1'; cmd /c "cargo test -p deer-vk"` | **205 passed / 0 failed**，跨 17 个 target（lib + 15 个集成测试 + doc-test） | 本轮实跑（M3b 冻结 HEAD；数字随测试增减漂移，**以运行输出为准**），与 `ROADMAP.md:182`、`FEATURES.md:73`、`docs/features/vulkan.md:35`、`docs/features/vulkan-swapchain.md:228` 记录的「205 passed / 0 failed」**一致** |
 | **（附加）真窗口完整门禁** | `$env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cmd /c "cargo test -p deer-vk"` | 本轮**未实测**（见 §8） | `ROADMAP.md:51-55`、`README.md:56-57`、`docs/features/window.md:227` |
 
 **各 crate 的分解规模（本轮实跑）**：
@@ -243,11 +243,11 @@ pub fn raw_handle_from_rwh06(raw: RwhRawWindowHandle) -> Result<deer_gpu::RawWin
 | `deer-gpu` | 81 | lib 10 + `draw_list_and_cpu_backend` 13 + `font_parse` 8 + `font_synthetic` 7 + `glyph_atlas` 7 + `render_pipeline` 7 + `text_measure` 9 + `text_pixels` 9 + `text_raster` 11 |
 | `deer-gui` | 6 | lib 0 + `docs_consistency` 5 + doc-test 1 |
 | `deer-layout` | 18 | lib 0 + `layout_invariants` 18（doc-test 0 passed / **1 ignored**，就是那 1 个 ignored 的来源） |
-| `deer-vk` | 167 | lib 37 + 13 个集成测试合计 130（`gpu_geom_parity` 29、`gpu_geom_stream` 28、`swapchain_smoke` 25、`gpu_vs_cpu` 12、`pipeline_smoke` 8、`offscreen_render` 7、`device_smoke` 6、`struct_layout` 5、`spirv_val` 3、`vulkan_smoke` 2、`validation_probe` 2、`export_spirv` 1、`raw_ffi_probe` 1、`vbo_probe` 1） |
+| `deer-vk` | 205 | lib 42 + 15 个集成测试合计 163（`gpu_geom_parity` 29、`gpu_geom_stream` 28、`swapchain_smoke` 25、`gpu_vs_cpu` 20、`gpu_text_stream` 17、`pipeline_smoke` 11、`struct_layout` 8、`offscreen_render` 7、`device_smoke` 6、`spirv_val` 5、`vulkan_smoke` 2、`validation_probe` 2、`export_spirv` 1、`raw_ffi_probe` 1、`vbo_probe` 1） |
 | `deer-window` | 11 | lib 0 + `window_logic` 10 + doc-test 1 |
-| **合计** | **283** | —— |
+| **合计** | **321** | —— |
 
-> **「以运行输出为准」是本仓库的明文规矩**：`ROADMAP.md:176`、`FEATURES.md:73`、`docs/features/vulkan.md:35`、`docs/features/vulkan-swapchain.md:228/281` 都写着「数字随测试增减漂移，以运行输出为准」。`docs/superpowers/plans/2026-09-27-m3a-drawlist-to-gpu-geometry.md:37-38` 还留了一条历史：计划里写 `203 passed`，实测基线是 `277 passed`（后来变成今天的 283）。
+> **「以运行输出为准」是本仓库的明文规矩**：`ROADMAP.md:182`、`FEATURES.md:73`、`docs/features/vulkan.md:35`、`docs/features/vulkan-swapchain.md:228/281` 都写着「数字随测试增减漂移，以运行输出为准」。`docs/superpowers/plans/2026-09-27-m3a-drawlist-to-gpu-geometry.md:37-38` 还留了一条历史：计划里写 `203 passed`，实测基线是 `277 passed`（后来变成今天的 321）。
 
 ---
 

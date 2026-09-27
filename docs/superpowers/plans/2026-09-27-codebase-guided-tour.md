@@ -94,7 +94,7 @@
 |---|---|---|---|
 | 1 | 「根 `AGENTS.md`」可作素材 | **`AGENTS.md` 不存在**（glob ×2 + `git log --all -- AGENTS.md` 三路确认）⇒ 本仓库的纪律只能从 `FEATURES.md:3-8/89-97`、`README.md:24-25`、`ROADMAP.md:109-159`、两个 plan 的 Global Constraints、`docs/features/TEMPLATE.md` 提取 | `docs/tour/03-app-and-process.md` §5 |
 | 2 | 「四道门禁」是既有约定 | **没有单一权威文档**：`docs/superpowers/plans/2026-09-27-m3a-…md:20` 只列**三条**（workspace 测试 / clippy / `DEER_VK_VALIDATION=1`）；第四道「示例全跑」是测绘员**本轮补实跑**后写进去的 | 同上 §8 |
-| 3 | 门禁数字 | `cargo test --workspace` = **283 passed / 0 failed / 1 ignored**（35 个二进制，含 doc-tests）；分解 deer-gpu 81 + deer-gui 6 + deer-layout 18 + deer-vk 167 + deer-window 11；`DEER_VK_VALIDATION=1 cargo test -p deer-vk` = **167 passed**；15 个 deer-gui 示例 + `window_smoke` 全 `exit=0` | 同上 §4 |
+| 3 | 门禁数字 | `cargo test --workspace` = **321 passed / 0 failed / 2 ignored**（36 个二进制，含 doc-tests）；分解 deer-gpu 81 + deer-gui 6 + deer-layout 18 + deer-vk 205 + deer-window 11；`DEER_VK_VALIDATION=1 cargo test -p deer-vk` = **205 passed / 0 failed**；15 个 deer-gui 示例 + `window_smoke` 全 `exit=0`（M3b 冻结 HEAD 实测；数字随测试增减漂移，**以运行输出为准**） | 同上 §4 |
 
 **顺带修掉我的一处含糊**：第 0 讲里我说的「四道门禁」应改写为「**三条有文档依据的门禁 + 示例全跑（补充项）**」，避免把自造约定讲成既有约定。
 
