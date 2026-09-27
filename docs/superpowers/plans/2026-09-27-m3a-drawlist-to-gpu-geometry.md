@@ -181,7 +181,13 @@ fn clip_is_intersected_on_the_cpu() {
     l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 8, 8), color: Color::WHITE });
     l.push(DrawCmd::PopClip);
     let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 8 });
-    assert_eq!(s.vertices[0].rect, [2.0, 2.0, 4.0, 4.0], "矩形被裁到 clip 内");
+    // **Ruling（见 ledger Ruling 5）**：`pos`（光栅化范围）用**裁剪后**的矩形；
+    // `rect` 属性（圆角/描边判据）用**原始**矩形 —— 两者必须分开，否则圆角会被裁剪挪位。
+    assert_eq!(s.vertices[0].rect, [0.0, 0.0, 8.0, 8.0], "rect 属性保持原始矩形");
+    let (x0, y0) = (s.vertices[0].pos[0], s.vertices[0].pos[1]);
+    // 裁剪后矩形 (2,2,4,4) 在 8×8 画布上的左上角 → NDC
+    assert!((x0 - (2.0 * 2.0 / 8.0 - 1.0)).abs() < 1e-6, "pos.x 应落在裁剪后矩形左边界");
+    assert!((y0 - (2.0 * 2.0 / 8.0 - 1.0)).abs() < 1e-6, "pos.y 同理（y 向下为正）");
 }
 ```
 Run: `cmd /c "cargo test -p deer-vk --test gpu_geom_stream"` → Expected: FAIL（模块不存在）
