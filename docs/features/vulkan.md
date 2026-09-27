@@ -32,7 +32,7 @@ Vulkan 能离屏画几何、也能把像素呈现在窗口里，但**还不消�
 > （校验层报 `VUID-StandaloneSpirv-PushConstant-06808`，请求校验层时会让进程 `0xc0000005` 崩溃；
 > `device_smoke` / `pipeline_smoke` 里涉及它的测试因此在校验层下**显式跳过**，t15）。
 > 设备/离屏路径曾经**故意不读**这个变量（那时 offscreen 有 3 个真缺陷），**t18 修完后重新接回**。
-> 本机实测 `DEER_VK_VALIDATION=1 cargo test -p deer-vk` → **205 passed / 0 failed**、零校验消息（M3b 冻结 HEAD `cbcd768` 实测；数字随测试增减漂移，**以运行输出为准**）；
+> 本机实测 `DEER_VK_VALIDATION=1 cargo test -p deer-vk` → **全部通过 / 0 failed**、零校验消息（**具体条数以运行输出为准**，本仓库不在文档里固化测试条数）；
 > 窗口示例 30 帧同样零消息、`exit=0`。细节与「修好它属于 M3」见 [`ROADMAP.md`](../../ROADMAP.md) 的 Q-5。
 
 ## 2. 最小示例

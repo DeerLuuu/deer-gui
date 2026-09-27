@@ -32,7 +32,7 @@ M2b 拿到窗口后接上 surface/交换链/呈现（Q-1 已决：引 `winit`）
 
 | 步 | 交付 | 状态 | 验收判据 |
 |---|---|---|---|
-| **M2a-1** | **自研 SPIR-V 汇编器**（`spirv.rs`） —— 解 Q-2 阻断点 | ✅ 完成 | 3 支着色器被驱动 `vkCreateShaderModule` 接受；模块自洽性 12 条断言 |
+| **M2a-1** | **自研 SPIR-V 汇编器**（`spirv.rs`） —— 解 Q-2 阻断点 | ✅ 完成 | 3 支着色器被驱动 `vkCreateShaderModule` 接受；模块自洽性有结构护栏（条数以 `cargo test -p deer-vk --test spirv_val -- --list` 的输出为准） |
 | **M2a-2** | **逻辑设备 + 队列**（`device.rs`，含线程生命周期解法） | ✅ 完成 | 真机打开设备、拿到图形队列、内存类型数正确；连续 3 次打开/关闭稳定 |
 | **M2a-3** | 渲染通道 + 管线布局 + **图形管线** | ✅ **完成** | `vkCreateGraphicsPipelines` 成功且句柄非空（真机）。**推送常量矩形着色器已知不可用**（三种写法分别导致空句柄/访问违例），矩形绘制后续改顶点缓冲 —— 不阻塞后续步 |
 | **M2a-4** | 命令池/命令缓冲 + 提交 + 栅栏同步 | ✅ 完成 | 栅栏在 ~1ms 内 signal（有限超时 1 秒）；提交后回读可用 |
@@ -167,8 +167,8 @@ deer-window v0.0.0
 ## 与 deer-ui 的关系
 
 - **只取控件语义**（有哪些控件、什么行为、什么状态），**不取实现**（DOM/CSS/React 全部丢弃）。
-- 布局代数来自 deer-ui 的 TypeScript 验证原型（V0）：那 28 条断言在这里以 Rust 测试重建，
-  并保留了它抓到过的三个缺陷的回归守卫。
+- 布局代数来自 deer-ui 的 TypeScript 验证原型（V0）：那个原型当时跑了 28 条断言（**历史值**，
+  不是本仓库当前的测试数），在这里以 Rust 测试重建，并保留了它抓到过的三个缺陷的回归守卫。
 - `deer-ui` 本身不动，仍可作为 web 场景的组件库存在。
 
 ## 已知未决 / 遗留（登记，不阻塞）
@@ -179,4 +179,4 @@ deer-window v0.0.0
 | Q-2 | ~~SPIR-V 来源~~ | ✅ **已解决（M2a-1）**：自写极简 SPIR-V 汇编器（`crates/deer-vk/src/spirv.rs`），**零外部依赖**，产物已被真机驱动接受（3 支着色器）。附带一条经验：`vkCreateShaderModule` **很宽容**（连 `bound=0` 都接受），所以「驱动接受」≠「SPIR-V 正确」，必须自己加结构护栏。 |
 | Q-3 | ~~文本度量与布局的耦合~~ | ✅ **已落实（M4-4/M4-5）**：`FontMeasure` 通过 `Measure` 注入点接入布局；`ApproxMeasure` 保留为**确定性测试用**实现（不带字体的 `render_tree_to_png` 仍用它）。**新纪律**：布局、绘制列表、光栅化必须用同一个字号、同一个度量。 |
 | Q-4 | 线程模型 | HAL 故意不实现 `Send`/`Sync`；M2 需要定「渲染线程 vs UI 线程」的边界。 |
-| Q-5 | **推送常量矩形着色器损坏（遗留缺陷，M2b 登记）** | **现象**：`crates/deer-vk/src/spirv.rs::vertex_shader_rect_pushconstant` 产出的 SPIR-V 被校验层判 `VUID-StandaloneSpirv-PushConstant-06808`（源码里已标「已知不工作，不要用它建管线」）。**影响**：普通驱动会「宽容接受」（不带校验层的验收照跑）；**请求校验层时**该 SPIR-V 会让进程 **`0xc0000005` 访问违例崩溃** —— 所以从 **t15** 起，`tests/device_smoke.rs` 与 `tests/pipeline_smoke.rs` 里涉及它的测试在**请求了校验层时显式跳过**（stderr 写明「这不是通过，是被显式跳过」），于是 `DEER_VK_VALIDATION=1` 跑全量 deer-vk 是安全动作。**现状（task-18 后）**：设备/离屏路径曾经**故意不读**这个环境变量，是因为 offscreen 侧有 3 个真缺陷（barrier `sType` 写成 47、`oldLayout` 与渲染通道 `finalLayout` 不符、图像内存 `mem::forget` 泄漏）；**t18 已全部修掉**，所以现在 `VkBackend::new`、设备/离屏路径与窗口路径 `WindowedRenderer` **三条路一致尊重** `DEER_VK_VALIDATION`。本机实测：`DEER_VK_VALIDATION=1 cargo test -p deer-vk` → **205 passed / 0 failed、零条校验消息**（M3b 冻结 HEAD `cbcd768` 实测；数字随测试增减漂移，**以运行输出为准**）；`DEER_VK_VALIDATION=1` 跑窗口示例 30 帧 → 零消息、`exit=0`。**修好它**归属 **M3**：矩形绘制改走**顶点缓冲**（与 M2a-3 记录的同一根因）。 |
+| Q-5 | **推送常量矩形着色器损坏（遗留缺陷，M2b 登记）** | **现象**：`crates/deer-vk/src/spirv.rs::vertex_shader_rect_pushconstant` 产出的 SPIR-V 被校验层判 `VUID-StandaloneSpirv-PushConstant-06808`（源码里已标「已知不工作，不要用它建管线」）。**影响**：普通驱动会「宽容接受」（不带校验层的验收照跑）；**请求校验层时**该 SPIR-V 会让进程 **`0xc0000005` 访问违例崩溃** —— 所以从 **t15** 起，`tests/device_smoke.rs` 与 `tests/pipeline_smoke.rs` 里涉及它的测试在**请求了校验层时显式跳过**（stderr 写明「这不是通过，是被显式跳过」），于是 `DEER_VK_VALIDATION=1` 跑全量 deer-vk 是安全动作。**现状（task-18 后）**：设备/离屏路径曾经**故意不读**这个环境变量，是因为 offscreen 侧有 3 个真缺陷（barrier `sType` 写成 47、`oldLayout` 与渲染通道 `finalLayout` 不符、图像内存 `mem::forget` 泄漏）；**t18 已全部修掉**，所以现在 `VkBackend::new`、设备/离屏路径与窗口路径 `WindowedRenderer` **三条路一致尊重** `DEER_VK_VALIDATION`。本机实测：`DEER_VK_VALIDATION=1 cargo test -p deer-vk` → **全部通过 / 0 failed、零条校验消息**（**具体条数以运行输出为准**）；`DEER_VK_VALIDATION=1` 跑窗口示例 30 帧 → 零消息、`exit=0`。**修好它**归属 **M3**：矩形绘制改走**顶点缓冲**（与 M2a-3 记录的同一根因）。 |

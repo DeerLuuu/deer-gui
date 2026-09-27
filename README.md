@@ -1,196 +1,241 @@
 # deer-gui
 
-> **从零实现的 Rust GUI 运行时** —— 不依赖 web、不依赖 DOM、不依赖 `wgpu`/`ash`/`vulkano`。
-> 以**节点树**为核心数据模型，支持两种构筑方式（imgui 式命令式 API / `.tscn` 式场景文件），
-> 由自研布局引擎驱动，渲染后端可插拔。
+A GUI runtime for Rust, written from scratch — no web, no DOM, and no `wgpu` / `ash` / `vulkano`.
 
-来源：`deer-ui` 的控件语义 + 一个 TypeScript 验证原型（V0，28 条断言）验证过的布局代数。
-**不是** web 项目的移植：DOM/CSS 全部丢弃，窗口、输入、渲染自己实现。
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-blue.svg)](#requirements)
+[![Edition](https://img.shields.io/badge/edition-2024-blue.svg)](#requirements)
+[![Dependencies](https://img.shields.io/badge/third--party%20deps-none%20(except%20winit)-green.svg)](#dependencies)
+[![Platform](https://img.shields.io/badge/window%20layer-Windows-lightgrey.svg)](#platform-support)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-> ### 🚀 第一次用？看这三份文档
-> | 文档 | 用途 |
-> |---|---|
-> | [**教程**](docs/TUTORIAL.md) | 一步一步，14 节（§0–§13），每节可独立运行 |
-> | [**功能清单**](FEATURES.md) | **有哪些功能、做到哪一步、哪些还不能** ← 唯一真相 |
-> | [**逐功能指南**](docs/features/) | 某个功能的完整用法与坑 |
->
-> 从没写过 Rust：[上手指南](docs/GETTING-STARTED.md)（更啰嗦的版本）。
-> 只想立刻看到结果：
-> ```sh
-> cd Z:\deer-gui
-> cargo run -p deer-gui --example tutorial     # → render_out/*.png
-> ```
+**English** | [中文](README.zh-CN.md)
 
-> **维护约定**：新增功能时**必须同时**加示例 + 加指南 + 登记 `FEATURES.md`
-> （缺一不算完成）。理由见 `FEATURES.md` 结尾 —— M1 交付后曾出现「库能跑但没人知道怎么用」。
+Licensed under MIT. No third-party dependencies except the windowing layer (`winit`, [registered in the roadmap](ROADMAP.md)).
 
-## 现状（里程碑 M1、M2 完成；M4 进行中）
+---
 
-| 项 | 状态 |
+## Overview
+
+deer-gui is a GUI runtime built around a **node tree**: you describe a UI, the tree is laid out by a layout engine written in this repository, and the result is handed to a pluggable render backend.
+
+Two authoring paths produce **the same tree**:
+
+- an **imperative API** with an imgui-like feel (`Builder`), and
+- a **scene file** format (`.dui`, in the spirit of Godot's `.tscn`).
+
+The layout algebra comes from a TypeScript validation prototype (which ran 28 assertions at the time — a historical value of that prototype, not a current test count for this repository); the widget vocabulary comes from `deer-ui`. This is **not** a port of a web project — DOM and CSS are discarded entirely, and the window, input, and rendering layers are implemented here.
+
+> [!NOTE]
+> The project is under active development. `FEATURES.md` is the single source of truth for what works today, what is partial, and what is not implemented yet. Please read it before assuming a feature exists.
+
+## Status
+
+| Area | Status |
 |---|---|
-| `deer-layout`：节点树 + 布局代数 + 命中测试 + `.dui` 解析 | ✅ **24 条断言全绿**（18 布局不变量 + 5 FFI 布局 + 1 忽略） |
-| `deer-gpu`：GPU HAL + CPU 参考后端（软件光栅化） | ✅ 类型与契约就位；CPU 后端能把绘制列表渲成像素，**并能贴真实字形（离屏）** |
-| `deer-vk`：Vulkan 后端（**自己声明符号 + 运行时动态加载**） | ✅ **真机枚举到 2 个 GPU**（Intel RaptorLake / NVIDIA RTX 5070 Ti, Vulkan 1.4.341）；设备/管线/离屏回读（M2a）+ surface/交换链/呈现（M2b） |
-| `deer-window`：窗口层（winit） | ✅ 真窗口 + 事件循环（**仅 Windows**）；**本 workspace 唯一第三方依赖**，登记在 `ROADMAP.md` Q-1 |
-| **窗口上屏**（surface + 交换链 + 帧同步 + 呈现） | ✅ 里程碑 M2b；窗口里是 GPU 清屏色 + 几何（**还不是界面**） |
-| 真实字形（字体解析 + 光栅化 + 图集 + 真实度量/换行） | 🔄 **离屏 CPU 已能出真字**（M4-1..5）；**GPU 侧文本**与 hinting/亚像素未做 |
-| dock（可停靠面板布局） | ⬜ 里程碑 M5 |
+| `deer-layout` — node tree, layout algebra, hit testing, `.dui` scene parsing | ✅ One test per layout invariant in `crates/deer-layout/tests/layout_invariants.rs` |
+| `deer-gpu` — GPU HAL + CPU reference backend (software rasterizer) | ✅ Contract in place; the CPU backend rasterizes draw lists to pixels and can blit real glyphs offscreen |
+| `deer-vk` — Vulkan backend (symbols declared by hand, loaded at runtime) | ✅ Enumerates 2 GPUs on real hardware (Intel RaptorLake / NVIDIA RTX 5070 Ti, Vulkan 1.4.341); device, pipeline, and offscreen readback, plus surface / swapchain / present |
+| `deer-window` — windowing layer (winit) | ✅ Real window and event loop on **Windows**; the only third-party dependency in the workspace |
+| Real glyphs — font parsing, rasterization, atlas, real metrics, line breaking | 🔄 Works offscreen on the CPU; GPU-side text, hinting, and subpixel positioning are not done |
+| On-screen rendering in a window | 🔄 The window presents a clear color and geometry; it does not show a laid-out UI yet |
+| Input events, focus, dockable panels | ⬜ Not implemented (milestones M5/M6) |
 
-> **依赖口径**：除窗口层 `deer-window` 的 `winit`（登记在 `ROADMAP.md` Q-1）外，
-> 其余零第三方依赖 —— `deer-layout` / `deer-gpu` / `deer-vk` 都没有第三方依赖，
-> `deer-gui` 不开 `window` feature 时也没有。
+See [`FEATURES.md`](FEATURES.md) for the per-feature breakdown and [`ROADMAP.md`](ROADMAP.md) for milestones.
 
-## 快速开始
+## Requirements
+
+- **Rust 1.85 or newer** (the workspace uses edition 2024).
+- **Windows** for the windowing layer and anything that presents to a window. Everything else — layout, CPU rasterization, offscreen rendering to PNG, and the Vulkan offscreen path — builds and runs without a window.
+- **No Vulkan SDK is required.** `deer-vk` declares the Vulkan symbols itself and loads `vulkan-1.dll` at runtime through `LoadLibraryW` + `GetProcAddress`, so only `kernel32` is linked. Struct layouts are hand-written and pinned with `offset_of!` assertions.
+
+## Installation
+
+The crates are not published yet; use the workspace directly:
 
 ```sh
-cargo test --workspace          # 全部断言（数量见输出；随里程碑增长）
-cargo test -p deer-vk -- --nocapture   # 看本机枚举到的 GPU
-
-# 渲染一张图（离屏，CI 友好）
-cargo run -p deer-gui --example render_to_png
-# → render_out/render_to_png.png
-
-# 开一个真窗口（M2b；**feature 必须带上**，仅 Windows）
-cargo run -p deer-gui --features window --example window_preview
-
-# M2b 的完整门禁：真窗口 e2e **默认跳过**，必须显式打开（跳过也算 pass，别当证据）
-#   PowerShell：$env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo test -p deer-vk
+git clone https://github.com/DeerLuuu/deer-gui.git
+cd deer-gui
 ```
 
-### 自己写代码渲染
+To consume the library from another project, depend on it by path:
+
+```toml
+[dependencies]
+deer-gui = { path = "path/to/deer-gui/crates/deer-gui" }
+```
+
+> [!IMPORTANT]
+> Add `--features window` only if you need a real window. Without it, `winit` is not pulled in and `deer-gui` has no third-party dependencies.
+
+## Quick start
+
+```sh
+# Run the whole assertion suite (the count grows with each milestone — read it from the output)
+cargo test --workspace
+
+# See which GPUs are enumerated on this machine
+cargo test -p deer-vk -- --nocapture
+
+# Render an image offscreen (CI-friendly) -> render_out/render_to_png.png
+cargo run -p deer-gui --example render_to_png
+
+# Render real glyphs to PNG -> render_out/text_render.png
+cargo run -p deer-gui --example text_render
+
+# Open a real window (Windows only; the feature flag is required)
+cargo run -p deer-gui --features window --example window_preview
+```
+
+If you have never written Rust, start with the more verbose [getting-started guide](docs/GETTING-STARTED.md).
+
+### Usage
 
 ```rust
 use deer_gui::prelude::*;
 use deer_gui::render_tree_to_png;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // ① 建树（也可用 .dui 场景文件：parse_scene(text, "ui.dui")?）
+    // 1. Build the tree (or parse a scene file: parse_scene(text, "ui.dui")?)
     let mut app = Builder::new(Kind::Column, "app").padding(12.0).gap(8.0);
-    app.text("标题");
+    app.text("Title");
     app.container_opts(Kind::Row, "bar", L::new().gap(8.0).to_props(), |r| {
-        r.button("确定");
-        r.button("取消");
+        r.button("OK");
+        r.button("Cancel");
     });
     let tree = app.build();
 
-    // ② 渲染成 PNG
+    // 2. Render it to a PNG
     std::fs::write("ui.png", render_tree_to_png(&tree, 320, 200, Theme::default())?)?;
     Ok(())
 }
 ```
 
-要拿到像素而不是文件：`render_tree_to_rgba(&tree, w, h, theme)` → `(宽, 高, RGBA8)`。
+- Want pixels instead of a file? `render_tree_to_rgba(&tree, w, h, theme)` returns `(width, height, RGBA8)`.
+- Want to inspect layout only? `deer_gui::layout_tree(&tree, w, h, theme)` returns a geometry table from node id to `Rect`.
 
-要单独看布局：`deer_gui::layout_tree(&tree, w, h, theme)` → nodeId 到 `Rect` 的几何表。
+### What rendering can and cannot do today
 
-### ⚠️ 现在能渲染到什么程度
-
-| 能力 | 状态 |
+| Capability | Status |
 |---|---|
-| 建树（命令式 / `.dui` 场景文件） | ✅ |
-| 布局计算、命中测试 | ✅ |
-| 树 + 几何 → 绘制列表 → **像素**（CPU 软件光栅化） | ✅ |
-| 写 PNG 文件 | ✅ |
-| **真实字形**（字体解析 → 光栅化 → 图集 → 贴像素） | ✅ **仅离屏 / CPU 后端** |
-| **渲染到窗口 / 屏幕上** | ❌ 里程碑 M2b |
-| **GPU 侧文本**（Vulkan 贴字形图集） | ❌ 里程碑 M3（依赖 M4 的图集，图集已就绪，后端还没接） |
-| 输入事件与焦点 | ❌ 里程碑 M5 |
+| Build a tree (imperative API / `.dui` scene file) | ✅ |
+| Layout computation and hit testing | ✅ |
+| Tree + geometry → draw list → **pixels** (CPU rasterizer) | ✅ |
+| Write PNG files | ✅ |
+| **Real glyphs** (font parsing → rasterization → atlas → pixels) | ✅ offscreen / CPU backend only |
+| **GPU-side text** (uploading the glyph atlas to Vulkan) | ❌ The atlas is ready; the backend is not wired up |
+| **Rendering into a window on screen** | 🔄 Presents a clear color and geometry, not a laid-out UI |
+| Input events and focus | ❌ Not implemented |
 
-**所以现在只能离屏出图**，不能像正常 GUI 那样开窗。真实字形已经能画出来了：
+One subtlety worth knowing: the older entry point `render_tree_to_png` does not load a font, so text drawn through it is still evenly spaced placeholder boxes. Real glyphs come from the text engine (`text_render`). Geometry, layering, and color are real on both paths.
 
-```sh
-cargo run -p deer-gui --example text_render     # → render_out/text_render.png（真字形）
-```
-
-但对**不带字体**的老入口（`render_tree_to_png`）来说，「字」仍是等宽占位方块 ——
-所以要看清区别，请把两条路径的产物放一起比。几何、层次、颜色一直是真的。
-
-## 架构
+## Architecture
 
 ```
 crates/
-├── deer-layout/   语言无关核心：Node 树、布局代数、命中测试、.dui 场景解析
-│                  ── 零平台依赖，可在无 GPU 的 CI 里完整断言
-├── deer-gpu/      GPU HAL：Backend/Device/Swapchain/Frame trait、DrawList、CPU 参考后端
-│                  ── 加一个后端 = 实现一个 trait
-├── deer-vk/       Vulkan 后端：自己声明 extern 符号 + LoadLibraryW 动态加载；surface/交换链/呈现
-└── deer-window/   窗口层：原生窗口 + 事件循环（winit）
-                   ── **唯一引入第三方依赖的地方**（`winit`，登记在 ROADMAP Q-1）；
-                      只把不透明的 RawWindowHandle 交给渲染层，所以换窗口实现不动渲染层
+├── deer-layout/   Platform-independent core: node tree, layout algebra, hit testing, .dui parsing
+│                  ── zero platform dependencies, fully assertable in a CI without a GPU
+├── deer-gpu/      GPU HAL: Backend/Device/Swapchain/Frame traits, DrawList, CPU reference backend
+│                  ── adding a backend means implementing one trait
+├── deer-vk/       Vulkan backend: hand-declared extern symbols + runtime loading; surface/swapchain/present
+└── deer-window/   Windowing: native window + event loop (winit)
+                   ── the only place a third-party dependency is introduced (winit);
+                      it hands the renderer an opaque RawWindowHandle, so swapping the window
+                      implementation does not touch the render layers
 ```
 
-### 两条构筑路径，一棵树
+### Two authoring paths, one tree
 
 ```text
-  Builder（命令式，imgui 式手感）─┐
-                                  ├─→ Node 树 ─→ layout() → 几何表 ─→ 后端
-  parse_scene(.dui，.tscn 式）   ─┘                └─→ hit_test() → 输入路由
+  Builder (imperative, imgui-like) ─┐
+                                    ├─→ Node tree ─→ layout() → geometry ─→ backend
+  parse_scene (.dui, tscn-like)    ─┘               └─→ hit_test() → input routing
 ```
 
-两条路径产出**结构相等**的树（`Node::structurally_eq`），这是核心不变式，
-也是测试 `t1_two_authoring_paths_produce_the_same_tree` 钉住的东西。
-
-```rust
-// 命令式
-let mut app = Builder::new(Kind::Column, "app").padding(12.0).gap(8.0);
-app.text("标题");
-app.container_opts(Kind::Row, "bar", L::new().gap(8.0).to_props(), |r| {
-    r.button("确定");
-    r.button("取消");
-});
-let tree = app.build();
-```
+Both paths produce **structurally equal** trees (`Node::structurally_eq`). That is the core invariant, and it is pinned by the test `t1_two_authoring_paths_produce_the_same_tree`.
 
 ```text
-# 等价的场景文件（.dui）
+# The equivalent scene file (.dui)
 [column name=app pad=12 gap=8]
-  [text label=标题]
+  [text label=Title]
   [row name=bar gap=8]
-    [button label=确定]
-    [button label=取消]
+    [button label=OK]
+    [button label=Cancel]
 ```
 
-## 布局引擎的不变式
+### Layout invariants
 
-每条都有对应测试（`crates/deer-layout/tests/layout_invariants.rs`）：
+Each invariant has a test in `crates/deer-layout/tests/layout_invariants.rs`:
 
-| # | 不变式 |
+| # | Invariant |
 |---|---|
-| I-1 | **纯函数**：不改输入树，只回几何表 |
-| I-2 | **确定性**：同输入 ⇒ 逐位相同输出（无时间/随机/环境探测） |
-| I-3 | **自底向上**：先算子节点固有尺寸，父容器再分配 |
-| I-4 | **像素取整**：几何全部整数 |
-| I-5 | **不假设拥有窗口**：根盒子由宿主给，根**不撑满** |
-| I-6 | **不越界**：结果夹在可用空间内 |
-| I-7 | **分配尺寸 ≠ 可用空间**：父分配的主轴尺寸必须被采信；百分比相对**父内容盒**解析 |
-| I-8 | **主轴 = sum(子)，交叉轴 = max(子)**：容器的固有尺寸按方向语义不同 |
+| I-1 | **Pure**: does not mutate the input tree, returns only the geometry table |
+| I-2 | **Deterministic**: identical input yields bit-identical output (no time, randomness, or environment probing) |
+| I-3 | **Bottom-up**: child intrinsic sizes are computed before the parent allocates |
+| I-4 | **Pixel-rounded**: all geometry is integral |
+| I-5 | **Does not assume window ownership**: the root box is given by the host, and the root does not stretch to fill |
+| I-6 | **No overflow**: results are clamped to the available space |
+| I-7 | **Allocated size ≠ available space**: a parent's main-axis allocation must be honored; percentages resolve against the parent's content box |
+| I-8 | **Main axis = sum(children), cross axis = max(children)**: a container's intrinsic size depends on direction |
 
-I-7 与 I-8 都是**踩过坑之后立的**（见下）。
+### Design constraints and known traps
 
-## 从验证原型继承的三个真缺陷
+Behavior that looks surprising is usually deliberate. The full list, with the defects that produced each rule and the tests that guard them, lives in [CONTRIBUTING.md](CONTRIBUTING.md#design-constraints-and-known-traps):
 
-`deer-ui` 的 TypeScript 原型（V0）用「改坏 → 红 → 改回」抓到了三个真缺陷，
-Rust 版把它们的**回归守卫**全部保留：
+- Layout, draw lists, and rasterization must use **the same font size and the same metrics**.
+- Vulkan uses a **static viewport/scissor**; dynamic state draws nothing on some integrated GPUs.
+- The color attachment must be `R8G8B8A8_UNORM`, **not** `_SRGB`, because the CPU baseline does no gamma conversion.
+- Five real defects found during validation (three inherited from the prototype, two found in the Rust port) are kept as regression guards.
 
-| # | 缺陷 | 守卫 |
-|---|---|---|
-| **B-1** | 两条构筑路径的 id 规则不一致（单计数器 vs 按类型计数）⇒ 树不等 | `t1_two_authoring_paths_produce_the_same_tree`、`t1_auto_id_rule_is_shared` |
-| **B-2** | 布局把「父分配尺寸」当成「可用空间上限」⇒ `grow` 分配被静默丢弃 | `t5_grow_fills_the_row` |
-| **B-3** | 容器固有尺寸漏算子节点显式尺寸（且方向语义错误） | `t13`、`t14_container_cross_axis_is_max_not_sum` |
+## Documentation
 
-Rust 移植过程中又抓到两个（同样已修 + 立守卫）：
-- **R-1** 建造顺序：`with_props`/`with_layout` 是**整体赋值**，先定 id 再设它们会连 id 一起改掉
-- **R-2** 主轴对齐的剩余空间算在 `grow` **之前** ⇒ `grow` 一旦生效，`center`/`end` **静默失效**
+| Document | What it covers |
+|---|---|
+| [Tutorial](docs/TUTORIAL.md) | Step by step, 14 sections (§0–§13); every section runs on its own |
+| [Feature list](FEATURES.md) | **Which features exist, how far they are, and which are not done** — the single source of truth |
+| [Per-feature guides](docs/features/) | Complete usage and pitfalls for one feature at a time |
+| [Roadmap](ROADMAP.md) | Milestones M1–M7 and their acceptance criteria |
+| [Getting started](docs/GETTING-STARTED.md) | A slower on-ramp if you have never written Rust |
+| [Agent notes](agent.md) | Repository rules and traps for AI agents and new maintainers |
 
-## 为什么不需要 Vulkan SDK
+### Crate-level examples
 
-`#[link(name = "vulkan-1")]` 在**没有 SDK** 的机器上会链接失败
-（`LNK1181: 无法打开输入文件 "vulkan-1.lib"` —— 系统只带 `vulkan-1.dll`，导入库属 SDK）。
+The [`crates/deer-gui/examples/`](crates/deer-gui/examples/) directory is the fastest way to see a feature working — 15 runnable examples, each with a self-check assertion:
 
-所以 `deer-vk` 走**运行时动态加载**：`LoadLibraryW("vulkan-1.dll")` + `GetProcAddress`，
-只依赖 `kernel32`。结构体布局在 crate 内手写并用 `offset_of!` 断言钉住。
-结果：**不需要 SDK、不需要 ash**，且在真机上枚举到了 2 个 GPU。
+```sh
+cargo run -p deer-gui --example tutorial        # guided tour, writes render_out/*.png
+cargo run -p deer-gui --example geometry        # layout and hit testing
+cargo run -p deer-gui --example scene_file      # .dui authoring, equivalent tree
+cargo run -p deer-gui --example gpu_geometry    # GPU geometry, compared against the CPU backend
+cargo run -p deer-gui --example glyph_atlas     # glyph atlas packing
+```
 
-## 待办
+See [`FEATURES.md`](FEATURES.md) for the example that belongs to each feature.
 
-见 [`ROADMAP.md`](ROADMAP.md) 与 [`docs/M1-report.md`](docs/M1-report.md)。
+## Dependencies
+
+Except for the windowing layer, the workspace has **no third-party dependencies**:
+
+| Crate | Third-party dependencies |
+|---|---|
+| `deer-layout` | none |
+| `deer-gpu` | none |
+| `deer-vk` | none |
+| `deer-gui` (without the `window` feature) | none |
+| `deer-window`, `deer-gui --features window` | `winit 0.30` |
+
+`winit` is the single registered exception, recorded in [`ROADMAP.md`](ROADMAP.md) under Q-1. New dependencies must be registered there with a rationale before being added.
+
+## Platform support
+
+| Platform | Layout, CPU rasterization, PNG output | Vulkan offscreen | Window / present |
+|---|---|---|---|
+| Windows | ✅ | ✅ (Vulkan 1.4, driver-provided) | ✅ |
+| Linux / macOS | ✅ | ✅ | ❌ returns an unsupported-platform error |
+
+## Contributing
+
+This repository treats documentation as part of the deliverable: a new feature is not complete until it ships with an example, a guide, and an entry in `FEATURES.md`. The rules, the review gates, and the command reference are in [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+MIT — the full text is in [LICENSE](LICENSE); the same identifier is declared in the `license` field of [`Cargo.toml`](Cargo.toml).
