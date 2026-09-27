@@ -239,6 +239,28 @@ fn stroke_rect_parity() {
     let mut l = DrawList::new();
     l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 6, 4), color: W, width: 4 });
     assert_parity("stroke-overlap", &l, E8);
+
+    // ★ 带宽**超过矩形边长** ⇒ 边带沿短边方向**伸出矩形之外**
+    //   （`null.rs::stroke()` 的 `for k in 0..width` 不把 k 限制在矩形内；
+    //    T1 的着色器为这个语义专门写了闭式，且记录「5 个候选公式被穷举推翻」）。
+    //   顶点流这一侧：`rect.bottom() - band` / `right() - band` 会走到矩形外面去。
+    let mut l = DrawList::new();
+    l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 6, 4), color: W, width: 6 });
+    assert_parity("stroke-w6-extends-above", &l, E8);
+
+    let mut l = DrawList::new();
+    l.push(DrawCmd::StrokeRect { rect: RectI::new(2, 3, 4, 2), color: W, width: 5 });
+    assert_parity("stroke-w5-both-axes", &l, E16);
+
+    // 伸出矩形之后又被画布裁掉一部分（行/列到负数）
+    let mut l = DrawList::new();
+    l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 0, 6, 3), color: W, width: 6 });
+    assert_parity("stroke-w6-offscreen", &l, E8);
+
+    // 退化矩形 × 厚带宽（1×1 的矩形配 3px 边框）
+    let mut l = DrawList::new();
+    l.push(DrawCmd::StrokeRect { rect: RectI::new(3, 3, 1, 1), color: W, width: 3 });
+    assert_parity("stroke-degenerate-thick", &l, E8);
 }
 
 #[test]

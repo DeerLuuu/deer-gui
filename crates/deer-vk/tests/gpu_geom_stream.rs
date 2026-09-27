@@ -345,6 +345,41 @@ fn zero_extent_still_clips_to_the_one_by_one_canvas() {
     assert_eq!(s.vertices[0].rect, [0.0, 0.0, 8.0, 8.0], "rect 属性仍是原始矩形（Ruling 5）");
 }
 
+/// 带宽**超过矩形边长**时，边带会沿短边方向**伸出矩形之外** —— 这不是笔误，
+/// 而是 `null.rs::stroke()` 的真实语义（它按 `for k in 0..width` 反复画 4 条 1px 线，
+/// **没有**把 `k` 限制在矩形内）。T1 的片元判据是按同一语义写的闭式
+/// （`spirv.rs` 里记着「5 个看起来对的候选公式被穷举推翻」），所以顶点流这一侧
+/// 也必须一致：本文钉住 `width > 矩形的宽/高` 时的 4 条边带几何。
+///
+/// rect = (2,3,4,2)、width = 5、画布 16×16 ⇒ 带宽 5 > rw(4) 也 > rh(2)：
+/// - 上带 (2,3,4,5) → y ∈ [3,8)
+/// - 下带 (2,0,4,5) → y ∈ [0,5) —— **行 0 在矩形上方**（ry = 3）
+/// - 左带 (2,3,5,2) → x ∈ [2,7)
+/// - 右带 (1,3,5,2) → x ∈ [1,6) —— **列 1 在矩形左侧**（rx = 2）
+#[test]
+fn thick_stroke_bands_extend_outside_the_rect() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::StrokeRect { rect: RectI::new(2, 3, 4, 2), color: Color::WHITE, width: 5 });
+    let e = Extent { width: 16, height: 16 };
+    let s = gpu_geom::build_stream(&l, e);
+    assert_eq!(s.vertices.len(), 24);
+    for v in &s.vertices {
+        assert_eq!(v.rect, [2.0, 3.0, 4.0, 2.0], "rect 属性始终是原始矩形（Ruling 5）");
+        assert_eq!(v.radius_kind, -5.0, "带宽 5 ⇒ radius_kind = -5.0（Ruling 6）");
+    }
+    let tl = |band: usize| s.vertices[band * 6].pos;
+    let br = |band: usize| s.vertices[band * 6 + 2].pos;
+    // ndc(p) = 2p/16 - 1 = p/8 - 1
+    assert!(close(tl(0)[0], -0.75) && close(tl(0)[1], -0.625), "上带左上 {:?}", tl(0));
+    assert!(close(br(0)[0], -0.25) && close(br(0)[1], 0.0), "上带右下 {:?}", br(0));
+    assert!(close(tl(1)[1], -1.0), "下带**伸出到矩形上方**（y0 = 0 < ry = 3）：{:?}", tl(1));
+    assert!(close(br(1)[1], -0.375), "下带右下 {:?}", br(1));
+    assert!(close(tl(2)[0], -0.75) && close(br(2)[0], -0.125), "左带 x ∈ [2,7)");
+    assert!(close(tl(3)[0], -0.875), "右带**伸出到矩形左侧**（x0 = 1 < rx = 2）：{:?}", tl(3));
+    assert!(close(br(3)[0], -0.25), "右带右下 {:?}", br(3));
+    assert!(close(tl(3)[1], -0.625) && close(br(3)[1], -0.375), "右带 y ∈ [3,5)");
+}
+
 /// 裁剪栈配平 ⇒ `clip_unbalanced == false`（含嵌套与正常弹出）。
 #[test]
 fn balanced_clip_stack_is_reported_as_balanced() {
