@@ -36,19 +36,27 @@ fn validation_requested() -> bool {
     deer_vk::ffi::Instance::validation_from_env()
 }
 
-/// 断言「到目前为止校验层**没有**报过任何消息」（进程级计数，见 `ffi::validation_message_count`）。
+/// 断言「到目前为止校验层**没有**报过任何消息」。
 ///
 /// 只在 `DEER_VK_VALIDATION=1` 下有意义（层没开时回调根本不会跑，计数恒为 0）——
 /// 所以它与 `validation_layer_state_matches_the_request` 配套：那条保证**层真的在跑**，
 /// 这条保证跑了之后**一条消息都没有**。两件事合起来才把「零校验消息」变成可回归结论
 /// （fix round 2 / R1-2；此前它只靠人眼看输出）。
+///
+/// ## 用**按线程**计数 + 窗口差值（M3c 复查修正）
+///
+/// 原来用**进程级**计数 + `== 0`——那是**绝对**断言，在并行测试里会被别的测试的
+/// 消息顶红（M3c 期间真实发生过：一条新测试产生 5 条 VUID 把这类断言全部假红）。
+/// 改成按线程后，差值只反映**本测试自己**触发的消息。
+/// 「本进程常规路径不产生消息」这条更弱的覆盖由 `pipeline_smoke.rs` 的
+/// `process_reports_zero_validation_messages_in_a_fresh_child`（干净子进程里的绝对断言）负责。
 fn assert_no_validation_messages(context: &str) {
     let n = deer_vk::ffi::validation_message_count();
     assert_eq!(
         n,
         0,
-        "{context}: 校验层报了 {n} 条消息（DEER_VK_VALIDATION={:?}）—— \
-         这是「零校验消息」的自动断言版",
+        "{context}: **本线程**收到 {n} 条校验层消息（DEER_VK_VALIDATION={:?}）—— \
+         这是「零校验消息」的自动断言版（按线程 ⇒ 不含别的测试）",
         std::env::var("DEER_VK_VALIDATION").ok()
     );
 }

@@ -747,18 +747,77 @@ type PfnDebugUtilsMessengerCallback = unsafe extern "system" fn(
     p_user_data: *mut c_void,
 ) -> u32;
 
-/// 校验层回调累计收到的消息数（**进程级**）。
+/// 校验层回调累计收到的消息数（**进程级**，永不重置）。
 ///
-/// 为什么要有它（T3 fix round 2 / R1-2）：`DEER_VK_VALIDATION=1` 的「零消息」原先只能
-/// **人眼看输出**，而测试里没有任何断言 —— 于是「层没装好」或「有人把报错改成静默降级」
-/// 都会让测试照样全绿。计数发生在**回调里**（消息真的到达回调才自增），所以它统计的是
-/// 「驱动真的报了什么」，不是「我们以为会报什么」。
+/// ## 为什么它还在（M3c 复查后保留，而不是被 thread_local 取代）
+///
+/// 它与下面的 [`VALIDATION_MESSAGE_COUNT_TLS`] 是**两个不同的问题**，不能互相顶替：
+///
+/// | 计数器 | 语义 | 谁需要它 |
+/// |---|---|---|
+/// | 本项（进程级） | 「**本进程**至今一共报过多少条」——含**其它线程**的 | 「整个进程一条消息都没有」这种**绝对断言**（测试用法见 [`validation_message_count_global`]） |
+/// | [`VALIDATION_MESSAGE_COUNT_TLS`] | 「**本线程**报过多少条」 | 「**本测试**期间零消息」这种**窗口差值**断言（[`validation_message_count`]） |
+///
+/// ⚠️ 两者被同时自增，并由 [`validation_message_count`] 的一条自检断言把
+/// 「全局 ≥ 本线程」钉住 ⇒ 因此**不可能出现「本线程计数把它漏掉了」而无人察觉**。
 static VALIDATION_MESSAGE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
-/// 累计收到的校验层消息数（进程级，从进程启动算起）。
+thread_local! {
+    /// **本线程**累计收到的校验层消息数。
+    ///
+    /// ## 为什么必须是 thread_local（M3c 复查：实测 + 一次真实的假红）
+    ///
+    /// 第一版这里是进程级 `AtomicUsize`。它的用途是「跑完一段代码后断言**没有增长**」
+    /// —— 这是**窗口差值**断言，而进程级计数器会被**别的测试线程**的消息污染。
+    /// 与 `device::TEXTURE_R8_UPLOAD_COUNT`（review I-1）**完全同类**。
+    ///
+    /// 这次不是理论风险，而是**已经发生过的假红**：M3c 期间我有一条新测试的顶点属性表
+    /// 不全（只声明 1 个，着色器消费 4/3 个）⇒ 校验层报 **5 条**
+    /// `VUID-...-Input-07904` ⇒ 落进进程级计数 ⇒
+    /// `texture_sampler_descriptor_are_clean_under_validation` **假红**
+    /// （它断言「本测试期间零消息」，却被别的测试的消息顶红了）。
+    ///
+    /// ## 实测：回调是**线程亲和**的（这才是能改成 thread_local 的依据）
+    ///
+    /// M3c 复查做过一次**故意的违规探针**测量（工作线程用
+    /// `create_graphics_pipelines` 传非法参数触发 11 条消息，主线程同时读**自己的** TLS）：
+    ///
+    /// ```text
+    ///   起始：               全局=0   主线程 TLS=0
+    ///   工作线程仍存活时：   主线程 TLS 自增=0   全局自增=11
+    ///   工作线程自己的 TLS 自增=11
+    ///   join 后：            主线程 TLS 自增=0
+    ///   ⇒ 消息全部记在**触发它的那个线程**上
+    /// ```
+    ///
+    /// 所以「按线程计数」如实反映「这段代码自己触发了什么」。若哪天换了 loader /
+    /// 校验层版本而**不再亲和**，回归锁
+    /// `tests/pipeline_smoke.rs::validation_counter_is_thread_local_not_process_wide`
+    /// 会红（它是确定性的，不是偶发 —— 见那条测试的构造）。
+    ///
+    /// ## 使用约束（诚实说明）
+    ///
+    /// 计数只属于调用它的线程 ⇒ **读的一方必须在同一线程上**做了那次调用。
+    /// 本项目满足：渲染与断言都在测试线程内完成。
+    /// 若将来有测试要断言「**别的线程**产生了消息」，那才是
+    /// [`validation_message_count_global`] 的用途。
+    pub static VALIDATION_MESSAGE_COUNT_TLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// **本线程**累计收到的校验层消息数。
 ///
-/// 测试用法（配合 `DEER_VK_VALIDATION=1`）：跑完一帧后断言它**没有增长**。
+/// 测试用法（配合 `DEER_VK_VALIDATION=1`）：跑完一段代码后断言它**没有增长** ——
+/// 因为只统计本线程，别的测试并行产生的消息**不会**干扰这个差值。
 pub fn validation_message_count() -> usize {
+    VALIDATION_MESSAGE_COUNT_TLS.with(|c| c.get())
+}
+
+/// **进程级**累计收到的校验层消息数（含其它线程）。
+///
+/// 用于「整个进程一条消息都没有」这种**绝对断言**。因为它含别的线程的消息，
+/// **不适合**做「本测试期间零消息」的窗口差值 —— 那种场合用
+/// [`validation_message_count`]（按线程）。
+pub fn validation_message_count_global() -> usize {
     VALIDATION_MESSAGE_COUNT.load(Ordering::Relaxed)
 }
 
@@ -797,6 +856,7 @@ unsafe extern "system" fn validation_callback(
     };
     // 计数点放在「确定有一条消息」之后（上面两个提前返回不计）—— 见 `validation_message_count`。
     VALIDATION_MESSAGE_COUNT.fetch_add(1, Ordering::Relaxed);
+    VALIDATION_MESSAGE_COUNT_TLS.with(|c| c.set(c.get() + 1));
     eprintln!("[{kind}] {msg}");
     0 // VK_FALSE：不中止
 }

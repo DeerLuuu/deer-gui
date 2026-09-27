@@ -32,12 +32,30 @@ fn open() -> Option<VkDevice> {
     }
 }
 
-/// 断言「到目前为止校验层**没有**报过任何消息」（进程级计数，见 `ffi::validation_message_count`）。
+/// 断言「到目前为止校验层**没有**报过任何消息」。
 ///
-/// 为什么必须是**计数断言**而不是人眼看 stderr：`DEER_VK_VALIDATION` 没开时回调
-/// 根本不会跑、计数恒为 0，所以「零消息」很容易变成一句空话。本文件里它与
-/// [`validation_layer_is_actually_running`] 配套：那条保证**层真的在跑**，
-/// 这条保证跑了之后**一条消息都没有**。两件事合起来才是可回归的结论。
+/// ## 用哪个计数、为什么（M3c 复查澄清，两次都踩过）
+///
+/// 这条断言原本用**进程级**计数 + `== 0`。问题：
+/// - 它是**绝对**断言（"整个进程至今零消息"），而在**并行测试**里，别的测试产生的
+///   消息也会让它非 0 ⇒ 一旦有任何一条测试合法地产生消息，**所有**这类断言都假红；
+/// - 而 M3c 期间恰恰发生了这件事：我一条新测试的顶点属性表不全（只声明 1 个，
+///   着色器消费 4/3 个）⇒ 5 条 `VUID-...-Input-07904` ⇒
+///   `texture_sampler_descriptor_are_clean_under_validation` **假红**。
+///
+/// 改为**按线程**计数 + **窗口差值**（快照 → 跑 → 再快照）：
+/// - 差值只看**本测试自己这几次调用**产生了什么 ⇒ 别的测试（别的线程）**不可能**影响它；
+/// - 也天然不受「本进程里有人合法产生消息」影响（例如本文件里那条**故意违规**的
+///   `validation_counter_is_thread_local_not_process_wide`）。
+///
+/// ## 强度上的取舍（诚实说明）
+///
+/// 按线程 + 差值看不见「**别的线程**在本测试期间报了什么」。
+/// 那条更弱的覆盖由**另一条**测试补上：
+/// [`process_reports_zero_validation_messages_in_a_fresh_child`] —— 它在**全新的子进程**里
+/// 跑一段最小工作负载，然后断言那个进程的**全局**计数为 0
+/// （子进程里没有别的测试 ⇒ 绝对断言在那里是**成立且有意义**的）。
+/// 两条合起来 = 「本测试干净」（按线程）+ 「本进程的常规路径不产生消息」（子进程全局）。
 fn assert_no_validation_messages(context: &str) {
     if !validation_requested() {
         // 层没开时计数恒为 0，断言没有意义（会给出虚假的安全感）——明确说出来。
@@ -48,8 +66,9 @@ fn assert_no_validation_messages(context: &str) {
     assert_eq!(
         n,
         0,
-        "{context}: 校验层报了 {n} 条消息 —— 这是「零校验消息」的自动断言版，\
-         请在上面输出里找 [VK ERROR]/[VALIDATION] 字样"
+        "{context}: **本线程**收到 {n} 条校验层消息 —— \
+         请在上面输出里找 [VK ERROR]/[VALIDATION] 字样。（按线程计数 ⇒ \
+         这个数字只反映本测试自己触发的消息，不含别的测试）"
     );
 }
 
@@ -183,6 +202,313 @@ fn render_pass_supports_all_target_formats() {
             Err(e) => panic!("{name} 应被支持（GUI 需要它）：{e}"),
         }
     }
+}
+
+/// **回归锁（M3c 复查）**：`validation_message_count()` 必须是**按线程**的。
+///
+/// ## 为什么需要它（与 I-1 同类的缺陷）
+///
+/// `validation_message_count()` 的第一版是**进程级**计数，而用它做的断言是
+/// 「跑完这段代码后**没有增长**」—— **窗口差值**。于是别的测试线程的消息会污染它。
+/// 这不是理论风险：M3c 期间我一条新测试的顶点属性表不全（只声明 1 个，着色器消费 4/3 个）
+/// ⇒ 校验层报 5 条 `VUID-...-Input-07904` ⇒ 落进进程级计数 ⇒
+/// `texture_sampler_descriptor_are_clean_under_validation` **假红**
+/// （它断言的是「本测试期间零消息」，却被**别的测试**的消息顶红了）。
+///
+/// ## 实测前提：回调是**线程亲和**的
+///
+/// 改 `thread_local!` 之前先实测过（故意的违规探针，工作线程触发 11 条消息、
+/// 主线程同时读自己的 TLS）：工作线程 TLS `0→11`，主线程 TLS **全程 0** ⇒
+/// 消息记在**触发它的那个线程**上。所以「按线程计数」如实反映「这段代码自己触发了什么」。
+///
+/// ## 这条锁**是确定性的**（不是偶发 flaky）
+///
+/// 它不依赖「碰巧并发」：用 channel 精确编排成
+/// ① 工作线程触发消息 → ② 工作线程**仍然存活**并阻塞等放行 → ③ 主线程在这期间读**自己的**计数
+/// → ④ 放行并 join → ⑤ 主线程再读一次。
+/// 若计数器被改回**进程级**：
+/// - 步骤 ③ 主线程会读到**工作线程**那 11 条（全局量）⇒ 立即红；
+/// - 即使跳过 ③，步骤 ⑤ 也必然非 0 ⇒ 仍红。
+///
+/// 所以「改回进程级」**必定**红，而不是偶发 —— 这正是 I-1 那把锁的同构写法。
+#[test]
+fn validation_counter_is_thread_local_not_process_wide() {
+    if !validation_requested() {
+        println!("跳过：需要 DEER_VK_VALIDATION=1 才有消息可测（这不是通过）");
+        return;
+    }
+    let Some(dev) = open() else { return };
+    drop(dev);
+    if !deer_vk::ffi::Instance::validation_from_env() {
+        println!("跳过：校验层未请求");
+        return;
+    }
+
+    let (tx_ready, rx_ready) = std::sync::mpsc::channel::<usize>();
+    let (tx_go, rx_go) = std::sync::mpsc::channel::<()>();
+
+    let worker = std::thread::spawn(move || {
+        // 设备在**本线程内**打开（VkDevice 句柄不是 Send）
+        let Ok(dev) = VkDevice::open(0) else { return 0usize };
+        let fns = *dev.fns();
+        let handle = dev.handle();
+        let before = deer_vk::ffi::validation_message_count();
+        // **故意违规**：null 渲染通道 + 零阶段 + 全零 sType ⇒ 校验层必然报若干条。
+        let mut pipe: vk::PipelineHandle = std::ptr::null_mut();
+        // SAFETY: 故意传非法参数 —— 本测试的目的就是**产生**校验消息。
+        let info = unsafe { std::mem::zeroed::<vk::GraphicsPipelineCreateInfo>() };
+        let _rc = unsafe {
+            (fns.create_graphics_pipelines)(
+                handle,
+                vk::NULL_HANDLE,
+                1,
+                &info,
+                std::ptr::null(),
+                &mut pipe,
+            )
+        };
+        let gain = deer_vk::ffi::validation_message_count() - before;
+        let _ = tx_ready.send(gain);
+        // 阻塞等主线程读完 —— 保证「工作线程仍存活」这个窗口存在
+        let _ = rx_go.recv();
+        gain
+    });
+
+    let worker_gain = rx_ready.recv().expect("工作线程没发信号");
+    assert!(
+        worker_gain > 0,
+        "违规调用没有产生校验层消息（{worker_gain} 条）—— 本测试的前提不成立，\
+         请检查校验层是否真的启用（validation_enabled）"
+    );
+    // ② 工作线程**仍存活**时，主线程读自己的计数：必须是 0
+    let main_during = deer_vk::ffi::validation_message_count();
+    let _ = tx_go.send(());
+    let _ = worker.join().expect("工作线程 panic");
+    let main_after = deer_vk::ffi::validation_message_count();
+
+    assert_eq!(
+        main_during, 0,
+        "主线程在**工作线程存活期间**读到了 {main_during} 条消息 —— 而这些消息是\
+         工作线程触发的 ⇒ `validation_message_count()` 不是按线程的（被改回进程级了？）"
+    );
+    assert_eq!(
+        main_after, 0,
+        "主线程的计数变成 {main_after}（工作线程触发了 {worker_gain} 条）⇒ \
+         `validation_message_count()` 不是按线程的"
+    );
+    // ③ 全局计数**确实**涨了（证明上面那个 0 是「按线程隔离」而不是「回调没跑」）
+    assert!(
+        deer_vk::ffi::validation_message_count_global() >= worker_gain,
+        "全局计数应当 ≥ 工作线程的增量（{} < {worker_gain}）—— \
+         若这里不成立，说明两条计数没有同时自增",
+        deer_vk::ffi::validation_message_count_global()
+    );
+    println!(
+        "校验消息按线程隔离 ✅（工作线程触发 {worker_gain} 条；主线程全程 0；\
+         全局 ≥ {worker_gain} —— 证明隔离而非回调未跑）"
+    );
+}
+
+/// **计数器自身的机制守卫**：故意产生校验消息，断言「按线程计数确实动了、
+/// 且全局计数同时动了」。
+///
+/// ## 为什么这条必要
+///
+/// 与它配对的 `assert_no_validation_messages` 断言的是「**0**」——
+/// 而**「0」有两种成因**：① 真的没有消息；② **回调没跑 / 计数没接线**。
+/// 光断言 0 无法区分，后者会让所有「零消息」结论变成空话。
+/// 这条测试**主动制造**消息，从而证明「计数机制在工作、层确实会把消息交给我们的回调」。
+///
+/// 它同时钉住「两个计数**同时**自增」这个不变式（按线程 + 全局）——
+/// 少了它，「本线程一直是 0」可能只是因为我漏接了自增。
+#[test]
+fn validation_counter_actually_counts_when_a_message_is_emitted() {
+    if !validation_requested() {
+        println!("跳过：需要 DEER_VK_VALIDATION=1（这不是通过）");
+        return;
+    }
+    let Some(dev) = open() else { return };
+    let fns = *dev.fns();
+    let handle = dev.handle();
+    assert!(
+        dev.validation_enabled(),
+        "请求了校验层但设备报告未启用 ⇒ 「零消息」结论没有意义"
+    );
+
+    let tls_before = deer_vk::ffi::validation_message_count();
+    let global_before = deer_vk::ffi::validation_message_count_global();
+
+    // 故意违规：全零 GraphicsPipelineCreateInfo（sType/stageCount/renderPass/layout 全非法）
+    let mut pipe: vk::PipelineHandle = std::ptr::null_mut();
+    // SAFETY: 故意传非法参数 —— 本测试的目的就是**产生**校验消息。
+    let info = unsafe { std::mem::zeroed::<vk::GraphicsPipelineCreateInfo>() };
+    let _ = unsafe {
+        (fns.create_graphics_pipelines)(
+            handle,
+            vk::NULL_HANDLE,
+            1,
+            &info,
+            std::ptr::null(),
+            &mut pipe,
+        )
+    };
+
+    let tls_gain = deer_vk::ffi::validation_message_count() - tls_before;
+    let global_gain = deer_vk::ffi::validation_message_count_global() - global_before;
+    assert!(
+        tls_gain > 0,
+        "故意违规的 vkCreateGraphicsPipelines 没有产生本线程消息（增量 {tls_gain}）—— \
+         要么校验层没真的把消息交给我们的回调，要么按线程计数没接上自增"
+    );
+    assert!(
+        global_gain >= tls_gain,
+        "全局增量({global_gain}) 应当 ≥ 按线程增量({tls_gain}) —— 两个计数必须同时自增"
+    );
+    println!(
+        "校验计数机制在工作 ✅（本线程 +{tls_gain} 条，全局 +{global_gain} 条）"
+    );
+}
+
+/// **「本进程常规路径不产生校验消息」的绝对断言 —— 在全新的子进程里做。**
+///
+/// ## 为什么必须开子进程
+///
+/// 「整个进程一条消息都没有」是**绝对**断言，而在本测试二进制里它**不可能**成立：
+/// 同文件的 `validation_counter_actually_counts_when_a_message_is_emitted` 与
+/// `validation_counter_is_thread_local_not_process_wide` 都**故意**产生消息，
+/// 且测试执行顺序不受控 ⇒ 进程级计数迟早非 0。
+///
+/// 所以把绝对断言放进**干净的进程**：子进程里只跑一个最小工作负载
+/// （开设备 → 建渲染通道/两条管线 → 建纹理/采样器/描述符 → 销毁），
+/// 然后断言那个进程的**全局**计数为 0。
+///
+/// ## 它是怎么做到「确定性」的
+///
+/// 子进程用**同一份测试二进制**、以 `--exact` 只跑 `child_probe_zero_messages` 这一个用例
+/// （由 `DEER_VK_TLS_VALIDATION_PROBE` 环境变量打开），于是子进程里没有别的测试 ⇒
+/// 绝对断言成立且有意义。父进程负责：注入 `DEER_VK_VALIDATION`、设开关、
+/// 断言子进程 exit code == 0，并在失败时把它 stderr 里的校验消息打出来。
+///
+/// 若子进程二进制找不到（环境特殊），**明确跳过并说明**，不伪装通过。
+#[test]
+fn process_reports_zero_validation_messages_in_a_fresh_child() {
+    // 自己是子进程时不要递归
+    if std::env::var("DEER_VK_TLS_VALIDATION_PROBE").is_ok() {
+        return;
+    }
+    if !validation_requested() {
+        println!("跳过：需要 DEER_VK_VALIDATION=1（这不是通过）");
+        return;
+    }
+    let Some(exe) = find_lib_test_binary() else {
+        println!(
+            "跳过：找不到 deer-vk 的 lib 测试二进制（先跑一次 `cargo test -p deer-vk --lib` \
+             即可生成）—— 明确说明，不伪装通过"
+        );
+        return;
+    };
+
+    let out = std::process::Command::new(&exe)
+        .args(["child_probe_zero_messages", "--exact", "--nocapture"])
+        .env("DEER_VK_VALIDATION", "1")
+        .env("DEER_VK_TLS_VALIDATION_PROBE", "1")
+        .output()
+        .expect("启动子进程");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // 子进程的 stderr 里若出现校验消息，原样打出来（这就是失败的原因）
+    for line in stderr.lines().filter(|l| l.contains("VK ERROR") || l.contains("VALIDATION")) {
+        println!("  子进程校验消息: {line}");
+    }
+    assert!(
+        out.status.success(),
+        "子进程（干净进程里的绝对断言）失败：exit={:?}\n--- stdout ---\n{}",
+        out.status.code(),
+        stdout.lines().rev().take(12).collect::<Vec<_>>().join("\n")
+    );
+    println!("干净子进程内「全局零校验消息」成立 ✅");
+}
+
+/// 在 target 目录里找 deer-vk 的 **lib** 测试二进制。
+///
+/// 选择理由：它同时含有 lib 单测与（通过 `DEER_VK_TLS_VALIDATION_PROBE` 打开的）
+/// 下面的子进程探针，且**不含**本文件这些故意违规的集成测试 ⇒ 干净。
+fn find_lib_test_binary() -> Option<std::path::PathBuf> {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/deps");
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        // `deer_vk-<hash>.exe`（lib 测试）；排除 `deer_vk-<hash>.d` 等
+        if !name.starts_with("deer_vk-") || !name.ends_with(".exe") {
+            continue;
+        }
+        let Ok(md) = e.metadata() else { continue };
+        let Ok(mt) = md.modified() else { continue };
+        if best.as_ref().map(|(t, _)| mt > *t).unwrap_or(true) {
+            best = Some((mt, e.path()));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+/// **子进程探针**：在干净进程里跑一条最小工作负载，断言**全局**校验计数为 0。
+///
+/// 由 [`process_reports_zero_validation_messages_in_a_fresh_child`] 以环境变量打开；
+/// 默认（直接跑整个测试套件时）它**立即返回**，不产生噪声。
+#[test]
+fn child_probe_zero_messages() {
+    if std::env::var("DEER_VK_TLS_VALIDATION_PROBE").is_err() {
+        return;
+    }
+    let Some(dev) = open() else {
+        eprintln!("子进程：没有可用 Vulkan");
+        std::process::exit(2);
+    };
+    assert!(dev.validation_enabled(), "子进程里校验层必须真的启用");
+
+    // 最小工作负载：渲染通道 + 两条管线 + 纹理/采样器/描述符
+    let Ok(pass) = dev.create_render_pass(
+        vk::VK_FORMAT_R8G8B8A8_UNORM,
+        vk::VK_ATTACHMENT_LOAD_OP_CLEAR,
+        vk::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+    ) else {
+        eprintln!("子进程：建渲染通道失败");
+        std::process::exit(3);
+    };
+    let shape = [deer_vk::VertexAttr {
+        location: 0,
+        format: vk::VK_FORMAT_R32G32_SFLOAT,
+        offset: 0,
+    }];
+    let _set = deer_vk::pipelines::build_pipelines(
+        &dev,
+        &pass,
+        vk::VK_FORMAT_R8G8B8A8_UNORM,
+        deer_vk::pipelines::ViewportStrategy::Dynamic,
+        8,
+        &shape,
+        8,
+        &shape,
+    )
+    .expect("子进程：建管线失败");
+    let tex = dev.create_texture_r8(4, 4, &[0u8; 16]).expect("纹理");
+    let sampler = dev.create_sampler().expect("采样器");
+    let dsl = dev.create_descriptor_set_layout_combined_sampler().expect("布局");
+    let pool = dev.create_descriptor_pool(1).expect("池");
+    let set = dev.allocate_descriptor_set(&pool, &dsl).expect("集");
+    dev.update_descriptor_texture(&set, &tex, &sampler).expect("写描述符");
+    dev.wait_idle().expect("空闲");
+    drop(set);
+    drop(pool);
+    drop(tex);
+
+    let n = deer_vk::ffi::validation_message_count_global();
+    if n != 0 {
+        eprintln!("子进程：干净进程里出现了 {n} 条校验消息 —— 绝对断言失败");
+        std::process::exit(1);
+    }
+    println!("子进程：全局校验计数 = 0 ✅");
 }
 
 // ── M3c-T1：共用管线层 ────────────────────────────────────────────────────────

@@ -356,12 +356,25 @@ impl PipelineSet {
 /// `TextVertex`）—— 那是**唯一**允许两路径不同的第三处（前两处是颜色格式与
 /// viewport 策略）。调用方把自己的 `stride` + `attrs` 传进来即可。
 ///
-/// ## `color_format` 必须与 `render_pass` 的附件格式一致
+/// ## ⚠️ `color_format` 必须与 `render_pass` 的附件格式一致 ——
+/// **但本机驱动不会替你发现不一致**
 ///
-/// 不一致时 `vkCreateGraphicsPipelines` 会拒绝（校验层报
-/// `VUID-VkGraphicsPipelineCreateInfo-renderPass-06043` 一类）。这里**不**去
-/// `render_pass` 里查（`RenderPass` 没有公开 format getter），靠调用方传对 ——
-/// 调用方本来就持有那个格式（离屏是 `COLOR_FORMAT` 常量，窗口是 `swapchain.format()`）。
+/// 规范上这不一致是错的（校验层报 `VUID-VkGraphicsPipelineCreateInfo-renderPass-06043`
+/// 一类）。**实践上**：本机 Intel 驱动在**校验层之外不报错** ——
+/// 实测（`tests/pipeline_smoke.rs::format_mismatch_is_accepted_by_this_driver_and_must_be_guarded_by_the_caller`）：
+/// 拿 `B8G8R8A8_SRGB` 的渲染通道 + `R8G8B8A8_UNORM` 的 `color_format` 建管线，
+/// `vkCreateGraphicsPipelines` **返回成功**。
+///
+/// 这是本项目反复遇到的那一类「**静默不一致**」（驱动接受非法/不一致的组合，
+/// 症状是「不报错也不画」或画出错色，而不是一个清晰的错误码）。
+/// 对 M3c 的具体风险：窗口路径若把 `color_format` 传成离屏那个 UNORM 常量，
+/// 管线会**建成功**、但像素语义按错误的格式走 ⇒ 除非做像素对照，否则发现不了。
+///
+/// 因此：**不要依赖驱动帮你拦住格式传错**。调用方必须传
+/// `render_pass` 的同一格式（离屏是 `COLOR_FORMAT` 常量、窗口是 `swapchain.format()`），
+/// 且 M3c-T3 的窗口读回对照是这条的最终判据。
+/// 这里**不**去 `render_pass` 里查（`RenderPass` 没有公开 format getter），
+/// 所以这条约束是**调用方契约**，不是本函数能强制的。
 ///
 /// ## `viewport` 由调用方按**路径**选
 ///
