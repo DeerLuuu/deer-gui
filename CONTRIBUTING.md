@@ -112,6 +112,20 @@ Do **not** rewrite repository files with a shell text pipeline — `Get-Content 
 - **Three incidents, all one class of bug**: `crates/deer-vk/src/windowed.rs` (M3a), `crates/deer-vk/src/device.rs` (M3b), and four feature guides (`docs/features/{gpu-geometry,gpu-offscreen,vulkan,window}.md`, C2 — 455 characters became `?`). The last one was caught by reading the file back with the `read` tool (it returned mojibake), then recovered with `git checkout --` and redone with `edit`.
 - **Why this is a rule and not advice**: the damage is invisible in `git diff --stat` (the file still parses and is roughly the right size) and cannot be undone — there is no way to turn a `?` back into the character it replaced.
 
+### After a scripted bulk rewrite, verify the result's *shape*
+
+A scripted in-place rewrite is **not** "run it and done". Bulk edits fail by **duplicating or truncating** content far more often than by being wrong in one spot, and the file still compiles, so nothing complains.
+
+⇒ After any scripted bulk edit, print and paste a **shape check**:
+
+- **line count** (before vs after — must match the intended delta),
+- **count of functions / tests / key symbols** (e.g. `git diff --numstat`, or `Select-String -Pattern '^fn ' | Measure-Object`),
+- the specific symbols or test names you meant to add, confirmed present **exactly once**.
+
+**Case.** A scripted rewrite of the test files wrote the content **twice** (≈1000 lines → **2956**). It was caught only by "line count + key function counts"; recovery was `git checkout --` back to HEAD, then doing the whole addition in **one** one-shot script and re-checking the shape.
+
+This complements the previous rule: *that* one prevents **encoding** damage (`?`), *this* one prevents **structural** damage (duplicated / truncated content). Use both whenever you touch repository files with a script.
+
 ### Referring to examples in guides (docs contract)
 
 `crates/deer-gui/tests/docs_consistency.rs` extracts every `--example <name>` from **`docs/features/*.md`** and requires `crates/deer-gui/examples/<name>.rs` to exist — **code blocks included**.
@@ -146,6 +160,19 @@ When you guard a *generated* artifact (SPIR-V, bytecode, an encoded format), **p
 
 - **Dump first** (`--nocapture`, `export_spirv`, an example that prints the bytes), **then** write the matcher against the dump.
 - **Give every artifact criterion a reverse self-check**: flip the threshold (e.g. `1.0` ⇒ must go red), or replace the operand with a constant (⇒ must go red). Without it, "matched the wrong thing" is indistinguishable from "correctly matched".
+
+### Pick the right *level* of criterion before making one complicated
+
+Ask first: **"which layer of equivalence am I proving?"** Then choose the criterion. If a criterion has to get complicated to pass, that is usually a signal you picked the wrong layer — not that the artifact is wrong.
+
+**Case (three versions, the first two refuted by measurement).** To show "the refactored shader is equivalent to the original": v1 — "byte-identical after a pure `Id` renumbering" — went **red** (330 words differed), so the differences were **not** just `Id`s. v2 added "pin `OpLoad` results to reserved slots" and still went **red** (133 words): "renumber by first-appearance order" is inherently a **sequence** concept, so any reordering shifts everything downstream — **the wrong tool for the job**. v3 switched to a **constant-time structural-signature multiset** and went green, with a reverse self-check (changing a single constant ⇒ must go red; measured red).
+
+Same author also hit both wrong ways of the underlying fixed-point iteration: **string-concatenating** sub-keys made the key space blow up so it never converged; switching to a **fixed-length hash** made it order-dependent and it still never converged.
+
+⇒ Rules:
+
+- **Word-by-word / byte-by-byte comparison cannot prove graph isomorphism** (equivalence up to renumbering and ordering). Structural equivalence needs a **structural** criterion — and such a criterion is typically **simple and constant-time**.
+- **Every equivalence-class criterion must state what it cannot prove.** In the case above the author wrote explicitly: "this does not catch wiring permutations; the authoritative evidence remains the 20663-point oracle + GPU pixel comparison." A criterion with no stated blind spot will be trusted beyond its power.
 
 ### After restoring a file in place, clean the crate or prove a rebuild
 
