@@ -32,6 +32,42 @@ fn open() -> Option<VkDevice> {
     }
 }
 
+/// 断言「到目前为止校验层**没有**报过任何消息」（进程级计数，见 `ffi::validation_message_count`）。
+///
+/// 为什么必须是**计数断言**而不是人眼看 stderr：`DEER_VK_VALIDATION` 没开时回调
+/// 根本不会跑、计数恒为 0，所以「零消息」很容易变成一句空话。本文件里它与
+/// [`validation_layer_is_actually_running`] 配套：那条保证**层真的在跑**，
+/// 这条保证跑了之后**一条消息都没有**。两件事合起来才是可回归的结论。
+fn assert_no_validation_messages(context: &str) {
+    if !validation_requested() {
+        // 层没开时计数恒为 0，断言没有意义（会给出虚假的安全感）——明确说出来。
+        println!("（{context}：未请求校验层，跳过「零校验消息」断言）");
+        return;
+    }
+    let n = deer_vk::ffi::validation_message_count();
+    assert_eq!(
+        n,
+        0,
+        "{context}: 校验层报了 {n} 条消息 —— 这是「零校验消息」的自动断言版，\
+         请在上面输出里找 [VK ERROR]/[VALIDATION] 字样"
+    );
+}
+
+/// **「层真的在跑」与「请求」必须一致**（T3 review F7 的同一条要求）。
+///
+/// 只在请求了校验层时检查：请求了就必须真的启用（否则后面那些「零消息」
+/// 断言是在对一个没跑的回调断言，等于没验）。
+fn validation_layer_is_actually_running(dev: &VkDevice) -> bool {
+    if validation_requested() {
+        assert!(
+            dev.validation_enabled(),
+            "DEER_VK_VALIDATION 已请求，但设备报告校验层未启用 —— \
+             这时「零校验消息」毫无意义（回调根本不会被调用）"
+        );
+    }
+    dev.validation_enabled()
+}
+
 /// 完整链路：渲染通道 → 管线布局 → 两个着色器模块 → **图形管线**。
 ///
 /// 用不带推送常量的着色器 —— 推送常量那条路当前不可用（见
@@ -315,4 +351,121 @@ fn create_vertex_pipeline_rejects_bad_arguments() {
         );
         println!("  {what} ⇒ 已拒：{msg}");
     }
+}
+
+// ── M3b：纹理 / 采样器 / 描述符集 ────────────────────────────────────────────
+
+/// 一帧可用的 `R8_UNORM` 覆盖率数据：左边一列 255、右边一列 0。
+///
+/// 用**有梯度**的数据而不是全 0：全 0 的纹理即使上传路径整段坏掉
+/// （例如拷贝没发生、屏障漏了），采样结果也是 0 —— 「传没传成功」无法区分。
+/// 一列 255 一列 0 时，只要采样能读到正确的 `x`，就能证明上传真的生效。
+fn coverage_8x2() -> Vec<u8> {
+    let mut data = vec![0u8; 8 * 2];
+    for row in 0..2 {
+        data[row * 8] = 255;
+        data[row * 8 + 1] = 128;
+    }
+    data
+}
+
+/// 建一遍 M3b 的全部资源（纹理 → 采样器 → 布局 → 池 → 集 → 写描述符），
+/// 返回尺寸等**可断言的事实**，资源本体在返回前全部析构。
+///
+/// ## 为什么把「创建」和「析构」放在同一个函数里
+///
+/// `vkFreeDescriptorSets` 要求池建时带 `FREE_DESCRIPTOR_SET_BIT`，而**不带时的报错
+/// 只在析构那一刻才出现**（实测：校验层报
+/// `VUID-vkFreeDescriptorSets-descriptorPool-00312`）。如果测试只在「创建完」时
+/// 断零消息，这条错误就永远漏掉 —— 这正是本次开发的真实经历。所以这里让资源
+/// 在函数返回前走完 `Drop`，调用方随后断消息计数才是「全生命周期」的结论。
+fn create_and_destroy_texture_pipeline(mut check: impl FnMut(&deer_vk::device::Texture)) -> (u32, u32) {
+    fn run(check: &mut impl FnMut(&deer_vk::device::Texture)) -> (u32, u32) {
+        let Some(dev) = open() else { return (0, 0) };
+        let tex = dev.create_texture_r8(8, 2, &coverage_8x2()).expect("创建 R8 纹理");
+        assert_eq!(tex.width(), 8);
+        assert_eq!(tex.height(), 2);
+        assert!(!tex.image_view().is_null(), "图像视图句柄不能为空");
+        assert_eq!(
+            tex.layout(),
+            vk::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            "上传完成后必须处于 SHADER_READ_ONLY_OPTIMAL（描述符里声明的是它）"
+        );
+        check(&tex);
+
+        let sampler = dev.create_sampler().expect("创建采样器");
+        assert!(!sampler.handle().is_null(), "采样器句柄不能为空");
+        let dsl = dev
+            .create_descriptor_set_layout_combined_sampler()
+            .expect("创建描述符集布局");
+        assert!(!dsl.handle().is_null(), "布局句柄不能为空");
+        let pool = dev.create_descriptor_pool(1).expect("创建描述符池");
+        assert_eq!(pool.max_sets(), 1);
+        // 声明顺序：`pool` 在 `set` 之前 ⇒ `set` 先析构（先归还集、后销毁池）
+        let set = dev.allocate_descriptor_set(&pool, &dsl).expect("分配描述符集");
+        assert!(!set.handle().is_null(), "描述符集句柄不能为空");
+        dev.update_descriptor_texture(&set, &tex, &sampler).expect("写描述符");
+        dev.wait_idle().expect("空闲等待");
+        (tex.width(), tex.height())
+        // 此处 set / pool / dsl / sampler / tex 依次 `Drop` —— 整个过程都在
+        // 校验层眼皮下，所以调用方的计数断言覆盖了创建 + 使用 + 析构。
+    }
+    run(&mut check)
+}
+
+/// **M3b T1 验收**：`R8_UNORM` 纹理 → staging 上传 → 图像视图 → 最近邻采样器
+/// → 描述符池/布局/集 → 写入描述符，**在校验层下零校验消息（计数断言 ==0）**。
+///
+/// 覆盖的是「自研汇编器第一次接触描述符体系」时最容易错的几种状态：
+/// 布局转换的 `oldLayout` 必须与图像**实际**布局一致、描述符的 `imageLayout`
+/// 必须与上传后的布局一致、`usage` 必须含 `SAMPLED | TRANSFER_DST`、
+/// 池必须允许归还单个集。这几条错了校验层都会报，而驱动可能只是
+/// 「采样到全黑」或「析构时报一条」。
+#[test]
+fn texture_sampler_descriptor_are_clean_under_validation() {
+    let Some(dev) = open() else { return };
+    let running = validation_layer_is_actually_running(&dev);
+    drop(dev);
+
+    let mut created = false;
+    let (w, h) = create_and_destroy_texture_pipeline(|_tex| {
+        created = true;
+    });
+    assert!(created, "纹理创建回调没被调用（说明资源根本没建起来）");
+    println!(
+        "R8 纹理（{w}×{h}，{} 字节）+ 采样器 + 描述符集 全生命周期走完 ✅（校验层 {}）",
+        coverage_8x2().len(),
+        if running { "已启用" } else { "未启用" }
+    );
+    assert_no_validation_messages("M3b 纹理/采样器/描述符（含析构）");
+}
+
+/// 纹理的**尺寸与数据长度**错误必须在调用驱动前被拒（纯函数校验的驱动侧复验）。
+///
+/// 纯函数那一侧在 `device.rs` 单元测试里已覆盖（无 GPU 也能跑）；这里额外走一遍
+/// **真实设备**的入口，防止「校验函数写了但 `create_texture_r8` 忘了调」这类
+/// 接线错误 —— 那种错在纯函数测试里是**看不见**的。
+#[test]
+fn texture_r8_rejects_bad_args_before_touching_driver() {
+    let Some(dev) = open() else { return };
+
+    let e = dev.create_texture_r8(0, 4, &[]).expect_err("宽为 0 必须被拒");
+    assert!(format!("{e}").contains("宽高"), "{e}");
+
+    let e = dev.create_texture_r8(4, 4, &[0u8; 15]).expect_err("数据少 1 字节必须被拒");
+    assert!(format!("{e}").contains("15"), "{e}");
+
+    let e = dev.create_texture_r8(4, 4, &[0u8; 17]).expect_err("数据多 1 字节必须被拒");
+    assert!(format!("{e}").contains("17"), "{e}");
+
+    println!("纹理参数错误在调用驱动前被拒 ✅");
+}
+
+/// 描述符池容量为 0 必须被拒（池的边界条件）。
+#[test]
+fn descriptor_pool_rejects_zero_capacity() {
+    let Some(dev) = open() else { return };
+    let e = dev.create_descriptor_pool(0).expect_err("max_sets=0 必须被拒");
+    assert!(format!("{e}").contains("max_sets"), "{e}");
+    println!("描述符池 max_sets=0 被拒 ✅");
 }

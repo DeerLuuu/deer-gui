@@ -35,6 +35,11 @@ pub type FramebufferHandle = *mut c_void;
 pub type FenceHandle = *mut c_void;
 pub type BufferHandle = *mut c_void;
 pub type SemaphoreHandle = *mut c_void;
+// ── M3b：纹理采样所需的句柄（描述符体系） ────────────────────────────────────
+pub type SamplerHandle = *mut c_void;
+pub type DescriptorSetLayoutHandle = *mut c_void;
+pub type DescriptorPoolHandle = *mut c_void;
+pub type DescriptorSetHandle = *mut c_void;
 
 /// `VK_NULL_HANDLE`
 pub const NULL_HANDLE: *mut c_void = ptr::null_mut();
@@ -107,6 +112,12 @@ pub const VK_FORMAT_B8G8R8A8_SRGB: i32 = 50;
 pub const VK_FORMAT_R8G8B8A8_SRGB: i32 = 43;
 /// `VkFormat`：8 位 RGBA，线性（回读用）
 pub const VK_FORMAT_R8G8B8A8_UNORM: i32 = 37;
+/// `VK_FORMAT_R8_UNORM` —— 字形图集的**覆盖率**纹理（单通道 8 位归一化）。
+///
+/// 之所以是 `R8_UNORM` 而不是 `R8G8B8A8_*`：覆盖率是**单通道**信息，
+/// 采样得到的 `.r` 就是 `[0,1]` 的覆盖率（`cov/255`）；用四通道存同一份
+/// 覆盖率只是浪费 4 倍显存与带宽。
+pub const VK_FORMAT_R8_UNORM: i32 = 9;
 /// `VkImageTiling`
 pub const VK_IMAGE_TILING_OPTIMAL: i32 = 0;
 pub const VK_IMAGE_TILING_LINEAR: i32 = 1;
@@ -198,12 +209,17 @@ pub const VK_PIPELINE_STAGE_TRANSFER_BIT: u32 = 1 << 12;
 pub const VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT: u32 = 1 << 10;
 pub const VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: u32 = 1 << 13;
 pub const VK_PIPELINE_STAGE_ALL_COMMANDS_BIT: u32 = 1 << 16;
+/// `VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT` —— 片元着色器阶段（M3b：纹理上传后
+/// 让它对采样可见的屏障目标阶段）。
+pub const VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT: u32 = 1 << 7;
 /// `VkAccessFlagBits`
 ///
 /// ⚠️ `TRANSFER_WRITE` 是 **1 << 12**（0x1000），不是 1 << 9
 /// （1 << 9 = 0x200 是 `VK_ACCESS_SHADER_WRITE_BIT`）。这里曾写错。
 pub const VK_ACCESS_TRANSFER_WRITE_BIT: u32 = 1 << 12;
 pub const VK_ACCESS_TRANSFER_READ_BIT: u32 = 1 << 11;
+/// `VK_ACCESS_SHADER_READ_BIT` —— 采样器/纹理读取（M3b：纹理上传屏障的目标访问）。
+pub const VK_ACCESS_SHADER_READ_BIT: u32 = 1 << 5;
 pub const VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT: u32 = 1 << 8;
 pub const VK_ACCESS_COLOR_ATTACHMENT_READ_BIT: u32 = 1 << 7;
 pub const VK_ACCESS_MEMORY_READ_BIT: u32 = 1 << 15;
@@ -227,6 +243,58 @@ pub const VK_TRUE: u32 = 1;
 pub const VK_FALSE: u32 = 0;
 /// 无限等待
 pub const U64_MAX: u64 = u64::MAX;
+
+// ── M3b：采样器与描述符（纹理采样） ──────────────────────────────────────────
+
+/// `VkFilter Nearest` —— **最近邻**。
+///
+/// 为什么必须最近邻：CPU 参考 `null.rs::draw_text_real` 是**点采样**
+/// （`coverage[row + col]` 直接取一个纹素，没有任何插值）。用 `Linear` 会让
+/// GPU 结果与 CPU 在字形边缘产生系统性差异（抗锯齿 vs 硬边），
+/// 「逐像素一致」这条验收就无从谈起。
+pub const VK_FILTER_NEAREST: i32 = 0;
+pub const VK_FILTER_LINEAR: i32 = 1;
+/// `VkCompareOp Always` —— 采样器不做比较（`compare_enable = VK_FALSE` 时该字段
+/// 不生效，但结构体必须给一个合法值）。
+pub const VK_COMPARE_OP_ALWAYS: i32 = 7;
+/// `VkSamplerMipmapMode Nearest`（无 mipmap：`mip_levels = 1`，采样模式实际不生效，
+/// 但结构体要求给一个值；给 Nearest 与「不做插值」的语义一致）。
+pub const VK_SAMPLER_MIPMAP_MODE_NEAREST: i32 = 0;
+/// `VkSamplerAddressMode`
+pub const VK_SAMPLER_ADDRESS_MODE_REPEAT: i32 = 0;
+pub const VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE: i32 = 2;
+/// `VkBorderColor`（只在 `CLAMP_TO_BORDER` 下生效）
+pub const VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK: i32 = 0;
+/// `VkDescriptorType`
+pub const VK_DESCRIPTOR_TYPE_SAMPLER: i32 = 0;
+pub const VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER: i32 = 1;
+/// `VkShaderStageFlags`
+pub const VK_SHADER_STAGE_ALL_GRAPHICS: u32 = 0x0000_001f;
+
+/// `VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO`
+pub const VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO: i32 = 31;
+/// `VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO`
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO: i32 = 32;
+/// `VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO`
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO: i32 = 33;
+/// `VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO`
+pub const VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO: i32 = 34;
+/// `VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET`
+pub const VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET: i32 = 35;
+
+/// `VkDescriptorPoolCreateFlagBits::FREE_DESCRIPTOR_SET_BIT`
+///
+/// ## ⚠️ 建池时**必须**带上它
+///
+/// 不带这个标志时 `vkFreeDescriptorSets` 是**非法调用**，校验层会报
+/// `VUID-vkFreeDescriptorSets-descriptorPool-00312`。这条实测踩过：
+/// 池建得「成功」、集也分配成功，直到**析构**时才报错 —— 而那时测试主体
+/// 已经跑完，如果只在创建阶段断校验消息计数就会漏掉（本项目的
+/// `pipeline_smoke.rs` 因此把计数断言放在**资源全部析构之后**）。
+///
+/// 我们的用法就是「单个描述符集随对象归还给池」（见 `device.rs` 的
+/// [`crate::device::DescriptorSet`]），所以这个标志是必需的，不是可选优化。
+pub const VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT: u32 = 1;
 
 // ── 结构体 ───────────────────────────────────────────────────────────────────
 
@@ -786,6 +854,102 @@ pub struct CommandBufferBeginInfo {
     pub p_inheritance_info: *const c_void,
 }
 
+// ── M3b：采样器与描述符结构体 ────────────────────────────────────────────────
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SamplerCreateInfo {
+    pub s_type: i32,
+    pub p_next: *const c_void,
+    pub flags: u32,
+    pub mag_filter: i32,
+    pub min_filter: i32,
+    pub mipmap_mode: i32,
+    pub address_mode_u: i32,
+    pub address_mode_v: i32,
+    pub address_mode_w: i32,
+    pub mip_lod_bias: f32,
+    pub anisotropy_enable: u32,
+    pub max_anisotropy: f32,
+    pub compare_enable: u32,
+    pub compare_op: i32,
+    pub min_lod: f32,
+    pub max_lod: f32,
+    pub border_color: i32,
+    pub unnormalized_coordinates: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DescriptorSetLayoutBinding {
+    pub binding: u32,
+    pub descriptor_type: i32,
+    pub descriptor_count: u32,
+    pub stage_flags: u32,
+    pub p_immutable_samplers: *const SamplerHandle,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DescriptorSetLayoutCreateInfo {
+    pub s_type: i32,
+    pub p_next: *const c_void,
+    pub flags: u32,
+    pub binding_count: u32,
+    pub p_bindings: *const DescriptorSetLayoutBinding,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DescriptorPoolSize {
+    pub descriptor_type: i32,
+    pub descriptor_count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DescriptorPoolCreateInfo {
+    pub s_type: i32,
+    pub p_next: *const c_void,
+    pub flags: u32,
+    pub max_sets: u32,
+    pub pool_size_count: u32,
+    pub p_pool_sizes: *const DescriptorPoolSize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DescriptorSetAllocateInfo {
+    pub s_type: i32,
+    pub p_next: *const c_void,
+    pub descriptor_pool: DescriptorPoolHandle,
+    pub descriptor_set_count: u32,
+    pub p_set_layouts: *const DescriptorSetLayoutHandle,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct DescriptorImageInfo {
+    pub sampler: SamplerHandle,
+    pub image_view: ImageViewHandle,
+    pub image_layout: i32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct WriteDescriptorSet {
+    pub s_type: i32,
+    pub p_next: *const c_void,
+    pub dst_set: DescriptorSetHandle,
+    pub dst_binding: u32,
+    pub dst_array_element: u32,
+    pub descriptor_count: u32,
+    pub descriptor_type: i32,
+    pub p_image_info: *const DescriptorImageInfo,
+    pub p_buffer_info: *const c_void,
+    pub p_texel_buffer_view: *const c_void,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct FramebufferCreateInfo {
@@ -1081,4 +1245,60 @@ pfn!(
 pfn!(
     PfnCmdClearColorImage,
     unsafe extern "system" fn(CommandBufferHandle, ImageHandle, i32, *const ClearColorValue, u32, *const ImageSubresourceRange)
+);
+
+// ── M3b：采样器 / 描述符 / 缓冲→图像拷贝 ─────────────────────────────────────
+
+pfn!(
+    PfnCreateSampler,
+    unsafe extern "system" fn(DeviceHandle, *const SamplerCreateInfo, *const c_void, *mut SamplerHandle) -> VkResult
+);
+pfn!(
+    PfnDestroySampler,
+    unsafe extern "system" fn(DeviceHandle, SamplerHandle, *const c_void)
+);
+pfn!(
+    PfnCreateDescriptorSetLayout,
+    unsafe extern "system" fn(DeviceHandle, *const DescriptorSetLayoutCreateInfo, *const c_void, *mut DescriptorSetLayoutHandle) -> VkResult
+);
+pfn!(
+    PfnDestroyDescriptorSetLayout,
+    unsafe extern "system" fn(DeviceHandle, DescriptorSetLayoutHandle, *const c_void)
+);
+pfn!(
+    PfnCreateDescriptorPool,
+    unsafe extern "system" fn(DeviceHandle, *const DescriptorPoolCreateInfo, *const c_void, *mut DescriptorPoolHandle) -> VkResult
+);
+pfn!(
+    PfnDestroyDescriptorPool,
+    unsafe extern "system" fn(DeviceHandle, DescriptorPoolHandle, *const c_void)
+);
+pfn!(
+    PfnAllocateDescriptorSets,
+    unsafe extern "system" fn(DeviceHandle, *const DescriptorSetAllocateInfo, *mut DescriptorSetHandle) -> VkResult
+);
+pfn!(
+    PfnFreeDescriptorSets,
+    unsafe extern "system" fn(DeviceHandle, DescriptorPoolHandle, u32, *const DescriptorSetHandle) -> VkResult
+);
+pfn!(
+    PfnUpdateDescriptorSets,
+    unsafe extern "system" fn(DeviceHandle, u32, *const WriteDescriptorSet, u32, *const c_void)
+);
+pfn!(
+    PfnCmdBindDescriptorSets,
+    unsafe extern "system" fn(
+        CommandBufferHandle,
+        i32,
+        PipelineLayoutHandle,
+        u32,
+        u32,
+        *const DescriptorSetHandle,
+        u32,
+        *const u32,
+    )
+);
+pfn!(
+    PfnCmdCopyBufferToImage,
+    unsafe extern "system" fn(CommandBufferHandle, BufferHandle, ImageHandle, i32, u32, *const BufferImageCopy)
 );

@@ -43,6 +43,12 @@ const OP_TYPE_BOOL: u16 = 20;
 const OP_TYPE_INT: u16 = 21;
 const OP_TYPE_FLOAT: u16 = 22;
 const OP_TYPE_VECTOR: u16 = 23;
+/// `OpTypeImage`（M3b：纹理）
+const OP_TYPE_IMAGE: u16 = 25;
+/// `OpTypeSampler`（M3b）
+const OP_TYPE_SAMPLER: u16 = 26;
+/// `OpTypeSampledImage`（M3b：`OpTypeImage` + `OpTypeSampler` 的组合类型）
+const OP_TYPE_SAMPLED_IMAGE: u16 = 27;
 const OP_TYPE_ARRAY: u16 = 28;
 const OP_TYPE_STRUCT: u16 = 30;
 const OP_TYPE_POINTER: u16 = 32;
@@ -74,6 +80,10 @@ const OP_SELECT: u16 = 169;
 const OP_F_ADD: u16 = 129;
 const OP_F_SUB: u16 = 131;
 const OP_F_MUL: u16 = 133;
+/// `OpImageSampleImplicitLod`（M3b：纹理采样）
+const OP_IMAGE_SAMPLE_IMPLICIT_LOD: u16 = 87;
+/// `OpVectorTimesScalar`（向量 × 标量，M3b：`color.rgb * cov`）
+const OP_VECTOR_TIMES_SCALAR: u16 = 142;
 const OP_F_NEGATE: u16 = 127;
 const OP_F_ORD_LESS_THAN: u16 = 184;
 const OP_F_ORD_GREATER_THAN: u16 = 186;
@@ -90,6 +100,13 @@ const SC_OUTPUT: u32 = 3;
 const SC_FUNCTION: u32 = 7;
 /// 推送常量
 pub const SC_PUSH_CONSTANT: u32 = 9;
+/// `UniformConstant` —— **纹理/采样器**的存储类别（M3b）。
+///
+/// 与 `Uniform`（`VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER` 用）不同：`SampledImage`
+/// 这类「不透明类型」必须放在 `UniformConstant` 里（Vulkan 规范：
+/// VUID-StandaloneSpirv-OpTypeImage-06940 一类约束）。放错存储类别时
+/// `spirv-val` 会报 `OpVariable ... has illegal type`。
+pub const SC_UNIFORM_CONSTANT: u32 = 0;
 
 // ── 装饰（SPIR-V 3.6 Decoration） ────────────────────────────────────────────
 
@@ -98,6 +115,23 @@ const DECORATION_LOCATION: u32 = 30;
 /// `Decoration InBounds` —— 给 `OpAccessChain` 加这个装饰能让校验器放心
 /// （表示索引不会越界）。Vulkan 校验层对缺它的访问链会报 warning。
 const DECORATION_IN_BOUNDS: u32 = 16;
+/// `Decoration DescriptorSet`（M3b：描述符集编号）
+const DECORATION_DESCRIPTOR_SET: u32 = 34;
+/// `Decoration Binding`（M3b：描述符集内 binding 编号）
+const DECORATION_BINDING: u32 = 33;
+
+// ── 图像类型参数（SPIR-V 3.8 / 3.17） ────────────────────────────────────────
+
+/// `Dim 2D`
+const DIM_2D: u32 = 1;
+/// `ImageFormat Unknown`。
+///
+/// Vulkan 要求**采样**用的 `OpTypeImage` 声明成 `Unknown`：真实格式由
+/// `VkImageView` 决定，着色器不该假设它。写具体格式（如 `R8`）会让
+/// 校验器报「格式不匹配」——因为图像视图才是权威。
+const IMAGE_FORMAT_UNKNOWN: u32 = 0;
+/// `Sampled 1` —— 表示这个图像**只用于采样**（不是存储图像、也不是两者兼用）。
+const SAMPLED_1: u32 = 1;
 
 // ── 内建量与执行模型 ─────────────────────────────────────────────────────────
 
@@ -464,6 +498,122 @@ impl Module {
         let r = self.id();
         self.op(OP_TYPE_ARRAY, &[r, element, length_const]);
         r
+    }
+
+    /// `OpTypeSampler result`（M3b）。
+    ///
+    /// 没有操作数 —— 采样器的**实际参数**（过滤方式、寻址模式）由 Rust 侧的
+    /// `VkSampler` 决定，着色器里只声明「我要一个采样器」。
+    pub fn type_sampler(&mut self) -> u32 {
+        let r = self.id();
+        self.op(OP_TYPE_SAMPLER, &[r]);
+        r
+    }
+
+    /// `OpTypeImage result sampledType dim depth arrayed ms sampled format [access]`
+    ///
+    /// M3b 只用 2D、无深度、非数组、单采样、`Sampled = 1`、`format = Unknown`。
+    /// 把参数**写死**而不是做成通用接口，理由：本项目的自研汇编器只服务自己的
+    /// 着色器，通用的 `OpTypeImage` 有 9+ 个组合参数，接口一放开就会有人传错
+    /// （而传错的表现是「驱动建管线时给一句含糊的错误」）。
+    /// 真需要别的形态时再加一个具名函数，比一个万能参数表更好review。
+    pub fn type_image_2d_unknown(&mut self, sampled_ty: u32) -> u32 {
+        let r = self.id();
+        self.op(
+            OP_TYPE_IMAGE,
+            &[
+                r,
+                sampled_ty,
+                DIM_2D,
+                0,                 // depth = 0（非深度图像）
+                0,                 // arrayed = 0
+                0,                 // ms = 0（单采样）
+                SAMPLED_1,         // sampled = 1
+                IMAGE_FORMAT_UNKNOWN,
+            ],
+        );
+        r
+    }
+
+    /// `OpTypeSampledImage result imageType`（M3b）。
+    pub fn type_sampled_image(&mut self, image: u32) -> u32 {
+        let r = self.id();
+        self.op(OP_TYPE_SAMPLED_IMAGE, &[r, image]);
+        r
+    }
+
+    /// `OpImageSampleImplicitLod resultType result sampledImage coordinate`（M3b）。
+    ///
+    /// ## ⚠️ 这里**不能**给 `Lod` 操作数（实测的反直觉之处）
+    ///
+    /// 编码是 `OpImageSampleImplicitLod resultType result sampledImage coordinate
+    /// [imageOperands...]`，看起来「补一个显式 `Lod 0` 更稳」——**错**。
+    /// 本机 `spirv-val`（SDK 1.4.357.0）明确拒绝：
+    ///
+    /// ```text
+    ///   error: Image Operand Lod can only be used with ExplicitLod opcodes and OpImageFetch
+    ///     %22 = OpImageSampleImplicitLod %v4float %20 %21 Lod %float_0
+    /// ```
+    ///
+    /// 规范把 `ImageOperands` 按 opcode 分类：`Lod` 只属于 `*ExplicitLod` 系列
+    /// 与 `OpImageFetch`。所以隐式采样**一个操作数都不给**。
+    ///
+    /// 那 LOD 怎么办？本用例里根本不需要它：字形图集 `mip_levels = 1`，
+    /// 隐式 LOD 唯一能采到的就是第 0 层 —— 「只有一层」这个事实由**资源**保证，
+    /// 不需要（也无法）在指令里再声明一次。
+    ///
+    /// 顺带说明为什么不用 `OpImageSampleExplicitLod`：那样确实可以写 `Lod 0`，
+    /// 但会引入一个**没必要的约束**（把「层数」这个本属资源的信息编进着色器）。
+    /// 隐式版在单层纹理上的行为与 `Lod 0` 完全一致。
+    pub fn op_image_sample_implicit_lod(
+        &mut self,
+        result_ty: u32,
+        sampled_image: u32,
+        coord: u32,
+    ) -> u32 {
+        let r = self.id();
+        self.op(OP_IMAGE_SAMPLE_IMPLICIT_LOD, &[result_ty, r, sampled_image, coord]);
+        r
+    }
+
+    /// `OpVectorTimesScalar`（`vecN * scalar`）。
+    ///
+    /// 当前**没有调用方**：`fragment_shader_text` 原本用它做「预乘」
+    /// （`color.rgb * cov`），后来按混合状态（`SRC_ALPHA/ONE_MINUS_SRC_ALPHA`）
+    /// 修正为**非预乘**（覆盖率只乘进 alpha，标量 `OpFMul` 就够）—— 详见
+    /// [`fragment_shader_text`] 的说明。
+    ///
+    /// 保留它的理由：M3b 之后的文本/图形混合（例如图集外的调制色、sRGB 校正）
+    /// 迟早要按向量缩放，而这条指令已经过 `spirv-val` 验证；
+    /// 删掉再写一遍不如留着并**如实标注它是备用的**。
+    #[allow(dead_code)]
+    pub fn op_vector_times_scalar(&mut self, ty: u32, vector: u32, scalar: u32) -> u32 {
+        let r = self.id();
+        self.op(OP_VECTOR_TIMES_SCALAR, &[ty, r, vector, scalar]);
+        r
+    }
+
+    /// `OpCompositeExtract` 的**连续分量**形式（取 `.rgb` 这类）。
+    ///
+    /// 当前**没有调用方**（同 [`Self::op_vector_times_scalar`] 的原因）。
+    ///
+    /// 实现方式：逐分量 `OpCompositeExtract` + `OpCompositeConstruct`，
+    /// **不用** `OpVectorShuffle`（那需要一个常量索引向量）—— 本项目在
+    /// 「运行时常量数组索引」上吃过大亏（见 [`vertex_shader_triangle`] 的教训），
+    /// 能不碰向量索引就不碰。
+    #[allow(dead_code)]
+    pub fn vector_swizzle(
+        &mut self,
+        out_ty: u32,
+        component_ty: u32,
+        vector: u32,
+        indexes: &[u32],
+    ) -> u32 {
+        let parts: Vec<u32> = indexes
+            .iter()
+            .map(|&i| self.composite_extract(component_ty, vector, &[i]))
+            .collect();
+        self.composite_construct(out_ty, &parts)
     }
 
     /// `OpTypeStruct result member0 member1 ...`
@@ -868,6 +1018,11 @@ fn opcode_name(op: u16) -> String {
         OP_F_MUL => "OpFMul",
         OP_F_NEGATE => "OpFNegate",
         OP_EXT_INST => "OpExtInst",
+        OP_TYPE_IMAGE => "OpTypeImage",
+        OP_TYPE_SAMPLER => "OpTypeSampler",
+        OP_TYPE_SAMPLED_IMAGE => "OpTypeSampledImage",
+        OP_IMAGE_SAMPLE_IMPLICIT_LOD => "OpImageSampleImplicitLod",
+        OP_VECTOR_TIMES_SCALAR => "OpVectorTimesScalar",
         OP_F_ORD_LESS_THAN => "OpFOrdLessThan",
         OP_F_ORD_GREATER_THAN => "OpFOrdGreaterThan",
         OP_LOGICAL_OR => "OpLogicalOr",
@@ -1847,6 +2002,211 @@ pub fn fragment_shader_rect_shape() -> Vec<u8> {
         m.composite_construct(v4, &comps)
     };
     m.store(out_color, hit_vec);
+
+    m.return_void();
+    m.function_end();
+    m.finish()
+}
+
+/// 顶点着色器（**文本/字形**）：M3b 的第二条管线。
+///
+/// ## 顶点布局（与 `gpu_text.rs` 的 `TextVertex` 共用，**不允许实现时改**）
+///
+/// | location | 类型 | 含义 |
+/// |---|---|---|
+/// | 0 | `vec2` | 位置（NDC，y 向下） |
+/// | 1 | `vec2` | uv（**归一化到整张字形图集**，`[0,1]`） |
+/// | 2 | `vec4` | 颜色 |
+///
+/// `TextVertex` 是 `#[repr(C)]`、stride 32（`pos` 0 / `uv` 8 / `color` 16）。
+///
+/// ## 为什么单独一条管线而不是复用 M3a 的 shape 管线
+///
+/// M3a 的顶点属性是 `pos + rect + radius_kind + color`，其中 `radius_kind` 的
+/// **负值已被「描边带宽」占用**（`-1.0` = 1px，见 Ruling 6）。文本既没有矩形
+/// 也没有描边，硬塞进那条管线就必须给 `radius_kind` 找个「既不是圆角半径、
+/// 也不是描边」的第三种含义 —— 那会破坏 M3a 已经冻结并逐像素验证过的契约。
+///
+/// ## 实现要点
+///
+/// 纯 `OpLoad` + `OpStore` 透传，无 `OpSelect`、无动态索引（与
+/// [`vertex_shader_from_vertex_buffer`] 同一条路）。
+pub fn vertex_shader_text() -> Vec<u8> {
+    let mut m = Module::new();
+    m.shader_capability().memory_model_glsl450().source_unknown();
+
+    let void = m.type_void();
+    let f32_ty = m.type_float();
+    let v2 = m.type_vector(f32_ty, 2);
+    let v4 = m.type_vector(f32_ty, 4);
+    let ptr_in_v2 = m.type_pointer(SC_INPUT, v2);
+    let ptr_in_v4 = m.type_pointer(SC_INPUT, v4);
+    let ptr_out_v4 = m.type_pointer(SC_OUTPUT, v4);
+    let ptr_out_v2 = m.type_pointer(SC_OUTPUT, v2);
+    let fn_ty = m.type_function(void, &[]);
+
+    let out_pos = m.variable(ptr_out_v4, SC_OUTPUT);
+    let out_uv = m.variable(ptr_out_v2, SC_OUTPUT);
+    let out_color = m.variable(ptr_out_v4, SC_OUTPUT);
+    let in_pos = m.variable(ptr_in_v2, SC_INPUT);
+    let in_uv = m.variable(ptr_in_v2, SC_INPUT);
+    let in_color = m.variable(ptr_in_v4, SC_INPUT);
+
+    let z = m.constant_f32(f32_ty, 0.0);
+    let w = m.constant_f32(f32_ty, 1.0);
+
+    let fn_id = m.id();
+    let block = m.id();
+    m.entry_point(
+        EXECUTION_MODEL_VERTEX,
+        fn_id,
+        "main",
+        &[out_pos, out_uv, out_color, in_pos, in_uv, in_color],
+    );
+
+    // 输入 location 0/1/2（顺序必须与 TextVertex 布局一致）
+    m.debug_name(in_pos, "in_pos");
+    m.decorate(in_pos, DECORATION_LOCATION, &[0]);
+    m.debug_name(in_uv, "in_uv");
+    m.decorate(in_uv, DECORATION_LOCATION, &[1]);
+    m.debug_name(in_color, "in_color");
+    m.decorate(in_color, DECORATION_LOCATION, &[2]);
+
+    // 内建输出
+    m.debug_name(out_pos, "gl_Position");
+    m.decorate(out_pos, DECORATION_BUILT_IN, &[BUILTIN_POSITION]);
+    // 输出 location 0/1（与片段着色器输入对齐）
+    m.debug_name(out_uv, "out_uv");
+    m.decorate(out_uv, DECORATION_LOCATION, &[0]);
+    m.debug_name(out_color, "out_color");
+    m.decorate(out_color, DECORATION_LOCATION, &[1]);
+
+    m.function(void, fn_id, fn_ty, block);
+
+    // gl_Position = vec4(pos, 0, 1)
+    let p = m.load(v2, in_pos);
+    let px = m.composite_extract(f32_ty, p, &[0]);
+    let py = m.composite_extract(f32_ty, p, &[1]);
+    // px/py 是运行时值 ⇒ 必须 OpCompositeConstruct
+    let pos4 = m.composite_construct(v4, &[px, py, z, w]);
+    m.store(out_pos, pos4);
+
+    // uv / color 透传
+    let uv = m.load(v2, in_uv);
+    m.store(out_uv, uv);
+    let color = m.load(v4, in_color);
+    m.store(out_color, color);
+
+    m.return_void();
+    m.function_end();
+    m.finish()
+}
+
+/// 片段着色器（**字形覆盖率采样**）：M3b 的文本管线片元阶段。
+///
+/// ## 判据（与 CPU `null.rs::draw_text_real` 逐字节对应）
+///
+/// ```text
+///   cov = texture(tex, uv).r                 // R8_UNORM ⇒ 已归一化到 [0,1]
+///   out = vec4(color.rgb, color.a * cov)     // **非预乘**：覆盖率只乘进 alpha
+/// ```
+///
+/// CPU 侧是 `blend_cov(fb, x, y, color, cov as f32 / 255.0, clip)`：
+/// `cov/255.0` 与 `R8_UNORM` 采样得到的 `.r` **是同一个数**（UNORM 采样即
+/// `value / 255`），所以这里不需要额外的缩放或取整。
+///
+/// ## ⚠️ 为什么 rgb **不**乘 cov（一条由混合状态决定的硬约束）
+///
+/// 本项目的管线混合状态是 **`SRC_ALPHA / ONE_MINUS_SRC_ALPHA`**（见
+/// `device.rs::build_pipeline`），代入方程
+/// `out = src_color * src_alpha + dst_color * (1 - src_alpha)`：
+///
+/// | 着色器输出 | 混合后 RGB | 与 CPU 一致？ |
+/// |---|---|---|
+/// | `(rgb*cov, a*cov)`（**预乘**） | `rgb*a*cov² + bg*(1-a*cov)` | ❌ alpha 被乘两次，文本边缘明显偏暗 |
+/// | `(rgb, a*cov)`（**非预乘**） | `rgb*a*cov + bg*(1-a*cov)` | ✅ 与 `blend_cov` 逐字节等价 |
+///
+/// CPU 的 `blend_cov` 正是后者：`a = c.a * cov`，然后 RGB 与 alpha 都按这个 `a`
+/// 做 src-over。**预乘写法只在混合因子是 `ONE / ONE_MINUS_SRC_ALPHA` 时才等价** ——
+/// 本项目的管线不是。
+///
+/// 计划初稿（M3b Task 2）写的是预乘版，是**计划里的错**；这里按实测的混合状态
+/// 修正为上面的非预乘版，并由 `pipeline_smoke.rs` 的绑定断言 +
+/// （后续 T4 的）逐像素对照共同守住。
+///
+/// ## 接口
+///
+/// | 方向 | location | 类型 | 含义 |
+/// |---|---|---|---|
+/// | in | 0 | `vec2` | uv（归一化到整张图集） |
+/// | in | 1 | `vec4` | 颜色（**非预乘**，见上） |
+/// | out | 0 | `vec4` | `(rgb, a*cov)` |
+/// | uniform | set 0 binding 0 | `sampler2D` | 字形覆盖率图集 |
+///
+/// ## 无控制流
+///
+/// 单基本块、零 `OpBranch`、零 `OpPhi`：只有一次采样 + 一次标量乘法。
+pub fn fragment_shader_text() -> Vec<u8> {
+    let mut m = Module::new();
+    m.shader_capability().memory_model_glsl450().source_unknown();
+
+    let void = m.type_void();
+    let f32_ty = m.type_float();
+    let v2 = m.type_vector(f32_ty, 2);
+    let v4 = m.type_vector(f32_ty, 4);
+    // 纹理类型链：OpTypeImage → OpTypeSampledImage → 指向它的指针（UniformConstant）
+    let img_ty = m.type_image_2d_unknown(f32_ty);
+    let sampled_ty = m.type_sampled_image(img_ty);
+    let ptr_tex = m.type_pointer(SC_UNIFORM_CONSTANT, sampled_ty);
+    let ptr_in_v2 = m.type_pointer(SC_INPUT, v2);
+    let ptr_in_v4 = m.type_pointer(SC_INPUT, v4);
+    let ptr_out_v4 = m.type_pointer(SC_OUTPUT, v4);
+    let fn_ty = m.type_function(void, &[]);
+
+    let tex = m.variable(ptr_tex, SC_UNIFORM_CONSTANT);
+    let out_color = m.variable(ptr_out_v4, SC_OUTPUT);
+    let in_uv = m.variable(ptr_in_v2, SC_INPUT);
+    let in_color = m.variable(ptr_in_v4, SC_INPUT);
+
+    let fn_id = m.id();
+    let block = m.id();
+    // ⚠️ `interface` 必须包含所有静态使用的 Input/Output 变量。
+    // **UniformConstant 的纹理变量不在此列**（SPIR-V 1.0 的 OpEntryPoint
+    // interface 只列 Input/Output；把 UniformConstant 塞进去会被校验器拒绝）。
+    m.entry_point(EXECUTION_MODEL_FRAGMENT, fn_id, "main", &[out_color, in_uv, in_color]);
+    m.execution_mode(fn_id, EXECUTION_MODE_ORIGIN_UPPER_LEFT, &[]);
+
+    // 描述符接口：set 0 / binding 0 —— 必须与 Rust 侧的
+    // `create_descriptor_set_layout_combined_sampler()` 逐字一致。
+    m.debug_name(tex, "glyph_atlas");
+    m.decorate(tex, DECORATION_DESCRIPTOR_SET, &[0]);
+    m.decorate(tex, DECORATION_BINDING, &[0]);
+
+    // 输出 location 0
+    m.debug_name(out_color, "out_color");
+    m.decorate(out_color, DECORATION_LOCATION, &[0]);
+    // 输入 location 0/1（与顶点着色器输出对齐）
+    m.debug_name(in_uv, "in_uv");
+    m.decorate(in_uv, DECORATION_LOCATION, &[0]);
+    m.debug_name(in_color, "in_color");
+    m.decorate(in_color, DECORATION_LOCATION, &[1]);
+
+    m.function(void, fn_id, fn_ty, block);
+
+    // cov = texture(tex, uv).r
+    let sampled = m.load(sampled_ty, tex);
+    let uv = m.load(v2, in_uv);
+    let rgba = m.op_image_sample_implicit_lod(v4, sampled, uv);
+    let cov = m.composite_extract(f32_ty, rgba, &[0]);
+
+    // out = vec4(color.rgb, color.a * cov)  —— **非预乘**（理由见上面的表格）
+    let color = m.load(v4, in_color);
+    let rgb0 = m.composite_extract(f32_ty, color, &[0]);
+    let rgb1 = m.composite_extract(f32_ty, color, &[1]);
+    let rgb2 = m.composite_extract(f32_ty, color, &[2]);
+    let a = m.composite_extract(f32_ty, color, &[3]);
+    let a_scaled = m.f_mul(f32_ty, a, cov);
+    let out = m.composite_construct(v4, &[rgb0, rgb1, rgb2, a_scaled]);    m.store(out_color, out);
 
     m.return_void();
     m.function_end();

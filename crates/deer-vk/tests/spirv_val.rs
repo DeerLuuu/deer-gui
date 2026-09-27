@@ -44,6 +44,18 @@ fn rect_attrs_shaders() -> [(&'static str, Vec<u8>); 2] {
     ]
 }
 
+/// M3b 新增的两支**采样**着色器（文本/字形管线）。
+///
+/// 与 [`rect_attrs_shaders`] 分开列，是为了让「采样指令 + 描述符」这条新路径
+/// 有**独立**的专项校验（见 `text_shaders_validate`），而不是混在通用流程里
+/// 只看到一个「没通过」。
+fn text_shaders() -> [(&'static str, Vec<u8>); 2] {
+    [
+        ("vs_text", spirv::vertex_shader_text()),
+        ("fs_text", spirv::fragment_shader_text()),
+    ]
+}
+
 /// 找一个可用的 `spirv-val`。
 fn find_spirv_val() -> Option<PathBuf> {
     // ① 环境变量优先
@@ -121,7 +133,283 @@ fn all_shaders() -> Vec<(&'static str, Vec<u8>)> {
     ]
     .into_iter()
     .chain(rect_attrs_shaders())
+    .chain(text_shaders())
     .collect()
+}
+
+/// M3b（采样着色器）的专项校验。
+///
+/// 自研汇编器**第一次**接触采样指令 + 描述符，所以这里除了「喂给官方
+/// `spirv-val`」之外，还逐条钉住**描述符接口**的正确性 —— 因为这几条
+/// 校验器**不一定**会报（它不知道 Rust 侧的 `VkDescriptorSetLayout` 长什么样）：
+///
+/// | 检查 | 为什么非查不可 |
+/// |---|---|
+/// | `OpDecorate %tex DescriptorSet 0` | 缺了它，`vkCreateGraphicsPipelines` 会说「着色器用了 set 0 但没有布局」或直接采到空描述符 |
+/// | `OpDecorate %tex Binding 0` | 与 `DescriptorSetLayoutBinding.binding = 0` 必须一致；不一致是**静默采样到未定义内容** |
+/// | `OpTypeImage ... Sampled 1` | `Sampled = 1` 表示「只采样不同步读写」；写成 2 会让布局校验失败 |
+/// | `OpImageSampleImplicitLod` **不带** `ImageOperands` | 本机实测：误加 `Lod 0` 会被 `spirv-val` 拒绝（`Lod` 只许配 `*ExplicitLod`） |
+#[test]
+fn text_shaders_validate() {
+    const OP_TYPE_IMAGE: u16 = 25;
+    const OP_TYPE_SAMPLED_IMAGE: u16 = 27;
+    const OP_IMAGE_SAMPLE_IMPLICIT_LOD: u16 = 87;
+    const OP_DECORATE: u16 = 71;
+    const DECORATION_BINDING: u32 = 33;
+    const DECORATION_DESCRIPTOR_SET: u32 = 34;
+    // ImageOperands 里的任何一位都不该出现（下面是几个常见位的并）
+    const ANY_IMAGE_OPERAND_BITS: u32 = 0x3ff;
+
+    // ① 纯字节自检（任何机器都能跑）
+    for (name, code) in text_shaders() {
+        assert_eq!(code.len() % 4, 0, "{name}: SPIR-V 必须 4 字节对齐");
+        let words: Vec<u32> = code
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(words[0], 0x0723_0203, "{name}: magic");
+        assert!(words[3] > 0, "{name}: 头部 bound 必须 > 0");
+        let mut i = 5usize;
+        while i < words.len() {
+            let wc = (words[i] >> 16) as usize;
+            assert!(wc >= 1, "{name}: 词 {i} 声明词数 0");
+            assert!(i + wc <= words.len(), "{name}: 词 {i} 越界（wc={wc}）");
+            i += wc;
+        }
+        assert_eq!(i, words.len(), "{name}: 指令流必须正好用完整份模块");
+    }
+
+    // ② 片元着色器的「采样 + 描述符」结构
+    let fs: Vec<u32> = spirv::fragment_shader_text()
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    let mut image_ty_count = 0usize;
+    let mut sampled_ty_count = 0usize;
+    let mut sample_count = 0usize;
+    let mut samples_with_image_operands = 0usize;
+    let mut binding0 = false;
+    let mut set0 = false;
+    let mut i = 5usize;
+    while i < fs.len() {
+        let wc = (fs[i] >> 16) as usize;
+        let op = (fs[i] & 0xffff) as u16;
+        match op {
+            OP_TYPE_IMAGE => {
+                image_ty_count += 1;
+                // OpTypeImage result sampledType dim depth arrayed ms sampled format [access]
+                // 操作数表：i+0 首字, i+1 result, i+2 sampledType, i+3 dim, i+4 depth,
+                //           i+5 arrayed, i+6 ms, i+7 sampled, i+8 format
+                assert!(
+                    wc >= 9,
+                    "OpTypeImage 至少要 9 个词（含 access qualifier 可省），实得 {wc}"
+                );
+                assert_eq!(fs[i + 3], 1, "OpTypeImage 的 dim 必须是 1（2D）");
+                assert_eq!(fs[i + 7], 1, "OpTypeImage 的 sampled 必须是 1（只采样）");
+                // image format = Unknown(0)：Vulkan 要求采样图像用 Unknown
+                assert_eq!(fs[i + 8], 0, "OpTypeImage 的 format 必须是 Unknown(0)");
+            }
+            OP_TYPE_SAMPLED_IMAGE => sampled_ty_count += 1,
+            OP_IMAGE_SAMPLE_IMPLICIT_LOD => {
+                sample_count += 1;
+                // OpImageSampleImplicitLod resultType result sampledImage coordinate [imageOperands...]
+                // 无 imageOperands ⇒ 恰好 5 个词。多出来就说明有人加了 Lod/Bias 之类
+                // ——「Lod 只许配 ExplicitLod」（实测被 spirv-val 拒），别加。
+                if wc > 5 && fs[i + 5] & ANY_IMAGE_OPERAND_BITS != 0 {
+                    samples_with_image_operands += 1;
+                }
+            }
+            OP_DECORATE => {
+                if fs[i + 2] == DECORATION_BINDING && fs[i + 3] == 0 {
+                    binding0 = true;
+                }
+                if fs[i + 2] == DECORATION_DESCRIPTOR_SET && fs[i + 3] == 0 {
+                    set0 = true;
+                }
+            }
+            _ => {}
+        }
+        i += wc;
+    }
+    assert_eq!(image_ty_count, 1, "片元着色器应当有**恰好一个** OpTypeImage");
+    assert_eq!(sampled_ty_count, 1, "片元着色器应当有**恰好一个** OpTypeSampledImage");
+    assert_eq!(sample_count, 1, "片元着色器应当**恰好一次** OpImageSampleImplicitLod");
+    assert_eq!(
+        samples_with_image_operands, 0,
+        "隐式采样**不能**带 ImageOperands —— `Lod` 只许配 `*ExplicitLod`/`OpImageFetch`，\
+         误加会被 spirv-val 拒绝（本机实测）。单层纹理的隐式 LOD 天然就是第 0 层。"
+    );
+    assert!(binding0, "描述符变量必须装饰 Binding 0（与 DescriptorSetLayoutBinding 一致）");
+    assert!(set0, "描述符变量必须装饰 DescriptorSet 0");
+
+    // ③ 交给官方 spirv-val（与 all_shaders 同一条流程、同一个 find_spirv_val）
+    let Some(val) = find_spirv_val() else {
+        println!(
+            "跳过官方 spirv-val 部分：本机没有 spirv-val。\n\
+             装 Vulkan SDK（含 Shader Toolchain）即可用，或设环境变量 SPIRV_VAL 指向它。\n\
+             ⚠️ 纯字节自检**不能**替代 spirv-val —— 采样指令的正确性只有校验器能判。"
+        );
+        return;
+    };
+    let dir = std::env::temp_dir().join("deer_spirv_val_text");
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    for (name, bytes) in text_shaders() {
+        let p = dir.join(format!("{name}.spv"));
+        std::fs::write(&p, &bytes).unwrap_or_else(|e| panic!("写 {} 失败：{e}", p.display()));
+        let out = Command::new(&val)
+            .arg(&p)
+            .output()
+            .unwrap_or_else(|e| panic!("执行 spirv-val 失败：{e}"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{name} 未通过官方 spirv-val（{}）：\n{stderr}",
+            val.display()
+        );
+        println!("  ✅ {name}（{} 字节）", bytes.len());
+    }
+    println!("M3b 采样着色器（顶点 + 片元）通过官方 spirv-val 校验 ✅");
+}
+
+/// **回归锁**：`fs_text` 必须输出「**非预乘**」颜色（覆盖率只乘进 alpha）。
+///
+/// ## 为什么这条必须有
+///
+/// M3b 计划初稿给的是预乘版 `vec4(rgb*cov, a*cov)`。它与本管线已冻结的混合状态
+/// （`SRC_ALPHA / ONE_MINUS_SRC_ALPHA`）**不兼容**：代入
+/// `src_color*src_alpha + dst*(1-src_alpha)` 后 RGB 会被乘**两次** alpha，
+/// 文本边缘肉眼可见地偏暗。
+///
+/// 而 `spirv-val` **查不出这个错** —— 两支写法都是合法 SPIR-V。所以这里从字节码
+/// 层面把契约钉死：`out_color` 的 **alpha** 操作数必须是「alpha × 输入」，
+/// **RGB** 操作数必须是输入颜色的分量本身。
+///
+/// 判据刻意写得「窄」：只认 `OpCompositeConstruct` + 恰好一条
+/// `OpVectorTimesScalar` 都不许出现 —— 预乘版必然引入 `OpVectorTimesScalar`
+/// （或等价的三次 `OpFMul`），一旦有人改回去这条就红。
+#[test]
+fn text_fragment_shader_is_not_premultiplied() {
+    const OP_STORE: u16 = 62;
+    const OP_COMPOSITE_CONSTRUCT: u16 = 80;
+    const OP_COMPOSITE_EXTRACT: u16 = 81;
+    const OP_IMAGE_SAMPLE_IMPLICIT_LOD: u16 = 87;
+    const OP_F_MUL: u16 = 133;
+    const OP_VECTOR_TIMES_SCALAR: u16 = 142;
+
+    let fs: Vec<u32> = spirv::fragment_shader_text()
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect();
+
+    // 收集需要的指令（按 result Id 索引）
+    // extracts: result -> (源 composite, 分量下标)
+    let mut extracts: std::collections::BTreeMap<u32, (u32, u32)> = Default::default();
+    let mut fmul_results: std::collections::BTreeSet<u32> = Default::default();
+    let mut construct: Option<(u32, Vec<u32>)> = None;
+    let mut sample_result: Option<u32> = None;
+    let mut vector_times_scalar = 0usize;
+    let mut stored: Option<(u32, u32)> = None;
+
+    let mut i = 5usize;
+    while i < fs.len() {
+        let wc = (fs[i] >> 16) as usize;
+        let op = (fs[i] & 0xffff) as u16;
+        match op {
+            OP_VECTOR_TIMES_SCALAR => vector_times_scalar += 1,
+            OP_F_MUL => {
+                fmul_results.insert(fs[i + 2]);
+            }
+            OP_COMPOSITE_EXTRACT => {
+                if wc >= 5 {
+                    extracts.insert(fs[i + 2], (fs[i + 3], fs[i + 4]));
+                }
+            }
+            OP_COMPOSITE_CONSTRUCT => {
+                let parts: Vec<u32> = fs[i + 3..i + wc].to_vec();
+                assert_eq!(parts.len(), 4, "只认 4 分量构造（vec4 输出）");
+                construct = Some((fs[i + 2], parts));
+            }
+            OP_IMAGE_SAMPLE_IMPLICIT_LOD => sample_result = Some(fs[i + 2]),
+            OP_STORE => stored = Some((fs[i + 1], fs[i + 2])),
+            _ => {}
+        }
+        i += wc;
+    }
+
+    // ① 绝不允许 `OpVectorTimesScalar`：它是「预乘」写法的标志
+    assert_eq!(
+        vector_times_scalar, 0,
+        "fs_text 里不允许出现 OpVectorTimesScalar —— 它是「预乘」写法的标志，\
+         而本管线的混合是 SRC_ALPHA/ONE_MINUS_SRC_ALPHA，预乘会让 RGB 被乘两次 alpha"
+    );
+
+    let sampled = sample_result.expect("fs_text 必须有 OpImageSampleImplicitLod");
+    let (construct_id, parts) = construct.expect("必须有一条 4 分量 OpCompositeConstruct");
+    let (_, store_val) = stored.expect("fs_text 必须有 OpStore");
+    assert_eq!(
+        store_val, construct_id,
+        "写入 out_color 的值必须就是那条 OpCompositeConstruct 的结果"
+    );
+
+    // ② alpha（第 4 分量）必须是 `color.a * cov`：
+    //    - 由 OpFMul 产出；
+    //    - 一侧操作数追溯到「某个 OpLoad 出来的 vec4 的分量 3」（= 顶点颜色 alpha）；
+    //    - 另一侧追溯到「采样结果的分量 0」（= cov）。
+    let a_out = parts[3];
+    assert!(
+        fmul_results.contains(&a_out),
+        "out_color 的 alpha（Id {a_out}）必须由 OpFMul 产出（= color.a * cov）；\
+         直接来自别处 ⇒ 覆盖率没有乘进 alpha"
+    );
+    let find_mul_operands = |target: u32| -> (u32, u32) {
+        let mut i = 5usize;
+        while i < fs.len() {
+            let wc = (fs[i] >> 16) as usize;
+            if (fs[i] & 0xffff) as u16 == OP_F_MUL && fs[i + 2] == target {
+                return (fs[i + 3], fs[i + 4]);
+            }
+            i += wc;
+        }
+        panic!("找不到产出 Id {target} 的 OpFMul");
+    };
+    let (m_a, m_b) = find_mul_operands(a_out);
+
+    // cov 侧：必须是「采样结果的分量 0」的抽取
+    let is_cov = |id: u32| extracts.get(&id) == Some(&(sampled, 0));
+    assert!(
+        is_cov(m_a) || is_cov(m_b),
+        "OpFMul 的一侧必须是采样结果的 .r（cov）：Id({m_a},{m_b}) 均不是 \
+         「%sample 的 0 号分量」的抽取结果（extracts 里有这些：{:?}）",
+        extracts
+            .iter()
+            .filter(|(_, (c, _))| *c == sampled)
+            .collect::<Vec<_>>()
+    );
+
+    // alpha 侧：必须是「某个 vec4 的分量 3」的抽取（即顶点颜色的 alpha）
+    let alpha_src = if is_cov(m_a) { m_b } else { m_a };
+    match extracts.get(&alpha_src) {
+        Some((_, 3)) => {}
+        other => panic!(
+            "OpFMul 的另一侧（Id {alpha_src}）必须是「某个 vec4 的 3 号分量」的抽取\
+             （顶点颜色 alpha）；实得 {other:?}"
+        ),
+    }
+
+    // ③ rgb 三个分量必须**不是**乘法结果（非预乘的核心）
+    for (n, part) in parts[..3].iter().enumerate() {
+        assert!(
+            !fmul_results.contains(part),
+            "out_color 的 rgb 分量 #{n}（Id {part}）是乘法结果 —— \
+             非预乘要求 rgb 原样输出，覆盖率只乘进 alpha"
+        );
+    }
+
+    println!(
+        "fs_text 输出为非预乘颜色（rgb 原值 + alpha×cov，零 OpVectorTimesScalar）✅ \
+         —— 与管线的 SRC_ALPHA/ONE_MINUS_SRC_ALPHA 混合相容"
+    );
 }
 
 /// M3a（矩形属性着色器）的专项校验。

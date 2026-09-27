@@ -82,6 +82,18 @@ pub struct DeviceFns {
     pub cmd_pipeline_barrier: vk::PfnCmdPipelineBarrier,
     pub cmd_copy_image_to_buffer: vk::PfnCmdCopyImageToBuffer,
     pub cmd_clear_color_image: vk::PfnCmdClearColorImage,
+    // ── M3b：纹理采样（采样器 + 描述符集 + 缓冲→图像拷贝） ──────────────────
+    pub create_sampler: vk::PfnCreateSampler,
+    pub destroy_sampler: vk::PfnDestroySampler,
+    pub create_descriptor_set_layout: vk::PfnCreateDescriptorSetLayout,
+    pub destroy_descriptor_set_layout: vk::PfnDestroyDescriptorSetLayout,
+    pub create_descriptor_pool: vk::PfnCreateDescriptorPool,
+    pub destroy_descriptor_pool: vk::PfnDestroyDescriptorPool,
+    pub allocate_descriptor_sets: vk::PfnAllocateDescriptorSets,
+    pub free_descriptor_sets: vk::PfnFreeDescriptorSets,
+    pub update_descriptor_sets: vk::PfnUpdateDescriptorSets,
+    pub cmd_bind_descriptor_sets: vk::PfnCmdBindDescriptorSets,
+    pub cmd_copy_buffer_to_image: vk::PfnCmdCopyBufferToImage,
 }
 
 /// 已打开的逻辑设备。
@@ -561,6 +573,486 @@ impl VkDevice {
         )
     }
 
+    /// 创建一个 `R8_UNORM` 覆盖率纹理（上传 + 转为 `SHADER_READ_ONLY_OPTIMAL`）。
+    ///
+    /// ## 参数校验
+    ///
+    /// `w == 0 || h == 0`、`data.len() != w * h` 都由纯函数
+    /// [`validate_texture_r8_args`] 在**调用驱动前**拦下（理由见那里的文档）。
+    ///
+    /// ## 上传路径（为什么绕了一圈 staging buffer）
+    ///
+    /// ```text
+    ///   主机数据 → (map/memcpy) HOST_VISIBLE staging buffer
+    ///            → vkCmdCopyBufferToImage → DEVICE_LOCAL 图像
+    ///            → 屏障转 SHADER_READ_ONLY_OPTIMAL
+    /// ```
+    ///
+    /// 为什么不直接把图像做成 `HOST_VISIBLE + LINEAR` 映射写入（那样少一次拷贝）：
+    /// - LINEAR 图像的**行距由驱动决定**（要另查 `vkGetImageSubresourceLayout`），
+    ///   对 `R8_UNORM` 也可能带 padding ⇒ 写入得逐行处理，多一处易错点；
+    /// - 多数桌面驱动对 `LINEAR` + `SAMPLED` 组合支持有限。
+    ///
+    /// 标准路径的代价只是一次性的一次拷贝 —— 字形图集只在**内容变化时**重传
+    /// （M3b T4 的契约），不是每帧，所以可忽略。
+    pub fn create_texture_r8(&self, w: u32, h: u32, data: &[u8]) -> GpuResult<Texture> {
+        validate_texture_r8_args(w, h, data)?;
+        let fns = self.fns;
+        let device = self.handle;
+
+        // ① 图像：DEVICE_LOCAL + OPTIMAL，用法 = 采样 + 传输目标
+        let img_info = vk::ImageCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            image_type: vk::VK_IMAGE_TYPE_2D,
+            format: vk::VK_FORMAT_R8_UNORM,
+            extent: vk::Extent3D {
+                width: w,
+                height: h,
+                depth: 1,
+            },
+            mip_levels: 1,
+            array_layers: 1,
+            samples: vk::VK_SAMPLE_COUNT_1_BIT,
+            tiling: vk::VK_IMAGE_TILING_OPTIMAL,
+            usage: vk::VK_IMAGE_USAGE_SAMPLED_BIT | vk::VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            sharing_mode: vk::VK_SHARING_MODE_EXCLUSIVE,
+            queue_family_index_count: 0,
+            p_queue_family_indices: std::ptr::null(),
+            initial_layout: vk::VK_IMAGE_LAYOUT_UNDEFINED,
+        };
+        let mut image_handle: vk::ImageHandle = std::ptr::null_mut();
+        // SAFETY: 结构体在栈上存活到调用结束；输出句柄可写。
+        let rc = unsafe { (fns.create_image)(device, &img_info, std::ptr::null(), &mut image_handle) };
+        check_vk("vkCreateImage", rc)?;
+        let image = OwnedHandle::destroy(image_handle, device, fns.destroy_image);
+
+        // ② 绑定 DEVICE_LOCAL 内存
+        let mut req = std::mem::MaybeUninit::<vk::MemoryRequirements>::uninit();
+        // SAFETY: 该函数完整写入结构体。
+        unsafe { (fns.get_image_memory_requirements)(device, image.handle(), req.as_mut_ptr()) };
+        let req = unsafe { req.assume_init() };
+        let local = vk::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        let mem_index = pick_memory_type(self.mem_props, req.memory_type_bits, local)?;
+        let image_memory = alloc_memory(device, &fns, req.size, mem_index, local)?;
+        check_vk(
+            "vkBindImageMemory",
+            // SAFETY: 图像与内存都是本设备的新对象，尺寸匹配；offset 0 合法。
+            unsafe { (fns.bind_image_memory)(device, image.handle(), image_memory.handle(), 0) },
+        )?;
+
+        // ③ 视图（R8_UNORM、2D、单层单 mip）
+        let view_info = vk::ImageViewCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            image: image.handle(),
+            view_type: vk::VK_IMAGE_VIEW_TYPE_2D,
+            format: vk::VK_FORMAT_R8_UNORM,
+            components_r: vk::VK_COMPONENT_SWIZZLE_IDENTITY,
+            components_g: vk::VK_COMPONENT_SWIZZLE_IDENTITY,
+            components_b: vk::VK_COMPONENT_SWIZZLE_IDENTITY,
+            components_a: vk::VK_COMPONENT_SWIZZLE_IDENTITY,
+            subresource_range: full_subresource_range(),
+        };
+        let mut view_handle: vk::ImageViewHandle = std::ptr::null_mut();
+        // SAFETY: 同上。
+        let rc = unsafe { (fns.create_image_view)(device, &view_info, std::ptr::null(), &mut view_handle) };
+        check_vk("vkCreateImageView", rc)?;
+        let view = OwnedHandle::destroy(view_handle, device, fns.destroy_image_view);
+
+        // ④ 上传：staging buffer → 图像（一次性提交，返回时图像已可采样）
+        self.upload_r8_into_image(image.handle(), w, h, data)?;
+
+        Ok(Texture {
+            view,
+            image,
+            memory: image_memory,
+            width: w,
+            height: h,
+        })
+    }
+
+    /// 把 staging buffer 的内容拷进图像，并把图像转到 `SHADER_READ_ONLY_OPTIMAL`
+    /// （**一次性提交并等待完成** ⇒ 返回后图像即可被采样）。
+    fn upload_r8_into_image(&self, image: vk::ImageHandle, w: u32, h: u32, data: &[u8]) -> GpuResult<()> {
+        let fns = self.fns;
+        let device = self.handle;
+
+        // ── staging buffer：HOST_VISIBLE | HOST_COHERENT（不需要 flush）
+        let buf_info = vk::BufferCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            size: data.len() as u64,
+            usage: vk::VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            sharing_mode: vk::VK_SHARING_MODE_EXCLUSIVE,
+            queue_family_index_count: 0,
+            p_queue_family_indices: std::ptr::null(),
+        };
+        let mut buf_handle: vk::BufferHandle = std::ptr::null_mut();
+        // SAFETY: 结构体在栈上；输出句柄可写。
+        let rc = unsafe { (fns.create_buffer)(device, &buf_info, std::ptr::null(), &mut buf_handle) };
+        check_vk("vkCreateBuffer", rc)?;
+        let buffer = OwnedHandle::destroy(buf_handle, device, fns.destroy_buffer);
+
+        let mut breq = std::mem::MaybeUninit::<vk::MemoryRequirements>::uninit();
+        // SAFETY: 完整写入结构体。
+        unsafe { (fns.get_buffer_memory_requirements)(device, buffer.handle(), breq.as_mut_ptr()) };
+        let breq = unsafe { breq.assume_init() };
+        let host_bits =
+            vk::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        let bidx = pick_memory_type(self.mem_props, breq.memory_type_bits, host_bits)?;
+        let buf_mem = alloc_memory(device, &fns, breq.size, bidx, host_bits)?;
+        check_vk(
+            "vkBindBufferMemory",
+            // SAFETY: 缓冲与内存都是本设备的新对象，尺寸匹配；offset 0 合法。
+            unsafe { (fns.bind_buffer_memory)(device, buffer.handle(), buf_mem.handle(), 0) },
+        )?;
+
+        // ── 写数据（HOST_COHERENT ⇒ 不需要 vkFlushMappedMemoryRanges）
+        {
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: 内存是 HOST_VISIBLE 且尚未映射；offset/size 在范围内。
+            let rc = unsafe { (fns.map_memory)(device, buf_mem.handle(), 0, vk::WHOLE_SIZE, 0, &mut ptr) };
+            check_vk("vkMapMemory", rc)?;
+            if ptr.is_null() {
+                return Err(GpuError::Driver {
+                    code: -1,
+                    message: "vkMapMemory 返回成功但指针为空".to_string(),
+                });
+            }
+            // SAFETY: 映射覆盖整个缓冲（`data.len()` 字节，等于缓冲大小）；
+            // 源与目标不重叠；HOST_COHERENT ⇒ 解映射后数据对设备可见。
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());
+                (fns.unmap_memory)(device, buf_mem.handle());
+            }
+        }
+
+        // ── 一次性命令：布局转换 → 拷贝 → 布局转换
+        let pool = self.create_transient_command_pool()?;
+        let cmd = self.alloc_one_command_buffer(pool.handle())?;
+        let begin = vk::CommandBufferBeginInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            p_next: std::ptr::null(),
+            flags: vk::VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            p_inheritance_info: std::ptr::null(),
+        };
+        check_vk(
+            "vkBeginCommandBuffer",
+            // SAFETY: 命令缓冲由本设备分配且未在录制中。
+            unsafe { (fns.begin_command_buffer)(cmd, &begin) },
+        )?;
+
+        let range = full_subresource_range();
+        // UNDEFINED → TRANSFER_DST_OPTIMAL（只写入，不关心旧内容）
+        let to_dst = vk::ImageMemoryBarrier {
+            s_type: vk::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            p_next: std::ptr::null(),
+            src_access_mask: 0,
+            dst_access_mask: vk::VK_ACCESS_TRANSFER_WRITE_BIT,
+            old_layout: vk::VK_IMAGE_LAYOUT_UNDEFINED,
+            new_layout: vk::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            image,
+            subresource_range: range,
+        };
+        // SAFETY: 命令缓冲正在录制；屏障在栈上存活到调用结束。
+        unsafe {
+            (fns.cmd_pipeline_barrier)(
+                cmd,
+                vk::VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                vk::VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0,
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                1,
+                &to_dst,
+            )
+        };
+
+        let copy = vk::BufferImageCopy {
+            buffer_offset: 0,
+            // 0 = 「紧密打包」：每行恰好 w 字节、层高恰好 h 行 —— 与主机数据布局
+            // 一致，不需要驱动做任何行对齐推断。
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::VK_IMAGE_ASPECT_COLOR_BIT,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: vk::Extent3D {
+                width: w,
+                height: h,
+                depth: 1,
+            },
+        };
+        // SAFETY: 同上；缓冲与图像都是本设备对象且尺寸匹配。
+        unsafe {
+            (fns.cmd_copy_buffer_to_image)(
+                cmd,
+                buffer.handle(),
+                image,
+                vk::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1,
+                &copy,
+            )
+        };
+
+        // TRANSFER_DST_OPTIMAL → SHADER_READ_ONLY_OPTIMAL
+        let to_shader = vk::ImageMemoryBarrier {
+            s_type: vk::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            p_next: std::ptr::null(),
+            src_access_mask: vk::VK_ACCESS_TRANSFER_WRITE_BIT,
+            dst_access_mask: vk::VK_ACCESS_SHADER_READ_BIT,
+            old_layout: vk::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            new_layout: vk::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            image,
+            subresource_range: range,
+        };
+        // SAFETY: 同上。
+        unsafe {
+            (fns.cmd_pipeline_barrier)(
+                cmd,
+                vk::VK_PIPELINE_STAGE_TRANSFER_BIT,
+                vk::VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0,
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                1,
+                &to_shader,
+            )
+        };
+
+        check_vk(
+            "vkEndCommandBuffer",
+            // SAFETY: 命令缓冲正在录制。
+            unsafe { (fns.end_command_buffer)(cmd) },
+        )?;
+
+        // ── 提交并等待完成（一次性；此处无并发，等待比栅栏更简单）
+        let submit = vk::SubmitInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            p_next: std::ptr::null(),
+            wait_semaphore_count: 0,
+            p_wait_semaphores: std::ptr::null(),
+            p_wait_dst_stage_mask: std::ptr::null(),
+            command_buffer_count: 1,
+            p_command_buffers: &cmd,
+            signal_semaphore_count: 0,
+            p_signal_semaphores: std::ptr::null(),
+        };
+        // SAFETY: 队列是本设备的图形队列；提交后立刻等待它空闲 ⇒ 不存在
+        // 「命令缓冲被重用而 GPU 仍在读」的窗口。
+        let rc = unsafe { (fns.queue_submit)(self.queue, 1, &submit, vk::NULL_HANDLE) };
+        check_vk("vkQueueSubmit", rc)?;
+        // SAFETY: 队列属于本设备。
+        check_vk("vkQueueWaitIdle", unsafe { (fns.queue_wait_idle)(self.queue) })?;
+        Ok(())
+        // buffer / buf_mem / pool 在此按声明逆序 `Drop`，队列此刻已空闲。
+    }
+
+    /// 创建一个 `TRANSIENT` 命令池（用于一次性上传/拷贝）。
+    ///
+    /// `TRANSIENT` 提示驱动「这个池里的命令缓冲寿命很短」，驱动可据此选更省的分配策略。
+    pub fn create_transient_command_pool(&self) -> GpuResult<CommandPool> {
+        let info = vk::CommandPoolCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: vk::VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
+            queue_family_index: self.queue_family_index,
+        };
+        let mut handle: vk::CommandPoolHandle = std::ptr::null_mut();
+        // SAFETY: 结构体在栈上；输出句柄可写。
+        let rc = unsafe {
+            (self.fns.create_command_pool)(self.handle, &info, std::ptr::null(), &mut handle)
+        };
+        check_vk("vkCreateCommandPool", rc)?;
+        Ok(CommandPool {
+            handle: OwnedHandle::destroy(handle, self.handle, self.fns.destroy_command_pool),
+        })
+    }
+
+    /// 从池里分配**一个**主命令缓冲。
+    fn alloc_one_command_buffer(&self, pool: vk::CommandPoolHandle) -> GpuResult<vk::CommandBufferHandle> {
+        let info = vk::CommandBufferAllocateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+            p_next: std::ptr::null(),
+            command_pool: pool,
+            level: vk::VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+            command_buffer_count: 1,
+        };
+        let mut handles = [std::ptr::null_mut(); 1];
+        // SAFETY: 输出数组长度与 `command_buffer_count` 一致。
+        let rc = unsafe { (self.fns.allocate_command_buffers)(self.handle, &info, handles.as_mut_ptr()) };
+        check_vk("vkAllocateCommandBuffers", rc)?;
+        Ok(handles[0])
+    }
+
+    /// 创建最近邻 / ClampToEdge / 无 mipmap 的采样器。
+    ///
+    /// 参数由纯函数 [`sampler_create_info`] 产出，所以「必须最近邻」这类契约
+    /// 在**没有 GPU 的机器上**也能被单测钉住。
+    pub fn create_sampler(&self) -> GpuResult<Sampler> {
+        let info = sampler_create_info();
+        let mut handle: vk::SamplerHandle = std::ptr::null_mut();
+        // SAFETY: 结构体在栈上；输出句柄可写。
+        let rc = unsafe { (self.fns.create_sampler)(self.handle, &info, std::ptr::null(), &mut handle) };
+        check_vk("vkCreateSampler", rc)?;
+        Ok(Sampler {
+            handle: OwnedHandle::destroy(handle, self.handle, self.fns.destroy_sampler),
+        })
+    }
+
+    /// 创建一个**只有一个 binding** 的描述符集布局：`binding 0` =
+    /// `COMBINED_IMAGE_SAMPLER`（片元阶段可见）。
+    ///
+    /// ## 为什么是 `COMBINED_IMAGE_SAMPLER` 而不是分开的 sampler + sampled-image
+    ///
+    /// 分开写需要两个 binding、两份 `VkDescriptorImageInfo`，而着色器里
+    /// `OpTypeSampledImage` + `OpImageSampleImplicitLod` 对两者要求完全相同。
+    /// 合成一个 binding 少一半描述符管理代码 —— 而描述符管理正是
+    /// 「写错不报错、只是画不出来」的重灾区。
+    pub fn create_descriptor_set_layout_combined_sampler(&self) -> GpuResult<DescriptorSetLayout> {
+        let binding = vk::DescriptorSetLayoutBinding {
+            binding: 0,
+            descriptor_type: vk::VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            descriptor_count: 1,
+            stage_flags: vk::VK_SHADER_STAGE_FRAGMENT_BIT,
+            p_immutable_samplers: std::ptr::null(),
+        };
+        let info = vk::DescriptorSetLayoutCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            binding_count: 1,
+            p_bindings: &binding,
+        };
+        let mut handle: vk::DescriptorSetLayoutHandle = std::ptr::null_mut();
+        // SAFETY: 结构体与 binding 都在栈上存活到调用结束。
+        let rc = unsafe {
+            (self.fns.create_descriptor_set_layout)(self.handle, &info, std::ptr::null(), &mut handle)
+        };
+        check_vk("vkCreateDescriptorSetLayout", rc)?;
+        Ok(DescriptorSetLayout {
+            handle: OwnedHandle::destroy(handle, self.handle, self.fns.destroy_descriptor_set_layout),
+        })
+    }
+
+    /// 创建一个描述符池（容量 `max_sets` 个 `COMBINED_IMAGE_SAMPLER`）。
+    ///
+    /// ⚠️ 池容量必须与用途匹配：可分配的集数受 `max_sets` 与各类型 `descriptorCount`
+    /// **双重**限制。不足时 `vkAllocateDescriptorSets` 返回
+    /// `VK_ERROR_OUT_OF_POOL_MEMORY`（错误信息里带上 `max_sets`，便于定位）。
+    ///
+    /// 池**总是**带 `FREE_DESCRIPTOR_SET_BIT`：我们的用法是「单个描述符集随对象
+    /// 归还给池」（见 [`DescriptorSet`]），而 `vkFreeDescriptorSets` 要求池建时
+    /// 带这个标志 —— 不带时校验层报 `VUID-vkFreeDescriptorSets-descriptorPool-00312`
+    /// （实测：这条错误只在**析构**时才出现，很容易被漏掉）。
+    pub fn create_descriptor_pool(&self, max_sets: u32) -> GpuResult<DescriptorPool> {
+        if max_sets == 0 {
+            return Err(GpuError::Unsupported(
+                "描述符池的 max_sets 必须 > 0（否则分配必定失败）".to_string(),
+            ));
+        }
+        let size = vk::DescriptorPoolSize {
+            descriptor_type: vk::VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            descriptor_count: max_sets,
+        };
+        let info = vk::DescriptorPoolCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: vk::VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT,
+            max_sets,
+            pool_size_count: 1,
+            p_pool_sizes: &size,
+        };
+        let mut handle: vk::DescriptorPoolHandle = std::ptr::null_mut();
+        // SAFETY: 结构体在栈上存活到调用结束。
+        let rc = unsafe { (self.fns.create_descriptor_pool)(self.handle, &info, std::ptr::null(), &mut handle) };
+        check_vk("vkCreateDescriptorPool", rc)?;
+        Ok(DescriptorPool {
+            handle: OwnedHandle::destroy(handle, self.handle, self.fns.destroy_descriptor_pool),
+            max_sets,
+        })
+    }
+
+    /// 从池里分配**一个**描述符集（用给定布局）。
+    ///
+    /// ## 生命周期契约（调用方必须保证）
+    ///
+    /// 返回的 [`DescriptorSet`] 析构时会调 `vkFreeDescriptorSets(device, pool, ..)`，
+    /// 所以 **`pool` 必须比返回值活得久**。典型用法是把池与集放进同一结构体，
+    /// **池的字段声明在集之后**（Rust 按声明顺序析构 ⇒ 后声明的先析构 ⇒ 集先于池）。
+    pub fn allocate_descriptor_set(
+        &self,
+        pool: &DescriptorPool,
+        layout: &DescriptorSetLayout,
+    ) -> GpuResult<DescriptorSet> {
+        let info = vk::DescriptorSetAllocateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            p_next: std::ptr::null(),
+            descriptor_pool: pool.handle(),
+            descriptor_set_count: 1,
+            p_set_layouts: &layout.handle(),
+        };
+        let mut handle: vk::DescriptorSetHandle = std::ptr::null_mut();
+        // SAFETY: 输出句柄可写；池与布局都是本设备对象。
+        let rc = unsafe { (self.fns.allocate_descriptor_sets)(self.handle, &info, &mut handle) };
+        check_vk("vkAllocateDescriptorSets", rc)?;
+        Ok(DescriptorSet {
+            handle,
+            pool: pool.handle(),
+            device: self.handle,
+            fns: self.fns,
+        })
+    }
+
+    /// 把「纹理 + 采样器」写进描述符集的 `binding 0`。
+    ///
+    /// `imageLayout` 用 [`Texture::layout`]（上传完成后的**实际**布局）——
+    /// 写错布局不会编译失败，而是采样读到未定义内容或校验层报警。
+    pub fn update_descriptor_texture(
+        &self,
+        set: &DescriptorSet,
+        tex: &Texture,
+        s: &Sampler,
+    ) -> GpuResult<()> {
+        let image_info = vk::DescriptorImageInfo {
+            sampler: s.handle(),
+            image_view: tex.image_view(),
+            image_layout: tex.layout(),
+        };
+        let write = vk::WriteDescriptorSet {
+            s_type: vk::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            p_next: std::ptr::null(),
+            dst_set: set.handle(),
+            dst_binding: 0,
+            dst_array_element: 0,
+            descriptor_count: 1,
+            descriptor_type: vk::VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            p_image_info: &image_info,
+            p_buffer_info: std::ptr::null(),
+            p_texel_buffer_view: std::ptr::null(),
+        };
+        // SAFETY: `write` 与 `image_info` 在调用期间存活；`dst_set` 是本设备对象；
+        // 此处没有在飞的提交（描述符集未被绑定到执行中的命令缓冲）。
+        unsafe { (self.fns.update_descriptor_sets)(self.handle, 1, &write, 0, std::ptr::null()) };
+        Ok(())
+    }
+
     /// 创建一个**图形管线**（单颜色附件、无顶点输入、动态 viewport/scissor、alpha 混合开）。
     ///
     /// **这是 SPIR-V 的真正验收关**：`vkCreateShaderModule` 很宽容（实测连 `bound = 0`
@@ -937,6 +1429,403 @@ fn validate_vertex_pipeline_args(
         }
     }
     Ok(())
+}
+
+/// 一个 Vulkan 对象的**销毁**方式。
+///
+/// 为什么需要它：销毁函数的签名不统一 —— `vkDestroyImage` / `vkDestroyBuffer` /
+/// `vkDestroySampler` / `vkDestroyDescriptorSetLayout` / `vkDestroyDescriptorPool`
+/// 都是 `(device, handle, pAllocator)`，而**内存**用的是 `vkFreeMemory`。
+/// 把两者写成两种**命名的**销毁方式，比「一个万能 `unsafe fn` + 调用方自己记参数
+/// 含义」可靠得多：`VkDeviceMemory` 不是「句柄对象」而是内存，调错销毁函数不会
+/// 编译失败（都是裸指针），而是运行期把驱动的内存管理器搞坏。
+#[derive(Clone, Copy)]
+enum DestroyOp {
+    /// `(device, handle, pAllocator)` 形态的 `vkDestroy*`。
+    Destroy(
+        vk::DeviceHandle,
+        unsafe extern "system" fn(vk::DeviceHandle, *mut std::ffi::c_void, *const std::ffi::c_void),
+    ),
+    /// `vkFreeMemory(device, memory, pAllocator)`。
+    FreeMemory(vk::DeviceHandle, vk::PfnFreeMemory),
+}
+
+/// 一个**自有**的 Vulkan 句柄（创建即拥有，`Drop` 即销毁）。
+///
+/// 与 `gpu_render.rs` 里那个私有的 `VkObject` 是同一模式。放在 `device.rs` 是因为
+/// M3b 的纹理 / 采样器 / 描述符都从这里创建，让「创建 + 销毁」成对出现在**同一个
+/// 模块**里，比每个模块各写一遍 `Drop` 更不容易漏（漏掉就是句柄泄漏，而 Vulkan
+/// 不会替我们报错）。
+struct OwnedHandle {
+    handle: *mut std::ffi::c_void,
+    op: DestroyOp,
+}
+
+impl OwnedHandle {
+    fn handle(&self) -> *mut std::ffi::c_void {
+        self.handle
+    }
+
+    /// 用 `(device, handle, pAllocator)` 形态的 `vkDestroy*` 包装一个句柄。
+    fn destroy(
+        handle: *mut std::ffi::c_void,
+        device: vk::DeviceHandle,
+        f: unsafe extern "system" fn(vk::DeviceHandle, *mut std::ffi::c_void, *const std::ffi::c_void),
+    ) -> OwnedHandle {
+        OwnedHandle {
+            handle,
+            op: DestroyOp::Destroy(device, f),
+        }
+    }
+
+    /// 用 `vkFreeMemory` 包装一块设备内存。
+    fn memory(handle: vk::DeviceMemoryHandle, device: vk::DeviceHandle, f: vk::PfnFreeMemory) -> OwnedHandle {
+        OwnedHandle {
+            handle,
+            op: DestroyOp::FreeMemory(device, f),
+        }
+    }
+}
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        if self.handle.is_null() {
+            return;
+        }
+        // SAFETY: `handle` 是本设备创建且尚未销毁的对象；`op` 里存的是与之匹配的
+        // 销毁函数与设备句柄；设备比本对象活得久（调用方持有 `VkDevice`）。
+        unsafe {
+            match self.op {
+                DestroyOp::Destroy(device, f) => f(device, self.handle, std::ptr::null()),
+                DestroyOp::FreeMemory(device, f) => f(device, self.handle, std::ptr::null()),
+            }
+        }
+        self.handle = std::ptr::null_mut();
+    }
+}
+
+/// 一个 `R8_UNORM` 覆盖率纹理（图像 + 视图 + 设备内存，`Drop` 时全部销毁）。
+///
+/// **字段顺序 = 析构顺序**：`view` 在前 ⇒ 先 `vkDestroyImageView`、再 `vkDestroyImage`、
+/// 最后 `vkFreeMemory`（视图引用图像、图像占用内存，顺序反过来就是使用已释放对象）。
+///
+/// ## 为什么特意做成 `R8_UNORM`
+///
+/// 字形图集是一张**单通道**覆盖率位图（每像素 0..255）。用 `R8_UNORM` 时着色器里
+/// `texture(tex, uv).r` 直接就是 `cov/255` 的归一化覆盖率 —— 与 CPU 参考
+/// `null.rs::draw_text_real` 的 `cov as f32 / 255.0` 逐字对应；换成 `R8G8B8A8`
+/// 只是把同一份覆盖率复制四份，浪费 4 倍带宽与显存。
+pub struct Texture {
+    view: OwnedHandle,
+    image: OwnedHandle,
+    memory: OwnedHandle,
+    width: u32,
+    height: u32,
+}
+
+/// 只打印尺寸（句柄对调用方无意义，而印出裸指针只会让日志变噪）。
+impl std::fmt::Debug for Texture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Texture")
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Texture {
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn image_view(&self) -> vk::ImageViewHandle {
+        self.view.handle()
+    }
+
+    /// 原始图像句柄。
+    ///
+    /// 存在的理由不只是「以后可能要用」：`image` / `memory` 两个字段**唯一的作用**
+    /// 就是「被 Drop 时按序销毁」（视图引用图像、图像占用内存）。只写不读会让
+    /// Rust 报 `dead_code`，而用 `#[allow]` 压掉等于把「这两个字段有意义」这条信息
+    /// 也一起压掉了。给一个真实可用的读取口，比压 lint 好。
+    pub fn image(&self) -> vk::ImageHandle {
+        self.image.handle()
+    }
+
+    /// 图像绑定的设备内存（重传纹理时需要，见 M3b T4「只在图集变化时重传」）。
+    pub fn image_memory_handle(&self) -> vk::DeviceMemoryHandle {
+        self.memory.handle()
+    }
+
+    /// 纹理上传完成后图像所处的布局（**常量事实**，不是猜测）。
+    ///
+    /// 必须是这个布局：`vkUpdateDescriptorSets` 里 `imageLayout` 与实际布局不符时，
+    /// 校验层会报（驱动可能只是采到垃圾）。上传流程的最后一步就是转到
+    /// `SHADER_READ_ONLY_OPTIMAL`，所以这里直接返回它。
+    pub fn layout(&self) -> i32 {
+        vk::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL
+    }
+}
+
+/// 最近邻 / ClampToEdge / 无 mipmap 的采样器。`Drop` 时销毁。
+pub struct Sampler {
+    handle: OwnedHandle,
+}
+
+impl std::fmt::Debug for Sampler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sampler(nearest, clamp-to-edge, no-mip)").finish()
+    }
+}
+
+impl Sampler {
+    pub fn handle(&self) -> vk::SamplerHandle {
+        self.handle.handle()
+    }
+}
+
+/// 只有一个 binding（`binding 0 = CombinedImageSampler`）的描述符集布局。`Drop` 时销毁。
+pub struct DescriptorSetLayout {
+    handle: OwnedHandle,
+}
+
+impl std::fmt::Debug for DescriptorSetLayout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DescriptorSetLayout(binding 0 = CombinedImageSampler)")
+            .finish()
+    }
+}
+
+impl DescriptorSetLayout {
+    pub fn handle(&self) -> vk::DescriptorSetLayoutHandle {
+        self.handle.handle()
+    }
+}
+
+/// 一个描述符池。`Drop` 时销毁（**会连带释放池内所有描述符集**）。
+pub struct DescriptorPool {
+    handle: OwnedHandle,
+    max_sets: u32,
+}
+
+impl std::fmt::Debug for DescriptorPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DescriptorPool")
+            .field("max_sets", &self.max_sets)
+            .finish_non_exhaustive()
+    }
+}
+
+impl DescriptorPool {
+    pub fn handle(&self) -> vk::DescriptorPoolHandle {
+        self.handle.handle()
+    }
+
+    pub fn max_sets(&self) -> u32 {
+        self.max_sets
+    }
+}
+
+/// 一个命令池。`Drop` 时销毁（会连带释放池内所有命令缓冲）。
+pub struct CommandPool {
+    handle: OwnedHandle,
+}
+
+impl CommandPool {
+    pub fn handle(&self) -> vk::CommandPoolHandle {
+        self.handle.handle()
+    }
+}
+
+/// 一个描述符集。`Drop` 时**归还给池**（`vkFreeDescriptorSets`），而不是销毁池。
+///
+/// ## 为什么不借用 `DescriptorPool`（而自己拿着池句柄 + 函数指针）
+///
+/// Vulkan 的规则是「池活多久，集子最多活多久」。如果这里借用
+/// `&'a DescriptorPool`，在 `deer-gpu` 的 `Box<dyn Device>` 抽象下就没法把两者
+/// 分开持有 —— 而 Vulkan 的正确用法恰恰是「集先还、池后销」。所以本类型自己持有
+/// 归还所需的全部信息，`Drop` 时直接 `vkFreeDescriptorSets`；调用方只需保证
+/// 「池比集活得久」（见 [`VkDevice::allocate_descriptor_set`] 的契约）。
+///
+/// 这里**没有**用 [`OwnedHandle`]：`vkFreeDescriptorSets` 的签名是
+/// `(device, pool, count, pSets) -> VkResult`，与 `OwnedHandle` 期望的
+/// `(device, handle, pAllocator)` 形态不同。硬塞需要一次函数指针 `transmute`
+/// （把「多一个参数」的签名当「少一个参数」来调）—— 那是**未定义行为**，
+/// 只是恰好能跑。所以这里老实存原始参数。
+pub struct DescriptorSet {
+    handle: vk::DescriptorSetHandle,
+    pool: vk::DescriptorPoolHandle,
+    device: vk::DeviceHandle,
+    fns: DeviceFns,
+}
+
+impl std::fmt::Debug for DescriptorSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DescriptorSet").finish_non_exhaustive()
+    }
+}
+
+impl DescriptorSet {
+    pub fn handle(&self) -> vk::DescriptorSetHandle {
+        self.handle
+    }
+}
+
+impl Drop for DescriptorSet {
+    fn drop(&mut self) {
+        if self.handle.is_null() {
+            return;
+        }
+        let sets = [self.handle];
+        // SAFETY: `handle` 由本设备从 `pool` 分配且尚未归还；`pool` 比本对象活得久
+        // （调用方契约）；`sets` 的长度 = 1 = 传入的 count。
+        unsafe {
+            (self.fns.free_descriptor_sets)(self.device, self.pool, 1, sets.as_ptr());
+        }
+        self.handle = std::ptr::null_mut();
+    }
+}
+
+/// 校验 [`VkDevice::create_texture_r8`] 的参数（**纯函数**：不碰 Vulkan、不碰设备）。
+///
+/// 抽出来的理由与 [`validate_vertex_pipeline_args`] 完全相同：错误路径若埋在
+/// 「必须先有真机才能跑」的方法里，就等于**没有负例测试**。
+///
+/// ## 这两条为什么要拦
+///
+/// - **`w == 0 || h == 0`**：0 边图像在 Vulkan 里非法；某些驱动直接拒绝，另一些会让
+///   后续采样读到未定义内存（表现为「画面偶尔花」这种极难查的缺陷）。
+/// - **`data.len() != w * h`**：**最危险**的一条。字数不够 ⇒ 上传时越界读；
+///   字数多了 ⇒ 静默忽略多余数据、掩盖调用方算错尺寸。两者都必须在**调用驱动前**
+///   报错，且信息里要点出「实得 vs 期望」，否则调用方还得自己反查尺寸。
+fn validate_texture_r8_args(w: u32, h: u32, data: &[u8]) -> GpuResult<()> {
+    if w == 0 || h == 0 {
+        return Err(GpuError::Unsupported(format!(
+            "R8 纹理的宽高必须 > 0，实际 {w}×{h}"
+        )));
+    }
+    // 用 u64 相乘：`w * h` 在 u32 下会溢出（例如 65536×65536），溢出后与
+    // `data.len()` 的比较会得出**错误结论**（可能反而「通过」）。覆盖率纹理不大，
+    // 但这条检查本身不该有可被绕过的边界。
+    let expected = w as u64 * h as u64;
+    if data.len() as u64 != expected {
+        return Err(GpuError::Unsupported(format!(
+            "R8 纹理数据长度必须等于 宽×高 = {w}×{h} = {expected} 字节，实际 {} 字节",
+            data.len()
+        )));
+    }
+    Ok(())
+}
+
+/// 最近邻 / ClampToEdge / 无 mipmap 的采样器参数（**纯函数**，便于单测钉死）。
+///
+/// ## 为什么是这三个「非默认」选择 —— 它们是与 CPU 逐像素对齐的前提
+///
+/// CPU 参考 `null.rs::draw_text_real` 的采样方式是
+/// `coverage[(slot.y + gy) * atlas_w + (slot.x + gx)]` —— 取**一个**纹素的整数值，
+/// 没有任何插值、没有任何环绕。所以：
+///
+/// - **`Nearest`**：`Linear` 会在字形边缘做双线性插值 ⇒ 与 CPU 的硬边系统性不同，
+///   「逐像素一致」这条验收直接失效；
+/// - **`ClampToEdge`**：字形图集是多个字形共用的一张**大图**。uv 落在字形边界之外
+///   哪怕一点点，`Repeat` 会采到图集**对侧**的纹素（完全无关的字形），表现为
+///   「字形边缘出现别的字符的碎片」；
+/// - **无 mipmap（`minLod = maxLod = 0`、`mip_levels = 1`）**：有 mip 时硬件按纹理
+///   坐标导数选层，小字号会采到模糊层，与 CPU 的清晰点采样不一致。
+fn sampler_create_info() -> vk::SamplerCreateInfo {
+    vk::SamplerCreateInfo {
+        s_type: vk::VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: 0,
+        mag_filter: vk::VK_FILTER_NEAREST,
+        min_filter: vk::VK_FILTER_NEAREST,
+        mipmap_mode: vk::VK_SAMPLER_MIPMAP_MODE_NEAREST,
+        address_mode_u: vk::VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        address_mode_v: vk::VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        address_mode_w: vk::VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+        mip_lod_bias: 0.0,
+        // 各向异性会带来额外的、依赖实现的多重采样 ⇒ 与 CPU 点采样不可比
+        anisotropy_enable: vk::VK_FALSE,
+        max_anisotropy: 1.0,
+        // 不是阴影比较采样器（`compare_enable` 会改变采样语义）
+        compare_enable: vk::VK_FALSE,
+        compare_op: vk::VK_COMPARE_OP_ALWAYS,
+        // 无 mipmap：把 LOD 区间钉死在 0，硬件就只会采第 0 层
+        min_lod: 0.0,
+        max_lod: 0.0,
+        // border color 只在 CLAMP_TO_BORDER 下生效；给个合法值以免结构体未初始化
+        border_color: vk::VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+        unnormalized_coordinates: vk::VK_FALSE,
+    }
+}
+
+/// 「整张图、单层单 mip、彩色通道」的子资源范围（M3b 的纹理与屏障共用）。
+fn full_subresource_range() -> vk::ImageSubresourceRange {
+    vk::ImageSubresourceRange {
+        aspect_mask: vk::VK_IMAGE_ASPECT_COLOR_BIT,
+        base_mip_level: 0,
+        level_count: 1,
+        base_array_layer: 0,
+        layer_count: 1,
+    }
+}
+
+/// 挑一个满足 `required` 位的内存类型（找不到就报错，**不静默退回**第一个）。
+///
+/// 「静默退回」是危险的：拿 `DEVICE_LOCAL` 的索引去要求 `HOST_VISIBLE` 的内存会
+/// 在映射时失败（或更糟：映射成功但主机写入对设备不可见）。
+fn pick_memory_type(
+    props: vk::PhysicalDeviceMemoryProperties,
+    type_bits: u32,
+    required: u32,
+) -> GpuResult<u32> {
+    let count = props.memory_type_count.min(32);
+    for i in 0..count {
+        let ty = &props.memory_types[i as usize];
+        if type_bits & (1 << i) != 0 && ty.property_flags & required == required {
+            return Ok(i);
+        }
+    }
+    Err(GpuError::Unsupported(format!(
+        "找不到满足属性 {required:#x} 的内存类型（memoryTypeBits = {type_bits:#x}）"
+    )))
+}
+
+/// 分配设备内存。
+fn alloc_memory(
+    device: vk::DeviceHandle,
+    fns: &DeviceFns,
+    size: u64,
+    memory_type_index: u32,
+    _required: u32,
+) -> GpuResult<OwnedHandle> {
+    let info = vk::MemoryAllocateInfo {
+        s_type: vk::VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+        p_next: std::ptr::null(),
+        allocation_size: size,
+        memory_type_index,
+    };
+    let mut handle: vk::DeviceMemoryHandle = std::ptr::null_mut();
+    // SAFETY: 结构体在栈上；输出句柄可写。
+    let rc = unsafe { (fns.allocate_memory)(device, &info, std::ptr::null(), &mut handle) };
+    check_vk("vkAllocateMemory", rc)?;
+    Ok(OwnedHandle::memory(handle, device, fns.free_memory))
+}
+
+/// 把 `VkResult` 变成 `GpuResult`（成功返回 `Ok(())`）。
+fn check_vk(what: &str, rc: i32) -> GpuResult<()> {
+    if rc == ffi::VK_SUCCESS {
+        Ok(())
+    } else {
+        Err(GpuError::Driver {
+            code: rc,
+            message: format!("{what} 失败：{}", vk_result_name(rc)),
+        })
+    }
 }
 
 /// 一个渲染通道。`Drop` 时销毁。
@@ -1438,6 +2327,17 @@ fn resolve_device_fns() -> GpuResult<DeviceFns> {
             cmd_pipeline_barrier: lib.sym("vkCmdPipelineBarrier")?,
             cmd_copy_image_to_buffer: lib.sym("vkCmdCopyImageToBuffer")?,
             cmd_clear_color_image: lib.sym("vkCmdClearColorImage")?,
+            create_sampler: lib.sym("vkCreateSampler")?,
+            destroy_sampler: lib.sym("vkDestroySampler")?,
+            create_descriptor_set_layout: lib.sym("vkCreateDescriptorSetLayout")?,
+            destroy_descriptor_set_layout: lib.sym("vkDestroyDescriptorSetLayout")?,
+            create_descriptor_pool: lib.sym("vkCreateDescriptorPool")?,
+            destroy_descriptor_pool: lib.sym("vkDestroyDescriptorPool")?,
+            allocate_descriptor_sets: lib.sym("vkAllocateDescriptorSets")?,
+            free_descriptor_sets: lib.sym("vkFreeDescriptorSets")?,
+            update_descriptor_sets: lib.sym("vkUpdateDescriptorSets")?,
+            cmd_bind_descriptor_sets: lib.sym("vkCmdBindDescriptorSets")?,
+            cmd_copy_buffer_to_image: lib.sym("vkCmdCopyBufferToImage")?,
         })
     }
 }
@@ -1567,5 +2467,60 @@ mod tests {
         };
         validate_vertex_pipeline_args(extent, 44, &good_attrs())
             .expect("合法参数（stride 44 / offset 0,8 / extent 16×16）必须通过");
+    }
+
+    /// **M3b：`R8_UNORM` 纹理的尺寸校验**（错误路径 + 正例）。
+    ///
+    /// 照 [`validate_vertex_pipeline_args`] 的同一模式：校验是**纯函数**，
+    /// 所以无 GPU 的机器也能覆盖负例 —— 而「负例没有测试」等于没有负例。
+    #[test]
+    fn texture_r8_args_reject_bad_sizes_and_lengths() {
+        // 正例：必须通过（否则下面几条可能是「永远报错」的假绿）
+        validate_texture_r8_args(4, 2, &[0u8; 8]).expect("4×2 且 8 字节覆盖率数据必须通过");
+
+        // ① 宽为 0
+        let e = validate_texture_r8_args(0, 4, &[]).expect_err("宽为 0 必须被拒");
+        assert!(format!("{e}").contains("宽高"), "{e}");
+
+        // ② 高为 0（两个方向都试，避免只查了一个字段）
+        let e = validate_texture_r8_args(4, 0, &[]).expect_err("高为 0 必须被拒");
+        assert!(format!("{e}").contains("宽高"), "{e}");
+
+        // ③ data 太短
+        let e = validate_texture_r8_args(4, 2, &[0u8; 7]).expect_err("data 少 1 字节必须被拒");
+        let msg = format!("{e}");
+        assert!(msg.contains("7") && msg.contains("8"), "错误信息要点出实得与期望：{msg}");
+
+        // ④ data 太长（「静默忽略多余数据」是最容易被放过的写法）
+        let e = validate_texture_r8_args(4, 2, &[0u8; 9]).expect_err("data 多 1 字节必须被拒");
+        let msg = format!("{e}");
+        assert!(msg.contains("9") && msg.contains("8"), "错误信息要点出实得与期望：{msg}");
+
+        // ⑤ 1×1 的合法最小纹理（边界：w*h == 1 不该被上面的比较写错成 0）
+        validate_texture_r8_args(1, 1, &[255]).expect("1×1 覆盖率纹理必须通过");
+    }
+
+    /// **M3b：采样器参数必须是「最近邻 + ClampToEdge + 无 mipmap」**。
+    ///
+    /// 抽成纯函数并在无 GPU 下单测的理由：这三条不是「随手选的默认值」，而是
+    /// **与 CPU 参考逐像素对齐的前提**（`null.rs::draw_text_real` 是点采样，
+    /// 且只按图集内坐标取纹素）—— 详见 [`sampler_create_info`] 的文档。
+    #[test]
+    fn sampler_params_are_nearest_clamp_no_mip() {
+        let info = sampler_create_info();
+        assert_eq!(info.mag_filter, vk::VK_FILTER_NEAREST, "放大必须最近邻");
+        assert_eq!(info.min_filter, vk::VK_FILTER_NEAREST, "缩小必须最近邻");
+        assert_eq!(info.mipmap_mode, vk::VK_SAMPLER_MIPMAP_MODE_NEAREST);
+        assert_eq!(info.address_mode_u, vk::VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+        assert_eq!(info.address_mode_v, vk::VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+        assert_eq!(info.address_mode_w, vk::VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+        assert_eq!(info.anisotropy_enable, vk::VK_FALSE, "各向异性会做额外采样");
+        assert_eq!(info.compare_enable, vk::VK_FALSE, "不是阴影采样器");
+        assert_eq!(info.unnormalized_coordinates, vk::VK_FALSE, "uv 是归一化坐标");
+        // 无 mipmap ⇒ LOD 区间必须钉在 0（min==max==0 才会只用第 0 层）
+        assert_eq!(info.min_lod, 0.0, "无 mipmap ⇒ minLod 必须是 0");
+        assert_eq!(info.max_lod, 0.0, "无 mipmap ⇒ maxLod 必须是 0");
+        // sType 写错是「驱动读垃圾」的经典来源，必须对上
+        assert_eq!(info.s_type, vk::VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);
     }
 }
