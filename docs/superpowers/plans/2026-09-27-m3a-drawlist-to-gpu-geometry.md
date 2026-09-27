@@ -25,11 +25,13 @@
 
 **Files:** 无（git 操作）
 
-- [ ] **Step 1: 建工作区**（`using-git-worktrees` 的 fallback 路径）
+> **Ruling（执行时改判，已记入 ledger）**：计划初稿要求 `git worktree`。实际改为**就地建分支** `feat/m3a-gpu-geometry`，因为 DSH 的 teammate 与本会话共享同一个工作目录，worktree 会让每个成员要额外区分两套绝对路径、并各自重建 `target/`。
+> **代价（若判错）**：隔离性弱于 worktree（测试与生成物落在同一棵树）；靠「一次只有一个实现者写同一批文件 + 收尾在分支上跑全量门禁」兜底。
+
+- [x] **Step 1: 建工作区**（已执行：就地分支）
 ```powershell
 cd Z:\deer-gui
-git worktree add ..\deer-gui-m3a -b feat/m3a-gpu-geometry
-cd ..\deer-gui-m3a
+git switch -c feat/m3a-gpu-geometry
 ```
 - [ ] **Step 2: 验证基线绿**
 Run: `cmd /c "cargo test --workspace"` → Expected: `203 passed / 0 failed`
@@ -74,8 +76,11 @@ fn rect_attrs_shaders_validate() {
         let words: Vec<u32> = code.chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
         assert_eq!(words[0], 0x0723_0203, "{name}: magic");
-        assert!(words[3] == 0, "{name}: bound 必须非 0 且 opcode 段序合法");
-        crate::spirv_val_helpers::run_spirv_val(name, &code).expect("spirv-val 必须接受");
+        // 头部第 4 个字是 bound，必须 > 0 且大于所有用到的 Id（见 spirv.rs 模块文档 L23-25）
+        assert!(words[3] > 0, "{name}: 头部 bound 必须 > 0");
+        // 再把这两支着色器加进本文件**既有**的官方 spirv-val 校验流程：
+        // 该文件已有 `find_spirv_val()`，照 `vertex_shader_triangle` 等既有用例的写法调用，
+        // **不要自造 helper 名**（计划初稿曾写成不存在的 `spirv_val_helpers::run_spirv_val`）。
     }
 }
 ```
