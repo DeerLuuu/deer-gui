@@ -70,7 +70,7 @@ M3 原写成一条「渲染器 + 管线（矩形/圆角/裁剪/文本）」。�
 |---|---|---|---|
 | **M3a-1** | **顶点流 + 着色器**：`gpu_geom.rs`（`DrawList` → `GpuVertex` 流，CPU 侧几何裁剪）、`spirv.rs` 的矩形属性 VS/FS | ✅ 完成 | 顶点布局 `#[repr(C)]` stride 44（`pos`/`rect`/`radius_kind`/`color`）；**静态** viewport/scissor；着色器经 `spirv-val` |
 | **M3a-2** | **离屏 GPU 几何渲染器**：`gpu_render.rs` 的 `GpuGeometryRenderer`（顶点缓冲 + 静态管线 + 回读） | ✅ 完成 | `cargo run -p deer-gui --example gpu_geometry` → `exit=0`；与 CPU **逐字节相同** |
-| **M3a-3** | **与 CPU 逐像素对照**：`crates/deer-vk/tests/gpu_vs_cpu.rs` | ✅ 完成 | 不透明语料**最大通道差 0**（逐字节相同）；半透明语料**最大差 1 LSB**（实测仅 `alpha-clip` 非 0，**是实测上限不是证明上界**）；覆盖矩形/圆角（含超大半径）/描边（含带宽 > 边长）/裁剪/**嵌套裁剪**/退化 extent/清屏/连续多帧；`DEER_VK_VALIDATION=1` 下 parity **零校验消息**（**「层确实在跑」与「消息为零」都是可回归断言** —— 进程级计数 + parity 三处 `assert_no_validation_messages`；但 VVL 不做通用同步验证 ⇒ 零消息**不能**证明内存域依赖正确） |
+| **M3a-3** | **与 CPU 逐像素对照**：`crates/deer-vk/tests/gpu_vs_cpu.rs` | ✅ 完成 | 不透明语料**最大通道差 0**（逐字节相同）；半透明语料**最大差 1 LSB**（实测仅 `alpha-clip` 非 0，**是实测上限不是证明上界**）；覆盖矩形/圆角（含超大半径）/描边（含带宽 > 边长）/裁剪/**嵌套裁剪**/退化 extent/清屏/连续多帧；`DEER_VK_VALIDATION=1` 下 parity **零校验消息**（**「层确实在跑」与「消息为零」都是可回归断言** —— 进程级计数 + parity 用例里的 `assert_no_validation_messages`，当前覆盖单帧/不透明/半透明/越界 alpha；但 VVL 不做通用同步验证 ⇒ 零消息**不能**证明内存域依赖正确） |
 | **M3b** | **文本 / 字形上 GPU** | ⬜ | `DrawCmd::Text` 目前明确 `Unsupported`；需要纹理（字形图集）与采样。**已知限制（本轮 defer）**：这个 `Unsupported` 是**无条件**的 —— 空串 / 零面积 / 整块被 clip 裁掉时 GPU 也报错，而 CPU 能正常出图（**假阳性**）；M3b 做文本时必须一并处理，详见 [`docs/features/gpu-geometry.md`](docs/features/gpu-geometry.md) 第 6 节的「做不到」 |
 | **M3c** | **窗口里显示界面** | ⬜ | M2b 能上屏、M3a 能离屏画出界面几何，但两者还没接起来（窗口里仍只有清屏色 + M2a 几何） |
 | **M3+** | **批处理优化** | ⬜ | 当前**每帧一个顶点缓冲、一次 draw**；属性能项，不影响正确性 |
@@ -82,7 +82,7 @@ M3 原写成一条「渲染器 + 管线（矩形/圆角/裁剪/文本）」。�
 2. **颜色附件必须 `R8G8B8A8_UNORM`（不是 `_SRGB`）** —— CPU 基准不做 gamma，用 SRGB 会系统性偏差。
 3. **「零校验消息」是可回归断言，但有明确覆盖边界** —— 「层确实在跑」由
    `validation_layer_state_matches_the_request` 钉住；「消息为零」由 `ffi::validation_message_count()`
-   （进程级计数）配合 parity 三处 `assert_no_validation_messages` 钉住（不再靠人眼看 stderr）。
+   （进程级计数）配合 parity 用例里的 `assert_no_validation_messages`（单帧/不透明/半透明/越界 alpha）钉住（不再靠人眼看 stderr）。
    **限制仍在**：计数只在 `DEER_VK_VALIDATION=1` 时有判别力，且 **VVL 不做通用同步验证** ⇒
    「零消息」**不能**证明内存域依赖正确（如 host→vertex 屏障；那条由
    `host_to_vertex_barrier_is_emitted_once_per_non_empty_frame` 单独守）。

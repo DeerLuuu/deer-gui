@@ -41,16 +41,27 @@ pub const RADIUS_STROKE: f32 = -1.0;
 
 /// 把 `StrokeRect { width }` 编码成 `radius_kind`。
 ///
-/// `width == 1` ⇒ [`RADIUS_STROKE`]（`-1.0`，最常见的 1px 边框走这个「好认」的值），
+/// `width <= 1` ⇒ [`RADIUS_STROKE`]（`-1.0`，最常见的 1px 边框走这个「好认」的值），
 /// 否则 ⇒ `-(width as f32)`。片元着色器用 `-radius_kind` 作为带宽。
 ///
-/// **调用方应先做 `width.max(1)`**：`0` 会得到 `-0.0`（等价于无描边），负值会变成**正数**
-/// 而被片元着色器误认为圆角半径 —— [`build_stream`] 内部已经先夹过一遍。
+/// ## 为什么在这里就把 `width <= 0` 夹到 1（而不是让调用方负责）
+///
+/// 三条理由，缺一不可：
+/// 1. **与 CPU 基线一致**：`null.rs::stroke()` 第一行就是 `let w = width.max(1)` ——
+///    CPU 语义里根本不存在「0 宽描边」，所以这里夹到 1 是**复刻**，不是发明；
+/// 2. **消灭两个会被静默误读的值**：不夹时 `0 ⇒ -0.0`（片元着色器的 `rk < 0` 为假 ⇒ 被当成
+///    **填充**，画出一整块实心），`-3 ⇒ +3.0`（正数 ⇒ 被当成**圆角半径**）。两者都不报错，
+///    只是画错；
+/// 3. **双层防护**：[`build_stream`] 内部也先 `width.max(1)` 一次 —— 将来若有别的调用方
+///    绕过它直接调本函数，仍然拿不到那两个危险值。
+///
+/// 语义被测试钉死：`gpu_geom_stream.rs::radius_kind_for_stroke_traps_are_closed`。
 pub fn radius_kind_for_stroke(width: i32) -> f32 {
-    if width == 1 {
+    let w = width.max(1);
+    if w == 1 {
         RADIUS_STROKE
     } else {
-        -(width as f32)
+        -(w as f32)
     }
 }
 
@@ -159,6 +170,17 @@ pub fn build_stream(list: &DrawList, extent: Extent) -> GpuStream {
                     emit_quad(&mut out.vertices, side, *rect, *color, rk, &clip, &ndc);
                 }
             }
+            // ## 已知限制（**明确 defer，不是没想到**）
+            //
+            // 这里**无条件**登记：只要命令是 `Text`，哪怕 `text.is_empty()`、`rect` 零面积、
+            // 或 `rect ∩ clip` 为空（这三种情形 **CPU 一个像素都不画**），GPU 侧同样会返回
+            // `Unsupported` —— 也就是在这类帧上，**GPU 会拒收 CPU 正常出得出来的图**（假阳性）。
+            //
+            // 为什么不当场修：修法是「先判断这条文本是否真的会画字，再决定登不登记」，
+            // 属于**错误策略的行为变更**（会动到 T4 parity 语料里「文本 ⇒ 报错」的前提），
+            // 必须作为独立任务做 + 单独 review，不能在收尾轮里悄悄改。
+            // 控制者已裁定本轮 defer；文档侧的「已知限制」由 docs-dev 同步，
+            // 本条注释是仓库里（代码旁）的可见登记。
             DrawCmd::Text { rect, text, .. } => out.unsupported.push(format!(
                 "DrawCmd::Text(rect=({}, {}, {}×{}), {} 字符)：GPU 后端尚未实现文本绘制",
                 rect.x,
@@ -257,6 +279,23 @@ fn intersect(a: &RectI, b: &RectI) -> RectI {
 ///
 /// `u8 / 255.0` 正是 `Rgba8Unorm` 的通道语义，所以 GPU 的 src-alpha 混合结果
 /// 与 CPU 的 `blend()` 在**不透明颜色**上逐字节一致，在半透明颜色上只差舍入。
+///
+/// ## alpha 必须 `clamp(0.0, 1.0)`（正是 CPU 基线的做法）
+///
+/// CPU 的 `null.rs::blend_cov` 第一步就是 `c.a.clamp(0.0, 1.0)`，而 `Color::rgba` 对 alpha
+/// **没有校验**（可以传 `1.5`）。若不在这里夹：
+/// - GPU 会拿到 `a = 1.5` ⇒ 按 `src*1.5 + dst*(1-1.5)` 混合（**外推**，dst 变成负数贡献）；
+/// - CPU 拿到同一个 `Color` 会按 `a = 1.0` 混合；
+///
+/// ⇒ 两边**必然对不上**，而「逐字节/≤1 LSB」的硬判据会被一个越界输入破坏。
+///
+/// 基准一致性不能建立在「没人会传 `a > 1.0`」之上 —— 一行 `clamp` 就免了。
+/// RGB 是 `u8`，除以 255 天然落在 `[0,1]`，无需处理。
 fn color_f32(c: Color) -> [f32; 4] {
-    [c.r as f32 / 255.0, c.g as f32 / 255.0, c.b as f32 / 255.0, c.a]
+    [
+        c.r as f32 / 255.0,
+        c.g as f32 / 255.0,
+        c.b as f32 / 255.0,
+        c.a.clamp(0.0, 1.0),
+    ]
 }

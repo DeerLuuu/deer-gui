@@ -330,6 +330,44 @@ fn semi_transparent_drawings_match_cpu_within_one_lsb() {
     assert_no_validation_messages("半透明语料");
 }
 
+/// **越界 alpha（`a > 1.0` 或 `< 0`）也必须与 CPU 逐字节一致**（T2 review M1）。
+///
+/// 依据：CPU 基线 `null.rs::blend_cov` 第一步就是 `c.a.clamp(0.0, 1.0)`，而 `Color::rgba`
+/// 对 alpha **没有校验**。`build_stream` 现在同样夹 ⇒ 两边都把 `a = 1.5` 当**不透明**、
+/// 把 `a = -1.0` 当**全透明**（都不写像素）。
+///
+/// 所以这里的判据是**逐字节相同**（`max_allowed = 0`），而不是「≤1 LSB」。
+///
+/// ⚠️ **诚实说明这条测试的判别力**（实测，别高估它）：把 `color_f32` 的 `clamp` 去掉后，
+/// **本测试仍然通过** —— 因为 UNORM 颜色附件在固定功能混合阶段会**隐式**把源 alpha 夹到
+/// `[0,1]`（本机 Intel 驱动实测如此）。也就是说：真正能抓住「忘了 clamp」的是**发射侧**的
+/// 断言 `gpu_geom_stream.rs::out_of_range_alpha_is_clamped_like_the_cpu_baseline`，
+/// 而本测试守的是「**两边在越界 alpha 上仍然等价**」这个结论本身（若将来换成浮点附件、
+/// 或驱动不再隐式夹，它就会变成有判别力的那一条）。
+#[test]
+fn out_of_range_alpha_matches_cpu_byte_for_byte() {
+    let Some(mut r) = renderer(Extent { width: 16, height: 12 }) else {
+        return;
+    };
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(1, 1, 12, 8),
+        color: Color::rgba(255, 0, 0, 1.5), // ⇒ 两边都 clamp 到 1.0（不透明）
+    });
+    l.push(DrawCmd::FillRoundRect {
+        rect: RectI::new(3, 3, 8, 6),
+        radius: 2,
+        color: Color::rgba(0, 128, 255, 2.0), // ⇒ 两边都 clamp 到 1.0
+    });
+    l.push(DrawCmd::StrokeRect {
+        rect: RectI::new(2, 2, 10, 7),
+        color: Color::rgba(255, 255, 255, -1.0), // ⇒ 两边都 clamp 到 0.0（全透明，不写像素）
+        width: 2,
+    });
+    assert_eq!(compare(&mut r, "alpha-out-of-range", &l, 0), 0);
+    assert_no_validation_messages("越界 alpha");
+}
+
 /// 另一个静态 viewport 尺寸（证明 viewport/scissor 是**跟着 extent 建进管线**的）。
 #[test]
 fn a_different_extent_uses_its_own_static_viewport() {

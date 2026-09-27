@@ -96,6 +96,21 @@ fn color_is_normalized_to_unit_range() {
     assert!(close(c[3], 0.5));
 }
 
+/// **alpha 必须被夹到 `[0,1]`**（T2 review M1）：`Color::rgba` 对 alpha 没有校验，
+/// 而 CPU 基线（`null.rs::blend_cov` 的 `c.a.clamp(0.0, 1.0)`）会夹。
+///
+/// 不夹的后果不是崩溃而是**两边必然对不上**：GPU 拿到 `a = 1.5` 会按 `src*1.5 + dst*(-0.5)`
+/// 外推，CPU 按 `a = 1.0` 混合 ⇒ 「逐字节相同 / ≤1 LSB」的硬判据被一个越界输入破坏。
+#[test]
+fn out_of_range_alpha_is_clamped_like_the_cpu_baseline() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 2, 2), color: Color::rgba(10, 20, 30, 1.5) });
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 2, 2), color: Color::rgba(10, 20, 30, -0.25) });
+    let s = gpu_geom::build_stream(&l, Extent { width: 2, height: 2 });
+    assert!(close(s.vertices[0].color[3], 1.0), "a = 1.5 ⇒ 夹到 1.0，实际 {}", s.vertices[0].color[3]);
+    assert!(close(s.vertices[6].color[3], 0.0), "a = -0.25 ⇒ 夹到 0.0，实际 {}", s.vertices[6].color[3]);
+}
+
 /// 圆角填充：`radius_kind` 携带**半径本身**（片元着色器据此复刻 CPU 的整数像素判据）。
 #[test]
 fn round_rect_carries_radius_in_radius_kind() {
@@ -122,6 +137,29 @@ fn radius_kind_for_stroke_encodes_band_width() {
     assert_eq!(gpu_geom::radius_kind_for_stroke(1), gpu_geom::RADIUS_STROKE);
     assert_eq!(gpu_geom::radius_kind_for_stroke(2), -2.0);
     assert_eq!(gpu_geom::radius_kind_for_stroke(4), -4.0);
+}
+
+/// **陷阱值已关闭**（T2 review M4 第 3 条）：`width <= 0` 必须与 CPU 的 `width.max(1)` 一致，
+/// 不能产生两个「不报错但画错」的值。
+///
+/// 选择的是**夹到 1**（而不是拒绝），理由写在 `radius_kind_for_stroke` 的文档里：
+/// ① CPU 基线 `null.rs::stroke()` 本身就是 `width.max(1)`，夹到 1 是复刻而非发明；
+/// ② 不夹时会得到 `0 ⇒ -0.0`（片元着色器 `rk < 0` 为假 ⇒ 被当成**填充**，画成实心）与
+///    `-3 ⇒ +3.0`（正数 ⇒ 被当成**圆角半径**）—— 两个都是静默画错；
+/// ③ `build_stream` 内部还会再夹一次（双层防护），将来绕过它的调用方也拿不到危险值。
+#[test]
+fn radius_kind_for_stroke_traps_are_closed() {
+    // 0 ⇒ 不是 -0.0，而是 1px 描边
+    let rk0 = gpu_geom::radius_kind_for_stroke(0);
+    assert_eq!(rk0, gpu_geom::RADIUS_STROKE, "width = 0 必须按 1px 描边处理");
+    assert_ne!(rk0, 0.0, "不能是 0（片元着色器会当成普通填充 → 画成实心）");
+    assert!(rk0 < 0.0, "必须是负数（负数才是描边）");
+
+    // 负数 ⇒ 不能变成正数（正数会被当成圆角半径）
+    let rk_neg = gpu_geom::radius_kind_for_stroke(-3);
+    assert_eq!(rk_neg, gpu_geom::RADIUS_STROKE, "width = -3 同样按 1px 描边处理");
+    assert!(rk_neg < 0.0, "负宽度不能变成正数（那会被片元着色器当圆角半径），实际 {rk_neg}");
+    assert_eq!(gpu_geom::radius_kind_for_stroke(i32::MIN), gpu_geom::RADIUS_STROKE);
 }
 
 /// 描边展开为 CPU `stroke()` 的 **4 条边带**（每带 6 顶点 ⇒ 共 24），

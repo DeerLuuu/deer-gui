@@ -108,7 +108,7 @@ DrawList ──gpu_geom::build_stream──→ GpuVertex 流 ──memcpy──�
 | 顶点布局 | `#[repr(C)]`：`pos: vec2`（NDC）@0、`rect: vec4`（**原始**像素矩形）@8、`radius_kind: float` @24、`color: vec4` @28，**stride 44** |
 | `radius_kind` | `0` = 普通填充；`> 0` = 圆角半径；`< 0` = 描边（`-带宽`；`width == 1` 用 `-1.0`） |
 | NDC | `x = 2*px/w - 1`、`y = 2*py/h - 1`（**y 向下为正**）⇒ 像素 (0,0) 映射到 `(-1,-1)` |
-| 顶点颜色 | `Color` 原值，0–1，**不预乘** |
+| 顶点颜色 | `Color` 的通道 `u8 / 255`，**alpha 会 `clamp(0.0, 1.0)`**（与 CPU `blend_cov` 的第一步一致：`Color::rgba` 不校验 alpha，越界值不能靠「没人会传」来保证一致）；**不预乘** |
 | 混合 | `src-alpha / one-minus-src-alpha`（与 CPU `blend_cov(cov = 1.0)` 同式） |
 | 颜色附件 | **`R8G8B8A8_UNORM`**（不是 `_SRGB`） |
 | 裁剪 | CPU 侧几何裁剪；顶点 `pos` 用**裁剪后**矩形，顶点属性 `rect` 保留**原始**矩形（圆角/描边判据要按原始矩形算） |
@@ -125,7 +125,7 @@ DrawList ──gpu_geom::build_stream──→ GpuVertex 流 ──memcpy──�
    **「层确实在跑」**由 `validation_layer_state_matches_the_request` 钉住（对照 `DEER_VK_VALIDATION` 的请求与
    `GpuGeometryRenderer::validation_enabled()` 的实际状态）；**「消息为零」**由
    `ffi::validation_message_count()`（进程级 `AtomicUsize` 计数）配合 parity 用例里的
-   `assert_no_validation_messages`（`tests/gpu_vs_cpu.rs:108/315/330` 三处 `assert_eq!(count, 0)`）钉住——
+   `assert_no_validation_messages`（单帧 / 不透明语料 / 半透明语料 / 越界 alpha 四处 `assert_eq!(count, 0)`）钉住——
    不再靠人眼看 stderr。**限制仍在**：计数只在 `DEER_VK_VALIDATION=1` 时有判别力（层没开时回调不跑、计数恒为 0），
    且 **VVL 不做通用同步验证** ⇒ 「零消息」**不能**证明内存域依赖是对的
    （例如删掉 host→vertex 屏障它也不报错；那条依赖由
@@ -157,7 +157,7 @@ assert_eq!(gpu.extent(), extent);
 ```
 
 本仓库的**权威判据**在 `crates/deer-vk/tests/gpu_vs_cpu.rs`（本机实跑：`cargo test -p deer-vk --test gpu_vs_cpu -- --list`
-→ **11 tests**；测试数/语料随加固增长，**以该命令输出为准**）：
+→ **12 tests**；测试数/语料随加固增长，**以该命令输出为准**）：
 
 | 测试 | 判据 | 本机实测 |
 |---|---|---|
@@ -172,6 +172,7 @@ assert_eq!(gpu.extent(), extent);
 | `validation_layer_state_matches_the_request` | 请求了校验层 ⇒ 层**确实在跑**（`validation_enabled()`），没请求 ⇒ 必须为假 | 通过 |
 | `host_to_vertex_barrier_is_emitted_once_per_non_empty_frame` | 有顶点的帧**恰好 +1** 条 host→vertex 屏障；空帧不增；每帧重传顶点 ⇒ 每帧都发（删掉那条屏障 ⇒ 变红） | 通过 |
 | `render_is_refused_after_an_unconfirmed_submit` | 上次提交未确认完成之后 `render` **必定报错**且**持续拒绝**（含空帧），不去碰任何资源；`ensure_reusable()` 的守卫不依赖调用方写法 | 通过 |
+| `out_of_range_alpha_matches_cpu_byte_for_byte` | 越界 alpha（`1.5` / `2.0` / `-1.0`）两边都按 `clamp(0.0, 1.0)` 混合 ⇒ 逐字节相同（守住「颜色契约」这个前提本身） | 最大通道差 0 |
 
 跑法：`cargo test -p deer-vk --test gpu_vs_cpu -- --nocapture`（会逐场景打印最大通道差）。
 
