@@ -27,14 +27,53 @@ use deer_vk::GpuGeometryRenderer;
 /// 清屏色（不透明 ⇒ UNORM 转换两边都是精确的）。
 const CLEAR: Color = Color::rgb(16, 16, 16);
 
+/// `DEER_VK_VALIDATION=1`/`true` ⇒ 请求校验层（与 `ffi::Instance::validation_from_env` 同一判据）。
+fn validation_requested() -> bool {
+    std::env::var("DEER_VK_VALIDATION")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// 建渲染器。**请求了校验层时「建不起来」就是测试失败，不是「跳过」**（T3 review F7）：
+/// 否则「层没装好 / 被静默降级」会表现成一次安静的跳过，而验收里最重要的那条
+/// （零校验消息）就变成了空话。
 fn renderer(extent: Extent) -> Option<GpuGeometryRenderer> {
     match GpuGeometryRenderer::new(0, extent, CLEAR) {
         Ok(r) => Some(r),
+        Err(e) if validation_requested() => panic!(
+            "DEER_VK_VALIDATION 已请求，但 GPU 渲染器建不起来（{e}）—— \
+             要么校验层没生效（`ffi::Instance::create_with_extensions` 本该直接报错），\
+             要么设备本身起不来；这两种都不能打印一句「跳过」就当通过"
+        ),
         Err(e) => {
             println!("跳过：本机没有可用的 Vulkan GPU（{e}）");
             None
         }
     }
+}
+
+/// **F7：把「零校验消息」从人工观察升级为可回归断言。**
+///
+/// 校验层的全部价值在于「它真的在跑」。「跑起来没看到消息」可能意味着两件事：
+/// ① 真的没问题；② 层根本没加载（或有人把「层缺失就报错」改成静默降级）。
+/// 只看输出无法区分，所以这里硬断言：
+/// - 请求了 ⇒ `validation_enabled()` 必须为真（设备建不起来时上面的 `renderer()` 已经 panic）；
+/// - 没请求 ⇒ 必须为假（挡住「永远返回 true」的假实现）。
+#[test]
+fn validation_layer_state_matches_the_request() {
+    let Some(r) = renderer(Extent { width: 4, height: 4 }) else {
+        return;
+    };
+    let requested = validation_requested();
+    let actual = r.validation_enabled();
+    println!("校验层：请求={requested} 实际={actual}");
+    assert_eq!(
+        actual,
+        requested,
+        "DEER_VK_VALIDATION={:?}（请求={requested}）但设备报告 validation_enabled={actual}；\
+         「零校验消息」必须建立在「校验层确实在跑」之上，否则它什么也没证明",
+        std::env::var("DEER_VK_VALIDATION").ok()
+    );
 }
 
 /// 对照一帧，返回**最大通道差**。

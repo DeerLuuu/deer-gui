@@ -39,6 +39,32 @@
 //! - **alpha 混合按 `src-alpha / one-minus-src-alpha`**（[`crate::device`] 里既有的管线状态），
 //!   与 `null.rs::blend_cov`（覆盖率 = 1）同式；
 //! - **不预乘**：顶点颜色就是 `Color` 的原值（见 [`crate::gpu_geom`] 的颜色约定）。
+//!
+//! ## 同步（T3 review I1/I2：这两条是**真缺陷**，不是洁癖）
+//!
+//! ### ① 顶点缓冲的 host 写入 → `vkCmdDraw` 读取，必须**显式**建依赖
+//!
+//! 每帧写顶点缓冲的是**主机**（`map → memcpy → unmap`），读它的是 GPU 的 `VERTEX_INPUT` 阶段。
+//! 这两个域之间的依赖**不会被校验层检查**（VVL 做的是对象/参数/布局类校验，不做通用同步验证）
+//! —— 所以「`DEER_VK_VALIDATION=1` 零消息」**不能**作为「同步正确」的证据。这里显式发一条
+//! `VkBufferMemoryBarrier`：`srcStageMask = HOST` / `srcAccessMask = HOST_WRITE` →
+//! `dstStageMask = VERTEX_INPUT` / `dstAccessMask = VERTEX_ATTRIBUTE_READ`。
+//!
+//! 关于 flush：**只**选 `HOST_COHERENT` 的内存（`create_host_buffer` 的 `required` 位里带着它，
+//! 拿不到就报 `Unsupported`；`pick_memory_type` 的单元测试把「绝不用非相干内存」钉住），
+//! 所以不需要 `vkFlushMappedMemoryRanges`。顺便说明为什么**不能**顺手加上它：`ffi_dev` 里没有
+//! `vkFlushMappedMemoryRanges` 符号，而 `ffi_dev.rs` 不在本任务的允许改动清单里。
+//! **将来若放开「必须相干」这个约束，必须同时补上 flush**，否则主机写入对设备不可见。
+//!
+//! 读回方向（`copyImageToBuffer` → 主机 `map`）靠**栅栏**保证：栅栏信号使设备写入对主机可见
+//! （相干内存下不需要 invalidate），我们等到栅栏才 map。
+//!
+//! ### ② 栅栏等待失败（超时）**不等于**提交完成 —— 之后不许复用任何东西
+//!
+//! `vkWaitForFences` 超时只说明「还没等到」。此时命令缓冲可能仍在执行、顶点缓冲可能仍被读，
+//! 于是下一帧的 `vkResetCommandBuffer` / 重写顶点缓冲 / `vkResetFences` 都是**未定义行为**
+//! （驱动不一定报错）。所以超时/失败后把渲染器置为 [`SubmitState::Broken`]，之后**任何**
+//! `render` 都直接报错，直到调用方丢弃并重建（判定逻辑有单元测试，见文件末尾 `tests`）。
 
 use std::ffi::c_void;
 
@@ -58,6 +84,28 @@ use crate::spirv;
 /// `R32G32B32A32_SFLOAT`（`vbo_probe.rs` 只需要 vec2）。规范里 `VK_FORMAT_R32_SFLOAT = 100`。
 /// 放在本模块而不是随手写 100：名字带来源，且只在这一处出现。
 const VK_FORMAT_R32_SFLOAT: i32 = 100;
+
+/// `VK_PIPELINE_STAGE_HOST_BIT`（= `0x0000_4000 = 1 << 14`）。
+///
+/// 与上面同一个理由：`ffi_dev` 里只有 `TOP_OF_PIPE` / `TRANSFER` / `COLOR_ATTACHMENT_OUTPUT` /
+/// `BOTTOM_OF_PIPE` / `ALL_COMMANDS` —— 主机侧同步（HOST / VERTEX_INPUT 与下面两个 access 位）
+/// 是 M3a-T3 第一次需要，而 `ffi_dev.rs` 不在允许改动清单里。
+const VK_PIPELINE_STAGE_HOST_BIT: u32 = 1 << 14;
+/// `VK_PIPELINE_STAGE_VERTEX_INPUT_BIT`（= `0x0000_0004 = 1 << 2`）。
+///
+/// ⚠️ **不是 `1 << 5`** —— `1 << 5`（`0x20`）是 `VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT`。
+/// 这一点是校验层替我们抓到的（fix round 1 首次跑校验：`dstStageMask` 含细分求值阶段而设备
+/// 没开 `tessellationShader` ⇒ `VUID-vkCmdPipelineBarrier-dstStageMask-04091`）。
+/// 症状很隐蔽：屏障**照样被接受**，只是它建立的依赖根本不覆盖顶点取数 ——
+/// 「加了屏障但没用」比「没加屏障」更难发现。
+const VK_PIPELINE_STAGE_VERTEX_INPUT_BIT: u32 = 1 << 2;
+/// `VK_ACCESS_HOST_WRITE_BIT`（= `0x0000_4000 = 1 << 14`）。
+const VK_ACCESS_HOST_WRITE_BIT: u32 = 1 << 14;
+/// `VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT`（= `0x0000_0004 = 1 << 2`）。
+///
+/// 同样**不是** `1 << 5`（那是 `VK_ACCESS_SHADER_READ_BIT`）。注意它与上面那个阶段位
+/// **数值相同但属于不同枚举** —— 这不是笔误。
+const VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT: u32 = 1 << 2;
 
 /// 颜色附件的格式：**线性 UNORM**（见模块文档「三条前提」）。
 const COLOR_FORMAT: i32 = vk::VK_FORMAT_R8G8B8A8_UNORM;
@@ -143,6 +191,89 @@ struct VertexBuffer {
     capacity: u64,
 }
 
+/// 提交同步状态（**纯逻辑** ⇒ 可以在无 GPU 的单元测试里覆盖，见文件末尾 `tests`）。
+///
+/// 存在理由（T3 review I2）：`vkWaitForFences` 失败（超时）**不等于**提交完成。
+/// 旧实现直接把错误往上抛，但渲染器**状态不变** —— 调用方（或同一次 `render` 的重试）
+/// 会接着 `vkResetCommandBuffer` / 重写顶点缓冲 / `vkResetFences`，而这些东西可能**仍在
+/// 被 GPU 使用**。那是未定义行为，且驱动往往不报错（症状是偶尔的垃圾像素或挂死）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum SubmitState {
+    /// 没有在飞的提交（上次已确认完成，或还没提交过）—— 可以复用命令缓冲与顶点缓冲。
+    #[default]
+    Idle,
+    /// 已提交、正在等栅栏 —— 只允许走「等 → resolve」这一条路。
+    InFlight,
+    /// 等待**失败**（超时等）：无法证明 GPU 已不再访问这些资源 ⇒ **永久不可复用**。
+    Broken,
+}
+
+impl SubmitState {
+    /// 复用任何资源之前的检查。
+    fn ensure_reusable(self) -> GpuResult<()> {
+        match self {
+            SubmitState::Broken => Err(GpuError::Unsupported(
+                "上一次提交没有确认完成（栅栏等待失败/超时）：命令缓冲与顶点缓冲里的内容\
+                 可能仍被 GPU 使用，本渲染器已不可复用 —— 请丢弃它并重建"
+                    .to_string(),
+            )),
+            SubmitState::Idle | SubmitState::InFlight => Ok(()),
+        }
+    }
+
+    /// 提交前的状态迁移。
+    fn begin(&mut self) {
+        *self = SubmitState::InFlight;
+    }
+
+    /// 等栅栏之后的状态迁移：成功 ⇒ 可复用；失败 ⇒ **Broken**（这是本条修复的核心）。
+    fn resolve(&mut self, wait_rc: i32) -> GpuResult<()> {
+        if wait_rc == ffi::VK_SUCCESS {
+            *self = SubmitState::Idle;
+            return Ok(());
+        }
+        *self = SubmitState::Broken;
+        Err(GpuError::Driver {
+            code: wait_rc,
+            message: format!(
+                "vkWaitForFences 失败（{} ⇒ 很可能是超时，即 GPU 没在预期时间内做完）。\
+                 提交状态未知 ⇒ 渲染器已被标记为不可复用（见 SubmitState）",
+                vk_result_name(wait_rc)
+            ),
+        })
+    }
+
+    /// 提交阶段出现别的错误时：**同样**不敢假设资源空闲。
+    fn mark_broken(&mut self) {
+        *self = SubmitState::Broken;
+    }
+}
+
+/// 已映射内存的 RAII 守卫：**无论从哪条路提前返回**都会 `unmap`。
+///
+/// 存在理由（T3 review F9）：`vkMapMemory` 成功之后的任何提前返回（例如空指针检查、拷贝失败）
+/// 都会漏掉 `vkUnmapMemory` —— 映射泄漏不会立刻报错，但下一次 `vkMapMemory` 会失败
+/// （VUID-vkMapMemory-memory-00678 之类），症状离原因很远。
+struct Mapped<'a> {
+    fns: &'a DeviceFns,
+    device: vk::DeviceHandle,
+    memory: vk::DeviceMemoryHandle,
+    ptr: *mut c_void,
+}
+
+impl Mapped<'_> {
+    fn as_mut_ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+}
+
+impl Drop for Mapped<'_> {
+    fn drop(&mut self) {
+        // SAFETY: 与创建时的 map 配对；句柄有效；本守卫持有期间内存保持映射。
+        unsafe { (self.fns.unmap_memory)(self.device, self.memory) };
+    }
+}
+
 /// 把 `rc` 变成 `GpuResult<()>`（错误信息里带上调用名与驱动返回码的名字）。
 fn check(what: &str, rc: i32) -> GpuResult<()> {
     if rc == ffi::VK_SUCCESS {
@@ -166,10 +297,13 @@ fn wrap_create(
     check(what, rc)?;
     if handle.is_null() {
         // 驱动返回成功却没写输出参数 —— 几乎总是「我们给的结构体与驱动理解的不一致」。
-        return Err(GpuError::Driver {
-            code: rc,
-            message: format!("{what} 返回成功但句柄为空（结构体或参数不符）"),
-        });
+        //
+        // 归到 `Unsupported` 而不是 `Driver { code: rc }`（T3 review F4）：
+        // 此刻 `rc == VK_SUCCESS`，把它当错误码塞进 `Driver` 只会打印出「驱动错误 0」，
+        // 是个**假的错误码**。本项目一律让 `Driver.code` 只承载**真实**的 `VkResult`。
+        return Err(GpuError::Unsupported(format!(
+            "{what} 返回成功但句柄为空（结构体或参数不符）"
+        )));
     }
     Ok(VkObject {
         handle,
@@ -225,6 +359,30 @@ fn alloc_memory(
         });
     }
     wrap_create(what, rc, handle, device, fns.free_memory)
+}
+
+/// map 一块主机可见内存，返回 **RAII 守卫**（释放即 `unmap`，见 [`Mapped`]）。
+fn map_memory<'a>(
+    what: &str,
+    fns: &'a DeviceFns,
+    device: vk::DeviceHandle,
+    memory: vk::DeviceMemoryHandle,
+) -> GpuResult<Mapped<'a>> {
+    let mut ptr: *mut c_void = std::ptr::null_mut();
+    // SAFETY: 内存是 HOST_VISIBLE；`ptr` 是可写输出；映射整块。
+    check(what, unsafe {
+        (fns.map_memory)(device, memory, 0, vk::WHOLE_SIZE, 0, &mut ptr)
+    })?;
+    if ptr.is_null() {
+        // 同上：没有真实 VkResult 可报，不用假的错误码。
+        return Err(GpuError::Unsupported(format!("{what} 返回空指针")));
+    }
+    Ok(Mapped {
+        fns,
+        device,
+        memory,
+        ptr,
+    })
 }
 
 /// 建一块缓冲 + 主机可见内存（顶点缓冲与回读暂存都用它）。
@@ -307,6 +465,8 @@ pub struct GpuGeometryRenderer {
     extent: Extent,
     clear: [f32; 4],
     unsupported: Vec<String>,
+    /// 提交同步状态：栅栏等待失败后置为 [`SubmitState::Broken`]，此后**拒绝复用**。
+    sync: SubmitState,
     /// **必须最后**（最后析构）。
     device: VkDevice,
 }
@@ -484,10 +644,9 @@ impl GpuGeometryRenderer {
             (fns.allocate_command_buffers)(device_handle, &alloc_info, &mut cmd)
         })?;
         if cmd.is_null() {
-            return Err(GpuError::Driver {
-                code: 0,
-                message: "vkAllocateCommandBuffers 返回成功但命令缓冲为空".to_string(),
-            });
+            return Err(GpuError::Unsupported(
+                "vkAllocateCommandBuffers 返回成功但命令缓冲为空".to_string(),
+            ));
         }
 
         // ⑦ 回读暂存（HOST_VISIBLE | HOST_COHERENT ⇒ 不需要显式 flush）
@@ -541,6 +700,7 @@ impl GpuGeometryRenderer {
                 clear.a,
             ],
             unsupported: Vec::new(),
+            sync: SubmitState::Idle,
             device,
         })
     }
@@ -548,6 +708,14 @@ impl GpuGeometryRenderer {
     /// **实际**渲染尺寸（请求 0 尺寸时是 1×1，见 [`GpuGeometryRenderer::new`]）。
     pub fn extent(&self) -> Extent {
         self.extent
+    }
+
+    /// **校验层是否真的启用**（不是「是否请求」）—— 见 [`VkDevice::validation_enabled`]。
+    ///
+    /// 测试可以据此**断言**「`DEER_VK_VALIDATION=1` ⇒ 校验层确实在跑」，从而把
+    /// 「零校验消息」从人工观察升级成可回归结论（T3 review F7）。
+    pub fn validation_enabled(&self) -> bool {
+        self.device.validation_enabled()
     }
 
     /// 上一帧里**未能翻译**的命令说明（目前只有 `DrawCmd::Text`）。
@@ -562,22 +730,27 @@ impl GpuGeometryRenderer {
     ///
     /// ## 报错策略（与 CPU 后端对齐）
     ///
-    /// - **裁剪栈不平衡**（`!list.clip_balanced()`，帧末净计数）⇒ `GpuError::Driver`。
-    ///   判据与 `null.rs:227-236`（`CpuFrame::record` / `CpuRenderer::render`）**完全相同**。
+    /// - **裁剪栈不平衡**（`!list.clip_balanced()`，帧末净计数）⇒ 报错。
+    ///   判据与 `null.rs:227-236`（`CpuFrame::record` / `CpuRenderer::render`）**完全相同**
+    ///   （CPU 用的错误形态是 `Driver { code: -1 }` 哨兵；这里用 `Unsupported` ——
+    ///   两边**都报错**才是契约，错误码不必逐字节相同，而假的 `-1` 不该当 VkResult 用）。
     ///   刻意**不用** [`gpu_geom::GpuStream::clip_unbalanced`] 当报错条件 —— 它更严
     ///   （额外拒绝「多出的 `PopClip`」这种 CPU 画得出来的列表），拿它报错会让 GPU 拒收
     ///   CPU 能画的输入，两边行为不再可比；那个字段是**诊断**用的；
     /// - **`unsupported` 非空**（文本）⇒ `GpuError::Unsupported` + [`Self::unsupported`] 可查；
-    /// - 其余是 `GpuError::Driver`（Vulkan 调用失败），错误信息带调用名与返回码名。
+    /// - **上一次提交没等到栅栏** ⇒ 本渲染器已不可复用，直接报错（见 [`SubmitState`]）；
+    /// - 其余是 `GpuError::Driver`（Vulkan 调用失败），`code` 一定是**真实的** `VkResult`。
     pub fn render(&mut self, list: &DrawList) -> GpuResult<Vec<u8>> {
         self.unsupported.clear();
 
+        // ⓪ 上一次提交没确认完成 ⇒ 什么都不许碰（命令缓冲/顶点缓冲可能仍在被 GPU 用）
+        self.sync.ensure_reusable()?;
+
         // ① 入口检查（与 CPU 同一判据）
         if !list.clip_balanced() {
-            return Err(GpuError::Driver {
-                code: -1,
-                message: "绘制列表的裁剪栈不平衡（PushClip/PopClip 未配对）".to_string(),
-            });
+            return Err(GpuError::Unsupported(
+                "绘制列表的裁剪栈不平衡（PushClip/PopClip 未配对）".to_string(),
+            ));
         }
 
         // ② 翻译成顶点流（CPU 侧已裁剪）
@@ -610,10 +783,14 @@ impl GpuGeometryRenderer {
         if self.vertex.as_ref().is_some_and(|v| v.capacity >= bytes) {
             return Ok(());
         }
-        // 先丢掉旧的：`VertexBuffer` 的字段顺序保证「先缓冲、后内存」；
-        // 到这里上一帧的提交已经等过栅栏 ⇒ 缓冲不在使用中，可以安全销毁。
-        self.vertex = None;
         let capacity = bytes.next_power_of_two().max(MIN_VERTEX_BYTES);
+        // **先建新的、成功后再换**（T3 review F11）：旧代码先 `self.vertex = None` 再建，
+        // 于是「新建失败」会留下「缓冲没了、容量也没了」的半残状态（下次还得从最小尺寸重来，
+        // 而且旧缓冲白白销毁）。这里把新对象建在局部变量里，失败就原样返回 ——
+        // 旧的仍然可用，`self.vertex` 不会被改坏。
+        //
+        // 析构顺序仍然正确：`VertexBuffer` 的字段顺序保证「先缓冲、后内存」；
+        // 赋值时旧值被 drop，此刻上一帧的提交已经等过栅栏 ⇒ 缓冲不在使用中。
         let (buffer, memory) = create_host_buffer(
             "vkCreateBuffer(vertex)",
             self.device_handle,
@@ -640,35 +817,22 @@ impl GpuGeometryRenderer {
         // SAFETY: `GpuVertex` 是 `#[repr(C)]` 的纯 `f32` 结构（无指针、无 Drop），
         // 按字节视图读它是定义良好的。
         let src = unsafe { std::slice::from_raw_parts(verts.as_ptr() as *const u8, bytes) };
-        let mut mapped: *mut c_void = std::ptr::null_mut();
-        // SAFETY: 内存是 HOST_VISIBLE；`mapped` 是可写输出；映射整块。
-        check("vkMapMemory(vertex)", unsafe {
-            (self.fns.map_memory)(
-                self.device_handle,
-                vb.memory.handle(),
-                0,
-                vk::WHOLE_SIZE,
-                0,
-                &mut mapped,
-            )
-        })?;
-        if mapped.is_null() {
-            return Err(GpuError::Driver {
-                code: 0,
-                message: "vkMapMemory(vertex) 返回空指针".to_string(),
-            });
-        }
-        // SAFETY: 映射了整块缓冲（≥ bytes，由 `ensure_vertex_capacity` 保证）；
-        // 源与目标不重叠。
+        // map 的守卫：**任何**提前返回都会 unmap（F9）。
+        let mapped = map_memory("vkMapMemory(vertex)", &self.fns, self.device_handle, vb.memory.handle())?;
+        // SAFETY: 映射了整块缓冲（≥ bytes，由 `ensure_vertex_capacity` 保证）；源与目标不重叠。
         unsafe {
-            std::ptr::copy_nonoverlapping(src.as_ptr(), mapped as *mut u8, bytes);
-            (self.fns.unmap_memory)(self.device_handle, vb.memory.handle());
+            std::ptr::copy_nonoverlapping(src.as_ptr(), mapped.as_mut_ptr() as *mut u8, bytes);
         }
+        // `mapped` 在此 drop ⇒ unmap。之后才提交（提交时主机写入已经发生 ——
+        // 「提交前的 host 写入对被提交的命令可见」这条由 `vkQueueSubmit` 保证；
+        // 而**显式**的缓冲区屏障在 `record_and_submit` 里发，见模块文档「同步」）。
         Ok(())
     }
 
     /// 录制一帧（清屏 + 绑定管线/顶点缓冲 + 绘制 + 屏障 + 拷贝），提交并等栅栏。
-    fn record_and_submit(&self, vertex_count: u32) -> GpuResult<()> {
+    ///
+    /// 需要 `&mut self`：等待失败时要把 [`SubmitState`] 置为 `Broken`（见模块文档「同步②」）。
+    fn record_and_submit(&mut self, vertex_count: u32) -> GpuResult<()> {
         // 上一帧已经等过栅栏 ⇒ 命令缓冲不在执行中，可以重置。
         check("vkResetCommandBuffer", unsafe {
             (self.fns.reset_command_buffer)(self.cmd, 0)
@@ -683,6 +847,44 @@ impl GpuGeometryRenderer {
         check("vkBeginCommandBuffer", unsafe {
             (self.fns.begin_command_buffer)(self.cmd, &begin)
         })?;
+
+        // ★ T3 review I1：主机刚写进顶点缓冲（map/memcpy/unmap）→ GPU 的 VERTEX_INPUT 要读它。
+        //   这条依赖**校验层不查**，所以必须显式建：srcStage=HOST / srcAccess=HOST_WRITE →
+        //   dstStage=VERTEX_INPUT / dstAccess=VERTEX_ATTRIBUTE_READ。
+        //   （放在渲染通道**之前**：缓冲区屏障在通道内也合法，但放在外面更简单、更不容易踩
+        //     「通道内允许哪些屏障」的规则。）
+        if vertex_count > 0 {
+            let vb = self
+                .vertex
+                .as_ref()
+                .expect("非空顶点数 ⇒ 缓冲已建（`render` 里先 ensure 再录）");
+            let host_to_vertex = vk::BufferMemoryBarrier {
+                s_type: vk::VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+                p_next: std::ptr::null(),
+                src_access_mask: VK_ACCESS_HOST_WRITE_BIT,
+                dst_access_mask: VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT,
+                src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+                buffer: vb.buffer.handle(),
+                offset: 0,
+                size: vk::WHOLE_SIZE,
+            };
+            // SAFETY: 结构体在栈上存活；句柄有效。
+            unsafe {
+                (self.fns.cmd_pipeline_barrier)(
+                    self.cmd,
+                    VK_PIPELINE_STAGE_HOST_BIT,
+                    VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+                    0,
+                    0,
+                    std::ptr::null(),
+                    1,
+                    &host_to_vertex,
+                    0,
+                    std::ptr::null(),
+                );
+            }
+        }
 
         let clear_value = vk::ClearValue {
             color: vk::ClearColorValue {
@@ -803,10 +1005,17 @@ impl GpuGeometryRenderer {
             signal_semaphore_count: 0,
             p_signal_semaphores: std::ptr::null(),
         };
+        // **提交前**把状态标成「在飞」：从这里到 `resolve` 之间任何失败都意味着
+        // 「未知 GPU 状态」，不允许再复用资源（见 `SubmitState`）。
+        self.sync.begin();
         // SAFETY: 队列与命令缓冲都有效；`submit` 在栈上存活；栅栏用于同步。
-        check("vkQueueSubmit", unsafe {
+        if let Err(e) = check("vkQueueSubmit", unsafe {
             (self.fns.queue_submit)(self.queue, 1, &submit, self.fence.handle())
-        })?;
+        }) {
+            // 提交失败时**无法**证明设备没有开始执行这条命令缓冲（例如 DEVICE_LOST）。
+            self.sync.mark_broken();
+            return Err(e);
+        }
         // 有限超时：驱动出问题时宁可失败，不要永久挂住。
         // SAFETY: 栅栏有效。
         let rc = unsafe {
@@ -818,43 +1027,24 @@ impl GpuGeometryRenderer {
                 TIMEOUT_NS,
             )
         };
-        if rc != ffi::VK_SUCCESS {
-            return Err(GpuError::Driver {
-                code: rc,
-                message: format!(
-                    "vkWaitForFences 失败（{} ⇒ 可能是超时，即 GPU 没在预期时间内做完）",
-                    vk_result_name(rc)
-                ),
-            });
-        }
-        Ok(())
+        // ★ T3 review I2：**超时 ≠ 完成**。`resolve` 成功才回到可复用态，失败即 Broken
+        //   （之后任何 render 都会先被 `ensure_reusable` 拦下）。
+        self.sync.resolve(rc)
     }
 
-    /// map 暂存缓冲 → 拷出 → unmap。
+    /// map 暂存缓冲 → 拷出 → unmap（`Mapped` 守卫保证 unmap 一定会发生，见 F9）。
     fn read_back(&self) -> GpuResult<Vec<u8>> {
-        let mut mapped: *mut c_void = std::ptr::null_mut();
-        // SAFETY: 内存是 HOST_VISIBLE 且 COHERENT；映射整块。
-        check("vkMapMemory(staging)", unsafe {
-            (self.fns.map_memory)(
-                self.device_handle,
-                self.staging_memory.handle(),
-                0,
-                vk::WHOLE_SIZE,
-                0,
-                &mut mapped,
-            )
-        })?;
-        if mapped.is_null() {
-            return Err(GpuError::Driver {
-                code: 0,
-                message: "vkMapMemory(staging) 返回空指针".to_string(),
-            });
-        }
+        let mapped = map_memory(
+            "vkMapMemory(staging)",
+            &self.fns,
+            self.device_handle,
+            self.staging_memory.handle(),
+        )?;
         // SAFETY: 映射了整块缓冲；长度取自缓冲大小。
-        let out =
-            unsafe { std::slice::from_raw_parts(mapped as *const u8, self.staging_size as usize).to_vec() };
-        // SAFETY: 与上面的 map 配对。
-        unsafe { (self.fns.unmap_memory)(self.device_handle, self.staging_memory.handle()) };
+        let out = unsafe {
+            std::slice::from_raw_parts(mapped.as_mut_ptr() as *const u8, self.staging_size as usize)
+                .to_vec()
+        };
         Ok(out)
     }
 }
@@ -867,5 +1057,89 @@ fn color_range() -> vk::ImageSubresourceRange {
         level_count: 1,
         base_array_layer: 0,
         layer_count: 1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **I2 的回归判据**：栅栏等待失败（例如超时）之后，渲染器必须**拒绝复用**。
+    ///
+    /// 为什么能在无 GPU 的单元测试里跑：这段逻辑是纯状态机（`SubmitState`），
+    /// 真正的 `vkWaitForFences` 只提供返回码。跑在 `cargo test -p deer-vk --lib` 里，
+    /// 不需要任何 Vulkan 环境。
+    #[test]
+    fn a_failed_fence_wait_makes_the_renderer_unusable() {
+        let mut s = SubmitState::default();
+        assert_eq!(s, SubmitState::Idle);
+        assert!(s.ensure_reusable().is_ok(), "空闲态可复用");
+
+        s.begin();
+        assert_eq!(s, SubmitState::InFlight);
+
+        // VK_TIMEOUT = 2 —— 这就是「超时」：**绝不能**当成完成。
+        let err = s.resolve(2).expect_err("超时必须报错");
+        let msg = format!("{err}");
+        assert!(msg.contains("2"), "错误里要带真实返回码：{msg}");
+        assert_eq!(s, SubmitState::Broken);
+        assert!(
+            s.ensure_reusable().is_err(),
+            "超时之后**不许**再碰命令缓冲/顶点缓冲 —— 旧实现会在这里继续跑"
+        );
+    }
+
+    /// 等待成功 ⇒ 回到可复用态（否则第一帧之后就再也不能画了）。
+    #[test]
+    fn a_successful_fence_wait_restores_reusability() {
+        let mut s = SubmitState::default();
+        s.begin();
+        s.resolve(ffi::VK_SUCCESS).expect("成功不该报错");
+        assert_eq!(s, SubmitState::Idle);
+        assert!(s.ensure_reusable().is_ok());
+    }
+
+    /// 提交阶段别的错误（例如 `vkQueueSubmit` 失败）同样不敢假设资源空闲。
+    #[test]
+    fn other_submit_errors_also_poison_the_state() {
+        let mut s = SubmitState::default();
+        s.begin();
+        s.mark_broken();
+        assert!(s.ensure_reusable().is_err());
+    }
+
+    /// **I1 的前提**：主机缓冲区**只**选相干内存（所以不需要 `vkFlushMappedMemoryRanges`；
+    /// 那支符号本项目还没有，见模块文档「同步①」）。
+    #[test]
+    fn host_buffers_never_use_non_coherent_memory() {
+        // 类型 0 = DEVICE_LOCAL（不可见）、类型 1 = HOST_VISIBLE 但**不相干**、
+        // 类型 2 = HOST_VISIBLE | HOST_COHERENT。
+        let mut props = vk::PhysicalDeviceMemoryProperties {
+            memory_type_count: 3,
+            memory_types: [vk::MemoryType {
+                property_flags: 0,
+                heap_index: 0,
+            }; 32],
+            memory_heap_count: 1,
+            memory_heaps: [vk::MemoryHeap {
+                size: 1 << 30,
+                flags: 0,
+            }; 16],
+        };
+        props.memory_types[0].property_flags = vk::VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+        props.memory_types[1].property_flags = vk::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT;
+        props.memory_types[2].property_flags =
+            vk::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+
+        let want =
+            vk::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        // 三种都可选时，必须挑到相干的那个（类型 2），**不能**挑类型 1。
+        assert_eq!(pick_memory_type(&props, 0b111, want).unwrap(), 2);
+        // 只有不相干的主机可见内存时（类型 1）：宁可报错，也不静默用非相干内存
+        // —— 非相干内存必须配 `vkFlushMappedMemoryRanges`，而本项目没有那支符号。
+        assert!(
+            pick_memory_type(&props, 0b010, want).is_err(),
+            "拿不到相干内存时必须明确报错，而不是静默降级"
+        );
     }
 }

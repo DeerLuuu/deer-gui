@@ -101,6 +101,13 @@ pub struct VkDevice {
     fns: DeviceFns,
     adapter: deer_gpu::AdapterInfo,
     memory_type_count: u32,
+    /// **校验层是否真的启用**（不是「是否请求」）。
+    ///
+    /// 存在的理由（T3 review F7）：校验层是 GPU 正确性的主要证据来源，但
+    /// 「跑起来没看到消息」**不等于**「校验层在跑」—— 层没装好、或有人把
+    /// `create_with_extensions` 的 `Err` 改成静默降级，都会让「零消息」变成空话。
+    /// 让测试能**断言**这个事实，比让评审人肉眼看输出可靠。
+    validation_enabled: bool,
     /// 物理设备的内存属性（挑内存类型时必需）
     mem_props: vk::PhysicalDeviceMemoryProperties,
     /// 停止信号：`Drop` 时 `send` 让后台线程销毁实例与设备
@@ -178,6 +185,7 @@ impl VkDevice {
                 fns: info.fns,
                 adapter: info.adapter,
                 memory_type_count: info.memory_type_count,
+                validation_enabled: info.validation_enabled,
                 mem_props: info.mem_props,
                 stop: Some(stop_tx),
                 thread: Some(thread),
@@ -310,6 +318,26 @@ impl VkDevice {
     /// 探测可用内存类型数（诊断/测试用）。
     pub fn memory_type_count(&self) -> u32 {
         self.memory_type_count
+    }
+
+    /// **校验层是否真的启用**（不是「是否请求」）。
+    ///
+    /// ## 为什么需要它（T3 review F7）
+    ///
+    /// 「`DEER_VK_VALIDATION=1` 跑起来没看到校验消息」是一份很弱的证据：如果层没装好、
+    /// 或者将来有人把 [`ffi::Instance::create_with_extensions`] 里「层缺失就报错」的逻辑
+    /// 改成静默降级，**测试会照样全绿**，而校验层其实什么都没查。把这个事实暴露出来，
+    /// 测试就能硬断言「请求了就必须真的启用」。
+    ///
+    /// ## `Own` 与 `Borrowed` 的差别（诚实说明）
+    ///
+    /// - `VkDevice::open`（`Own`）：实例由本设备创建并持有 ⇒ 返回**实例的事实**
+    ///   （[`ffi::Instance::validation_enabled`]）；
+    /// - `VkDevice::open_with_present`（`Borrowed`）：实例归调用方（[`crate::surface::Surface`]
+    ///   只存句柄，查不到层的状态）⇒ 只能返回**请求值** `validation_from_env()`。
+    ///   窗口路径（`windowed.rs`）正是用这个判据建实例的，所以两者一致。
+    pub fn validation_enabled(&self) -> bool {
+        self.validation_enabled
     }
 
     /// **物理设备**的内存属性。挑内存类型时必需（逻辑设备上拿不到）。
@@ -1021,6 +1049,8 @@ struct ReadyInfo {
     fns: DeviceFns,
     adapter: deer_gpu::AdapterInfo,
     memory_type_count: u32,
+    /// 见 [`VkDevice::validation_enabled`]（`Own` 是实例的**事实**，`Borrowed` 是**请求值**）。
+    validation_enabled: bool,
 }
 
 // SAFETY: Vulkan 句柄是**进程级的不透明值**（`VK_NULL_HANDLE` 之外的任何句柄都可跨线程
@@ -1106,6 +1136,12 @@ fn create_device(
             ffi::Instance::validation_from_env(),
         )?),
         InstancePlan::Borrowed(_) => None,
+    };
+    // 校验层「真的启用了没有」：`Own` 时问实例（**事实**）；`Borrowed` 时只能给出**请求值**
+    // （借来的实例归调用方，句柄里查不到层状态 —— 见 `VkDevice::validation_enabled`）。
+    let validation_enabled_fact = match &owned_instance {
+        Some(inst) => inst.validation_enabled(),
+        None => ffi::Instance::validation_from_env(),
     };
     let (instance_handle, core) = match plan {
         InstancePlan::Own => {
@@ -1297,6 +1333,8 @@ fn create_device(
             fns,
             adapter,
             memory_type_count,
+            // `Own` 时这是**实例的事实**；`Borrowed` 时是**请求值**（见 `validation_enabled`）。
+            validation_enabled: validation_enabled_fact,
             mem_props: mem_props_value,
         },
         owned_instance,

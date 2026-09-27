@@ -12,8 +12,13 @@
 //! 3. 与 `deer_gpu::null::CpuRenderer` 的帧缓冲逐字节比较。
 //!
 //! 这样能咬住的错误（都是**几何/语义**错误，不是 GPU 驱动问题）：
-//! `pos` 的 NDC 换算错、裁剪求交错、Ruling 5 的「两个矩形」被合并、描边边带位置/厚度错、
-//! 命令顺序错、把不该丢的几何丢掉。
+//! `pos` 的 NDC 换算错、裁剪求交错、描边边带位置/厚度错、命令顺序错、把不该丢的几何丢掉；
+//! 以及**填充/圆角路径**上「Ruling 5 的两个矩形被合并」（`pos` 与顶点属性 `rect` 用了同一个矩形）。
+//!
+//! ⚠️ **描边路径不适用「两个矩形被合并」这条**（T2 review N2 收紧的措辞）：
+//! 描边的 `pos` 来自「边带 ∩ 裁剪区」、属性 `rect` 是**原始**矩形，两者**本来就不同形** ——
+//! 对描边要守的是「边带几何（位置/厚度/伸出矩形之外）」与「带宽是否正确编码进
+//! `radius_kind`」，不是「两个矩形是否相同」。
 //!
 //! ## 与 T1 的同步约束（**改一边必须改另一边**）
 //!
@@ -191,109 +196,211 @@ const E16: Extent = Extent { width: 16, height: 12 };
 
 // ---------------------------------------------------------------------------
 // 用例：不透明（构造性必然）
+//
+// **一个场景一个 `#[test]`**（T2 review N4）：串在一条 `#[test]` 里时，首个 panic 会
+// 掩盖同组其余场景。
 // ---------------------------------------------------------------------------
 
 #[test]
-fn fill_rect_parity() {
+fn fill_parity() {
     let mut l = DrawList::new();
     l.push(DrawCmd::FillRect { rect: RectI::new(2, 1, 4, 2), color: W });
     assert_parity("fill", &l, E8);
+}
 
-    // 部分越出画布（负坐标）：pos 该被夹住，CPU 的 blend 本来就不写越界像素
+/// 部分越出画布（负坐标）：`pos` 该被夹住，CPU 的 `blend` 本来就不写越界像素。
+#[test]
+fn fill_offscreen_parity() {
     let mut l = DrawList::new();
     l.push(DrawCmd::FillRect { rect: RectI::new(-3, -2, 6, 5), color: W });
     assert_parity("fill-offscreen", &l, E8);
+}
 
-    // 零面积：两边都应当什么都不画
+/// 零面积：两边都应当什么都不画。
+#[test]
+fn fill_degenerate_parity() {
     let mut l = DrawList::new();
     l.push(DrawCmd::FillRect { rect: RectI::new(3, 3, 0, 5), color: W });
     assert_parity("fill-degenerate", &l, E8);
 }
 
+/// 退化 extent（`0×0`）：`build_stream` 与 CPU 都把 0 当 1 —（`max(1)`），所以这里比的是
+/// **1×1** 的结果。两边若对「退化尺寸」的处理方式不同（例如一边按 0 尺寸算 NDC、一边按 1），
+/// 这条会红（T2 review N3 补的用例）。
 #[test]
-fn round_rect_parity() {
-    for radius in [1, 2, 3] {
-        let mut l = DrawList::new();
-        l.push(DrawCmd::FillRoundRect { rect: RectI::new(1, 1, 6, 6), radius, color: W });
-        assert_parity(&format!("round-{radius}"), &l, E8);
-    }
-    // 圆角半径很大（超过半宽）：两边的显式判据都必须给出一致结果
+fn degenerate_extent_parity() {
+    let zero = Extent { width: 0, height: 0 };
+    let one = Extent { width: 1, height: 1 };
+    // 空列表：只剩清屏色
+    assert_parity("degenerate-clear", &DrawList::new(), zero);
+    // 铺满 1×1 的填充
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 1, 1), color: W });
+    assert_parity("degenerate-fill", &l, zero);
+    // 同一份列表在「显式 1×1」下必须给出完全一样的像素 —— 证明 0 真的被当成了 1
+    let clear = Color::rgb(16, 16, 16);
+    assert_eq!(
+        rasterize_stream(&gpu_geom::build_stream(&l, zero), zero, clear),
+        rasterize_stream(&gpu_geom::build_stream(&l, one), one, clear),
+        "0×0 应当与 1×1 等价（CPU 的 `Framebuffer::new(..max(1))` 同一约定）"
+    );
+}
+
+#[test]
+fn round_radius_1_parity() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRoundRect { rect: RectI::new(1, 1, 6, 6), radius: 1, color: W });
+    assert_parity("round-1", &l, E8);
+}
+
+#[test]
+fn round_radius_2_parity() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRoundRect { rect: RectI::new(1, 1, 6, 6), radius: 2, color: W });
+    assert_parity("round-2", &l, E8);
+}
+
+#[test]
+fn round_radius_3_parity() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRoundRect { rect: RectI::new(1, 1, 6, 6), radius: 3, color: W });
+    assert_parity("round-3", &l, E8);
+}
+
+/// 圆角半径超过半宽：两边的显式判据都必须给出一致结果。
+#[test]
+fn round_huge_radius_parity() {
     let mut l = DrawList::new();
     l.push(DrawCmd::FillRoundRect { rect: RectI::new(1, 1, 6, 6), radius: 5, color: W });
     assert_parity("round-huge", &l, E8);
 }
 
+// ---------------------------------------------------------------------------
+// 描边（Ruling 6：4 条边带、厚度 = width、带宽编码在 radius_kind 里）
+//
+// **一个场景一个 `#[test]`**（T2 review N4）：同一条 `#[test]` 里串多个 `assert_parity`
+// 会让**首个 panic 掩盖后面所有场景** —— 修一个跑一次，其余问题要等下一轮才暴露。
+// ---------------------------------------------------------------------------
+
 #[test]
-fn stroke_rect_parity() {
-    // 1px 与厚边（Ruling 6：band 厚度 = width，带宽编码在 radius_kind 里）
-    for width in [1, 2, 3] {
-        let mut l = DrawList::new();
-        l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 6, 4), color: W, width });
-        assert_parity(&format!("stroke-w{width}"), &l, E8);
-    }
+fn stroke_1px_parity() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 6, 4), color: W, width: 1 });
+    assert_parity("stroke-w1", &l, E8);
+}
+
+#[test]
+fn stroke_2px_parity() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 6, 4), color: W, width: 2 });
+    assert_parity("stroke-w2", &l, E8);
+}
+
+#[test]
+fn stroke_3px_parity() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 6, 4), color: W, width: 3 });
+    assert_parity("stroke-w3", &l, E8);
+}
+
+#[test]
+fn stroke_full_canvas_parity() {
     let mut l = DrawList::new();
     l.push(DrawCmd::StrokeRect { rect: RectI::new(0, 0, 8, 8), color: W, width: 1 });
     assert_parity("stroke-full", &l, E8);
+}
 
-    // 带宽超过半宽：4 条带两两重叠，两边的**重叠次数**必须一致
+/// 带宽超过半宽：4 条带两两重叠，两边的**重叠次数**必须一致。
+#[test]
+fn stroke_overlapping_bands_parity() {
     let mut l = DrawList::new();
     l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 6, 4), color: W, width: 4 });
     assert_parity("stroke-overlap", &l, E8);
+}
 
-    // ★ 带宽**超过矩形边长** ⇒ 边带沿短边方向**伸出矩形之外**
-    //   （`null.rs::stroke()` 的 `for k in 0..width` 不把 k 限制在矩形内；
-    //    T1 的着色器为这个语义专门写了闭式，且记录「5 个候选公式被穷举推翻」）。
-    //   顶点流这一侧：`rect.bottom() - band` / `right() - band` 会走到矩形外面去。
+/// ★ 带宽**超过矩形边长** ⇒ 边带沿短边方向**伸出矩形之外**
+/// （`null.rs::stroke()` 的 `for k in 0..width` 不把 k 限制在矩形内；
+/// T1 的着色器为这个语义专门写了闭式，且记录「5 个候选公式被穷举推翻」）。
+/// 顶点流这一侧：`rect.bottom() - band` / `right() - band` 会走到矩形外面去。
+#[test]
+fn stroke_band_exceeds_rect_below_parity() {
     let mut l = DrawList::new();
     l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 6, 4), color: W, width: 6 });
-    assert_parity("stroke-w6-extends-above", &l, E8);
+    assert_parity("stroke-w6-extends-below", &l, E8);
+}
 
+/// 两个方向的边长都被带宽超过（`rw = 4`、`rh = 2`，带宽 5）。
+#[test]
+fn stroke_band_exceeds_rect_both_axes_parity() {
     let mut l = DrawList::new();
     l.push(DrawCmd::StrokeRect { rect: RectI::new(2, 3, 4, 2), color: W, width: 5 });
     assert_parity("stroke-w5-both-axes", &l, E16);
+}
 
-    // 伸出矩形之后又被画布裁掉一部分（行/列到负数）
+/// 厚带宽 + 矩形贴画布上沿（`rect.y = 0`，带宽 6 > 矩形高 3）。
+///
+/// **这份用例的判别力在「上带向下伸出的那几行」**：矩形只占 `y ∈ [0,3)`，
+/// 而上带厚度 6 ⇒ 会画到 `y ∈ [3,6)`。把边带裁进矩形的错误实现会在这里露出来。
+/// 注意**列不会走到负数**：左带从 `x = 1` 起、右带 `right - bw = 1` 也从 `x = 1` 起 ——
+/// 所以它**不是**一份「越界到负坐标」的用例（T2 review N5 更正了早先不准确的注释）。
+#[test]
+fn stroke_thick_band_draws_below_a_canvas_touching_rect_parity() {
     let mut l = DrawList::new();
     l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 0, 6, 3), color: W, width: 6 });
-    assert_parity("stroke-w6-offscreen", &l, E8);
+    assert_parity("stroke-w6-band-below-rect", &l, E8);
+}
 
-    // 退化矩形 × 厚带宽（1×1 的矩形配 3px 边框）
+/// 退化矩形 × 厚带宽（1×1 的矩形配 3px 边框）。
+#[test]
+fn stroke_degenerate_rect_thick_band_parity() {
     let mut l = DrawList::new();
     l.push(DrawCmd::StrokeRect { rect: RectI::new(3, 3, 1, 1), color: W, width: 3 });
     assert_parity("stroke-degenerate-thick", &l, E8);
 }
 
+/// 裁剪 × 填充：Ruling 5 的核心场景（`pos` 用裁剪后矩形、`rect` 属性用原始矩形）。
 #[test]
-fn clip_parity() {
-    // 裁剪 × 填充（Ruling 5 的核心场景）
+fn clip_fill_parity() {
     let mut l = DrawList::new();
     l.push(DrawCmd::PushClip { rect: RectI::new(2, 2, 4, 4) });
     l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 8, 8), color: W });
     l.push(DrawCmd::PopClip);
     assert_parity("clip-fill", &l, E8);
+}
 
-    // 裁剪 × 圆角：`rect` 属性必须是原始矩形，否则圆角会被裁剪挪位
+/// 裁剪 × 圆角：`rect` 属性必须是原始矩形，否则圆角会被裁剪挪位。
+#[test]
+fn clip_round_parity() {
     let mut l = DrawList::new();
     l.push(DrawCmd::PushClip { rect: RectI::new(2, 1, 4, 5) });
     l.push(DrawCmd::FillRoundRect { rect: RectI::new(1, 1, 6, 6), radius: 2, color: W });
     l.push(DrawCmd::PopClip);
     assert_parity("clip-round", &l, E8);
+}
 
-    // 裁剪 × 描边：4 条边带**各自**求交（上带可见、下带整条被丢、左右带被截半）
+/// 裁剪 × 1px 描边：4 条边带**各自**求交（上带可见、下带整条被丢、左右带被截半）。
+#[test]
+fn clip_stroke_1px_parity() {
     let mut l = DrawList::new();
     l.push(DrawCmd::PushClip { rect: RectI::new(0, 0, 8, 2) });
     l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 6, 4), color: W, width: 1 });
     l.push(DrawCmd::PopClip);
     assert_parity("clip-stroke-w1", &l, E8);
+}
 
-    // 裁剪 × 厚描边
+/// 裁剪 × 厚描边。
+#[test]
+fn clip_stroke_2px_parity() {
     let mut l = DrawList::new();
     l.push(DrawCmd::PushClip { rect: RectI::new(2, 0, 4, 3) });
     l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 6, 6), color: W, width: 2 });
     l.push(DrawCmd::PopClip);
     assert_parity("clip-stroke-w2", &l, E8);
+}
 
-    // 裁剪区完全在几何之外：两边都什么都不画
+/// 裁剪区完全在几何之外：两边都什么都不画。
+#[test]
+fn clip_outside_geometry_parity() {
     let mut l = DrawList::new();
     l.push(DrawCmd::PushClip { rect: RectI::new(100, 100, 4, 4) });
     l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 8, 8), color: W });
@@ -361,32 +468,45 @@ fn text_does_not_change_geometry() {
 /// （例如描边四角被两条边带各混合一次），**不**证明 GPU 会算出同样的字节 ——
 /// `0 < a < 1` 的 GPU 逐字节一致不可先验保证（`float → unorm8` 舍入 vs `.round()` 可能差
 /// 1 LSB），容差策略归 T4。
+///
+/// 下面按场景各一条 `#[test]`（同一理由：避免首个 panic 掩盖其余场景）。
 #[test]
-fn semi_transparent_parity_is_same_formula_recomputation() {
+fn alpha_stroke_2px_overlap_parity() {
     let half = Color::rgba(255, 0, 0, 0.5);
-    let quarter = Color::rgba(0, 128, 255, 0.25);
-
     // 2px 半透明描边：四角像素落在两条边带里 ⇒ 被混合两次
     let mut l = DrawList::new();
     l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 12, 8), color: half, width: 2 });
     assert_parity("alpha-stroke-w2", &l, E16);
+}
 
+#[test]
+fn alpha_mixed_commands_parity() {
+    let half = Color::rgba(255, 0, 0, 0.5);
+    let quarter = Color::rgba(0, 128, 255, 0.25);
     // 三条半透明命令叠加：顺序 + 覆盖都要一致
     let mut l = DrawList::new();
     l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 12, 10), color: quarter });
     l.push(DrawCmd::FillRoundRect { rect: RectI::new(2, 2, 8, 6), radius: 2, color: half });
     l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 10, 8), color: quarter, width: 1 });
     assert_parity("alpha-mixed", &l, E16);
+}
 
-    // 半透明 + 厚描边 + 裁剪：Ruling 5 + Ruling 6 一起上
+/// 半透明 + 厚描边 + 裁剪：Ruling 5 + Ruling 6 一起上。
+#[test]
+fn alpha_clip_parity() {
+    let half = Color::rgba(255, 0, 0, 0.5);
+    let quarter = Color::rgba(0, 128, 255, 0.25);
     let mut l = DrawList::new();
     l.push(DrawCmd::PushClip { rect: RectI::new(2, 2, 8, 6) });
     l.push(DrawCmd::FillRoundRect { rect: RectI::new(1, 1, 10, 8), radius: 3, color: half });
     l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 10, 8), color: quarter, width: 3 });
     l.push(DrawCmd::PopClip);
     assert_parity("alpha-clip", &l, E16);
+}
 
-    // 全透明：两边都必须什么都不写（alpha 累计也不该变）
+/// 全透明：两边都必须什么都不写（alpha 累计也不该变）。
+#[test]
+fn alpha_zero_parity() {
     let mut l = DrawList::new();
     l.push(DrawCmd::FillRect { rect: RectI::new(1, 1, 6, 6), color: Color::TRANSPARENT });
     assert_parity("alpha-zero", &l, E8);
