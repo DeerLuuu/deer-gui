@@ -101,7 +101,7 @@
 
 | 结论 | 理由 / 后果 |
 |---|---|
-| **静态 viewport/scissor**（离屏路径），录制时不要调 `vkCmdSetViewport`/`vkCmdSetScissor` | 这是**实现事实**（已够用），**不是**「动态不可用」：旧说法「动态版在本机 Intel 核显上画不出任何像素」**存疑未证实** —— 同机动态/静态各跑 30 帧都出 93900 界面像素，而「声明动态却**从不调** `vkCmdSetViewport`」会崩（窗口 `0xC000041D` / 离屏 `0xC0000005`）；M2a 记的是「无像素」而非崩溃 ⇒ 同因只能算**高度可能**。**窗口路径用动态**（默认，每帧真的设置）；换 extent 就新建渲染器。详见 `docs/features/window.md` 第 5.2 节 |
+| **静态 viewport/scissor**（离屏路径），录制时不要调 `vkCmdSetViewport`/`vkCmdSetScissor` | 这是**实现事实**（已够用），**不是**「动态不可用」：旧说法「动态版在本机 Intel 核显上画不出任何像素」**已被本机三组对照推翻**（动态 + 每帧真的调 ⇒ 与静态逐字节相同、校验消息 0、能画出像素；动态 + 从不设置 ⇒ **崩**：离屏 `0xC0000005`、窗口 `0xC000041D`）。**边界**：本机实测，别读成「动态现已支持」；M2a 记的是「零像素不崩溃」≠ 本次「崩溃」⇒ 不能断定当年同源。**产品行为不变**：离屏仍用静态（C1 只推翻了旧理由）。重跑：`cargo run -p deer-vk --example viewport_dynamic_probe`；详见 `docs/features/window.md` 第 5.2 节 |
 | **颜色附件必须 `R8G8B8A8_UNORM`，不是 `_SRGB`** | CPU 基准不做 gamma，用 SRGB 会**系统性偏差**，parity 必挂；**上屏交换链同理**（M3c 改成**线性 `*_UNORM` 优先**：sRGB 附件的混合在线性空间，与 CPU 字节空间实测差 **44 字节**） |
 | 推送常量矩形着色器 `spirv.rs::vertex_shader_rect_pushconstant` **是坏的，别用它建管线** | 校验层报 `VUID-StandaloneSpirv-PushConstant-06808`；**普通驱动会宽容接受**，但开校验层会 **`0xc0000005` 崩溃**。矩形走顶点缓冲（M3a 已这么做） |
 | **自研 SPIR-V 汇编器必须过 `spirv-val`** | 曾经的根因是**段序错误**（`OpEntryPoint` 排在类型之后）——驱动**既不报错也不画**。`vkCreateShaderModule` 很宽容，**"驱动接受" ≠ "SPIR-V 正确"** |

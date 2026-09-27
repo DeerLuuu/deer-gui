@@ -183,10 +183,12 @@ Behavior that looks surprising is usually deliberate. The full list, with the de
 
 - Layout, draw lists, and rasterization must use **the same font size and the same metrics**.
 - Vulkan uses a **static viewport/scissor** (an implementation fact, not a driver limitation). The old claim
-  that "dynamic viewport draws nothing on some integrated GPUs" is **unverified/contested**: dynamic and static
-  both render 93900 UI pixels over 30 frames on this Intel iGPU, but declaring dynamic state *without ever calling*
-  `vkCmdSetViewport` crashes the process (`0xC000041D` window / `0xC0000005` offscreen). M2a's recorded symptom was
-  "no pixels", not a crash, so the same root cause is only *likely* — see `docs/features/window.md` §5.2.
+  that "dynamic viewport draws nothing on some integrated GPUs" has been **refuted on this machine** (offscreen +
+  triangle, three-way control): dynamic *with* a per-frame `vkCmdSetViewport` is byte-identical to static (0 validation
+  messages, pixels drawn), while dynamic *without ever setting it* crashes (`0xC0000005` offscreen / `0xC000041D` window).
+  Boundaries: this is a **local measurement** (not "dynamic is now supported" across devices), and M2a recorded
+  "no pixels without crashing" — a *different symptom* — so the original cause is still unexplained.
+  Offscreen keeps using static (C1 only refuted the *reason*); see `docs/features/window.md` §5.2.
 - The color attachment must be `R8G8B8A8_UNORM`, **not** `_SRGB`, because the CPU baseline does no gamma conversion.
   The window swapchain follows the same rule (linear `*_UNORM` first): sRGB attachments blend in linear space,
   which differs from the CPU's byte-space `blend_cov` by ~44 bytes.

@@ -14,12 +14,12 @@
 
 - **零新增第三方依赖**；`deer-vk`/`deer-gpu` 保持零依赖。
 - **CPU 后端是基准**：不得为让对照通过而改 `null.rs` 的像素语义。
-- 静态 viewport/scissor（~~动态版在本机 Intel 核显上画不出像素~~ —— **该理由已被标为存疑的旧结论**，见下方 Ruling）；颜色附件 `R8G8B8A8_UNORM`（非 `_SRGB`）。
-  > **Ruling（M3c 更正）**：对照实验显示同一台 Intel 集显上动态与静态各跑 30 帧结果**相同**（各 93900 界面像素）；
-  > 「声明动态却从不调 `vkCmdSetViewport`」会崩（窗口 `0xC000041D`、离屏 `0xC0000005` / 0-21 跑完），
-  > 但 M2a 记的是「无像素」而非崩溃 ⇒ **症状不同，不能断定同因**（定性：高度可能）。
-  > **实现不变**：离屏用静态（已够用）；待办是重跑当年的**离屏 + 三角形 + 动态**场景。
-  > 详见 `docs/features/window.md` 第 5.2 节。
+- 静态 viewport/scissor（~~动态版在本机 Intel 核显上画不出像素~~ —— **该理由已被实测推翻**，见下方 Ruling）；颜色附件 `R8G8B8A8_UNORM`（非 `_SRGB`）。
+  > **Ruling（C1 判定，2026-09-28）**：本机三组对照（离屏 + 三角形）—— ① 动态 + 每帧真的调 ⇒ 与静态**逐字节相同**、
+  > 校验消息 0、能画出像素；② 动态 + 从不设置 ⇒ **崩**（离屏 `0xC0000005`、窗口 `0xC000041D`）；③ 静态基线 ⇒ 正常。
+  > 可重跑 `cargo run -p deer-vk --example viewport_dynamic_probe`（`--group=0|1|2`）。**边界**：本机实测，不等于
+  > 「动态现已支持」；M2a 记的是「零像素不崩溃」、② 是「崩溃」⇒ **不能断定当年同源，当年为什么零像素仍未解释**。
+  > **实现不变**：离屏用静态（C1 只推翻了旧**理由**）。详见 `docs/features/window.md` 第 5.2 节。
 - 新增 SPIR-V 必须过官方 `spirv-val`；`DEER_VK_VALIDATION=1` 下零校验消息**且**消息计数断言为 0。
 - 门禁：`cargo test --workspace`、`cargo clippy --workspace --all-targets --features deer-gui/window`、`docs_consistency`、示例 exit 0。
 - 不跑 `cargo fmt`；**遇到 SPIR-V 相关红先 `cargo clean -p deer-vk`**（陈旧 target 会造成假红）。

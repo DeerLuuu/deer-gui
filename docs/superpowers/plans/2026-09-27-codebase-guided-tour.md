@@ -72,7 +72,7 @@
 
 **Materials:** `crates/deer-window/src/lib.rs`、`crates/deer-vk/src/{surface,swapchain,windowed}.rs`、`crates/deer-gui/examples/{window_preview,hal_window_path}.rs`
 **逐步做到:** 能跑起窗口示例并解释事件循环、实例/表面/交换链重建、呈现结果映射。
-**自测:** ① 「动态 viewport/scissor 在本机画不出像素」这条旧结论**目前是什么定性、缺哪格证据、怎么才能钉死或钉倒它**？（答案：存疑未证实 —— 动态/静态各 30 帧结果相同，而「声明动态却从不设置」会崩；缺口是 M2a 当年的**离屏 + 三角形 + 动态**场景没重跑，见 `docs/features/window.md` 第 5.2 节）② 交换链 `OutOfDate` 应该怎么处理？
+**自测:** ① 「动态 viewport/scissor 在本机画不出像素」这条旧结论**后来被什么实验推翻、推翻到什么程度、哪些边界不能省**？（答案：C1 三组对照 —— 动态 + 每帧真的调 ⇒ 与静态逐字节相同/校验消息 0/能画出像素；动态 + 从不设置 ⇒ 崩（离屏 `0xC0000005`、窗口 `0xC000041D`）；静态基线 ⇒ 正常。边界：**本机实测**、不等于「动态现已支持」；**症状不吻合**（M2a 记「零像素且不崩溃」vs 本次「崩溃」）⇒ 不能断定当年同源、当年为什么零像素仍未解释；**产品行为不变**：离屏仍用静态。见 `docs/features/window.md` 第 5.2 节）② 交换链 `OutOfDate` 应该怎么处理？
 
 ### 第 9 讲：应用层与工程纪律
 
