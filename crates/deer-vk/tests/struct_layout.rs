@@ -147,3 +147,223 @@ fn alignment_matches_expectation() {
     assert_eq!(std::mem::align_of::<vk::PipelineRasterizationStateCreateInfo>(), 8);
     assert_eq!(std::mem::align_of::<vk::PipelineInputAssemblyStateCreateInfo>(), 8);
 }
+
+/// **M3b：采样器 + 描述符结构体**（review M-6：这些此前「实现有、护栏没有」）。
+///
+/// 护栏缺口的性质：reviewer 已逐字段手工核过下面这些大小/偏移**全对**，
+/// 但它们没进本文件 ⇒ 将来改字段类型或顺序时**没有人拦** —— 而手写 `repr(C)`
+/// 结构体写错的症状是驱动按官方大小写入越界（`0xc0000409`/`0xc0000005`），
+/// 不是一句清晰的错误码（见本文件开头的说明）。
+///
+/// 每个数字都注明**它由什么决定**。含指针的结构体 `align_of = 8`，
+/// 所以「字段和」常小于 `size_of`。
+#[test]
+fn sampler_and_descriptor_structs_match_measured_sizes() {
+    // i32(4) + pad(4) + pNext/pAllocator 形态的指针(8) + flags(4)
+    // + 2×filter(8) + mipmap(4) + 3×address(12) + mipLodBias f32(4)
+    // + anisotropyEnable(4) + maxAnisotropy f32(4) + compareEnable(4) + compareOp(4)
+    // + minLod f32(4) + maxLod f32(4) + borderColor(4) + unnormalizedCoordinates(4) = 80
+    assert_eq!(
+        std::mem::size_of::<vk::SamplerCreateInfo>(),
+        80,
+        "sType(4)+pad(4)+2 指针(16)+flags..compareOp(44)+lod/border/unnorm(16) = 80"
+    );
+
+    // binding(4) + descriptorType(4) + descriptorCount(4) + stageFlags(4) + pImmutableSamplers(8) = 24
+    assert_eq!(std::mem::size_of::<vk::DescriptorSetLayoutBinding>(), 24);
+    // sType(4)+pad(4)+pNext(8)+flags(4)+bindingCount(4)+pBindings(8) = 32（**正好 8 的倍数**，
+    // 没有尾部补齐 —— 我第一版把它和 DescriptorPoolCreateInfo 搞混了，写成 40，实测红）
+    assert_eq!(
+        std::mem::size_of::<vk::DescriptorSetLayoutCreateInfo>(),
+        32,
+        "sType(4)+pad(4)+pNext(8)+flags(4)+bindingCount(4)+pBindings(8) = 32（无需补齐）"
+    );
+    assert_eq!(std::mem::size_of::<vk::DescriptorPoolSize>(), 8, "2 个 u32");
+    // sType(4)+pad(4)+pNext(8)+flags(4)+maxSets(4)+poolSizeCount(4)+pad(4)+pPoolSizes(8) = 40
+    assert_eq!(
+        std::mem::size_of::<vk::DescriptorPoolCreateInfo>(),
+        40,
+        "字段和 36，但 pPoolSizes 要求 8 字节对齐 ⇒ 中间补 4、总 40"
+    );
+    // sType(4)+pad(4)+pNext(8)+pool(8)+count(4)+pad(4)+pSetLayouts(8) = 40
+    assert_eq!(
+        std::mem::size_of::<vk::DescriptorSetAllocateInfo>(),
+        40,
+        "字段和 36，descriptorSetCount 后补 4 ⇒ 40"
+    );
+    assert_eq!(
+        std::mem::size_of::<vk::DescriptorImageInfo>(),
+        24,
+        "sampler(8) + imageView(8) + imageLayout(4) + pad(4) = 24"
+    );
+    // sType(4)+pad(4)+pNext(8)+dstSet(8)+dstBinding(4)+dstArrayElement(4)+descriptorCount(4)
+    // +descriptorType(4)+3 指针(24) = 64
+    assert_eq!(
+        std::mem::size_of::<vk::WriteDescriptorSet>(),
+        64,
+        "前 3 个 u32 连着排，然后 descriptorType 才是指针前的最后一个 4 字节字段"
+    );
+}
+
+/// **M3b：关键偏移**（只看大小不够 —— 字段顺序错时大小可能仍对，而驱动会读到别的字段）。
+#[test]
+fn sampler_and_descriptor_offsets_are_stable() {
+    // pNext 必须在 sType 之后（8 字节对齐）；`flags` 紧贴 pNext 之后
+    assert_eq!(std::mem::offset_of!(vk::SamplerCreateInfo, p_next), 8);
+    assert_eq!(std::mem::offset_of!(vk::SamplerCreateInfo, flags), 16);
+    assert_eq!(
+        std::mem::offset_of!(vk::SamplerCreateInfo, mag_filter),
+        20,
+        "flags(16..20) 之后才是 magFilter —— 我第一版漏了 flags 写成 16，实测红"
+    );
+    assert_eq!(std::mem::offset_of!(vk::SamplerCreateInfo, min_filter), 24);
+    assert_eq!(std::mem::offset_of!(vk::SamplerCreateInfo, mipmap_mode), 28);
+    assert_eq!(std::mem::offset_of!(vk::SamplerCreateInfo, address_mode_u), 32);
+    assert_eq!(std::mem::offset_of!(vk::SamplerCreateInfo, address_mode_v), 36);
+    assert_eq!(std::mem::offset_of!(vk::SamplerCreateInfo, address_mode_w), 40);
+    assert_eq!(std::mem::offset_of!(vk::SamplerCreateInfo, mip_lod_bias), 44);
+    assert_eq!(std::mem::offset_of!(vk::SamplerCreateInfo, anisotropy_enable), 48);
+    assert_eq!(std::mem::offset_of!(vk::SamplerCreateInfo, max_anisotropy), 52);
+    assert_eq!(std::mem::offset_of!(vk::SamplerCreateInfo, compare_enable), 56);
+    assert_eq!(
+        std::mem::offset_of!(vk::SamplerCreateInfo, compare_op),
+        60,
+        "compareOp 必须在 compareEnable **之后**（顺序错不会编译报错）"
+    );
+    assert_eq!(std::mem::offset_of!(vk::SamplerCreateInfo, min_lod), 64);
+    assert_eq!(std::mem::offset_of!(vk::SamplerCreateInfo, max_lod), 68);
+    assert_eq!(std::mem::offset_of!(vk::SamplerCreateInfo, border_color), 72);
+    assert_eq!(
+        std::mem::offset_of!(vk::SamplerCreateInfo, unnormalized_coordinates),
+        76,
+        "最后一个字段在 76..80 ⇒ 结构体正好 80、无需尾部补齐"
+    );
+
+    // 描述符集绑定：`pImmutableSamplers` 被前面 4 个 u32 顶到偏移 16
+    assert_eq!(std::mem::offset_of!(vk::DescriptorSetLayoutBinding, descriptor_type), 4);
+    assert_eq!(std::mem::offset_of!(vk::DescriptorSetLayoutBinding, descriptor_count), 8);
+    assert_eq!(std::mem::offset_of!(vk::DescriptorSetLayoutBinding, stage_flags), 12);
+    assert_eq!(
+        std::mem::offset_of!(vk::DescriptorSetLayoutBinding, p_immutable_samplers),
+        16
+    );
+
+    // 池创建：flags 紧贴 pNext 之后（注意 sType+pNext 占了 16 字节，不是 12）
+    assert_eq!(std::mem::offset_of!(vk::DescriptorPoolCreateInfo, flags), 16);
+    assert_eq!(std::mem::offset_of!(vk::DescriptorPoolCreateInfo, max_sets), 20);
+    assert_eq!(
+        std::mem::offset_of!(vk::DescriptorPoolCreateInfo, pool_size_count),
+        24,
+        "flags/maxSets/poolSizeCount 连着排在 16/20/24"
+    );
+    assert_eq!(
+        std::mem::offset_of!(vk::DescriptorPoolCreateInfo, p_pool_sizes),
+        32,
+        "poolSizeCount(24..28) 后有 4 字节 pad ⇒ 指针在 32（少算这个 pad 会让指针错位 4 字节）"
+    );
+
+    // 集分配：`pSetLayouts` 同理
+    assert_eq!(std::mem::offset_of!(vk::DescriptorSetAllocateInfo, descriptor_pool), 16);
+    assert_eq!(std::mem::offset_of!(vk::DescriptorSetAllocateInfo, descriptor_set_count), 24);
+    assert_eq!(
+        std::mem::offset_of!(vk::DescriptorSetAllocateInfo, p_set_layouts),
+        32,
+        "descriptorSetCount 后有 4 字节 pad ⇒ 指针在 32"
+    );
+
+    // 图像信息：sampler / imageView（两个 8 字节句柄）之后才是 imageLayout
+    assert_eq!(std::mem::offset_of!(vk::DescriptorImageInfo, sampler), 0);
+    assert_eq!(std::mem::offset_of!(vk::DescriptorImageInfo, image_view), 8);
+    assert_eq!(std::mem::offset_of!(vk::DescriptorImageInfo, image_layout), 16);
+
+    // 写描述符：三个指针必须连续排在 64 字节结构体的末尾三分之一
+    assert_eq!(std::mem::offset_of!(vk::WriteDescriptorSet, dst_binding), 24);
+    assert_eq!(std::mem::offset_of!(vk::WriteDescriptorSet, dst_array_element), 28);
+    assert_eq!(std::mem::offset_of!(vk::WriteDescriptorSet, descriptor_count), 32);
+    assert_eq!(
+        std::mem::offset_of!(vk::WriteDescriptorSet, descriptor_type),
+        36,
+        "descriptorType 在 descriptorCount 之后、pImageInfo **之前**"
+    );
+    assert_eq!(std::mem::offset_of!(vk::WriteDescriptorSet, p_image_info), 40);
+    assert_eq!(std::mem::offset_of!(vk::WriteDescriptorSet, p_buffer_info), 48);
+    assert_eq!(std::mem::offset_of!(vk::WriteDescriptorSet, p_texel_buffer_view), 56);
+}
+
+/// **M3b：新结构体的 `sType` 常量值必须与 Vulkan 规范一致**。
+///
+/// 为什么 `sType` 值得单独一组断言：它是驱动**分派结构体类型**的唯一依据 ——
+/// 写错（例如把 `DESCRIPTOR_POOL_CREATE_INFO`(33) 当成 `DESCRIPTOR_SET_LAYOUT_
+/// CREATE_INFO`(32)）时结构体**大小可能刚好也对**，于是编译过、运行也不再是
+/// 「立刻报错」，而是驱动按错误的布局解读内存。这类错误极难从症状反推。
+///
+/// 这里同时断言**常量之间的相对关系**（例如 SET_LAYOUT < POOL < POOL_SIZE <
+/// SET_ALLOCATE < WRITE），这样即使有人整体挪动编号也能被拦住。
+#[test]
+fn m3b_structure_type_constants_match_spec() {
+    assert_eq!(vk::VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO, 31);
+    assert_eq!(vk::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO, 32);
+    assert_eq!(vk::VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO, 33);
+    assert_eq!(vk::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO, 34);
+    assert_eq!(vk::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET, 35);
+
+    // 相对关系（顺序即规范里的编号顺序）。
+    // 用 `const { assert!(..) }` 而不是运行期 `assert!`：两边都是常量，
+    // 于是这些断言在**编译期**就成立 —— 编号一旦被改乱，编译就失败，
+    // 而不是等到跑测试（clippy 的 `assertions_on_constants` 也正是指这一点）。
+    const {
+        assert!(
+            vk::VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO
+                < vk::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+        );
+        assert!(
+            vk::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO
+                < vk::VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+        );
+        assert!(
+            vk::VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO
+                < vk::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+        );
+        assert!(
+            vk::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO
+                < vk::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET
+        );
+    }
+
+    // 与既有 M3a 结构体编号**不冲突**（挡住「复制粘贴忘了改」）
+    for (name, ty) in [
+        ("SAMPLER_CREATE_INFO", vk::VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO),
+        (
+            "DESCRIPTOR_SET_LAYOUT_CREATE_INFO",
+            vk::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+        ),
+        (
+            "DESCRIPTOR_POOL_CREATE_INFO",
+            vk::VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+        ),
+        (
+            "DESCRIPTOR_SET_ALLOCATE_INFO",
+            vk::VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+        ),
+        ("WRITE_DESCRIPTOR_SET", vk::VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET),
+    ] {
+        for (other_name, other) in [
+            ("IMAGE_CREATE_INFO", vk::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO),
+            ("IMAGE_VIEW_CREATE_INFO", vk::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO),
+            ("BUFFER_CREATE_INFO", vk::VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO),
+            (
+                "PIPELINE_LAYOUT_CREATE_INFO",
+                vk::VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            ),
+            (
+                "GRAPHICS_PIPELINE_CREATE_INFO",
+                vk::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+            ),
+        ] {
+            assert_ne!(
+                ty, other,
+                "{name} 与既有的 {other_name} 编号撞了（典型原因是复制粘贴没改常量）"
+            );
+        }
+    }
+}

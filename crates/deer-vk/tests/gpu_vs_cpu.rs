@@ -876,3 +876,62 @@ fn consecutive_text_frames_stay_in_sync() {
         );
     }
 }
+
+/// **M-4 护栏**：同一图集连续多帧 ⇒ 纹理**只上传一次**（不重传）。
+///
+/// ## 为什么必须有这条（reviewer 实测的护栏缺口）
+///
+/// `refresh_atlas_texture()` 里有一个指纹判断（`(宽, 高, 已光栅化字形数)`）——
+/// 「图集没变就不重传」。reviewer 把这个判断**删掉、改成每帧重传**之后，
+/// `consecutive_text_frames_stay_in_sync` **仍然全绿**：那个测试只看最终像素，
+/// 而重传几次对像素没有影响。
+///
+/// 也就是说「只在指纹变化时重传」这条**性能前提**此前只有实现、没有护栏 ——
+/// 删掉实现测试照样绿。这条测试补上护栏：用
+/// [`deer_vk::device::texture_r8_upload_count()`]（进程级计数，在被调用方自增）
+/// 的**差值**断言「同一图集不应触发上传」。
+///
+/// ## 为什么是「先渲染一次收干，再连续两次同文本」
+///
+/// 第一次渲染必然上传（图集从无到有）。之后**第三次**渲染前，图集里已经含有了
+/// 这次要用的全部字形 ⇒ 如果指纹判断在，这几次的上传次数必须为 **0**；
+/// 一旦有人删掉指纹、改成每帧重传，次数就会变成 2 ⇒ 立刻红。
+///
+/// 用同一段文本（没有新字形）而不是不同文本，是为了让「应有 0 次上传」这个
+/// 结论不依赖「哪些字形已在图集里」的推断 —— 文本完全相同就没有新字形，
+/// 这是最不容易随实现变化的判据。
+#[test]
+fn repeated_frames_with_unchanged_atlas_do_not_reupload_texture() {
+    let extent = Extent {
+        width: 128,
+        height: 48,
+    };
+    let Some(mut pair) = text_pair(extent, 20.0) else {
+        return;
+    };
+
+    // 固定一段含多个字形的文本；三次渲染用的是**完全相同**的绘制列表。
+    let text = "atlas";
+    let mut l = DrawList::new();
+    l.push(text_cmd(text, RectI::new(4, 4, 120, 36), 20.0, 0));
+
+    // ① 首次渲染：图集从无到有（会先把所有字形光栅化进图集，然后上传一次）
+    assert_eq!(compare_text(&mut pair, "atlas-warmup", &l, 0), 0);
+
+    // ② 之后再渲染两次：文本相同 ⇒ 没有新字形 ⇒ 图集未变 ⇒ **零**上传
+    for i in 0..2 {
+        let before = deer_vk::device::texture_r8_upload_count();
+        assert_eq!(compare_text(&mut pair, &format!("atlas-repeat-{i}"), &l, 0), 0);
+        let after = deer_vk::device::texture_r8_upload_count();
+        assert_eq!(
+            after - before,
+            0,
+            "第 {i} 次重复渲染触发了 {} 次纹理上传 —— \
+             「图集未变则不重传」这条前提被破坏了（每帧重传会让 vkQueueWaitIdle \
+             卡在每一帧上）。注意：这条断言就是它的护栏，删掉指纹判断必须让它变红。",
+            after - before
+        );
+    }
+
+    println!("同一图集连续 3 帧：只上传 1 次（后续 2 帧零重传）✅");
+}

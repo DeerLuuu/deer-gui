@@ -25,6 +25,46 @@ use crate::loader::Lib;
 /// SPIR-V 魔数（`MagicNumber`，固定值）。
 pub const SPIRV_MAGIC: u32 = 0x0723_0203;
 
+/// `create_texture_r8` 实际执行**上传**（图像 + staging + 两次屏障 + 拷贝）的次数。
+///
+/// ## 为什么这个计数器是必要的护栏（M3b review M-4）
+///
+/// 「图集纹理**只在指纹变化时**重传」是本项目一条**性能前提**
+/// （`create_texture_r8` 内部会 `vkQueueWaitIdle` —— 每帧重传会把 CPU 卡在每一帧的
+/// 同步上）。但它此前**只有实现、没有护栏**：reviewer 实测把
+/// `refresh_atlas_texture()` 的指纹判断删掉、改成每帧重传之后，
+/// `consecutive_text_frames_stay_in_sync` **依然全绿** —— 因为那个测试只看最终像素，
+/// 而「重传几次」对像素没有影响。
+///
+/// 「删掉实现、测试照样绿」正是本项目最在意的那类缺口，所以这里给出一个
+/// **可断言的可观测量**：测试用两次读取的差值断言「同一图集连续多帧只上传一次」。
+///
+/// ## 为什么是进程级 `AtomicUsize`（而不是渲染器上的字段）
+///
+/// 与 `ffi::validation_message_count()` 同一理由：调用点在
+/// `gpu_render.rs::refresh_atlas_texture`，而计数在**被调用方**（本函数）里自增 ——
+/// 于是无论调用方怎么改（删指纹、改判断条件、换调用点），只要真的走了上传路径，
+/// 计数就会动。若把计数器做成渲染器字段并要求调用方上报，护栏就退化成
+/// 「实现者在自证」，挡不住「把上报一起删掉」这种变异。
+///
+/// 代价（诚实说明）：它统计的是**本进程内所有** `VkDevice` 的上传总和，
+/// 所以测试必须用**差值**且同进程内不能有并发渲染（本项目的测试都是串行单线程）。
+static TEXTURE_R8_UPLOAD_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// 累计的 `create_texture_r8` 上传次数（进程级，从进程启动算起）。
+///
+/// 测试用法：在两次渲染之间取**差值** ——
+/// ```ignore
+/// let before = deer_vk::device::texture_r8_upload_count();
+/// gpu.render(&list)?;                       // 同一图集
+/// assert_eq!(deer_vk::device::texture_r8_upload_count() - before, 0,
+///            "同一图集不应重传");
+/// ```
+pub fn texture_r8_upload_count() -> usize {
+    TEXTURE_R8_UPLOAD_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// 设备级函数表（在后台线程里解析；全是函数指针，故 `Send`）。
 #[derive(Clone, Copy)]
 pub struct DeviceFns {
@@ -631,6 +671,10 @@ impl VkDevice {
     /// （M3b T4 的契约），不是每帧，所以可忽略。
     pub fn create_texture_r8(&self, w: u32, h: u32, data: &[u8]) -> GpuResult<Texture> {
         validate_texture_r8_args(w, h, data)?;
+        // 计数点放在**校验之后**：被拒的调用不算一次上传（它没碰驱动），
+        // 否则 `texture_r8_rejects_bad_args_before_touching_driver` 那类负例
+        // 会让计数虚增，护栏就变得不可断言。
+        TEXTURE_R8_UPLOAD_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let fns = self.fns;
         let device = self.handle;
 

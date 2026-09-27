@@ -399,16 +399,20 @@ fn create_and_destroy_texture_pipeline(mut check: impl FnMut(&deer_vk::device::T
             .create_descriptor_set_layout_combined_sampler()
             .expect("创建描述符集布局");
         assert!(!dsl.handle().is_null(), "布局句柄不能为空");
+        // ⚠️ 声明顺序**故意**是 `pool` 在前、`set` 在后：
+        // Rust 的局部量按**声明逆序**析构 ⇒ `set` 先析构（`vkFreeDescriptorSets`
+        // 要求池此刻仍存活），`pool` 后析构。反过来（`set` 在前）会让
+        // `vkFreeDescriptorSets` 拿到已销毁的池 —— reviewer 实测那会
+        // **0xc0000005 崩溃**，不是一句清晰的错误码。
         let pool = dev.create_descriptor_pool(1).expect("创建描述符池");
         assert_eq!(pool.max_sets(), 1);
-        // 声明顺序：`pool` 在 `set` 之前 ⇒ `set` 先析构（先归还集、后销毁池）
         let set = dev.allocate_descriptor_set(&pool, &dsl).expect("分配描述符集");
         assert!(!set.handle().is_null(), "描述符集句柄不能为空");
         dev.update_descriptor_texture(&set, &tex, &sampler).expect("写描述符");
         dev.wait_idle().expect("空闲等待");
         (tex.width(), tex.height())
-        // 此处 set / pool / dsl / sampler / tex 依次 `Drop` —— 整个过程都在
-        // 校验层眼皮下，所以调用方的计数断言覆盖了创建 + 使用 + 析构。
+        // 此处按声明逆序 `Drop`：set → pool → dsl → sampler → tex。
+        // 全过程都在校验层眼皮下，所以调用方的计数断言覆盖了创建 + 使用 + 析构。
     }
     run(&mut check)
 }
