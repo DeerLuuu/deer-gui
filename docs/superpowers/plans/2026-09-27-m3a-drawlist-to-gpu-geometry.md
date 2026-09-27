@@ -118,7 +118,7 @@ pub fn fragment_shader_rect_shape() -> Vec<u8> {
     // out_color = inside ? color : vec4(0.0)
 }
 ```
-> 判据必须与 `crates/deer-gpu/src/null.rs` 的 `inside_rounded`（四角 `dx*dx + dy*dy > r*r`，坐标取**整数像素**）逐字一致；描边（`rk == -1`）按 CPU `stroke()` 的 4 条 1px 边实现。
+> 判据必须与 `crates/deer-gpu/src/null.rs` 的 `inside_rounded`（四角 `dx*dx + dy*dy > r*r`，坐标取**整数像素**）逐字一致；描边按 CPU `stroke()` 的 4 条边带实现，**带宽 = `-radius_kind`**（见 Ruling 6）。
 - [ ] **Step 5: 跑测试**
 Run: `cmd /c "cargo test -p deer-vk --test spirv_val"` → Expected: PASS（含官方 spirv-val）
 - [ ] **Step 6: 校验层下建管线不崩**
@@ -147,7 +147,10 @@ pub struct GpuVertex { pub pos: [f32; 2], pub rect: [f32; 4], pub radius_kind: f
 #[derive(Debug, Clone, PartialEq)]
 pub struct GpuStream { pub vertices: Vec<GpuVertex>, pub unsupported: Vec<String> }
 pub const RADIUS_FILL: f32 = 0.0;
+/// 1px 描边（`width == 1`）；更宽的描边按 **`-width`** 编码（见 Ruling 6）
 pub const RADIUS_STROKE: f32 = -1.0;
+/// 把 `StrokeRect { width }` 编码成 `radius_kind`：`width == 1` ⇒ `RADIUS_STROKE`，否则 `-(width as f32)`
+pub fn radius_kind_for_stroke(width: i32) -> f32;
 /// 把绘制列表翻译成顶点流；`extent` 用于像素→NDC 换算与裁剪。
 pub fn build_stream(list: &DrawList, extent: Extent) -> GpuStream;
 ```
@@ -191,7 +194,7 @@ fn clip_is_intersected_on_the_cpu() {
 }
 ```
 Run: `cmd /c "cargo test -p deer-vk --test gpu_geom_stream"` → Expected: FAIL（模块不存在）
-- [ ] **Step 2: 实现**：维护 clip 栈（初始 = 全画布）；`FillRect`/`FillRoundRect`/`StrokeRect` 各展开为 6 顶点矩形（`FillRoundRect` 带 `radius`，`StrokeRect` 带 `RADIUS_STROKE` 且几何按 CPU `stroke()` 的 4 条边展开为 4×6 顶点）；与 clip **求交**后若为空则整条跳过；`NodeHint` 忽略；`Text` 记入 `unsupported`。
+- [ ] **Step 2: 实现**：维护 clip 栈（初始 = 全画布）；`FillRect`/`FillRoundRect`/`StrokeRect` 各展开为矩形三角形（`FillRoundRect` 带 `radius`；`StrokeRect` 的 `radius_kind = radius_kind_for_stroke(width)`，几何按 CPU `stroke()` 展开为 **4 条边带**、**每条厚度 = `width`**，每带与 clip 求交）；与 clip **求交**后若为空则整条跳过；`NodeHint` 忽略；`Text` 记入 `unsupported`。
 - [ ] **Step 3: 跑测试** → `... gpu_geom_stream` → Expected: PASS
 - [ ] **Step 4: Commit** → `feat(deer-vk): DrawList → GPU 顶点流（CPU 侧裁剪；文本显式 Unsupported）`
 
