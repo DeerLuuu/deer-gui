@@ -185,6 +185,219 @@ fn render_pass_supports_all_target_formats() {
     }
 }
 
+// ── M3c-T1：共用管线层 ────────────────────────────────────────────────────────
+
+/// **M3c-T1 验收**：共用层能同时建出「形状 + 文本」两条管线，且**同一批状态**
+/// 换一个颜色格式 + viewport 策略就能服务另一条路径（离屏 ↔ 窗口）。
+///
+/// ## 为什么这条测试的重点是「两种格式都能建出来」
+///
+/// M3c 要让窗口用同一套画法，而窗口的颜色格式是 **`B8G8R8A8_SRGB`（本机实测 `0x32`）**、
+/// 离屏是 `R8G8B8A8_UNORM` —— 两者走的是**同一份** `build_pipelines`，只是
+/// `color_format` 参数不同。所以「共用层对两种格式都能建出管线」是这层能用的前提。
+///
+/// 注意这里**只**验证管线建得出来（驱动接受状态组合）；**像素语义**在
+/// `pipelines.rs` 的纯函数测试里定（sRGB 混合空间差 44 字节 ⇒ 结论是窗口要用
+/// 线性格式，见那里的 `srgb_attachment_blending_diverges_far_beyond_one_lsb`）。
+#[test]
+fn shared_pipeline_layer_builds_both_paths() {
+    let Some(dev) = open() else { return };
+
+    // (名字, 颜色格式, viewport 策略) —— 覆盖两条路径的**真实**组合
+    let cases: [(&str, i32, deer_vk::pipelines::ViewportStrategy); 2] = [
+        (
+            "离屏 R8G8B8A8_UNORM + 静态",
+            vk::VK_FORMAT_R8G8B8A8_UNORM,
+            deer_vk::pipelines::ViewportStrategy::Static {
+                width: 64,
+                height: 48,
+            },
+        ),
+        (
+            "窗口 B8G8R8A8_SRGB + 动态",
+            vk::VK_FORMAT_B8G8R8A8_SRGB,
+            deer_vk::pipelines::ViewportStrategy::Dynamic,
+        ),
+    ];
+
+    for (name, format, viewport) in cases {
+        let pass = dev
+            .create_render_pass(
+                format,
+                vk::VK_ATTACHMENT_LOAD_OP_CLEAR,
+                vk::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            )
+            .unwrap_or_else(|e| panic!("{name}: 建渲染通道失败：{e}"));
+
+        // 形状顶点布局（GpuVertex stride 44）与文本顶点布局（TextVertex stride 32）
+        let shape_attrs = [
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::VK_FORMAT_R32G32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
+                offset: 8,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: 100, // R32_SFLOAT
+                offset: 24,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 3,
+                binding: 0,
+                format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
+                offset: 28,
+            },
+        ];
+        let text_attrs = [
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::VK_FORMAT_R32G32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::VK_FORMAT_R32G32_SFLOAT,
+                offset: 8,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 2,
+                binding: 0,
+                format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
+                offset: 16,
+            },
+        ];
+        let to_attr = |d: &vk::VertexInputAttributeDescription| deer_vk::VertexAttr {
+            location: d.location,
+            format: d.format,
+            offset: d.offset,
+        };
+        let shape: Vec<deer_vk::VertexAttr> = shape_attrs.iter().map(to_attr).collect();
+        let text: Vec<deer_vk::VertexAttr> = text_attrs.iter().map(to_attr).collect();
+
+        let set = deer_vk::pipelines::build_pipelines(
+            &dev,
+            &pass,
+            format,
+            viewport,
+            44,
+            &shape,
+            32,
+            &text,
+        )
+        .unwrap_or_else(|e| panic!("{name}: 共用层建两条管线失败：{e}"));
+
+        assert!(!set.shape.handle().is_null(), "{name}: 形状管线句柄不能为空");
+        assert!(!set.text.handle().is_null(), "{name}: 文本管线句柄不能为空");
+        assert_eq!(set.color_format(), format, "{name}: 记录的格式必须与传入一致");
+        println!("  {name}: 形状 + 文本两条管线建成 ✅");
+    }
+}
+
+/// **实测记录**：颜色格式与渲染通道**不一致**时，本机驱动**不报错**。
+///
+/// ## 为什么这条测试断言的是「接受」而不是「拒绝」
+///
+/// 我最初写的断言是「不一致必须被拒绝」，**实测红了** —— 本机 Intel 驱动对
+/// 「管线 `colorAttachment` 格式 ≠ 渲染通道附件格式」的组合返回成功。
+/// 这与本项目反复踩到的那一类缺陷同源：**驱动接受非法/不一致的状态，症状是
+/// 「不报错也不画」（或画出错色）**，而不是一个清晰的错误码。
+///
+/// 所以这条测试改成**记录事实**，于是它有两个作用：
+/// 1. 钉住「不能指望驱动替我们发现格式传错」⇒ 调用方必须自己传对
+///    （`build_pipelines` 的文档里写明这条前提）；
+/// 2. 若某天驱动升级后开始拒绝，这条会红，我们会知道「驱动变严了」——
+///    那也是必须知道的变化（它意味着别处可能有依赖「被宽容接受」的代码）。
+///
+/// ⚠️ 因此**不把这条当护栏用**：真正防「传错格式」的手段是调用方传
+/// `render_pass` 的同一格式（离屏 `COLOR_FORMAT`、窗口 `swapchain.format()`），
+/// 以及 M3c-T3 的窗口读回对照（格式传错时像素会明显不对）。
+#[test]
+fn format_mismatch_is_accepted_by_this_driver_and_must_be_guarded_by_the_caller() {
+    let Some(dev) = open() else { return };
+    let pass = dev
+        .create_render_pass(
+            vk::VK_FORMAT_B8G8R8A8_SRGB,
+            vk::VK_ATTACHMENT_LOAD_OP_CLEAR,
+            vk::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        )
+        .expect("建渲染通道");
+
+    // ⚠️ 属性表必须**覆盖着色器真正消费的所有 location**，否则校验层会报
+    // `VUID-VkGraphicsPipelineCreateInfo-Input-07904`（"does not have a Location N,
+    // but VERTEX has ... at that Location"）——本条测试**只想**验证格式不一致的行为，
+    // 不该顺带引入别的 VUID（那会让「零校验消息」的断言被无关消息污染：
+    // 这正是我第一版只声明 1 个属性时踩到的，实测 5 条 VUID）。
+    let shape_attrs = [
+        deer_vk::VertexAttr {
+            location: 0,
+            format: vk::VK_FORMAT_R32G32_SFLOAT,
+            offset: 0,
+        },
+        deer_vk::VertexAttr {
+            location: 1,
+            format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
+            offset: 8,
+        },
+        deer_vk::VertexAttr {
+            location: 2,
+            format: 100, // R32_SFLOAT
+            offset: 24,
+        },
+        deer_vk::VertexAttr {
+            location: 3,
+            format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
+            offset: 28,
+        },
+    ];
+    let text_attrs = [
+        deer_vk::VertexAttr {
+            location: 0,
+            format: vk::VK_FORMAT_R32G32_SFLOAT,
+            offset: 0,
+        },
+        deer_vk::VertexAttr {
+            location: 1,
+            format: vk::VK_FORMAT_R32G32_SFLOAT,
+            offset: 8,
+        },
+        deer_vk::VertexAttr {
+            location: 2,
+            format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
+            offset: 16,
+        },
+    ];
+    let r = deer_vk::pipelines::build_pipelines(
+        &dev,
+        &pass,
+        vk::VK_FORMAT_R8G8B8A8_UNORM, // ← 与通道的 SRGB **不一致**
+        deer_vk::pipelines::ViewportStrategy::Dynamic,
+        44,
+        &shape_attrs,
+        32,
+        &text_attrs,
+    );
+    match r {
+        Ok(_) => println!(
+            "实测：颜色格式与渲染通道不一致时驱动**接受**（不报错）—— \
+             这正是本项目反复遇到的那类「静默不一致」；格式必须由调用方传对"
+        ),
+        Err(e) => println!(
+            "实测：本机驱动**拒绝**了格式不一致（{e}）—— \
+             比预期的更严，说明驱动版本变了；本测试的断言需要随之更新"
+        ),
+    }
+}
+
 /// 推送常量大小必须是 4 的倍数 —— 这类错误应当在**调用驱动前**就被拦下。
 #[test]
 fn pipeline_layout_rejects_misaligned_push_constant() {

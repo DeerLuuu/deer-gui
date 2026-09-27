@@ -1183,6 +1183,197 @@ impl VkDevice {
         Ok(())
     }
 
+    /// 创建一个**图形管线**（M3c：状态由 [`crate::pipelines::PipelineState`] 统一提供）。
+    ///
+    /// ## 与 `build_pipeline`（私有）、`create_vertex_pipeline`（M3a 诊断用）的关系
+    ///
+    /// `build_pipeline` 里的管线状态是**字面量**，M3a 与 M3b 各写了一份；
+    /// M3c 把「形状与文本命共同的那 20 多项状态」提到 `pipelines.rs`，由本方法消费。
+    /// 于是**离屏与窗口、形状与文本**四条路径共用同一份状态来源 ——
+    /// 这正是「提取共用层」要解决的事（复制四份字面量 = 四份将来只改一份的风险）。
+    ///
+    /// `create_vertex_pipeline` 保留不动：它是 M3a 的路径，且 `pipeline_smoke.rs`
+    /// 的 `create_vertex_pipeline_rejects_bad_arguments` 直接依赖它做**参数校验**
+    /// 的驱动侧复验。两条路径产出**完全相同**的状态（本方法与它逐字段同值），
+    /// 所以离屏改用本方法后行为不变 —— 由 M3a/M3b 的 207 条判据守住。
+    ///
+    /// ## 顶点输入结构体的生命周期
+    ///
+    /// `binding` / `descs` / `vertex_input` 三者都在这**一个**作用域里，
+    /// `vertex_input` 持有的两处指针在本函数返回前一直有效 ——
+    /// 手写 `repr(C)` 结构体最容易踩的坑就是「结构体活着、它指向的东西已经没了」。
+    pub fn create_pipeline_from_state(
+        &self,
+        state: &crate::pipelines::PipelineState,
+        stages: &[(&ShaderModule, u32)],
+        layout: &PipelineLayout,
+        render_pass: &RenderPass,
+    ) -> GpuResult<Pipeline> {
+        use crate::pipelines::ViewportStrategy;
+
+        // ① viewport/scissor：静态版写进管线、动态版留空（值在录制时给）
+        let (vp, sc) = match state.viewport {
+            ViewportStrategy::Static { width, height } => (
+                vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: width as f32,
+                    height: height as f32,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                },
+                vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D { width, height },
+                },
+            ),
+            ViewportStrategy::Dynamic => (
+                vk::Viewport {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 0.0,
+                    height: 0.0,
+                    min_depth: 0.0,
+                    max_depth: 1.0,
+                },
+                vk::Rect2D {
+                    offset: vk::Offset2D { x: 0, y: 0 },
+                    extent: vk::Extent2D {
+                        width: 0,
+                        height: 0,
+                    },
+                },
+            ),
+        };
+        let dynamic = matches!(state.viewport, ViewportStrategy::Dynamic);
+        let viewport_state = vk::PipelineViewportStateCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            viewport_count: 1,
+            p_viewports: if dynamic { std::ptr::null() } else { &vp },
+            scissor_count: 1,
+            p_scissors: if dynamic { std::ptr::null() } else { &sc },
+        };
+        // ⚠️ 动态状态列表必须**只在动态策略下**声明：静态管线声明了动态状态却不设值，
+        // 渲染时用的是「未定义」的 viewport（校验层会报，驱动可能画 0 像素）。
+        let dynamic_states = [vk::VK_DYNAMIC_STATE_VIEWPORT, vk::VK_DYNAMIC_STATE_SCISSOR];
+        let dynamic_state = vk::PipelineDynamicStateCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            dynamic_state_count: if dynamic { dynamic_states.len() as u32 } else { 0 },
+            p_dynamic_states: if dynamic {
+                dynamic_states.as_ptr()
+            } else {
+                std::ptr::null()
+            },
+        };
+
+        // ② 顶点输入（值 → 结构体，全部在同一作用域）
+        let binding = vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: state.stride,
+            input_rate: vk::VK_VERTEX_INPUT_RATE_VERTEX,
+        };
+        let descs = state.vertex_attr_descs();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            vertex_binding_description_count: 1,
+            p_vertex_binding_descriptions: &binding,
+            vertex_attribute_description_count: descs.len() as u32,
+            p_vertex_attribute_descriptions: descs.as_ptr(),
+        };
+
+        // ③ 颜色混合（`color_blend` 持有所述 attachment 的指针 ⇒ 两者同一作用域）
+        let blend_attachment = state.blend;
+        let color_blend = vk::PipelineColorBlendStateCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            logic_op_enable: vk::VK_FALSE,
+            logic_op: vk::VK_LOGIC_OP_COPY,
+            attachment_count: 1,
+            p_attachments: &blend_attachment,
+            blend_constants: [0.0; 4],
+        };
+
+        // ④ 阶段列表
+        let entry = c"main";
+        let stage_infos: Vec<vk::PipelineShaderStageCreateInfo> = stages
+            .iter()
+            .map(|(m, stage)| vk::PipelineShaderStageCreateInfo {
+                s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                p_next: std::ptr::null(),
+                flags: 0,
+                stage: *stage,
+                module: m.handle(),
+                p_name: entry.as_ptr(),
+                p_specialization_info: std::ptr::null(),
+            })
+            .collect();
+        if stage_infos.is_empty() {
+            return Err(GpuError::Unsupported(
+                "图形管线至少要有一个着色器阶段".to_string(),
+            ));
+        }
+
+        // ⑤ 组装并创建
+        let info = vk::GraphicsPipelineCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            stage_count: stage_infos.len() as u32,
+            p_stages: stage_infos.as_ptr(),
+            p_vertex_input_state: &vertex_input,
+            p_input_assembly_state: &state.input_assembly,
+            p_tessellation_state: std::ptr::null(),
+            p_viewport_state: &viewport_state,
+            p_rasterization_state: &state.rasterization,
+            p_multisample_state: &state.multisample,
+            p_depth_stencil_state: std::ptr::null(),
+            p_color_blend_state: &color_blend,
+            p_dynamic_state: &dynamic_state,
+            layout: layout.handle(),
+            render_pass: render_pass.handle(),
+            subpass: 0,
+            base_pipeline_handle: vk::NULL_HANDLE,
+            base_pipeline_index: -1,
+        };
+        let mut pipeline_handle: vk::PipelineHandle = vk::NULL_HANDLE;
+        // SAFETY: 上面所有被引用的结构体都在本函数作用域内存活到这次调用结束；
+        // 输出句柄可写；管线缓存为空（合法）。
+        let rc = unsafe {
+            (self.fns.create_graphics_pipelines)(
+                self.handle,
+                vk::NULL_HANDLE,
+                1,
+                &info,
+                std::ptr::null(),
+                &mut pipeline_handle,
+            )
+        };
+        if rc != ffi::VK_SUCCESS || pipeline_handle.is_null() {
+            // 句柄为空但返回成功，是本项目实测过的「驱动不报错也不写句柄」失败方式
+            return Err(GpuError::Driver {
+                code: rc,
+                message: format!(
+                    "vkCreateGraphicsPipelines 失败（rc={} handle_is_null={}）：{}",
+                    vk_result_name(rc),
+                    pipeline_handle.is_null(),
+                    "管线创建被拒"
+                ),
+            });
+        }
+        Ok(Pipeline {
+            handle: pipeline_handle,
+            device: self.handle,
+            destroy: self.fns.destroy_pipeline,
+        })
+    }
+
     /// 创建一个**图形管线**（单颜色附件、无顶点输入、动态 viewport/scissor、alpha 混合开）。
     ///
     /// **这是 SPIR-V 的真正验收关**：`vkCreateShaderModule` 很宽容（实测连 `bound = 0`

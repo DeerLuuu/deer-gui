@@ -82,14 +82,13 @@ use std::ffi::c_void;
 use deer_gpu::{Color, DrawCmd, DrawList, Extent, GpuError, GpuResult, RectI, TextEngine};
 
 use crate::device::{
-    vk_result_name, DescriptorPool, DescriptorSet, DescriptorSetLayout, DeviceFns, Pipeline,
-    PipelineLayout, RenderPass, Sampler, ShaderModule, Texture, VertexAttr, VkDevice,
+    vk_result_name, DescriptorPool, DescriptorSet, DeviceFns, RenderPass, Texture, VertexAttr,
+    VkDevice,
 };
 use crate::ffi;
 use crate::ffi_dev as vk;
 use crate::gpu_geom::{self, GpuVertex};
 use crate::gpu_text::{self, TextVertex};
-use crate::spirv;
 
 /// `VK_FORMAT_R32_SFLOAT`（单个 `float`）——`radius_kind` 用它。
 ///
@@ -216,18 +215,20 @@ struct DrawCall {
 /// `vs` / `fs` / `set_layout` / `pool` **从不被读取** —— 它们存在只为**所有权**：
 /// 着色器模块与描述符集布局必须在管线存活期间有效，池必须在集释放之后才销毁。
 /// 删掉任何一个都会让对象提前销毁。`allow(dead_code)` 是这里的正确表达。
+/// ## M3c-T1：管线与布局搬走了
+///
+/// 从前这里还持有 `pipeline` / `layout` / `vs` / `fs` / `set_layout` —— 管线状态
+/// **手写了两份**（形状一份、文本一份）。现在这些都在
+/// [`GpuGeometryRenderer::pipelines`]（[`crate::pipelines::PipelineSet`]）里，
+/// 本结构体只保留**文本特有的资源**：图集纹理、它的描述符集与池、文本顶点缓冲。
+///
+/// `pool` 仍然必须**在 `set` 之后**声明（集先归还、池后销毁）。
 #[allow(dead_code)]
 struct TextResources {
     engine: TextEngine,
-    pipeline: Pipeline,
-    layout: PipelineLayout,
-    vs: ShaderModule,
-    fs: ShaderModule,
-    set_layout: DescriptorSetLayout,
     /// 描述符集（**必须在 `pool` 之前声明** ⇒ 先于池析构，见上面的说明）。
     set: DescriptorSet,
     pool: DescriptorPool,
-    sampler: Sampler,
     /// 文本顶点缓冲（**独立于形状的**：两者顶点布局不同，不能共用）。
     vertex: Option<VertexBuffer>,
     /// 当前已上传的图集纹理（`None` = 还没传过）。
@@ -633,10 +634,17 @@ fn create_host_buffer(
 #[allow(dead_code)]
 pub struct GpuGeometryRenderer {
     pass: RenderPass,
-    pipeline: Pipeline,
-    layout: PipelineLayout,
-    vs: ShaderModule,
-    fs: ShaderModule,
+    /// **两条管线统一由共用层建出**（M3c-T1）。
+    ///
+    /// 从前这里是 `pipeline: Pipeline` + `TextResources` 里的 `pipeline`/`layout`/
+    /// `vs`/`fs`/`set_layout` —— 即**管线状态被手写了两份**（形状一份、文本一份）。
+    /// 现在状态集中在 [`crate::pipelines::build_pipelines`]，离屏与（M3c 的）窗口
+    /// 两条路径共用同一份来源：复制 N 份字面量 = N 份「将来只改一份」的风险。
+    ///
+    /// 离屏用**静态** viewport（M2a 实测：动态在本机 Intel 上零像素），
+    /// 窗口用**动态**（M2b 实证能上屏）—— 这个差异是 [`ViewportStrategy`] 参数，
+    /// 不是两份手写状态。
+    pipelines: crate::pipelines::PipelineSet,
     image: VkObject,
     image_memory: VkObject,
     view: VkObject,
@@ -691,9 +699,8 @@ impl GpuGeometryRenderer {
         let device_handle = device.handle();
         let mem_props = *device.memory_properties();
 
-        // ① 着色器：顶点属性透传 + 按 `rect`/`radius_kind` 逐像素判定（M3a-T1）
-        let vs = device.create_shader_module(&spirv::vertex_shader_rect_attrs())?;
-        let fs = device.create_shader_module(&spirv::fragment_shader_rect_shape())?;
+        // ① 着色器不再在这里建：两条管线的着色器由 `pipelines::build_pipelines` 统一建出
+        //    （M3c-T1；从前这里建形状的、`with_text` 里建文本的 —— 两处各一份）。
 
         // ② 渲染通道：清屏 + 离开通道即 `TRANSFER_SRC_OPTIMAL`（好直接回读）
         let pass = device.create_render_pass(
@@ -702,42 +709,20 @@ impl GpuGeometryRenderer {
             vk::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         )?;
 
-        // 管线布局：**不含推送常量** —— 顶点属性方案，刻意绕开 M2a 的推送常量地雷
-        // （`spirv.rs::vertex_shader_rect_pushconstant` 的说明）。
-        let layout = device.create_pipeline_layout(None)?;
-
-        // ③ 管线：静态 viewport/scissor = 整幅 extent；真实顶点输入（binding stride 44）
-        let entry = c"main";
-        let stages = [
-            vk::PipelineShaderStageCreateInfo {
-                s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                p_next: std::ptr::null(),
-                flags: 0,
-                stage: vk::VK_SHADER_STAGE_VERTEX_BIT,
-                module: vs.handle(),
-                p_name: entry.as_ptr(),
-                p_specialization_info: std::ptr::null(),
-            },
-            vk::PipelineShaderStageCreateInfo {
-                s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                p_next: std::ptr::null(),
-                flags: 0,
-                stage: vk::VK_SHADER_STAGE_FRAGMENT_BIT,
-                module: fs.handle(),
-                p_name: entry.as_ptr(),
-                p_specialization_info: std::ptr::null(),
-            },
-        ];
-        let pipeline = device.create_vertex_pipeline(
-            &stages,
-            &layout,
+        // ③ 两条管线：**由共用层建出**（M3c-T1）。颜色格式 = 本路径的附件格式；
+        //    viewport 用**静态**（M2a 实测：动态在本机 Intel 驱动上零像素）。
+        let pipelines = crate::pipelines::build_pipelines(
+            &device,
             &pass,
-            vk::Extent2D {
+            COLOR_FORMAT,
+            crate::pipelines::ViewportStrategy::Static {
                 width: extent.width,
                 height: extent.height,
             },
             std::mem::size_of::<GpuVertex>() as u32,
             &vertex_attrs(),
+            std::mem::size_of::<TextVertex>() as u32,
+            &text_attrs(),
         )?;
 
         // ④ 离屏图像（DEVICE_LOCAL：颜色附件 | 传输源）
@@ -877,10 +862,7 @@ impl GpuGeometryRenderer {
 
         Ok(GpuGeometryRenderer {
             pass,
-            pipeline,
-            layout,
-            vs,
-            fs,
+            pipelines,
             image,
             image_memory,
             view,
@@ -933,59 +915,25 @@ impl GpuGeometryRenderer {
     /// - 图集纹理**不在这里上传**：改为在 [`Self::render`] 里按「图集指纹」惰性重传
     ///   （图集只在出现新字形时变化，见 [`TextResources::uploaded`]）。
     pub fn with_text(mut self, engine: TextEngine) -> GpuResult<Self> {
-        // 与 M3a 的 shape 管线完全独立：不同顶点布局、不同着色器、多一条描述符集
-        let vs = self.device.create_shader_module(&spirv::vertex_shader_text())?;
-        let fs = self.device.create_shader_module(&spirv::fragment_shader_text())?;
-        let set_layout = self.device.create_descriptor_set_layout_combined_sampler()?;
-        let layout = self
-            .device
-            .create_pipeline_layout_ex(None, Some(&set_layout))?;
-        let stages = [
-            vk::PipelineShaderStageCreateInfo {
-                s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                p_next: std::ptr::null(),
-                flags: 0,
-                stage: vk::VK_SHADER_STAGE_VERTEX_BIT,
-                module: vs.handle(),
-                p_name: c"main".as_ptr(),
-                p_specialization_info: std::ptr::null(),
-            },
-            vk::PipelineShaderStageCreateInfo {
-                s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-                p_next: std::ptr::null(),
-                flags: 0,
-                stage: vk::VK_SHADER_STAGE_FRAGMENT_BIT,
-                module: fs.handle(),
-                p_name: c"main".as_ptr(),
-                p_specialization_info: std::ptr::null(),
-            },
-        ];
-        let pipeline = self.device.create_vertex_pipeline(
-            &stages,
-            &layout,
-            &self.pass,
-            vk::Extent2D {
-                width: self.extent.width,
-                height: self.extent.height,
-            },
-            std::mem::size_of::<TextVertex>() as u32,
-            &text_attrs(),
-        )?;
-        let sampler = self.device.create_sampler()?;
+        // **管线、布局、着色器、采样器、set 0 布局都已经在 `new()` 里由共用层
+        // （`pipelines::build_pipelines`）建好了** —— M3c-T1 之前这里是**第二份**
+        // 手写的管线状态，与形状那份必须逐字段一致却没有任何东西保证。
+        // 现在 `self.pipelines.text` 与 `self.pipelines.shape` 出自同一批构造函数，
+        // 「除格式/viewport/顶点布局外相同」是结构上保证的（见 `pipelines.rs` 的测试）。
+        //
+        // 这里只剩下**文本特有的资源**：描述符**池**与**集**（图集 + 它的纹理）。
+
+        // 池/集的容量与用途匹配：1 个 `COMBINED_IMAGE_SAMPLER`。
         let pool = self.device.create_descriptor_pool(1)?;
-        let set = self.device.allocate_descriptor_set(&pool, &set_layout)?;
+        let set = self
+            .device
+            .allocate_descriptor_set(&pool, &self.pipelines.text_set_layout)?;
 
         self.text = Some(TextResources {
             engine,
-            pipeline,
-            layout,
-            vs,
-            fs,
-            set_layout,
             // 字段顺序有契约：`set` 必须在 `pool` 之前（见 `TextResources` 的文档）
             set,
             pool,
-            sampler,
             vertex: None,
             texture: None,
             uploaded: None,
@@ -1261,7 +1209,7 @@ impl GpuGeometryRenderer {
         {
             let res = self.text.as_mut().expect("同上");
             self.device
-                .update_descriptor_texture(&res.set, &texture, &res.sampler)?;
+                .update_descriptor_texture(&res.set, &texture, &self.pipelines.sampler)?;
             res.texture = Some(texture);
             res.uploaded = Some((w, h, glyphs));
         }
@@ -1446,7 +1394,7 @@ impl GpuGeometryRenderer {
                             (self.fns.cmd_bind_pipeline)(
                                 self.cmd,
                                 vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                self.pipeline.handle(),
+                                self.pipelines.shape.handle(),
                             );
                             let vb = self.vertex.as_ref().expect("形状段 ⇒ 缓冲已上传");
                             let offset: vk::DeviceSize = 0;
@@ -1463,7 +1411,7 @@ impl GpuGeometryRenderer {
                             (self.fns.cmd_bind_pipeline)(
                                 self.cmd,
                                 vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                res.pipeline.handle(),
+                                self.pipelines.text.handle(),
                             );
                             let vb = res.vertex.as_ref().expect("文本段 ⇒ 缓冲已上传");
                             let offset: vk::DeviceSize = 0;
@@ -1478,7 +1426,7 @@ impl GpuGeometryRenderer {
                             (self.fns.cmd_bind_descriptor_sets)(
                                 self.cmd,
                                 vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                res.layout.handle(),
+                                self.pipelines.text_layout.handle(),
                                 0,
                                 1,
                                 &res.set.handle(),
