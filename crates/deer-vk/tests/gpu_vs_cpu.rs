@@ -27,11 +27,29 @@ use deer_vk::GpuGeometryRenderer;
 /// 清屏色（不透明 ⇒ UNORM 转换两边都是精确的）。
 const CLEAR: Color = Color::rgb(16, 16, 16);
 
-/// `DEER_VK_VALIDATION=1`/`true` ⇒ 请求校验层（与 `ffi::Instance::validation_from_env` 同一判据）。
+/// `DEER_VK_VALIDATION=1`/`true` ⇒ 请求校验层。
+///
+/// **直接调库里的那个判据**（fix round 2 / R4）：测试不该手抄一份「什么算请求」——
+/// 抄了就有两份口径，而口径分叉正是「同一个二进制只有一半开了校验」那类问题的来源。
 fn validation_requested() -> bool {
-    std::env::var("DEER_VK_VALIDATION")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    deer_vk::ffi::Instance::validation_from_env()
+}
+
+/// 断言「到目前为止校验层**没有**报过任何消息」（进程级计数，见 `ffi::validation_message_count`）。
+///
+/// 只在 `DEER_VK_VALIDATION=1` 下有意义（层没开时回调根本不会跑，计数恒为 0）——
+/// 所以它与 `validation_layer_state_matches_the_request` 配套：那条保证**层真的在跑**，
+/// 这条保证跑了之后**一条消息都没有**。两件事合起来才把「零校验消息」变成可回归结论
+/// （fix round 2 / R1-2；此前它只靠人眼看输出）。
+fn assert_no_validation_messages(context: &str) {
+    let n = deer_vk::ffi::validation_message_count();
+    assert_eq!(
+        n,
+        0,
+        "{context}: 校验层报了 {n} 条消息（DEER_VK_VALIDATION={:?}）—— \
+         这是「零校验消息」的自动断言版",
+        std::env::var("DEER_VK_VALIDATION").ok()
+    );
 }
 
 /// 建渲染器。**请求了校验层时「建不起来」就是测试失败，不是「跳过」**（T3 review F7）：
@@ -61,7 +79,7 @@ fn renderer(extent: Extent) -> Option<GpuGeometryRenderer> {
 /// - 没请求 ⇒ 必须为假（挡住「永远返回 true」的假实现）。
 #[test]
 fn validation_layer_state_matches_the_request() {
-    let Some(r) = renderer(Extent { width: 4, height: 4 }) else {
+    let Some(mut r) = renderer(Extent { width: 8, height: 8 }) else {
         return;
     };
     let requested = validation_requested();
@@ -74,6 +92,20 @@ fn validation_layer_state_matches_the_request() {
          「零校验消息」必须建立在「校验层确实在跑」之上，否则它什么也没证明",
         std::env::var("DEER_VK_VALIDATION").ok()
     );
+
+    // 真的画一帧（让校验层有东西可校验），再断言「一条消息都没有」。
+    // 这一帧刻意同时用上裁剪 / 圆角 / 半透明厚描边 —— 也就是最容易被校验层挑出问题的几条路径。
+    let mut l = DrawList::new();
+    l.push(DrawCmd::PushClip { rect: RectI::new(1, 1, 5, 5) });
+    l.push(DrawCmd::FillRoundRect { rect: RectI::new(0, 0, 8, 8), radius: 2, color: Color::WHITE });
+    l.push(DrawCmd::StrokeRect {
+        rect: RectI::new(0, 0, 8, 8),
+        color: Color::rgba(255, 0, 0, 0.5),
+        width: 2,
+    });
+    l.push(DrawCmd::PopClip);
+    r.render(&l).expect("这一帧应当成功");
+    assert_no_validation_messages("单帧（裁剪 + 圆角 + 半透明厚描边）");
 }
 
 /// 对照一帧，返回**最大通道差**。
@@ -280,6 +312,7 @@ fn opaque_drawings_match_cpu_byte_for_byte() {
     worst = worst.max(compare(&mut r, "net-balanced-extra-pop", &net_balanced_with_extra_pop(), 0));
     println!("不透明语料最大通道差 = {worst}（要求 0）");
     assert_eq!(worst, 0, "不透明绘制必须逐字节相同");
+    assert_no_validation_messages("不透明语料");
 }
 
 /// 半透明绘制：最大通道差 **≤ 1 LSB**。
@@ -294,6 +327,7 @@ fn semi_transparent_drawings_match_cpu_within_one_lsb() {
     }
     println!("半透明语料最大通道差 = {worst}（要求 ≤1）");
     assert!(worst <= 1, "半透明最大通道差 {worst} 超过 1 LSB");
+    assert_no_validation_messages("半透明语料");
 }
 
 /// 另一个静态 viewport 尺寸（证明 viewport/scissor 是**跟着 extent 建进管线**的）。
@@ -409,4 +443,76 @@ fn vertex_layout_matches_the_hand_written_attribute_offsets() {
     assert_eq!(std::mem::offset_of!(GpuVertex, rect), 8, "location 1：vec4 rect");
     assert_eq!(std::mem::offset_of!(GpuVertex, radius_kind), 24, "location 2：float radius_kind");
     assert_eq!(std::mem::offset_of!(GpuVertex, color), 28, "location 3：vec4 color");
+}
+
+/// **R1-1**：一个「有顶点」的帧必须发出**恰好一条** host→vertex 屏障；空帧不得发。
+///
+/// 为什么要有这条（而不是只靠 `vertex_barrier_params_pin_the_exact_masks` 那个单元测试）：
+/// 单元测试只能钉「参数对不对」，钉不住「屏障有没有真的被发出来」。reviewer 的变异证明
+/// **把整段屏障删掉**（= 原始缺陷复原）在 16 个测试靶上**全绿** —— 本测试就是那条变异的判据：
+/// 删掉屏障 ⇒ 计数不再增长 ⇒ **变红**。
+#[test]
+fn host_to_vertex_barrier_is_emitted_once_per_non_empty_frame() {
+    let Some(mut r) = renderer(Extent { width: 8, height: 8 }) else {
+        return;
+    };
+    let base = r.host_to_vertex_barrier_count();
+
+    // 空列表（只剩清屏）：没有顶点要读 ⇒ 不该发
+    r.render(&DrawList::new()).expect("空帧应当成功");
+    assert_eq!(
+        r.host_to_vertex_barrier_count(),
+        base,
+        "空帧没有顶点缓冲要读，不得发 host→vertex 屏障"
+    );
+
+    // 有顶点 ⇒ 恰好 +1
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect { rect: RectI::new(1, 1, 4, 4), color: Color::WHITE });
+    r.render(&l).expect("有顶点的帧应当成功");
+    assert_eq!(
+        r.host_to_vertex_barrier_count(),
+        base + 1,
+        "有顶点的帧必须发**且只发一条** host→vertex 屏障"
+    );
+
+    // 每帧都重写顶点缓冲 ⇒ 每帧都要重新建立这条依赖
+    r.render(&l).expect("第二帧应当成功");
+    assert_eq!(
+        r.host_to_vertex_barrier_count(),
+        base + 2,
+        "每帧重传顶点 ⇒ 每帧都要发屏障"
+    );
+}
+
+/// **R1-3**：「上次提交未确认完成」之后，`render` 必须**必定报错**，且不去碰任何资源。
+///
+/// 真实触发路径是栅栏超时/设备丢失（测试里无法稳定复现），所以用
+/// [`GpuGeometryRenderer::force_unconfirmed_submit_for_test`] 这个明确的测试入口进入该状态。
+///
+/// **变异验证**：把 `render` 开头的 `ensure_reusable()?` 改成 `let _ =`（reviewer 的变异 C）
+/// ⇒ 本测试**仍然通过**（这正是修复的目的：守卫不依赖调用方的写法）；但把
+/// `record_and_submit` 与 `ensure_vertex_capacity` 内部的守卫**也**去掉 ⇒ **本测试变红**。
+#[test]
+fn render_is_refused_after_an_unconfirmed_submit() {
+    let Some(mut r) = renderer(Extent { width: 8, height: 8 }) else {
+        return;
+    };
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect { rect: RectI::new(1, 1, 4, 4), color: Color::WHITE });
+
+    // 先正常画一帧，确认这个渲染器本来是可用的（否则下面的断言可能因为别的原因通过）
+    r.render(&l).expect("正常帧应当成功");
+
+    r.force_unconfirmed_submit_for_test();
+    let err = r.render(&l).expect_err("上次提交未确认完成 ⇒ 必须拒绝复用");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("不可复用") || msg.contains("没有确认完成"),
+        "错误信息要说清原因是「上次提交未确认完成」：{msg}"
+    );
+    // 状态不会被「用掉」：第二次仍然拒绝，而不是只报一次错
+    assert!(r.render(&l).is_err(), "Broken 必须**持续**拒绝，而不是一次性报错");
+    // 空帧同样要复用命令缓冲/栅栏 ⇒ 也必须拒绝
+    assert!(r.render(&DrawList::new()).is_err(), "空帧也要复用命令缓冲 ⇒ 同样拒绝");
 }

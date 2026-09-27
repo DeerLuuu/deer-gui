@@ -1094,6 +1094,7 @@ fn lifetime_thread(
         }
     };
     let destroy_device = info.fns.destroy_device;
+    let device_wait_idle = info.fns.device_wait_idle;
     let device = info.handle;
 
     if ready.send(Ok(info)).is_err() {
@@ -1105,6 +1106,23 @@ fn lifetime_thread(
 
     // 等停止信号（`recv` 在发送端析构时也会返回，避免永久阻塞）
     let _ = stop.recv();
+
+    // ⚠️ **必须先 `vkDeviceWaitIdle` 再销毁设备**（T3 fix round 2 / R3）。
+    //
+    // 存在的理由：`VkDevice` 的 `Drop` 只是「发停止信号 + join 本线程」，它**不知道**
+    // 队列上还有没有在飞的提交。正常路径下调用方已经等到栅栏，但**异常路径**（栅栏超时、
+    // 设备丢失）下可能有提交仍在执行，此时销毁仍在被 GPU 使用的对象是**未定义行为** ——
+    // 也就是说「超时后不再复用」这条修复只是把 UB 从「复用」搬到了「销毁」。
+    //
+    // 失败不报错：设备可能已经丢失（那时 `VK_ERROR_DEVICE_LOST`），而我们此时除了销毁别无他法。
+    // SAFETY: 设备由本线程创建、尚未销毁。
+    let idle_rc = unsafe { (device_wait_idle)(device) };
+    if idle_rc != ffi::VK_SUCCESS {
+        eprintln!(
+            "[deer-vk] 销毁设备前 vkDeviceWaitIdle 失败（{}）—— 按可能的设备丢失处理，继续销毁",
+            vk_result_name(idle_rc)
+        );
+    }
 
     // 销毁顺序：设备 → 实例（Own 时 `owned_instance` 的 Drop 负责后者；
     // Borrowed 时它是 None —— 例 **不属于我们**，绝不能在这里销毁）。

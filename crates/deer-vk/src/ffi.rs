@@ -20,6 +20,7 @@
 
 use std::ffi::{CStr, c_char, c_void};
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use deer_gpu::{GpuError, GpuResult};
 
@@ -746,6 +747,21 @@ type PfnDebugUtilsMessengerCallback = unsafe extern "system" fn(
     p_user_data: *mut c_void,
 ) -> u32;
 
+/// 校验层回调累计收到的消息数（**进程级**）。
+///
+/// 为什么要有它（T3 fix round 2 / R1-2）：`DEER_VK_VALIDATION=1` 的「零消息」原先只能
+/// **人眼看输出**，而测试里没有任何断言 —— 于是「层没装好」或「有人把报错改成静默降级」
+/// 都会让测试照样全绿。计数发生在**回调里**（消息真的到达回调才自增），所以它统计的是
+/// 「驱动真的报了什么」，不是「我们以为会报什么」。
+static VALIDATION_MESSAGE_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// 累计收到的校验层消息数（进程级，从进程启动算起）。
+///
+/// 测试用法（配合 `DEER_VK_VALIDATION=1`）：跑完一帧后断言它**没有增长**。
+pub fn validation_message_count() -> usize {
+    VALIDATION_MESSAGE_COUNT.load(Ordering::Relaxed)
+}
+
 /// 校验层回调：把消息打到 stderr（`[VALIDATION]`/`[VK ERROR]` 前缀便于筛选）。
 ///
 /// 用 `eprintln!` 而非日志框架：零依赖约束下最简单，且校验消息本来就不该混进正常输出。
@@ -779,6 +795,8 @@ unsafe extern "system" fn validation_callback(
         DEBUG_UTILS_MESSAGE_SEVERITY_VERBOSE => "VK VERBOSE",
         _ => "VK INFO",
     };
+    // 计数点放在「确定有一条消息」之后（上面两个提前返回不计）—— 见 `validation_message_count`。
+    VALIDATION_MESSAGE_COUNT.fetch_add(1, Ordering::Relaxed);
     eprintln!("[{kind}] {msg}");
     0 // VK_FALSE：不中止
 }

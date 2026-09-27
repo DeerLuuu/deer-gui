@@ -40,15 +40,24 @@
 //!   与 `null.rs::blend_cov`（覆盖率 = 1）同式；
 //! - **不预乘**：顶点颜色就是 `Color` 的原值（见 [`crate::gpu_geom`] 的颜色约定）。
 //!
-//! ## 同步（T3 review I1/I2：这两条是**真缺陷**，不是洁癖）
+//! ## 同步（T3 review I1/I2）
 //!
-//! ### ① 顶点缓冲的 host 写入 → `vkCmdDraw` 读取，必须**显式**建依赖
+//! ### ① 顶点缓冲的 host 写入 → `vkCmdDraw` 读取：**依赖没有被显式表达**
 //!
-//! 每帧写顶点缓冲的是**主机**（`map → memcpy → unmap`），读它的是 GPU 的 `VERTEX_INPUT` 阶段。
-//! 这两个域之间的依赖**不会被校验层检查**（VVL 做的是对象/参数/布局类校验，不做通用同步验证）
-//! —— 所以「`DEER_VK_VALIDATION=1` 零消息」**不能**作为「同步正确」的证据。这里显式发一条
-//! `VkBufferMemoryBarrier`：`srcStageMask = HOST` / `srcAccessMask = HOST_WRITE` →
-//! `dstStageMask = VERTEX_INPUT` / `dstAccessMask = VERTEX_ATTRIBUTE_READ`。
+//! ⚠️ **定性（fix round 2 收紧；依据 Vulkan §7.9 Host Write Ordering Guarantees）**：
+//! `vkQueueSubmit` 对 happened-before 的 host 写入**已经隐式建立 HOST → ALL_COMMANDS 依赖**，
+//! 因此**像素一直是对的、加屏障前后也不会变**。这不是「本次观察到过错误像素」的缺陷，而是
+//! **依赖没有被写出来** —— 一旦将来出现下列任一改动，它会**静默**出错（驱动不报错、校验层也不查）：
+//! - 主机写入挪到 `vkQueueSubmit` **之后**（例如「先提交再改缓冲」这类优化）；
+//! - 顶点缓冲改用**非相干**的 `HOST_VISIBLE` 内存；
+//! - 数据来自**另一个队列**（跨队列没有隐式的执行顺序保证）。
+//!
+//! 所以这里显式发一条 `VkBufferMemoryBarrier` 把它钉住（参数来自纯函数
+//! [`vertex_buffer_barrier_params`]，有单元测试钉确切常量；发射次数也有断言，见
+//! [`GpuGeometryRenderer::host_to_vertex_barrier_count`]）。
+//!
+//! 另一个**确定**的事实：这类内存域依赖**校验层不查**（它做对象/参数/布局类校验，
+//! 不做通用同步验证）—— 所以「`DEER_VK_VALIDATION=1` 零消息」**不能**当作同步正确的证据。
 //!
 //! 关于 flush：**只**选 `HOST_COHERENT` 的内存（`create_host_buffer` 的 `required` 位里带着它，
 //! 拿不到就报 `Unsupported`；`pick_memory_type` 的单元测试把「绝不用非相干内存」钉住），
@@ -59,12 +68,14 @@
 //! 读回方向（`copyImageToBuffer` → 主机 `map`）靠**栅栏**保证：栅栏信号使设备写入对主机可见
 //! （相干内存下不需要 invalidate），我们等到栅栏才 map。
 //!
-//! ### ② 栅栏等待失败（超时）**不等于**提交完成 —— 之后不许复用任何东西
+//! ### ② 栅栏等待失败（超时）**不等于**提交完成 —— 之后不许复用任何东西（**真缺陷**）
 //!
-//! `vkWaitForFences` 超时只说明「还没等到」。此时命令缓冲可能仍在执行、顶点缓冲可能仍被读，
-//! 于是下一帧的 `vkResetCommandBuffer` / 重写顶点缓冲 / `vkResetFences` 都是**未定义行为**
-//! （驱动不一定报错）。所以超时/失败后把渲染器置为 [`SubmitState::Broken`]，之后**任何**
-//! `render` 都直接报错，直到调用方丢弃并重建（判定逻辑有单元测试，见文件末尾 `tests`）。
+//! 这条与 I1 性质不同：`vkWaitForFences` 超时只说明「还没等到」，此时命令缓冲可能仍在执行、
+//! 顶点缓冲可能仍被读，于是下一帧的 `vkResetCommandBuffer` / 重写顶点缓冲 / `vkResetFences`
+//! 都是**未定义行为**（驱动不一定报错）。所以超时/失败后把渲染器置为 [`SubmitState::Broken`]，
+//! 之后**任何** `render` 都直接报错，直到调用方丢弃并重建。
+//! **守卫放在会做破坏性操作的地方本身**（不只是 `render` 开头）—— 这样即便调用方漏写 `?`，
+//! 也不会真的去碰那些资源；判定逻辑有单元测试，见文件末尾 `tests`。
 
 use std::ffi::c_void;
 
@@ -153,6 +164,37 @@ fn vertex_attrs() -> [VertexAttr; 4] {
 /// （`offscreen.rs` 里为 6 种对象各写一遍 `Drop`，这里等价但少 100 行样板；
 /// 代价是类型上区分不了句柄种类，用[`wrap_create`] 的 `what` 参数在报错里补回来）。
 type DestroyFn = unsafe extern "system" fn(vk::DeviceHandle, *mut c_void, *const c_void);
+
+/// 顶点缓冲的 host→vertex 依赖所用的四个掩码。
+///
+/// 抽成**纯函数 + 具名结构**的理由（fix round 2 / R1）：reviewer 的变异证明「代码语义对了」
+/// 不等于「**可回归**」—— 把 `dstStage` 写成 `1 << 5`、或把整段屏障删掉，16 个测试靶**全绿**。
+/// 参数一旦由纯函数产出，就能用单元测试钉**确切常量**
+/// （本项目既有做法：`hal.rs` 的 `present_result_of()` 就是为补同类覆盖漏洞抽出来的）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BarrierParams {
+    src_stage: u32,
+    dst_stage: u32,
+    src_access: u32,
+    dst_access: u32,
+}
+
+/// 「主机写顶点缓冲 → GPU 顶点取数」这条依赖的参数：
+/// `HOST` / `HOST_WRITE` → `VERTEX_INPUT` / `VERTEX_ATTRIBUTE_READ`。
+///
+/// ⚠️ **`VERTEX_INPUT` 是 `1 << 2`（`0x4`），不是 `1 << 5`** —— `1 << 5` 是
+/// `VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT`。写错时校验层会报
+/// `VUID-vkCmdPipelineBarrier-dstStageMask-04091`（本设备没开细分），但它**照样接受**这条屏障 ——
+/// 只是它建立的依赖不覆盖顶点取数（「加了屏障但没用」，比不加更难发现）。
+/// 单元测试 `vertex_barrier_params_pin_the_exact_masks` 钉住这四个值。
+fn vertex_buffer_barrier_params() -> BarrierParams {
+    BarrierParams {
+        src_stage: VK_PIPELINE_STAGE_HOST_BIT,
+        dst_stage: VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+        src_access: VK_ACCESS_HOST_WRITE_BIT,
+        dst_access: VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT,
+    }
+}
 
 /// 一个「有句柄 + 有销毁函数」的 Vulkan 对象：`Drop` 时销毁。
 ///
@@ -374,8 +416,14 @@ fn map_memory<'a>(
         (fns.map_memory)(device, memory, 0, vk::WHOLE_SIZE, 0, &mut ptr)
     })?;
     if ptr.is_null() {
-        // 同上：没有真实 VkResult 可报，不用假的错误码。
-        return Err(GpuError::Unsupported(format!("{what} 返回空指针")));
+        // 措辞与实现必须一致（fix round 2 / R5）：`vkMapMemory` 返回成功却给出空指针是驱动异常，
+        // 但按规范的语义「调用成功 ⇒ 该内存被视为已映射」—— 所以这里**防御性地解除映射**，
+        // 不让一个可疑的映射留在进程里（否则下一次 map 会失败，症状离原因很远）。
+        // SAFETY: 与上面刚成功的那次 map 配对。
+        unsafe { (fns.unmap_memory)(device, memory) };
+        return Err(GpuError::Unsupported(format!(
+            "{what} 返回成功但给出空指针（已防御性 unmap）"
+        )));
     }
     Ok(Mapped {
         fns,
@@ -467,6 +515,9 @@ pub struct GpuGeometryRenderer {
     unsupported: Vec<String>,
     /// 提交同步状态：栅栏等待失败后置为 [`SubmitState::Broken`]，此后**拒绝复用**。
     sync: SubmitState,
+    /// 累计发出的 host→vertex 屏障条数（诊断 + 回归，见
+    /// [`GpuGeometryRenderer::host_to_vertex_barrier_count`]）。
+    host_to_vertex_barriers: u64,
     /// **必须最后**（最后析构）。
     device: VkDevice,
 }
@@ -701,6 +752,7 @@ impl GpuGeometryRenderer {
             ],
             unsupported: Vec::new(),
             sync: SubmitState::Idle,
+            host_to_vertex_barriers: 0,
             device,
         })
     }
@@ -724,6 +776,30 @@ impl GpuGeometryRenderer {
     /// 这里能看到具体是哪几条、什么内容。
     pub fn unsupported(&self) -> &[String] {
         &self.unsupported
+    }
+
+    /// 累计发出的 **host→vertex 屏障**条数。
+    ///
+    /// 为什么需要这个计数器（fix round 2 / R1-1）：屏障的**参数**可以由纯函数 + 单元测试钉住，
+    /// 但「屏障有没有真的被发出来」在进程内原本不可观测 —— 于是「把整段屏障删掉」这种变异
+    /// （= 原始缺陷复原）在 16 个测试靶上**全绿**。计数器把这件事变成可断言的：
+    /// 一个「有顶点」的帧必须让计数 +1，空帧不得增加。
+    ///
+    /// 诚实说明它的上限：它证明「这段代码被执行了」，不能证明驱动真的按语义用了这条屏障
+    /// （那属于真机逐像素对照的范畴）。反过来说，任何「删掉屏障却留着计数自增」的变异是
+    /// 刻意构造的，不在防御范围内。
+    pub fn host_to_vertex_barrier_count(&self) -> u64 {
+        self.host_to_vertex_barriers
+    }
+
+    /// **把渲染器置为「上次提交未确认完成」** —— 之后所有 `render` 都会报错。
+    ///
+    /// 真实触发路径是栅栏等待失败（超时/设备丢失），那在测试里无法稳定复现；这个入口让
+    /// 「Broken ⇒ render 必 Err（且不碰命令缓冲/顶点缓冲/栅栏）」成为**可回归**断言，
+    /// 而不是靠读代码确认接线。名字带 `for_test` 是刻意的：它不是给正常调用方的功能。
+    #[doc(hidden)]
+    pub fn force_unconfirmed_submit_for_test(&mut self) {
+        self.sync.mark_broken();
     }
 
     /// 画一帧并回读 RGBA8（长度 = 宽 × 高 × 4，行优先、无 padding）。
@@ -780,6 +856,8 @@ impl GpuGeometryRenderer {
 
     /// 确保顶点缓冲至少有 `bytes` 字节（不够就按 2 的幂重建）。
     fn ensure_vertex_capacity(&mut self, bytes: u64) -> GpuResult<()> {
+        // 同样是破坏性操作（会销毁旧缓冲、分配新内存）⇒ 守卫也放在这里（见 R1-3）。
+        self.sync.ensure_reusable()?;
         if self.vertex.as_ref().is_some_and(|v| v.capacity >= bytes) {
             return Ok(());
         }
@@ -833,6 +911,10 @@ impl GpuGeometryRenderer {
     ///
     /// 需要 `&mut self`：等待失败时要把 [`SubmitState`] 置为 `Broken`（见模块文档「同步②」）。
     fn record_and_submit(&mut self, vertex_count: u32) -> GpuResult<()> {
+        // ★ **守卫就放在破坏性操作本身**（fix round 2 / R1-3）：`render` 开头那句检查可能
+        //   因为调用方漏写 `?` 而失效（reviewer 的变异 C 就是这么全绿的）。这里再查一次，
+        //   于是「Broken ⇒ 绝不去碰命令缓冲/栅栏」不依赖任何调用方的写法。
+        self.sync.ensure_reusable()?;
         // 上一帧已经等过栅栏 ⇒ 命令缓冲不在执行中，可以重置。
         check("vkResetCommandBuffer", unsafe {
             (self.fns.reset_command_buffer)(self.cmd, 0)
@@ -848,9 +930,9 @@ impl GpuGeometryRenderer {
             (self.fns.begin_command_buffer)(self.cmd, &begin)
         })?;
 
-        // ★ T3 review I1：主机刚写进顶点缓冲（map/memcpy/unmap）→ GPU 的 VERTEX_INPUT 要读它。
-        //   这条依赖**校验层不查**，所以必须显式建：srcStage=HOST / srcAccess=HOST_WRITE →
-        //   dstStage=VERTEX_INPUT / dstAccess=VERTEX_ATTRIBUTE_READ。
+        // ★ 主机刚写进顶点缓冲（map/memcpy/unmap）→ GPU 的 VERTEX_INPUT 要读它。
+        //   参数来自纯函数（可被单元测试钉常量）；**依赖是否真的被发出**由计数器断言
+        //   （`host_to_vertex_barrier_count`）—— 两者合起来才让这条屏障**可回归**。
         //   （放在渲染通道**之前**：缓冲区屏障在通道内也合法，但放在外面更简单、更不容易踩
         //     「通道内允许哪些屏障」的规则。）
         if vertex_count > 0 {
@@ -858,11 +940,12 @@ impl GpuGeometryRenderer {
                 .vertex
                 .as_ref()
                 .expect("非空顶点数 ⇒ 缓冲已建（`render` 里先 ensure 再录）");
+            let p = vertex_buffer_barrier_params();
             let host_to_vertex = vk::BufferMemoryBarrier {
                 s_type: vk::VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
                 p_next: std::ptr::null(),
-                src_access_mask: VK_ACCESS_HOST_WRITE_BIT,
-                dst_access_mask: VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT,
+                src_access_mask: p.src_access,
+                dst_access_mask: p.dst_access,
                 src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                 dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
                 buffer: vb.buffer.handle(),
@@ -873,8 +956,8 @@ impl GpuGeometryRenderer {
             unsafe {
                 (self.fns.cmd_pipeline_barrier)(
                     self.cmd,
-                    VK_PIPELINE_STAGE_HOST_BIT,
-                    VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+                    p.src_stage,
+                    p.dst_stage,
                     0,
                     0,
                     std::ptr::null(),
@@ -884,6 +967,7 @@ impl GpuGeometryRenderer {
                     std::ptr::null(),
                 );
             }
+            self.host_to_vertex_barriers += 1;
         }
 
         let clear_value = vk::ClearValue {
@@ -1089,7 +1173,30 @@ mod tests {
         );
     }
 
-    /// 等待成功 ⇒ 回到可复用态（否则第一帧之后就再也不能画了）。
+    /// **I1 的回归判据（fix round 2 / R1-1）**：屏障的四个掩码必须**确切**是
+    /// `HOST` / `VERTEX_INPUT(0x4)` / `HOST_WRITE` / `VERTEX_ATTRIBUTE_READ(0x4)`。
+    ///
+    /// 变异验证：把 `VK_PIPELINE_STAGE_VERTEX_INPUT_BIT` 改成 `1 << 5`（细分求值）⇒ 本测试**变红**。
+    /// 之前没有这条断言时，那个变异在 16 个测试靶上全绿（只有校验层刷 VUID-04091）。
+    #[test]
+    fn vertex_barrier_params_pin_the_exact_masks() {
+        let p = vertex_buffer_barrier_params();
+        assert_eq!(p.src_stage, 1 << 14, "srcStageMask 必须是 VK_PIPELINE_STAGE_HOST_BIT");
+        assert_eq!(
+            p.dst_stage, 0x4,
+            "dstStageMask 必须是 VK_PIPELINE_STAGE_VERTEX_INPUT_BIT = 0x4 = 1<<2"
+        );
+        assert_eq!(p.src_access, 1 << 14, "srcAccessMask 必须是 VK_ACCESS_HOST_WRITE_BIT");
+        assert_eq!(
+            p.dst_access, 0x4,
+            "dstAccessMask 必须是 VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT = 0x4 = 1<<2"
+        );
+        // 把「易错的那个值」显式钉出来：1<<5 是**细分求值**阶段，不是顶点输入。
+        assert_ne!(p.dst_stage, 1 << 5, "1<<5 = VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT");
+        assert_ne!(p.dst_access, 1 << 5, "1<<5 = VK_ACCESS_SHADER_READ_BIT");
+    }
+
+    /// 一次成功的帧之后可以继续画（否则第一帧之后就全废了）。
     #[test]
     fn a_successful_fence_wait_restores_reusability() {
         let mut s = SubmitState::default();
