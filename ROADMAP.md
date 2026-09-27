@@ -70,8 +70,8 @@ M3 原写成一条「渲染器 + 管线（矩形/圆角/裁剪/文本）」。�
 |---|---|---|---|
 | **M3a-1** | **顶点流 + 着色器**：`gpu_geom.rs`（`DrawList` → `GpuVertex` 流，CPU 侧几何裁剪）、`spirv.rs` 的矩形属性 VS/FS | ✅ 完成 | 顶点布局 `#[repr(C)]` stride 44（`pos`/`rect`/`radius_kind`/`color`）；**静态** viewport/scissor；着色器经 `spirv-val` |
 | **M3a-2** | **离屏 GPU 几何渲染器**：`gpu_render.rs` 的 `GpuGeometryRenderer`（顶点缓冲 + 静态管线 + 回读） | ✅ 完成 | `cargo run -p deer-gui --example gpu_geometry` → `exit=0`；与 CPU **逐字节相同** |
-| **M3a-3** | **与 CPU 逐像素对照**：`crates/deer-vk/tests/gpu_vs_cpu.rs` | ✅ 完成 | 不透明语料**最大通道差 0**（逐字节相同）；半透明语料**最大差 1 LSB**（实测仅 `alpha-clip` 非 0，**是实测上限不是证明上界**）；覆盖矩形/圆角（含超大半径）/描边（含带宽 > 边长）/裁剪/**嵌套裁剪**/退化 extent/清屏/连续多帧；`DEER_VK_VALIDATION=1` 下 parity **零校验消息**（**「层确实在跑」已有断言**；**「消息为零」仍是观察性结论**，不得写成硬保证） |
-| **M3b** | **文本 / 字形上 GPU** | ⬜ | `DrawCmd::Text` 目前明确 `Unsupported`；需要纹理（字形图集）与采样 |
+| **M3a-3** | **与 CPU 逐像素对照**：`crates/deer-vk/tests/gpu_vs_cpu.rs` | ✅ 完成 | 不透明语料**最大通道差 0**（逐字节相同）；半透明语料**最大差 1 LSB**（实测仅 `alpha-clip` 非 0，**是实测上限不是证明上界**）；覆盖矩形/圆角（含超大半径）/描边（含带宽 > 边长）/裁剪/**嵌套裁剪**/退化 extent/清屏/连续多帧；`DEER_VK_VALIDATION=1` 下 parity **零校验消息**（**「层确实在跑」与「消息为零」都是可回归断言** —— 进程级计数 + parity 三处 `assert_no_validation_messages`；但 VVL 不做通用同步验证 ⇒ 零消息**不能**证明内存域依赖正确） |
+| **M3b** | **文本 / 字形上 GPU** | ⬜ | `DrawCmd::Text` 目前明确 `Unsupported`；需要纹理（字形图集）与采样。**已知限制（本轮 defer）**：这个 `Unsupported` 是**无条件**的 —— 空串 / 零面积 / 整块被 clip 裁掉时 GPU 也报错，而 CPU 能正常出图（**假阳性**）；M3b 做文本时必须一并处理，详见 [`docs/features/gpu-geometry.md`](docs/features/gpu-geometry.md) 第 6 节的「做不到」 |
 | **M3c** | **窗口里显示界面** | ⬜ | M2b 能上屏、M3a 能离屏画出界面几何，但两者还没接起来（窗口里仍只有清屏色 + M2a 几何） |
 | **M3+** | **批处理优化** | ⬜ | 当前**每帧一个顶点缓冲、一次 draw**；属性能项，不影响正确性 |
 
@@ -80,8 +80,12 @@ M3 原写成一条「渲染器 + 管线（矩形/圆角/裁剪/文本）」。�
 1. **静态 viewport/scissor** —— 动态版在本机 Intel 核显上**画不出任何像素**（M2a 实测），
    故管线写死静态状态、录制时不调 `vkCmdSetViewport`/`vkCmdSetScissor`；换 extent 就新建渲染器。
 2. **颜色附件必须 `R8G8B8A8_UNORM`（不是 `_SRGB`）** —— CPU 基准不做 gamma，用 SRGB 会系统性偏差。
-3. **「零校验消息」** —— 「校验层确实在跑」已有断言（`validation_layer_state_matches_the_request`），
-   但**「消息为零」是观察性结论**（没有把校验层输出抓成断言的机制），不得写成硬保证。
+3. **「零校验消息」是可回归断言，但有明确覆盖边界** —— 「层确实在跑」由
+   `validation_layer_state_matches_the_request` 钉住；「消息为零」由 `ffi::validation_message_count()`
+   （进程级计数）配合 parity 三处 `assert_no_validation_messages` 钉住（不再靠人眼看 stderr）。
+   **限制仍在**：计数只在 `DEER_VK_VALIDATION=1` 时有判别力，且 **VVL 不做通用同步验证** ⇒
+   「零消息」**不能**证明内存域依赖正确（如 host→vertex 屏障；那条由
+   `host_to_vertex_barrier_is_emitted_once_per_non_empty_frame` 单独守）。
 4. **半透明 1 LSB 是实测上限而非证明上界**。
 
 ### M4 的细步与状态
@@ -169,4 +173,4 @@ deer-window v0.0.0
 | Q-2 | ~~SPIR-V 来源~~ | ✅ **已解决（M2a-1）**：自写极简 SPIR-V 汇编器（`crates/deer-vk/src/spirv.rs`），**零外部依赖**，产物已被真机驱动接受（3 支着色器）。附带一条经验：`vkCreateShaderModule` **很宽容**（连 `bound=0` 都接受），所以「驱动接受」≠「SPIR-V 正确」，必须自己加结构护栏。 |
 | Q-3 | ~~文本度量与布局的耦合~~ | ✅ **已落实（M4-4/M4-5）**：`FontMeasure` 通过 `Measure` 注入点接入布局；`ApproxMeasure` 保留为**确定性测试用**实现（不带字体的 `render_tree_to_png` 仍用它）。**新纪律**：布局、绘制列表、光栅化必须用同一个字号、同一个度量。 |
 | Q-4 | 线程模型 | HAL 故意不实现 `Send`/`Sync`；M2 需要定「渲染线程 vs UI 线程」的边界。 |
-| Q-5 | **推送常量矩形着色器损坏（遗留缺陷，M2b 登记）** | **现象**：`crates/deer-vk/src/spirv.rs::vertex_shader_rect_pushconstant` 产出的 SPIR-V 被校验层判 `VUID-StandaloneSpirv-PushConstant-06808`（源码里已标「已知不工作，不要用它建管线」）。**影响**：普通驱动会「宽容接受」（不带校验层的验收照跑）；**请求校验层时**该 SPIR-V 会让进程 **`0xc0000005` 访问违例崩溃** —— 所以从 **t15** 起，`tests/device_smoke.rs` 与 `tests/pipeline_smoke.rs` 里涉及它的测试在**请求了校验层时显式跳过**（stderr 写明「这不是通过，是被显式跳过」），于是 `DEER_VK_VALIDATION=1` 跑全量 deer-vk 是安全动作。**现状（task-18 后）**：设备/离屏路径曾经**故意不读**这个环境变量，是因为 offscreen 侧有 3 个真缺陷（barrier `sType` 写成 47、`oldLayout` 与渲染通道 `finalLayout` 不符、图像内存 `mem::forget` 泄漏）；**t18 已全部修掉**，所以现在 `VkBackend::new`、设备/离屏路径与窗口路径 `WindowedRenderer` **三条路一致尊重** `DEER_VK_VALIDATION`。本机实测：`DEER_VK_VALIDATION=1 cargo test -p deer-vk` → **86 passed / 0 failed、零条校验消息**（数字随测试增长，以实测为准）；`DEER_VK_VALIDATION=1` 跑窗口示例 30 帧 → 零消息、`exit=0`。**修好它**归属 **M3**：矩形绘制改走**顶点缓冲**（与 M2a-3 记录的同一根因）。 |
+| Q-5 | **推送常量矩形着色器损坏（遗留缺陷，M2b 登记）** | **现象**：`crates/deer-vk/src/spirv.rs::vertex_shader_rect_pushconstant` 产出的 SPIR-V 被校验层判 `VUID-StandaloneSpirv-PushConstant-06808`（源码里已标「已知不工作，不要用它建管线」）。**影响**：普通驱动会「宽容接受」（不带校验层的验收照跑）；**请求校验层时**该 SPIR-V 会让进程 **`0xc0000005` 访问违例崩溃** —— 所以从 **t15** 起，`tests/device_smoke.rs` 与 `tests/pipeline_smoke.rs` 里涉及它的测试在**请求了校验层时显式跳过**（stderr 写明「这不是通过，是被显式跳过」），于是 `DEER_VK_VALIDATION=1` 跑全量 deer-vk 是安全动作。**现状（task-18 后）**：设备/离屏路径曾经**故意不读**这个环境变量，是因为 offscreen 侧有 3 个真缺陷（barrier `sType` 写成 47、`oldLayout` 与渲染通道 `finalLayout` 不符、图像内存 `mem::forget` 泄漏）；**t18 已全部修掉**，所以现在 `VkBackend::new`、设备/离屏路径与窗口路径 `WindowedRenderer` **三条路一致尊重** `DEER_VK_VALIDATION`。本机实测：`DEER_VK_VALIDATION=1 cargo test -p deer-vk` → **161 passed / 0 failed、零条校验消息**（数字随测试增长，以实测为准）；`DEER_VK_VALIDATION=1` 跑窗口示例 30 帧 → 零消息、`exit=0`。**修好它**归属 **M3**：矩形绘制改走**顶点缓冲**（与 M2a-3 记录的同一根因）。 |

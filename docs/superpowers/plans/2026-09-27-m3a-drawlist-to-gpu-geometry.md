@@ -35,10 +35,13 @@ git switch -c feat/m3a-gpu-geometry
 ```
 - [ ] **Step 2: 验证基线绿**
 Run: `cmd /c "cargo test --workspace"` → Expected: `203 passed / 0 failed`
+> **执行记录（Ruling）**：本步**未执行**（分支上没有任何基线产物），当前实测基线是 `277 passed / 0 failed`（最终 review §6）。
+> 属审计链缺口、无功能影响。
 - [ ] **Step 3: 提交锚点**
 ```powershell
 git commit --allow-empty -m "chore(m3a): 从 master 切出 feat/m3a-gpu-geometry 工作区"
 ```
+> **执行记录（Ruling）**：本步**未执行** —— `git log master..HEAD --grep='chore(m3a)'` = 0 条（最终 review §1 #2/#3）。
 
 ---
 
@@ -61,7 +64,7 @@ git commit --allow-empty -m "chore(m3a): 从 master 切出 feat/m3a-gpu-geometry
 |---|---|---|
 | 0 | `vec2` | 位置（NDC，y 向下） |
 | 1 | `vec4` | `rect = (x, y, w, h)`，像素单位 |
-| 2 | `float` | `radius_kind`：`0` = 普通填充；`>0` = 圆角半径；`-1` = 描边 |
+| 2 | `float` | `radius_kind`：`0` = 普通填充；`> 0` = 圆角半径；**`< 0` = 描边**（带宽 = `-radius_kind`；`width == 1` 用 `-1.0`） |
 | 3 | `vec4` | 颜色（预乘不做，直接 src-alpha 混合） |
 
 - [ ] **Step 1: 写失败测试**（`spirv_val.rs` 追加）
@@ -96,6 +99,10 @@ impl Module {
     pub fn op_ford_greater_than(&mut self, bool_ty: u32, a: u32, b: u32) -> u32 { /* opcode 186 */ }
 }
 ```
+> **Ruling（执行时改判）**：上面 `OP_FLOOR = 8` 与 `op_floor(&mut self, ty, value)` 两处都**作废**：
+> 实现用的是扩展指令 **`GLSL_STD_450_FLOOR`**（那是**扩展指令编号，不是 opcode**）与
+> `op_floor(&mut self, ty, set, value)`；另补了 `OpFNegate` / `OpFOrdLessThan` / `OpLogicalOr` / `OpLogicalAnd` / `OpSelect`。
+> **以 `crates/deer-vk/src/spirv.rs:132-152` 为准**（那里留了整段说明）。
 - [ ] **Step 3: 写顶点着色器**（透传属性）
 ```rust
 pub fn vertex_shader_rect_attrs() -> Vec<u8> {
@@ -205,6 +212,9 @@ Run: `cmd /c "cargo test -p deer-vk --test gpu_geom_stream"` → Expected: FAIL�
 **Files:**
 - Create: `crates/deer-vk/src/gpu_render.rs`
 - Modify: `crates/deer-vk/src/device.rs`（新增 `create_vertex_pipeline(&self, stages, layout, render_pass, attrs: &[vk::VertexInputAttributeDescription], stride: u32) -> GpuResult<Pipeline>`，参照 `vbo_probe.rs:273-276` 的顶点输入写法，**静态 viewport/scissor**）
+  > **Ruling（执行时改判）**：实际签名多一个 `extent`（静态 viewport 必须知道尺寸），
+  > 属性类型是 `&[VertexAttr]`：`create_vertex_pipeline(&self, stages, layout, render_pass, extent: vk::Extent2D, stride: u32, attrs: &[VertexAttr])`；
+  > **以实现为准**（ledger §29）。
 - Modify: `crates/deer-vk/src/lib.rs`（导出 `GpuGeometryRenderer`）
 - Test: `crates/deer-vk/tests/gpu_vs_cpu.rs`（Task 4 使用）
 

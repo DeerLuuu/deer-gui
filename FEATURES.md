@@ -66,11 +66,11 @@
 
 | 功能 | 里程碑 | 现状说明 |
 |---|---|---|
-| **GPU 侧文本**（Vulkan 消费 `DrawCmd::Text` / 字形图集） | M3b | 依赖 M4 的字形图集（**已就绪**）；M3a 已把**非文本**几何画通，但 `DrawCmd::Text` 仍明确 `Unsupported` |
+| **GPU 侧文本**（Vulkan 消费 `DrawCmd::Text` / 字形图集） | M3b | 依赖 M4 的字形图集（**已就绪**）；M3a 已把**非文本**几何画通，但 `DrawCmd::Text` 仍明确 `Unsupported`。**已知限制（本轮 defer）**：该 `Unsupported` 是**无条件**的 —— 空串 / 零面积 / 整块被 clip 裁掉时 GPU 也报错，而 CPU 能正常出图（假阳性）；见 [`gpu-geometry.md`](docs/features/gpu-geometry.md) 第 6 节 |
 | **窗口里显示界面**（把 GPU 画好的界面呈到窗口） | M3c | M2b 已能上屏、M3a 已能离屏画出界面几何；但两者还没接起来 —— 窗口里仍只有清屏色 + M2a 几何 |
 | **批处理优化**（按命令合批 / 跨帧复用顶点缓冲） | M3+ | 当前**每帧一个顶点缓冲、一次 draw**；这是性能问题，不影响正确性 |
 | **纹理 / 字形图集上 GPU**（`create_texture`/`upload_texture`） | M3b | 仍明确 `Unsupported`（字形上 GPU 需要它） |
-| **推送常量矩形着色器**（`spirv.rs::vertex_shader_rect_pushconstant`） | M3 | **这支 SPIR-V 是损坏的**（校验层 `VUID-StandaloneSpirv-PushConstant-06808`）；请求校验层时会让进程 `0xc0000005` 崩溃，所以 `device_smoke` / `pipeline_smoke` 里涉及它的测试在**校验层下显式跳过**（t15）。**task-18 后三条路径（`VkBackend::new` / 设备·离屏 / 窗口）都读 `DEER_VK_VALIDATION`**（当时 offscreen 的 3 个真缺陷已修）；实测 `DEER_VK_VALIDATION=1 cargo test -p deer-vk` → 86 passed / 0 failed、零校验消息（本机实测，数字随测试增长）。矩形改**顶点缓冲**即可修（M3a 的新几何路径已用顶点缓冲，不再走这支着色器） |
+| **推送常量矩形着色器**（`spirv.rs::vertex_shader_rect_pushconstant`） | M3 | **这支 SPIR-V 是损坏的**（校验层 `VUID-StandaloneSpirv-PushConstant-06808`）；请求校验层时会让进程 `0xc0000005` 崩溃，所以 `device_smoke` / `pipeline_smoke` 里涉及它的测试在**校验层下显式跳过**（t15）。**task-18 后三条路径（`VkBackend::new` / 设备·离屏 / 窗口）都读 `DEER_VK_VALIDATION`**（当时 offscreen 的 3 个真缺陷已修）；实测 `DEER_VK_VALIDATION=1 cargo test -p deer-vk` → **161 passed / 0 failed**、零校验消息（本机实测，数字随测试增长）。矩形改**顶点缓冲**即可修（M3a 的新几何路径已用顶点缓冲，不再走这支着色器） |
 | **字形 hinting**（小字号像素对齐） | M4 残余 | 不做 —— 不读 `glyf` 的 instructions，用超采样抗锯齿代替 |
 | **亚像素定位 / LCD 子像素渲染** | M4 残余 | 不做 —— 字形按**整数像素**落位 |
 | **字距与连字**（`kern` / `GSUB` / `GPOS`） | M4 残余 | 不做整形，`advance` 就是 `hmtx` 的原始值 |

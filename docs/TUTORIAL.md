@@ -490,8 +490,10 @@ assert_eq!(gpu_px, cpu.pixels, "不透明几何必须逐字节相同");
 - **静态 viewport/scissor**：动态版在本机 Intel 核显上**画不出任何像素**（M2a 实测），
   所以管线把 viewport/scissor 写死；**换画布尺寸要新建渲染器**。
 - **颜色附件是线性 `R8G8B8A8_UNORM`**（不是 `_SRGB`）：CPU 基准不做 gamma，用 SRGB 会系统性偏差。
-- **`DEER_VK_VALIDATION=1` 下 parity 零校验消息**是**观察性**结论（自动断言还在加固），
-  不要把它当成硬保证。
+- **`DEER_VK_VALIDATION=1` 下 parity 零校验消息是「可回归断言」**：「层确实在跑」与「消息为零」
+  都有断言（`validation_layer_state_matches_the_request` + `ffi::validation_message_count()` 的三处
+   `assert_no_validation_messages`）。但**它不能证明内存域依赖正确**：VVL 不做通用同步验证，
+   删掉 host→vertex 屏障它也不报错（那条由 `host_to_vertex_barrier_is_emitted_once_per_non_empty_frame` 守）。
 - 当前**每帧一个顶点缓冲、一次 draw**（没有批处理优化），属性能项、不影响正确性。
 
 **仍然做不到**：文本/字形（M3b）、纹理、窗口里显示界面（M3c）、批处理优化、sRGB/色彩管理、MSAA。

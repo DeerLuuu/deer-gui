@@ -121,11 +121,15 @@ DrawList ──gpu_geom::build_stream──→ GpuVertex 流 ──memcpy──�
 2. **颜色附件必须是 `R8G8B8A8_UNORM`，不能是 `_SRGB`**：CPU 基准**不做 gamma 转换**，
    用 SRGB 格式会让 GPU 多一次编码 ⇒ 两边**系统性对不上**（这与上屏路径刻意相反：
    窗口呈现用 `B8G8R8A8_SRGB`，因为那里要和系统窗口合成）。
-3. **「零校验消息」是观察性结论**：**「校验层确实在跑」现在有断言**
-   （`validation_layer_state_matches_the_request`：对照 `DEER_VK_VALIDATION` 的请求与
-   `GpuGeometryRenderer::validation_enabled()` 的实际状态，防止「层没装好/被静默降级」把验收变成空话），
-   但**「消息为零」本身仍没有 in-code 断言**（parity 只把最大通道差打成输出）⇒ 不得写成硬保证，
-   只能读作「这次实跑没看到消息」。
+3. **「零校验消息」是可回归断言，但它有明确的覆盖边界**：
+   **「层确实在跑」**由 `validation_layer_state_matches_the_request` 钉住（对照 `DEER_VK_VALIDATION` 的请求与
+   `GpuGeometryRenderer::validation_enabled()` 的实际状态）；**「消息为零」**由
+   `ffi::validation_message_count()`（进程级 `AtomicUsize` 计数）配合 parity 用例里的
+   `assert_no_validation_messages`（`tests/gpu_vs_cpu.rs:108/315/330` 三处 `assert_eq!(count, 0)`）钉住——
+   不再靠人眼看 stderr。**限制仍在**：计数只在 `DEER_VK_VALIDATION=1` 时有判别力（层没开时回调不跑、计数恒为 0），
+   且 **VVL 不做通用同步验证** ⇒ 「零消息」**不能**证明内存域依赖是对的
+   （例如删掉 host→vertex 屏障它也不报错；那条依赖由
+   `host_to_vertex_barrier_is_emitted_once_per_non_empty_frame` 单独守着）。
 4. **半透明 1 LSB 是实测上限、不是证明上界**：8 位 UNORM 的目标舍入与 CPU 的 `f32` 舍入在
    个别像素上会差 1；实测最大差就是 1，但**没有证明**它不可能更大。
 
@@ -152,8 +156,8 @@ assert_eq!(gpu_px, again);
 assert_eq!(gpu.extent(), extent);
 ```
 
-本仓库的**权威判据**在 `crates/deer-vk/tests/gpu_vs_cpu.rs`（本机实跑：`cargo test -p deer-vk --test gpu_vs_cpu`
-→ 9 个测试全绿；测试数/语料随加固增长，**以该命令输出为准**）：
+本仓库的**权威判据**在 `crates/deer-vk/tests/gpu_vs_cpu.rs`（本机实跑：`cargo test -p deer-vk --test gpu_vs_cpu -- --list`
+→ **11 tests**；测试数/语料随加固增长，**以该命令输出为准**）：
 
 | 测试 | 判据 | 本机实测 |
 |---|---|---|
@@ -166,6 +170,8 @@ assert_eq!(gpu.extent(), extent);
 | `unbalanced_clip_is_rejected_like_the_cpu_backend` | 裁剪栈不平衡 ⇒ GPU 与 CPU **同样**拒收 | 两边都 `Err` |
 | `vertex_layout_matches_the_hand_written_attribute_offsets` | 顶点布局的字面偏移（stride 44 / 0 / 8 / 24 / 28） | 通过 |
 | `validation_layer_state_matches_the_request` | 请求了校验层 ⇒ 层**确实在跑**（`validation_enabled()`），没请求 ⇒ 必须为假 | 通过 |
+| `host_to_vertex_barrier_is_emitted_once_per_non_empty_frame` | 有顶点的帧**恰好 +1** 条 host→vertex 屏障；空帧不增；每帧重传顶点 ⇒ 每帧都发（删掉那条屏障 ⇒ 变红） | 通过 |
+| `render_is_refused_after_an_unconfirmed_submit` | 上次提交未确认完成之后 `render` **必定报错**且**持续拒绝**（含空帧），不去碰任何资源；`ensure_reusable()` 的守卫不依赖调用方写法 | 通过 |
 
 跑法：`cargo test -p deer-vk --test gpu_vs_cpu -- --nocapture`（会逐场景打印最大通道差）。
 
@@ -178,7 +184,8 @@ assert_eq!(gpu.extent(), extent);
 | 圆角/描边位置在裁剪后错位 | 把顶点 `pos`（裁剪后矩形）也当成了形状判据输入 | 形状判据一律用**顶点属性 `rect`（原始矩形）**；`pos` 只决定光栅化范围 |
 | 带文字的树 `render` 报 `Unsupported` | `DrawCmd::Text` 还不会画（M3b） | 移掉文本（本示例的树只用带 `pad` 的容器），或先用 CPU 路径；错误信息里能查到是哪条 |
 | 半透明边缘差 1 | 8 位 UNORM 舍入 vs CPU `f32` 舍入 | 这是实测上限；对照时用 `≤1`（不透明场景仍要求 0） |
-| 画面比预期「少了一块」 | 裁剪栈不平衡/多余 `PopClip` 的列表被 CPU 与 GPU **同样**拒收 | 先看 `list.clip_balanced()`；两边行为一致是有意的 |
+| 画面比预期「少了一块」（整条几何消失） | 绘制列表的**裁剪栈净计数不平衡**（`PushClip`/`PopClip` 未配对）⇒ CPU 与 GPU **同样拒收** | 看 `list.clip_balanced()`；两边行为一致是有意的 |
+| 以为「多一个 `PopClip`」也会被拒 | 只有**帧末净计数不平衡**才两边都拒；`[PopClip, PushClip]` 这种**净计数配平但弹过一次全画布**的列表，**CPU 与 GPU 都照画**（`GpuStream::clip_unbalanced` 只是诊断，不作为报错条件 —— Ruling 19 的正面用例） | 用 `net_balanced_with_extra_pop` 那种列表时，两边仍然逐字节一致，别自行加拒收 |
 | 请求 0×0 却拿到 1×1 | `new` 把 0 尺寸按 1 处理（Vulkan 图像不能是 0），与 CPU 的 `max(1)` 同约定 | 用 `gpu.extent()` 拿**实际**尺寸再比长度 |
 | 换了 `extent` 但画面是旧的 | 这个渲染器的静态状态是**建的时候**定死的 | 新建一个 `GpuGeometryRenderer` |
 
@@ -190,7 +197,16 @@ assert_eq!(gpu.extent(), extent);
 - GPU HAL（`Device`/`Frame` 抽象层）：[`gpu-hal.md`](gpu-hal.md)
 - 字形上 GPU 的前置（图集）：[`glyph-atlas.md`](glyph-atlas.md)
 - **做不到**（本模块的边界）：
-  - **文本 / 字形**：`DrawCmd::Text` ⇒ `Unsupported`（M3b；需要把字形图集作为纹理采样）；
+  - **文本 / 字形**：`DrawCmd::Text` ⇒ `Unsupported`（M3b；需要把字形图集作为纹理采样）。
+    ⚠️ **已知限制（未修，本轮明确 defer）**：这个 `Unsupported` 是**无条件**的 —— 下面**任一**条件成立时
+    GPU 侧仍会报错，而 **CPU 后端在这些情况下能正常出图**，于是你会看到一个**假阳性**：
+    ① 文本是**空串**（`text == ""`）；② 文本矩形**零面积**（`rect.w == 0` 或 `rect.h == 0`）；
+    ③ 整块文本**被 clip 完全裁掉**（与裁剪区求交后为空）。
+    **判断「我会不会踩到」**：只要绘制列表里出现过 `DrawCmd::Text`（哪怕它画不出任何像素），
+    `GpuGeometryRenderer::render` 就会返回 `Unsupported`，`unsupported()` 里能看到是哪条、多少字符。
+    **绕法**：在把列表交给 GPU 前自行过滤掉这三类文本命令（或整棵树的文本节点）。
+    **为什么现在不修**：这属于「错误策略」的行为变更，需要单独任务 + 单独 review，不能在收尾轮里改；
+    **M3b 做文本时必须一并处理**（见 [`ROADMAP.md`](../../ROADMAP.md) 的 M3b 行）。
   - **纹理**：没有纹理绑定/采样（`create_texture`/`upload_texture` 仍是 `Unsupported`）；
   - **窗口呈现**：本模块只出离屏像素；把界面呈到窗口是 **M3c**；
   - **批处理优化**：当前**每帧一个顶点缓冲、一次 draw**；没有按命令合批/多帧复用；
