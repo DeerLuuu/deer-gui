@@ -30,6 +30,7 @@ pub mod device;
 pub mod ffi;
 pub mod ffi_dev;
 pub mod gpu_geom;
+pub mod gpu_render;
 pub mod hal;
 pub mod loader;
 pub mod offscreen;
@@ -38,7 +39,9 @@ pub mod surface;
 pub mod swapchain;
 pub mod windowed;
 
-pub use device::{Pipeline, PipelineLayout, RenderPass, ShaderModule, VkDevice};
+pub use device::{Pipeline, PipelineLayout, RenderPass, ShaderModule, VertexAttr, VkDevice};
+pub use gpu_geom::{GpuStream, GpuVertex};
+pub use gpu_render::GpuGeometryRenderer;
 pub use hal::{VulkanDevice, VulkanFrame, VulkanSwapchain};
 pub use offscreen::{Buffer, CommandPool, Fence, Framebuffer, Image, ImageView, Memory, OffscreenRenderer};
 pub use surface::Surface;

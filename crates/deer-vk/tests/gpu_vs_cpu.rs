@@ -1,0 +1,373 @@
+//! M3a-T4：**GPU 几何渲染器 vs CPU 后端逐像素对照**（本切片的终局判据）。
+//!
+//! ## 判据
+//!
+//! - **不透明（`a == 1`）⇒ 逐字节相同**；
+//! - **半透明（`0 < a < 1`）⇒ 最大通道差 ≤ 1 LSB**。CPU 用 `round()`、GPU 走固定功能
+//!   `float → unorm8` 转换（舍入时机与平局规则都不同），差 1 是**允许的**，不是缺陷；
+//! - 另外两条行为也要对齐：**裁剪栈不平衡 ⇒ 报错**（与 `null.rs` 同一判据）、
+//!   **`DrawCmd::Text` ⇒ `Unsupported`**（不静默丢弃）。
+//!
+//! ## 语料
+//!
+//! 填充 / 圆角（含超大半径）/ 描边（含**带宽 > 矩形边长** —— 那边带会伸出矩形之外）/
+//! 退化描边宽度 / 裁剪 / **嵌套裁剪** / 退化 extent / 全画布清屏 / 半透明混合 /
+//! 同一渲染器连续两帧 / 「净计数配平但有多余 PopClip」的列表（CPU 画得出来，GPU 也必须画）。
+//!
+//! ## 无 GPU 时
+//!
+//! 优雅跳过（打印原因），与既有 GPU 测试（`offscreen_render.rs` 等）一致 ——
+//! 绝不伪装成通过。
+
+use deer_gpu::null::CpuRenderer;
+use deer_gpu::{Color, DrawCmd, DrawList, Extent, RectI};
+use deer_vk::gpu_geom::GpuVertex;
+use deer_vk::GpuGeometryRenderer;
+
+/// 清屏色（不透明 ⇒ UNORM 转换两边都是精确的）。
+const CLEAR: Color = Color::rgb(16, 16, 16);
+
+fn renderer(extent: Extent) -> Option<GpuGeometryRenderer> {
+    match GpuGeometryRenderer::new(0, extent, CLEAR) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            println!("跳过：本机没有可用的 Vulkan GPU（{e}）");
+            None
+        }
+    }
+}
+
+/// 对照一帧，返回**最大通道差**。
+///
+/// `max_allowed = 0` ⇒ 额外断言逐字节相同（不透明）；`= 1` ⇒ 半透明（UNORM 舍入）。
+fn compare(r: &mut GpuGeometryRenderer, name: &str, list: &DrawList, max_allowed: u8) -> u8 {
+    let extent = r.extent();
+    let gpu = r
+        .render(list)
+        .unwrap_or_else(|e| panic!("{name}: GPU 渲染失败：{e}"));
+    assert!(r.unsupported().is_empty(), "{name}: 本用例不该有 unsupported");
+    let cpu = CpuRenderer::new()
+        .render(extent, list, CLEAR)
+        .expect("CPU 渲染失败");
+    let cpu = cpu.to_rgba();
+    assert_eq!(
+        gpu.len(),
+        cpu.len(),
+        "{name}: 回读长度必须等于 CPU 帧缓冲长度（{} vs {}）",
+        gpu.len(),
+        cpu.len()
+    );
+
+    let mut worst = 0u8;
+    let mut at = 0usize;
+    for (i, (g, c)) in gpu.iter().zip(cpu.iter()).enumerate() {
+        let d = g.abs_diff(*c);
+        if d > worst {
+            worst = d;
+            at = i;
+        }
+    }
+    let (px, ch) = (at / 4, at % 4);
+    println!(
+        "  {name}: 最大通道差 {worst}（允许 {max_allowed}）{}",
+        if worst == 0 { "，逐字节相同" } else { "" }
+    );
+    assert!(
+        worst <= max_allowed,
+        "{name}: 最大通道差 {worst} > 允许的 {max_allowed}；最差处像素 ({}, {}) 通道 {ch}：\
+         GPU={:?} CPU={:?}",
+        px % extent.width.max(1) as usize,
+        px / extent.width.max(1) as usize,
+        &gpu[at - ch..at - ch + 4],
+        &cpu[at - ch..at - ch + 4]
+    );
+    if max_allowed == 0 {
+        assert_eq!(gpu, cpu, "{name}: 不透明绘制必须逐字节相同");
+    }
+    worst
+}
+
+/// 不透明语料（**逐字节**判据）。
+fn opaque_corpus() -> Vec<(&'static str, DrawList)> {
+    let one = |cmd: DrawCmd| {
+        let mut l = DrawList::new();
+        l.push(cmd);
+        l
+    };
+    let w = Color::WHITE;
+    vec![
+        // 全画布清屏：空列表 ⇒ 全是清屏色
+        ("empty-clear", DrawList::new()),
+        ("fill", one(DrawCmd::FillRect { rect: RectI::new(3, 2, 8, 5), color: w })),
+        // 部分越出画布：CPU 的 blend 本来就不写越界像素，GPU 靠静态 scissor 裁
+        ("fill-offscreen", one(DrawCmd::FillRect { rect: RectI::new(-4, -3, 8, 7), color: w })),
+        // 零面积：两边都什么都不画
+        ("fill-degenerate", one(DrawCmd::FillRect { rect: RectI::new(5, 5, 0, 4), color: w })),
+        ("round-1", one(DrawCmd::FillRoundRect { rect: RectI::new(2, 2, 10, 8), radius: 1, color: w })),
+        ("round-3", one(DrawCmd::FillRoundRect { rect: RectI::new(2, 2, 10, 8), radius: 3, color: w })),
+        // 超大圆角：半径 > 半宽，四角判据必须与 CPU 逐字一致
+        ("round-huge", one(DrawCmd::FillRoundRect { rect: RectI::new(2, 1, 9, 7), radius: 9, color: w })),
+        ("stroke-1px", one(DrawCmd::StrokeRect { rect: RectI::new(2, 2, 12, 9), color: w, width: 1 })),
+        ("stroke-w2", one(DrawCmd::StrokeRect { rect: RectI::new(2, 2, 12, 9), color: w, width: 2 })),
+        ("stroke-w3", one(DrawCmd::StrokeRect { rect: RectI::new(2, 2, 12, 9), color: w, width: 3 })),
+        // ★ 带宽 > 矩形边长：边带会沿短边**伸出矩形之外**，GPU 只光栅化图元覆盖区
+        ("stroke-band-exceeds-rect", one(DrawCmd::StrokeRect { rect: RectI::new(3, 3, 4, 2), color: w, width: 5 })),
+        ("stroke-band-exceeds-tall", one(DrawCmd::StrokeRect { rect: RectI::new(4, 2, 2, 9), color: w, width: 6 })),
+        // 退化描边宽度：CPU `stroke()` 是 `width.max(1)` ⇒ 1px 边框（不是实心！）
+        ("stroke-width-zero", one(DrawCmd::StrokeRect { rect: RectI::new(2, 2, 10, 6), color: w, width: 0 })),
+        ("stroke-width-negative", one(DrawCmd::StrokeRect { rect: RectI::new(2, 2, 10, 6), color: w, width: -3 })),
+        // 1×1 矩形配 3px 带宽
+        ("stroke-tiny-rect-thick", one(DrawCmd::StrokeRect { rect: RectI::new(6, 5, 1, 1), color: w, width: 3 })),
+        // 裁剪 × 各种形状
+        (
+            "clip-fill",
+            {
+                let mut l = DrawList::new();
+                l.push(DrawCmd::PushClip { rect: RectI::new(4, 3, 8, 6) });
+                l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 24, 16), color: w });
+                l.push(DrawCmd::PopClip);
+                l
+            },
+        ),
+        (
+            "clip-round",
+            {
+                let mut l = DrawList::new();
+                l.push(DrawCmd::PushClip { rect: RectI::new(3, 2, 10, 8) });
+                l.push(DrawCmd::FillRoundRect { rect: RectI::new(2, 1, 14, 10), radius: 3, color: w });
+                l.push(DrawCmd::PopClip);
+                l
+            },
+        ),
+        (
+            "clip-stroke-thick",
+            {
+                let mut l = DrawList::new();
+                l.push(DrawCmd::PushClip { rect: RectI::new(5, 4, 9, 7) });
+                l.push(DrawCmd::StrokeRect { rect: RectI::new(4, 3, 12, 9), color: w, width: 3 });
+                l.push(DrawCmd::PopClip);
+                l
+            },
+        ),
+        // 嵌套裁剪：内层 Pop 之后必须回到**外层**裁剪
+        (
+            "nested-clip",
+            {
+                let mut l = DrawList::new();
+                l.push(DrawCmd::PushClip { rect: RectI::new(1, 1, 14, 12) });
+                l.push(DrawCmd::PushClip { rect: RectI::new(5, 3, 10, 8) });
+                l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 24, 16), color: w });
+                l.push(DrawCmd::PopClip);
+                l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 24, 16), color: w });
+                l.push(DrawCmd::PopClip);
+                l
+            },
+        ),
+        // 多条命令叠加（顺序敏感）+ `NodeHint` 不产生像素
+        (
+            "mixed",
+            {
+                let mut l = DrawList::new();
+                l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 24, 16), color: w });
+                l.push(DrawCmd::NodeHint { rect: RectI::new(0, 0, 24, 16), node_id_len: 3 });
+                l.push(DrawCmd::FillRect { rect: RectI::new(2, 2, 12, 9), color: Color::rgb(0, 0, 0) });
+                l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 20, 13), color: w, width: 2 });
+                l.push(DrawCmd::FillRoundRect { rect: RectI::new(7, 4, 8, 7), radius: 2, color: w });
+                l
+            },
+        ),
+    ]
+}
+
+/// **Ruling 19 的正面用例**：`[PopClip, PushClip]` 这种「净计数配平但有多余 PopClip」的列表
+/// CPU 画得出来，GPU 也必须画（**不**拿更严的 `GpuStream::clip_unbalanced` 当报错条件）。
+///
+/// 净计数：`PopClip`（-1）+ `PushClip`（+1）= **0** ⇒ `clip_balanced()` 为真，
+/// 但栈里被弹过一次「全画布」⇒ `GpuStream::clip_unbalanced` 为真。两者必须分开对待。
+fn net_balanced_with_extra_pop() -> DrawList {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::PopClip);
+    l.push(DrawCmd::PushClip { rect: RectI::new(4, 4, 8, 8) });
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 24, 16), color: Color::WHITE });
+    l
+}
+
+/// 半透明语料（**≤1 LSB** 判据）。
+fn alpha_corpus() -> Vec<(&'static str, DrawList)> {
+    let half = Color::rgba(255, 0, 0, 0.5);
+    let quarter = Color::rgba(0, 128, 255, 0.25);
+    let mut v: Vec<(&'static str, DrawList)> = Vec::new();
+
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect { rect: RectI::new(3, 2, 12, 9), color: half });
+    v.push(("alpha-fill", l));
+
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 20, 14), color: quarter });
+    l.push(DrawCmd::FillRoundRect { rect: RectI::new(3, 2, 14, 10), radius: 3, color: half });
+    l.push(DrawCmd::StrokeRect { rect: RectI::new(2, 1, 18, 12), color: quarter, width: 1 });
+    v.push(("alpha-mixed", l));
+
+    // 2px 半透明描边：四角像素落在两条边带里 ⇒ 被混合**两次**（CPU 也如此）
+    let mut l = DrawList::new();
+    l.push(DrawCmd::StrokeRect { rect: RectI::new(3, 2, 14, 10), color: half, width: 2 });
+    v.push(("alpha-stroke-overlap", l));
+
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect { rect: RectI::new(2, 2, 10, 8), color: Color::TRANSPARENT });
+    v.push(("alpha-zero", l));
+
+    // 半透明 + 裁剪
+    let mut l = DrawList::new();
+    l.push(DrawCmd::PushClip { rect: RectI::new(4, 3, 10, 8) });
+    l.push(DrawCmd::FillRoundRect { rect: RectI::new(2, 1, 16, 12), radius: 4, color: half });
+    l.push(DrawCmd::StrokeRect { rect: RectI::new(2, 1, 16, 12), color: quarter, width: 3 });
+    l.push(DrawCmd::PopClip);
+    v.push(("alpha-clip", l));
+
+    v
+}
+
+/// 不透明绘制：**逐字节相同**（这是本切片的硬性验收）。
+#[test]
+fn opaque_drawings_match_cpu_byte_for_byte() {
+    let Some(mut r) = renderer(Extent { width: 24, height: 16 }) else {
+        return;
+    };
+    let mut worst = 0u8;
+    for (name, list) in opaque_corpus() {
+        worst = worst.max(compare(&mut r, name, &list, 0));
+    }
+    worst = worst.max(compare(&mut r, "net-balanced-extra-pop", &net_balanced_with_extra_pop(), 0));
+    println!("不透明语料最大通道差 = {worst}（要求 0）");
+    assert_eq!(worst, 0, "不透明绘制必须逐字节相同");
+}
+
+/// 半透明绘制：最大通道差 **≤ 1 LSB**。
+#[test]
+fn semi_transparent_drawings_match_cpu_within_one_lsb() {
+    let Some(mut r) = renderer(Extent { width: 24, height: 16 }) else {
+        return;
+    };
+    let mut worst = 0u8;
+    for (name, list) in alpha_corpus() {
+        worst = worst.max(compare(&mut r, name, &list, 1));
+    }
+    println!("半透明语料最大通道差 = {worst}（要求 ≤1）");
+    assert!(worst <= 1, "半透明最大通道差 {worst} 超过 1 LSB");
+}
+
+/// 另一个静态 viewport 尺寸（证明 viewport/scissor 是**跟着 extent 建进管线**的）。
+#[test]
+fn a_different_extent_uses_its_own_static_viewport() {
+    let Some(mut r) = renderer(Extent { width: 8, height: 6 }) else {
+        return;
+    };
+    assert_eq!(r.extent(), Extent { width: 8, height: 6 });
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRoundRect { rect: RectI::new(1, 1, 6, 4), radius: 2, color: Color::WHITE });
+    l.push(DrawCmd::StrokeRect { rect: RectI::new(0, 0, 8, 6), color: Color::WHITE, width: 1 });
+    assert_eq!(compare(&mut r, "small-canvas", &l, 0), 0);
+}
+
+/// 退化 extent（0×0）：按 1×1 渲染（与 CPU `Framebuffer::new(..max(1))` 同一约定），
+/// 且画出来的内容与 CPU 的 1×1 帧缓冲**逐字节相同**。
+#[test]
+fn degenerate_extent_renders_as_one_by_one_like_the_cpu() {
+    let Some(mut r) = renderer(Extent { width: 0, height: 0 }) else {
+        return;
+    };
+    assert_eq!(
+        r.extent(),
+        Extent { width: 1, height: 1 },
+        "0 尺寸必须按 1×1 渲染（否则 Vulkan 图像非法，而 CPU 那边能画 1×1）"
+    );
+    // 全画布清屏
+    assert_eq!(compare(&mut r, "degenerate-clear", &DrawList::new(), 0), 0);
+    // 铺满 1×1 的填充
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 1, 1), color: Color::WHITE });
+    assert_eq!(compare(&mut r, "degenerate-fill", &l, 0), 0);
+}
+
+/// 同一个渲染器连续两帧：第二帧必须是**第二帧的内容**（顶点缓冲每帧重传，不能留上一帧）。
+#[test]
+fn consecutive_frames_do_not_leak_vertex_data() {
+    let Some(mut r) = renderer(Extent { width: 24, height: 16 }) else {
+        return;
+    };
+    // 第一帧：一个铺满的大矩形（顶点数与第二帧不同，且覆盖面积更大）
+    let mut big = DrawList::new();
+    big.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 24, 16), color: Color::WHITE });
+    let _ = compare(&mut r, "first-frame-big", &big, 0);
+    // 第二帧：一个小矩形（如果顶点缓冲没重传，会看到上一帧的残留）
+    let mut small = DrawList::new();
+    small.push(DrawCmd::FillRect { rect: RectI::new(5, 4, 3, 2), color: Color::WHITE });
+    assert_eq!(compare(&mut r, "second-frame-small", &small, 0), 0);
+    // 第三帧：回到空列表 ⇒ 应该只剩清屏色
+    assert_eq!(compare(&mut r, "third-frame-clear", &DrawList::new(), 0), 0);
+}
+
+/// `DrawCmd::Text`：**报 `Unsupported`** 而不是静默丢弃；报告里能看到是哪条命令；
+/// 而且失败之后渲染器仍然可用（状态没被弄坏）。
+#[test]
+fn text_is_reported_as_unsupported_and_the_renderer_survives() {
+    let Some(mut r) = renderer(Extent { width: 24, height: 16 }) else {
+        return;
+    };
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 8, 8), color: Color::WHITE });
+    l.push(DrawCmd::Text {
+        rect: RectI::new(0, 0, 20, 10),
+        text: "hi".into(),
+        color: Color::WHITE,
+        size: 12.0,
+        align: 0,
+    });
+    let err = r.render(&l).expect_err("含文本的列表必须报错，不能静默画一半");
+    let msg = format!("{err}");
+    assert!(msg.contains("Unsupported") || msg.contains("不支持"), "错误应当是 Unsupported：{msg}");
+    assert_eq!(r.unsupported().len(), 1, "报告里要有那一条文本命令");
+    assert!(r.unsupported()[0].contains("Text"), "报告应当指认命令：{:?}", r.unsupported());
+
+    // 失败之后仍能正常画（没有半提交、没有卡死的栅栏）
+    let mut ok = DrawList::new();
+    ok.push(DrawCmd::FillRect { rect: RectI::new(1, 1, 6, 4), color: Color::WHITE });
+    assert_eq!(compare(&mut r, "after-unsupported", &ok, 0), 0);
+}
+
+/// 裁剪栈**不平衡**：GPU 必须像 CPU 一样**报错**（判据相同 ⇒ 行为相同）。
+#[test]
+fn unbalanced_clip_is_rejected_like_the_cpu_backend() {
+    let Some(mut r) = renderer(Extent { width: 24, height: 16 }) else {
+        return;
+    };
+    let mut l = DrawList::new();
+    l.push(DrawCmd::PushClip { rect: RectI::new(1, 1, 8, 8) });
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 24, 16), color: Color::WHITE });
+
+    let cpu = CpuRenderer::new().render(r.extent(), &l, CLEAR);
+    assert!(cpu.is_err(), "CPU 后端本来就拒收不平衡的列表（null.rs:227-236）");
+    let gpu = r.render(&l);
+    assert!(gpu.is_err(), "GPU 也必须拒收（判据与 CPU 相同）");
+    println!("两边都拒收未配对的 PushClip：CPU={:?} / GPU={:?}", cpu.err(), gpu.err().map(|e| e.to_string()));
+
+    // 反面：多一个 PopClip 但净计数配平 ⇒ **两边都要画得出来**（Ruling 19）
+    let odd = net_balanced_with_extra_pop();
+    assert!(odd.clip_balanced(), "这份列表的净计数是配平的");
+    let cpu = CpuRenderer::new().render(r.extent(), &odd, CLEAR);
+    assert!(cpu.is_ok(), "CPU 能画这种列表");
+    assert_eq!(compare(&mut r, "net-balanced-extra-pop", &odd, 0), 0);
+}
+
+/// `GpuVertex` 的布局是给 `VkVertexInputAttributeDescription` 的硬契约：
+/// 这里钉**字面数字**（`gpu_render.rs` 用 `offset_of!` 取偏移，两者必须一致）。
+#[test]
+fn vertex_layout_matches_the_hand_written_attribute_offsets() {
+    assert_eq!(std::mem::size_of::<GpuVertex>(), 44, "stride");
+    assert_eq!(std::mem::align_of::<GpuVertex>(), 4);
+    assert_eq!(std::mem::offset_of!(GpuVertex, pos), 0, "location 0：vec2 pos");
+    assert_eq!(std::mem::offset_of!(GpuVertex, rect), 8, "location 1：vec4 rect");
+    assert_eq!(std::mem::offset_of!(GpuVertex, radius_kind), 24, "location 2：float radius_kind");
+    assert_eq!(std::mem::offset_of!(GpuVertex, color), 28, "location 3：vec4 color");
+}

@@ -454,6 +454,107 @@ impl VkDevice {
         })
     }
 
+    /// 创建一个**用真实顶点输入**的图形管线（M3a 的顶点缓冲路径）。
+    ///
+    /// 与 [`VkDevice::create_graphics_pipeline`] 的差别只有两点：
+    /// 1. **声明顶点缓冲与属性**（那个版本的 `vertex_binding_description_count = 0`）；
+    /// 2. **静态 viewport/scissor**（尺寸 = `extent`）—— 实测动态版在本机 Intel 驱动上
+    ///    画不出任何像素（见 [`VkDevice::create_graphics_pipeline_static_viewport`]）。
+    ///
+    /// ## 调用方的两条硬约束
+    ///
+    /// - **不要再调 `vkCmdSetViewport` / `vkCmdSetScissor`**：本管线没有声明这两个动态状态，
+    ///   对静态状态发动态设置命令会触发校验层报错（`vbo_probe.rs` 里踩过）。
+    /// - `attrs[].offset` 必须与 `stride` 描述的那个顶点结构**逐字节**一致。
+    ///   M3a 的顶点是 [`crate::gpu_geom::GpuVertex`]（`#[repr(C)]`，stride 44）——
+    ///   `gpu_render.rs` 用 `offset_of!` 取偏移，所以这里不靠手抄数字。
+    ///
+    /// `VertexAttr` 比 `vk::VertexInputAttributeDescription` 少一个字段：`binding` 恒为 0
+    /// （只有一个顶点缓冲）。少一个「忘了写 binding 于是读到别的缓冲」的机会。
+    pub fn create_vertex_pipeline(
+        &self,
+        stages: &[vk::PipelineShaderStageCreateInfo],
+        layout: &PipelineLayout,
+        render_pass: &RenderPass,
+        extent: vk::Extent2D,
+        stride: u32,
+        attrs: &[VertexAttr],
+    ) -> GpuResult<Pipeline> {
+        if stride == 0 {
+            return Err(GpuError::Unsupported("顶点 stride 不能为 0".to_string()));
+        }
+        if attrs.is_empty() {
+            return Err(GpuError::Unsupported(
+                "顶点管线至少要有一个属性（否则顶点缓冲毫无意义）".to_string(),
+            ));
+        }
+        if extent.width == 0 || extent.height == 0 {
+            return Err(GpuError::Unsupported(format!(
+                "静态 viewport 的宽高必须 > 0，实际 {}×{}",
+                extent.width, extent.height
+            )));
+        }
+        for (i, a) in attrs.iter().enumerate() {
+            if a.offset >= stride {
+                return Err(GpuError::Unsupported(format!(
+                    "属性 {}（location {}）的 offset {} 超出 stride {}",
+                    i, a.location, a.offset, stride
+                )));
+            }
+            if attrs[..i].iter().any(|b| b.location == a.location) {
+                return Err(GpuError::Unsupported(format!(
+                    "属性 location {} 重复声明",
+                    a.location
+                )));
+            }
+        }
+
+        // `binding` 恒为 0；`input_rate` = 每顶点。
+        let binding = vk::VertexInputBindingDescription {
+            binding: 0,
+            stride,
+            input_rate: vk::VK_VERTEX_INPUT_RATE_VERTEX,
+        };
+        let attr_descs: Vec<vk::VertexInputAttributeDescription> = attrs
+            .iter()
+            .map(|a| vk::VertexInputAttributeDescription {
+                location: a.location,
+                binding: 0,
+                format: a.format,
+                offset: a.offset,
+            })
+            .collect();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            vertex_binding_description_count: 1,
+            p_vertex_binding_descriptions: &binding,
+            vertex_attribute_description_count: attr_descs.len() as u32,
+            p_vertex_attribute_descriptions: attr_descs.as_ptr(),
+        };
+        let viewport = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: extent.width as f32,
+            height: extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let scissor = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+        self.build_pipeline(
+            stages,
+            layout,
+            render_pass,
+            Some((&viewport, &scissor)),
+            &vertex_input,
+            true,
+        )
+    }
+
     /// 创建一个**图形管线**（单颜色附件、无顶点输入、动态 viewport/scissor、alpha 混合开）。
     ///
     /// **这是 SPIR-V 的真正验收关**：`vkCreateShaderModule` 很宽容（实测连 `bound = 0`
@@ -565,7 +666,14 @@ impl VkDevice {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: vk::Extent2D { width, height },
         };
-        self.build_pipeline(&stages, layout, render_pass, Some((&viewport, &scissor)), blend_enable)
+        self.build_pipeline(
+            &stages,
+            layout,
+            render_pass,
+            Some((&viewport, &scissor)),
+            &empty_vertex_input(),
+            blend_enable,
+        )
     }
 
     /// 用**显式给定**的阶段列表建管线。
@@ -579,16 +687,22 @@ impl VkDevice {
         layout: &PipelineLayout,
         render_pass: &RenderPass,
     ) -> GpuResult<Pipeline> {
-        self.build_pipeline(stages, layout, render_pass, None, true)
+        self.build_pipeline(stages, layout, render_pass, None, &empty_vertex_input(), true)
     }
 
     /// 建管线的核心：`static_viewport = None` ⇒ 动态 viewport/scissor；`Some` ⇒ 写死。
+    ///
+    /// `vertex_input` 由调用方给：M2a 的路径传 [`empty_vertex_input`]（位置来自着色器里的
+    /// 常量表），M3a 的 [`VkDevice::create_vertex_pipeline`] 传**真实的** binding + attribute
+    /// （顶点缓冲路径）。之所以做成参数而不是两个函数：其余 20 多项管线状态**完全相同**，
+    /// 复制一份就等于复制一份「以后只改了一边」的风险。
     fn build_pipeline(
         &self,
         stages: &[vk::PipelineShaderStageCreateInfo],
         layout: &PipelineLayout,
         render_pass: &RenderPass,
         static_viewport: Option<(&vk::Viewport, &vk::Rect2D)>,
+        vertex_input: &vk::PipelineVertexInputStateCreateInfo,
         blend_enable: bool,
     ) -> GpuResult<Pipeline> {
         if stages.is_empty() {
@@ -596,16 +710,6 @@ impl VkDevice {
                 "图形管线至少要有一个着色器阶段".to_string(),
             ));
         }
-        // 顶点完全由着色器内的常量表 + 推送常量决定 ⇒ 无需顶点缓冲/属性
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo {
-            s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            vertex_binding_description_count: 0,
-            p_vertex_binding_descriptions: std::ptr::null(),
-            vertex_attribute_description_count: 0,
-            p_vertex_attribute_descriptions: std::ptr::null(),
-        };
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo {
             s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
             p_next: std::ptr::null(),
@@ -705,7 +809,7 @@ impl VkDevice {
             flags: 0,
             stage_count: stages.len() as u32,
             p_stages: stages.as_ptr(),
-            p_vertex_input_state: &vertex_input,
+            p_vertex_input_state: vertex_input,
             p_input_assembly_state: &input_assembly,
             p_tessellation_state: std::ptr::null(),
             p_viewport_state: &viewport_state,
@@ -754,6 +858,37 @@ impl VkDevice {
             device: self.handle,
             destroy: self.fns.destroy_pipeline,
         })
+    }
+}
+
+/// 一个顶点属性（`vk::VertexInputAttributeDescription` 的项目内形态）。
+///
+/// 比原生结构少一个 `binding` 字段：顶点缓冲只有 0 号一个，写死比「每次都写对」可靠。
+/// `offset` 是**相对顶点起点**的字节偏移，必须落在 `stride` 之内（[`VkDevice::create_vertex_pipeline`] 会检查）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VertexAttr {
+    /// 着色器里的 `layout(location = N)`。
+    pub location: u32,
+    /// `VkFormat`（例如 `VK_FORMAT_R32G32B32A32_SFLOAT`）。
+    pub format: i32,
+    /// 相对顶点起点的字节偏移。
+    pub offset: u32,
+}
+
+/// 「没有顶点输入」的顶点输入状态。
+///
+/// M2a 的着色器把顶点位置写在 SPIR-V 的常量表里（不碰顶点缓冲），
+/// 所以那条路径声明 `count = 0`；M3a 的顶点缓冲路径用
+/// [`VkDevice::create_vertex_pipeline`] 传真实的 binding + attribute。
+fn empty_vertex_input() -> vk::PipelineVertexInputStateCreateInfo {
+    vk::PipelineVertexInputStateCreateInfo {
+        s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: 0,
+        vertex_binding_description_count: 0,
+        p_vertex_binding_descriptions: std::ptr::null(),
+        vertex_attribute_description_count: 0,
+        p_vertex_attribute_descriptions: std::ptr::null(),
     }
 }
 
