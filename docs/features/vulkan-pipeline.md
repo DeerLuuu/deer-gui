@@ -116,6 +116,7 @@ for _ in 0..5 {
 | 用 `OpAccessChain` + **运行时索引**访问 `OpConstantComposite` 数组 | 本机驱动**直接崩**（`STATUS_STACK_BUFFER_OVERRUN`）。这就是崩溃的真凶 | 不要用常量数组做动态索引。改用 `OpCompositeExtract`（静态下标）或位运算算角点 |
 | 推送常量块建管线失败 | **已知问题**：三种写法（`{vec4}`+Block+访问链 / 直接 load Block / 纯 `vec4`）分别导致「空句柄」或「访问违例」 | 暂时别用推送常量。矩形绘制后续改**顶点缓冲**方案（见 `spirv::vertex_shader_rect_pushconstant` 的文档） |
 | 非法阶段配置（如重复 `VERTEX`）让进程崩 | 本机驱动对非法阶段配置**崩溃而不返回错误码** | 别用非法输入做校验测试；用**合法**输入 + 断言句柄非空 |
+| **管线 `colorAttachment` 格式 ≠ 渲染通道附件格式**，却「什么都没发生」 | 本机驱动**静默接受**（`vkCreateGraphicsPipelines` 返回成功）—— 属于 [`vulkan.md`](vulkan.md) 第 6 节的**静默不一致清单**；只有**像素对照**能发现 | 调用方必须传 `render_pass` 的同一格式（离屏 `COLOR_FORMAT` / 窗口 `swapchain.format()`）；可重跑用例 `cargo test -p deer-vk --test pipeline_smoke format_mismatch_is_accepted_by_this_driver_and_must_be_guarded_by_the_caller` |
 | `expect_err` 编译不过（`PipelineLayout doesn't implement Debug`） | `expect_err` 需要 `T: Debug` | 用 `match` 取错误 |
 | 找不到 `open()` / `adapters()` | 忘了 `use deer_gpu::Backend;` | trait 方法必须引进作用域 |
 

@@ -255,6 +255,12 @@ DEER_VK_WINDOW_TESTS=1 cargo run -q -p deer-gui --features window --example wind
 从「差几十」变成 **≤1 LSB**（只剩舍入），而**不透明仍然要求 0**（判据没有放宽）。
 `window_parity` 会**先把实际拿到的格式打印出来并断言它是线性的**。
 
+> ⚠️ **格式传错不会被驱动拦住**：管线 `colorAttachment` 格式与渲染通道附件格式**不一致**时，本机驱动
+> `vkCreateGraphicsPipelines` **返回成功、静默接受**（可重跑用例：
+> `cargo test -p deer-vk --test pipeline_smoke format_mismatch_is_accepted_by_this_driver_and_must_be_guarded_by_the_caller`）。
+> 所以窗口路径必须把 `swapchain.format()` 传进管线，**并且**靠**上屏像素对照**兜底 ——
+> 这正是本节 `window_parity` 存在的理由（同族清单位于 [`vulkan.md`](vulkan.md) 第 6 节）。
+
 ### 5.2 viewport 策略：窗口用**动态**（默认）；「动态画不出像素」是一条**存疑的旧结论**（未证实）
 
 窗口路径**每帧显式设置** `vkCmdSetViewport`/`vkCmdSetScissor`（动态，产品行为）。

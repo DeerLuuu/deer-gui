@@ -94,7 +94,36 @@ M1 实测：`#[link(name = "vulkan-1")]` 在**没装 SDK** 的机器上**链接�
 1. **调用前的结构检查**（长度、4 字节对齐、20 字节最小头部、魔数、`bound > 0`）—— 归我们；
 2. **驱动验收** —— 归驱动，但只对「管线可创建性」负责。
 
-## 6. 自检
+## 6. 静默不一致清单（**驱动不会替你拦**）
+
+本仓库反复踩到同一类缺陷：**驱动接受「非法/不一致的组合」，症状是「不报错也不画」或「画出错色」**，
+而不是一个清晰的错误码。下面每条都附**证据出处**；新增发现请续在这张表里（**不写死测试条数**，只写命令）。
+
+| 不一致 | 驱动行为（本机实测） | 怎么兜住 |
+|---|---|---|
+| 管线 `colorAttachment` 格式 **≠** 渲染通道附件格式 | `vkCreateGraphicsPipelines` **返回成功、静默接受**（原文曾写「会拒绝」，与实测相反，已改） | 调用方必须传**同一格式**（离屏 `COLOR_FORMAT`、窗口 `swapchain.format()`）**且**靠**像素对照**兜底 |
+| 管线**声明**了动态 viewport/scissor 却**从不调** `vkCmdSetViewport`/`vkCmdSetScissor` | 规范未定义行为：本机驱动**崩**（窗口 `0xC000041D`、离屏 `0xC0000005`） | 声明与调用必须一致：声明动态就每帧真的设置；声明静态就不能设 |
+| SPIR-V 自身非法（如 `bound = 0`） | `vkCreateShaderModule` **宽容接受**（见上一节） | 我们自己的结构检查 + `spirv-val` |
+| 损坏的推送常量着色器（`spirv.rs::vertex_shader_rect_pushconstant`） | 普通驱动**宽容接受**；**开校验层**会 `0xc0000005` 崩溃 | 别用它建管线（矩形走顶点缓冲）；见 `FEATURES.md` 与 `ROADMAP.md` 的 Q-5 |
+
+**第一条（格式不一致）的证据与用法**：
+
+```powershell
+# 可重跑用例：拿 B8G8R8A8_SRGB 的渲染通道 + R8G8B8A8_UNORM 的 color_format 建管线
+cargo test -p deer-vk --test pipeline_smoke format_mismatch_is_accepted_by_this_driver_and_must_be_guarded_by_the_caller
+```
+
+- **症状**：不被驱动拦住 ⇒ **只能靠调用方自觉 + 像素对照**兜住（像素对照是唯一能咬住它的手段）。
+- **`DEER_VK_VALIDATION=1` 时才有人提醒**：校验层会报 `VUID-VkGraphicsPipelineCreateInfo-renderPass-06043`
+  一类；**普通运行不会**。所以「零校验消息」这条门禁是这类问题的**唯一自动护栏**。
+- **与 M3c 的具体关联**：这正是 **M3c 必须把交换链换成线性 `*_UNORM`** 的**同族问题** ——
+  格式（以及由此决定的编码/混合空间）**传错也能建成功**，但**像素语义**会按错误格式走；
+  窗口路径若把 `color_format` 传成离屏那个 UNORM 常量、或交换链退回 sRGB，都会「跑得通、画得不对」，
+  只有**上屏像素对照**（[`window.md`](window.md) 第 5 节的 `window_parity`）能发现。
+- 实现侧的说明与这条契约写在 `crates/deer-vk/src/pipelines.rs` 的 `build_pipelines` 文档里
+  （`RenderPass` 没有公开的 format getter ⇒ 这条约束**无法由 `build_pipelines` 强制**，是**调用方契约**）。
+
+## 7. 自检
 
 ```rust
 // ① 设备必须真的能拿到队列与内存类型
@@ -114,7 +143,7 @@ dev.create_shader_module(&bad).is_err();                     // 魔数错
 for _ in 0..3 { let d = deer_vk::VkDevice::open(0)?; d.wait_idle()?; }
 ```
 
-## 7. 常见坑
+## 8. 常见坑
 
 | 现象 | 原因 | 怎么改 |
 |---|---|---|
@@ -124,7 +153,7 @@ for _ in 0..3 { let d = deer_vk::VkDevice::open(0)?; d.wait_idle()?; }
 | 编译报找不到 `vulkan-1.lib` | 你在尝试静态链接 | 本 crate 已改成动态加载；别自己加 `#[link]` |
 | `VkDevice` 不能跨线程随便用 | 句柄在后台线程里被持有 | 现在只支持**单线程**用 `&mut self`；线程模型是 Q-4（未决） |
 
-## 8. 相关
+## 9. 相关
 
 - GPU HAL 契约：[`gpu-hal.md`](gpu-hal.md)
 - 里程碑与剩余步骤：[`../../ROADMAP.md`](../../ROADMAP.md)（M2a-3..6、M2b）
@@ -132,10 +161,11 @@ for _ in 0..3 { let d = deer_vk::VkDevice::open(0)?; d.wait_idle()?; }
 - **做不到**：把界面（`DrawList`）送上 GPU（M3）、纹理上传（M3）、多线程（HAL 无 `Send`/`Sync`，见 Q-4）。
   交换链回读**不走 HAL**：`Frame::read_pixels()` 明确 `Unsupported`，用 `WindowedRenderer::read_back_last_frame()`（见 [`vulkan-swapchain.md`](vulkan-swapchain.md)）
 
-## 9. 检查清单
+## 10. 检查清单
 
 - [x] 示例能跑：`cargo run -p deer-gui --example vulkan_devices` → `exit=0`
 - [x] 示例有自检断言（适配器非空；边界如实打印）
 - [x] `FEATURES.md` 已登记（标 🔄 并写明未完成部分）
 - [x] `docs/TUTORIAL.md` 已包含（作为「进阶/现状」章节）
 - [x] 明确写了「做不到什么」
+- [x] 「静默不一致清单」已登记（第 6 节：格式不一致 / 动态状态声明未设置 / SPIR-V 非法 / 损坏的推送常量）

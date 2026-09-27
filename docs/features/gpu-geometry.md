@@ -243,6 +243,7 @@ assert_eq!(gpu.extent(), extent);
 |---|---|---|
 | 颜色整体偏亮/偏暗，和 CPU 对不上 | 颜色附件用了 `_SRGB`：GPU 多做一次 sRGB 编码，CPU 不做 | 用 **`R8G8B8A8_UNORM`**（见第 3 节的不可回退前提 2） |
 | 画面上什么都没有（甚至进程崩） | **声明了动态状态却从不设置**（`vkCmdSetViewport`/`SetScissor`）—— 规范未定义行为，本机 Intel 会崩（`0xC000041D`） | 本模块走**静态** viewport/scissor（写进管线）；**若改用动态，就必须每帧真的设置**（见第 3 节前提 1 的更正） |
+| **格式传错却照样「跑通」**（颜色/编码整体不对） | 管线 `colorAttachment` 格式与渲染通道附件格式**不一致时驱动不报错、静默接受**（本机实测 `vkCreateGraphicsPipelines` 返回成功）⇒ 不会被拦住 | 传**同一格式**（离屏 `COLOR_FORMAT`、窗口 `swapchain.format()`）**并用像素对照兜住** —— 清单与可重跑用例见 [`vulkan.md`](vulkan.md) 第 6 节；M3c 的线性交换链正是这类问题的同族 |
 | 圆角/描边位置在裁剪后错位 | 把顶点 `pos`（裁剪后矩形）也当成了形状判据输入 | 形状判据一律用**顶点属性 `rect`（原始矩形）**；`pos` 只决定光栅化范围 |
 | 带文字的树 `render` 报 `Unsupported` | 建渲染器时**没调 `with_text`** ⇒ 文本仍按 M3a 行为被拒收（刻意：不静默丢弃） | 用 `GpuGeometryRenderer::new(..)?.with_text(engine)?`；`text_enabled()` 可查 |
 | 文本对照全红、偏差很大（不是 1 LSB） | CPU 侧用了 `CpuRenderer::new()` —— 那是**占位格**模型（0.6em 等宽方块 + i32 截断除法），而 GPU 画的是真字形 | CPU 侧必须 `CpuRenderer::with_text(engine)`，且与 GPU 各持一个**同源**引擎（同字体、同字号、同命令顺序 ⇒ 图集槽位一致） |
