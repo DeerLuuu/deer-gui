@@ -20,6 +20,11 @@
 cargo run -p deer-gui --example <示例名>
 ```
 
+> ⚠️ **示例名必须是 `crates/deer-gui/examples/` 里真实存在的**：`docs_consistency` 会把本目录每份指南里的
+> 每个 `--example <名字>` 都要求存在对应源码（**代码块也会被扫**）。**其它 crate 的示例（如
+> `crates/deer-vk/examples/`）在指南里只能给源码路径**，命令请写进 `docs/tour/*.md`、计划或 `ROADMAP.md`。
+> 详见 `CONTRIBUTING.md` 的 "Referring to examples in guides"。
+
 ## 3. 完整 API
 
 用表格列出可用的类型/函数/属性，逐个说明。**别只列名字**——要写清参数含义与默认值。

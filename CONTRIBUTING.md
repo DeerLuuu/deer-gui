@@ -103,6 +103,25 @@ Test and assertion counts change with every milestone, so **live documentation m
 
 If you want a number to be verifiable, do not freeze it in prose: assert it in a test, or read it from the run output. When you must reference a magnitude in live docs, prefer a **stable structural fact** instead of a count — for example "one test per layout invariant in `crates/deer-layout/tests/layout_invariants.rs`" rather than "18 tests" or "24 assertions".
 
+### Never edit repository files through shell text pipelines
+
+Do **not** rewrite repository files with a shell text pipeline — `Get-Content -Raw … | … | Set-Content`, in-place `-replace`, or `>>` redirection into a source or documentation file. On this machine, Windows PowerShell 5.1 reads UTF-8-without-BOM as ANSI, so **CJK text is silently rewritten as `?` (or U+FFFD), and the damage is irreversible**.
+
+- Use the **version-guarded editor tools** (`read` / `edit` / `write`) for every file change.
+- If you genuinely need a script, **write to a new file — never overwrite in place** — and specify the encoding explicitly.
+- **Three incidents, all one class of bug**: `crates/deer-vk/src/windowed.rs` (M3a), `crates/deer-vk/src/device.rs` (M3b), and four feature guides (`docs/features/{gpu-geometry,gpu-offscreen,vulkan,window}.md`, C2 — 455 characters became `?`). The last one was caught by reading the file back with the `read` tool (it returned mojibake), then recovered with `git checkout --` and redone with `edit`.
+- **Why this is a rule and not advice**: the damage is invisible in `git diff --stat` (the file still parses and is roughly the right size) and cannot be undone — there is no way to turn a `?` back into the character it replaced.
+
+### Referring to examples in guides (docs contract)
+
+`crates/deer-gui/tests/docs_consistency.rs` extracts every `--example <name>` from **`docs/features/*.md`** and requires `crates/deer-gui/examples/<name>.rs` to exist — **code blocks included**.
+
+⇒ Examples that live in **another crate** (e.g. `crates/deer-vk/examples/viewport_dynamic_probe.rs`) must be referenced in guides by **source path only**. Do not write the `--example` flag together with that name inside a guide. Put the full runnable command in a non-guide document (`docs/tour/*.md`, `docs/superpowers/plans/*.md`, `ROADMAP.md`), or use a placeholder that the checker ignores:
+
+```sh
+cargo run -p deer-vk --example <file name without .rs> -- --group=0
+```
+
 ## Design constraints and known traps
 
 These are not suggestions. Each one exists because a defect was found, and each is guarded by a test. Read this section before changing layout, rendering, or text code.
