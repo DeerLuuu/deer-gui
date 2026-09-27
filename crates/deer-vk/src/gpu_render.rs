@@ -262,6 +262,45 @@ fn single_command_in_clip(active_clip: &[RectI], cmd: &DrawCmd) -> DrawList {
     l
 }
 
+/// 把「新一段顶点」的偏移与数量转成 `u32`（`vkCmdDraw` 的参数类型）。
+///
+/// 抽成纯函数的理由（review M3）：循环体里**不能**再用 `?` 早退 —— 那时 `self.text` 已被
+/// 借出，早退会把它丢成 `None`。改成「返回 `Result`，由调用方记进 `fatal`」，循环后统一
+/// 「还原资源 + 返回错误」。顺带也让这段溢出判断可以被单元测试直接喂边界值。
+fn vertex_range(base: usize, len: usize) -> GpuResult<(u32, u32)> {
+    let first = u32::try_from(base).map_err(|_| {
+        GpuError::Unsupported(format!("顶点偏移 {base} 超出 u32（一帧画不了这么多顶点）"))
+    })?;
+    let count = u32::try_from(len).map_err(|_| {
+        GpuError::Unsupported(format!("顶点数 {len} 超出 u32（一帧画不了这么多顶点）"))
+    })?;
+    Ok((first, count))
+}
+
+/// 把翻译层报出的「未支持」清单并进帧级错误状态（**两条管线共用**）。
+///
+/// ## 为什么抽出这个函数（review M1）
+///
+/// 形状路径今天**不可达**（`gpu_geom` 什么命令都翻译得了），而「不可达的分支」最容易被
+/// 后人删掉或写错却没有任何测试发现。但它在**将来**一定会用到：`gpu_geom` 只要新增一条
+/// 尚未支持的命令，落到 `other` 分支的就是「静默少画」——比报错糟得多。
+/// 抽成纯函数后可以用合成消息直接钉住行为（见本模块单测），不必等真实分支出现。
+fn absorb_unsupported(acc: &mut Vec<String>, from: &[String]) {
+    acc.extend_from_slice(from);
+}
+
+/// 帧末把收集到的「未支持」清单变成结果：**非空 ⇒ `Unsupported`**（与 M3a 同一策略）。
+///
+/// 与 [`absorb_unsupported`] 配对：一个负责收集、一个负责在**所有**路径都结束时统一报错
+/// （包括循环里 `break` 出来的路径 —— 见 `render` 的 M3 说明）。
+fn unsupported_outcome(messages: &[String]) -> GpuResult<()> {
+    if messages.is_empty() {
+        Ok(())
+    } else {
+        Err(GpuError::Unsupported(messages.join("；")))
+    }
+}
+
 /// 对象销毁/内存释放的函数形态。
 ///
 /// 本项目里所有 `vk::*Handle` 都是 `*mut c_void` 的别名、所有 destroy/free 都是
@@ -627,6 +666,11 @@ pub struct GpuGeometryRenderer {
     /// 累计发出的 host→vertex 屏障条数（诊断 + 回归，见
     /// [`GpuGeometryRenderer::host_to_vertex_barrier_count`]）。
     host_to_vertex_barriers: u64,
+    /// 其中属于**形状**顶点缓冲的条数（见 [`GpuGeometryRenderer::shape_host_to_vertex_barrier_count`]）。
+    shape_host_to_vertex_barriers: u64,
+    /// 其中属于**文本**顶点缓冲的条数（review M2 的护栏，见
+    /// [`GpuGeometryRenderer::text_host_to_vertex_barrier_count`]）。
+    text_host_to_vertex_barriers: u64,
     /// **必须最后**（最后析构）。
     device: VkDevice,
 }
@@ -863,6 +907,8 @@ impl GpuGeometryRenderer {
             sync: SubmitState::Idle,
             text: None,
             host_to_vertex_barriers: 0,
+            shape_host_to_vertex_barriers: 0,
+            text_host_to_vertex_barriers: 0,
             device,
         })
     }
@@ -991,6 +1037,25 @@ impl GpuGeometryRenderer {
         self.host_to_vertex_barriers
     }
 
+    /// 累计发出的 host→VERTEX_INPUT 屏障里，**属于文本顶点缓冲**的那部分（review M2）。
+    ///
+    /// ## 为什么需要分项计数
+    ///
+    /// 文本路径引入了**第二块**顶点缓冲，它的屏障一开始只有实现、没有护栏：
+    /// reviewer 把那条发射整体删掉，`cargo test -p deer-vk` **17 靶仍然全绿**
+    /// （总数计数器只被形状帧的断言驱动，文本帧没人查）。
+    ///
+    /// 现在测试用差值断言：**文本单管线帧 ⇒ 本计数 +1**、**形状+文本交错帧 ⇒ 总数 +2 且本计数 +1**、
+    /// **全被跳过的文本帧 ⇒ 本计数 +0**。删掉发射必然红。
+    pub fn text_host_to_vertex_barrier_count(&self) -> u64 {
+        self.text_host_to_vertex_barriers
+    }
+
+    /// 与 [`Self::text_host_to_vertex_barrier_count`] 对称：属于形状顶点缓冲的那部分。
+    pub fn shape_host_to_vertex_barrier_count(&self) -> u64 {
+        self.shape_host_to_vertex_barriers
+    }
+
     /// **把渲染器置为「上次提交未确认完成」** —— 之后所有 `render` 都会报错。
     ///
     /// 真实触发路径是栅栏等待失败（超时/设备丢失），那在测试里无法稳定复现；这个入口让
@@ -1036,8 +1101,11 @@ impl GpuGeometryRenderer {
         let mut calls: Vec<DrawCall> = Vec::new();
         let mut active_clip: Vec<RectI> = Vec::new();
         let mut text_skipped = 0usize;
-        // 借出文本资源：避免在循环里同时可变借用 `self.text` 与读 `self.unsupported` 等字段
+        // 借出文本资源：避免在循环里同时可变借用 `self.text` 与读 `self.unsupported` 等字段。
+        // ⚠️ 因此**循环体内绝不提前 `return`**（review M3）：任何早退都会把 `self.text`
+        //    留在 `None`（文本资源丢失）。致命错误记进 `fatal`，循环后统一「还原 + 返回」。
         let mut text_res = self.text.take();
+        let mut fatal: Option<GpuError> = None;
 
         for cmd in &list.cmds {
             match cmd {
@@ -1054,62 +1122,76 @@ impl GpuGeometryRenderer {
                     let s = gpu_text::build_text_stream(&one, self.extent, &mut res.engine);
                     text_skipped += s.skipped;
                     if !s.vertices.is_empty() {
-                        let first = u32::try_from(text_verts.len()).map_err(|_| {
-                            GpuError::Unsupported("文本顶点数超出 u32".to_string())
-                        })?;
-                        let count = u32::try_from(s.vertices.len()).map_err(|_| {
-                            GpuError::Unsupported("文本顶点数超出 u32".to_string())
-                        })?;
-                        text_verts.extend_from_slice(&s.vertices);
-                        calls.push(DrawCall {
-                            kind: PipelineKind::Text,
-                            first,
-                            count,
-                        });
+                        match vertex_range(text_verts.len(), s.vertices.len()) {
+                            Ok((first, count)) => {
+                                text_verts.extend_from_slice(&s.vertices);
+                                calls.push(DrawCall {
+                                    kind: PipelineKind::Text,
+                                    first,
+                                    count,
+                                });
+                            }
+                            Err(e) => {
+                                fatal = Some(e);
+                                break;
+                            }
+                        }
                     }
                     let _ = (rect, text);
                 }
                 DrawCmd::Text { rect, text, .. } => {
                     // 没有 `TextEngine` ⇒ M3a 行为：**报告**而不是静默丢弃
-                    self.unsupported.push(format!(
-                        "DrawCmd::Text(rect=({}, {}, {}×{}), {} 字符)：GPU 后端尚未实现文本绘制",
-                        rect.x,
-                        rect.y,
-                        rect.w,
-                        rect.h,
-                        text.chars().count()
-                    ));
+                    absorb_unsupported(
+                        &mut self.unsupported,
+                        &[format!(
+                            "DrawCmd::Text(rect=({}, {}, {}×{}), {} 字符)：GPU 后端尚未实现文本绘制",
+                            rect.x,
+                            rect.y,
+                            rect.w,
+                            rect.h,
+                            text.chars().count()
+                        )],
+                    );
                 }
                 // 其余（形状命令）：走 M3a 的翻译层
                 other => {
                     let one = single_command_in_clip(&active_clip, other);
                     let s = gpu_geom::build_stream(&one, self.extent);
+                    // **M1（review）**：形状路径今天不会产出 `unsupported`，但**将来会**
+                    // （`gpu_geom` 里任何新增的未支持命令都会落到这里）。丢掉它 =
+                    // 「实现有、护栏没有」的反面：**静默少画**。所以按与 `Text` 同一策略处理 ——
+                    // 收集起来，帧末统一报错（`absorb_unsupported` + `unsupported_outcome`）。
+                    absorb_unsupported(&mut self.unsupported, &s.unsupported);
                     if !s.vertices.is_empty() {
-                        let first = u32::try_from(shape_verts.len()).map_err(|_| {
-                            GpuError::Unsupported("形状顶点数超出 u32".to_string())
-                        })?;
-                        let count = u32::try_from(s.vertices.len()).map_err(|_| {
-                            GpuError::Unsupported("形状顶点数超出 u32".to_string())
-                        })?;
-                        shape_verts.extend_from_slice(&s.vertices);
-                        calls.push(DrawCall {
-                            kind: PipelineKind::Shape,
-                            first,
-                            count,
-                        });
+                        match vertex_range(shape_verts.len(), s.vertices.len()) {
+                            Ok((first, count)) => {
+                                shape_verts.extend_from_slice(&s.vertices);
+                                calls.push(DrawCall {
+                                    kind: PipelineKind::Shape,
+                                    first,
+                                    count,
+                                });
+                            }
+                            Err(e) => {
+                                fatal = Some(e);
+                                break;
+                            }
+                        }
                     }
                 }
             }
         }
 
+        // ★ 无论循环是正常结束还是 `break`，都先把文本资源还回去（M3）
         if let Some(res) = text_res.as_mut() {
             res.skipped = text_skipped;
         }
         self.text = text_res;
 
-        if !self.unsupported.is_empty() {
-            return Err(GpuError::Unsupported(self.unsupported.join("；")));
+        if let Some(e) = fatal {
+            return Err(e);
         }
+        unsupported_outcome(&self.unsupported)?;
 
         // ③④⑤⑥ 上传顶点/图集（按需）+ 录制 + 提交 + 回读
         self.record_and_submit(&shape_verts, &text_verts, &calls)?;
@@ -1190,7 +1272,10 @@ impl GpuGeometryRenderer {
     ///
     /// 收**句柄**而不是 `&VertexBuffer`：调用点通常正持有 `self.vertex` / `self.text` 的借用，
     /// 传引用会和 `&mut self`（要自增计数器）撞借用检查 —— 句柄是 `Copy` 的普通值。
-    fn emit_host_to_vertex_barrier(&mut self, buffer: vk::BufferHandle) {
+    ///
+    /// `kind` 决定除总数之外**再**记到哪个分项计数器上（review M2：文本那条屏障要有单独护栏）。
+    /// 计数与 Vulkan 调用**写在同一处** ⇒ 删掉发射就必然删掉计数，护栏挡得住「整体删掉」这类变异。
+    fn emit_host_to_vertex_barrier(&mut self, buffer: vk::BufferHandle, kind: PipelineKind) {
         let p = vertex_buffer_barrier_params();
         let host_to_vertex = vk::BufferMemoryBarrier {
             s_type: vk::VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
@@ -1219,6 +1304,10 @@ impl GpuGeometryRenderer {
             );
         }
         self.host_to_vertex_barriers += 1;
+        match kind {
+            PipelineKind::Shape => self.shape_host_to_vertex_barriers += 1,
+            PipelineKind::Text => self.text_host_to_vertex_barriers += 1,
+        }
     }
 
     /// 录制一帧（清屏 + 按 z 序逐段绑定管线/顶点缓冲 + 绘制 + 屏障 + 拷贝），提交并等栅栏。
@@ -1299,13 +1388,15 @@ impl GpuGeometryRenderer {
 
         // ★ 主机刚写进顶点缓冲（map/memcpy/unmap）→ GPU 的 VERTEX_INPUT 要读它。
         //   **每个本帧用到的缓冲各一条**（形状与文本是两块独立缓冲）。
-        //   参数来自纯函数（可被单元测试钉常量）；「屏障是否真的发出」由计数器断言
-        //   （`host_to_vertex_barrier_count`）—— 两者合起来才让这条屏障**可回归**。
+        //   参数来自纯函数（可被单元测试钉常量）；「屏障是否真的发出」由计数器断言 ——
+        //   `host_to_vertex_barrier_count()`（总数）+ `text_host_to_vertex_barrier_count()`
+        //   （**文本路径单独计数**，review M2）：两条合起来才让「文本那条屏障」也可回归。
+        //   历史：文本屏障曾经**只有实现、没有护栏** —— reviewer 把它整体删掉、17 靶仍然全绿。
         //   （放在渲染通道**之前**：缓冲区屏障在通道内也合法，但放在外面更简单、更不容易踩
         //     「通道内允许哪些屏障」的规则。）
         if !shape_verts.is_empty() {
             let h = self.vertex.as_ref().expect("形状顶点已上传").buffer.handle();
-            self.emit_host_to_vertex_barrier(h);
+            self.emit_host_to_vertex_barrier(h, PipelineKind::Shape);
         }
         if !text_verts.is_empty() {
             let h = self
@@ -1315,7 +1406,7 @@ impl GpuGeometryRenderer {
                 .expect("文本顶点已上传")
                 .buffer
                 .handle();
-            self.emit_host_to_vertex_barrier(h);
+            self.emit_host_to_vertex_barrier(h, PipelineKind::Text);
         }
 
         let clear_value = vk::ClearValue {
@@ -1584,6 +1675,62 @@ mod tests {
         // 把「易错的那个值」显式钉出来：1<<5 是**细分求值**阶段，不是顶点输入。
         assert_ne!(p.dst_stage, 1 << 5, "1<<5 = VK_PIPELINE_STAGE_TESSELLATION_EVALUATION_SHADER_BIT");
         assert_ne!(p.dst_access, 1 << 5, "1<<5 = VK_ACCESS_SHADER_READ_BIT");
+    }
+
+    /// **M1 护栏**：形状路径报出的「未支持」必须被**收集**（而不是被丢掉）。
+    ///
+    /// 形状路径今天不会产出 `unsupported`（`gpu_geom` 什么都翻译得了）⇒ 这条策略**不可达**。
+    /// 不可达的分支最容易被后人删掉而没有测试发现（review M1 的原话：今天等价、将来会静默少画），
+    /// 所以这里直接喂合成消息钉住「收集」这一步的行为。
+    #[test]
+    fn absorb_unsupported_keeps_every_message_in_order() {
+        let mut acc: Vec<String> = Vec::new();
+        absorb_unsupported(&mut acc, &[]);
+        assert!(acc.is_empty(), "空清单不该产生任何条目");
+
+        absorb_unsupported(&mut acc, &["形状：某条命令未支持".to_string()]);
+        absorb_unsupported(&mut acc, &["文本：另一条".to_string()]);
+        assert_eq!(
+            acc,
+            vec![
+                "形状：某条命令未支持".to_string(),
+                "文本：另一条".to_string()
+            ],
+            "两个管线的消息都要按出现顺序留下（丢了就是静默少画）"
+        );
+    }
+
+    /// **M1 护栏**：帧末的判定 —— 空 ⇒ `Ok`；非空 ⇒ `Unsupported` 且消息带在错误里。
+    #[test]
+    fn unsupported_outcome_errors_iff_there_are_messages() {
+        assert!(unsupported_outcome(&[]).is_ok(), "没有消息 ⇒ 这一帧不算失败");
+
+        let e = unsupported_outcome(&["形状：未支持".to_string(), "文本：未支持".to_string()])
+            .expect_err("有消息就必须报错（否则等于静默少画）");
+        let msg = format!("{e}");
+        assert!(
+            msg.contains("形状：未支持") && msg.contains("文本：未支持"),
+            "两条消息都要出现在错误里（用「；」连接）：{msg}"
+        );
+    }
+
+    /// **M3 护栏**：`vertex_range` 的边界与错误信息（循环里改用它是为了「不提前 return」）。
+    #[test]
+    fn vertex_range_converts_and_rejects_overflow() {
+        assert_eq!(vertex_range(0, 6).expect("正常值"), (0, 6));
+        assert_eq!(vertex_range(1024, 0).expect("零长度也合法"), (1024, 0));
+        assert_eq!(
+            vertex_range(u32::MAX as usize, 1).expect("刚好放得下"),
+            (u32::MAX, 1)
+        );
+        // 溢出：两侧都要报 `Unsupported`（不是 panic、也不是截断）
+        assert!(vertex_range(u32::MAX as usize + 1, 1).is_err(), "偏移溢出必须报错");
+        assert!(vertex_range(0, u32::MAX as usize + 1).is_err(), "数量溢出必须报错");
+        let e = vertex_range(0, u32::MAX as usize + 1).expect_err("应报错");
+        assert!(
+            format!("{e}").contains("超出 u32"),
+            "错误信息要说清是「超出 u32」：{e}"
+        );
     }
 
     /// 一次成功的帧之后可以继续画（否则第一帧之后就全废了）。

@@ -773,6 +773,10 @@ fn text_and_shapes_keep_z_order() {
 }
 
 /// 半透明文本：与 M3a 同样的口径 —— **≤1 LSB**（CPU `round()` vs GPU UNORM 舍入）。
+///
+/// review M4 要求「不止一例」，所以这里给三例，覆盖不同的混合底色：
+/// ① 纯背景上 α=0.5；② 形状之上 α=0.5（**文本要按形状混合过的底色再混一次**）；
+/// ③ α=0.25（权重更小，对舍入更敏感）。
 #[test]
 fn semi_transparent_text_matches_cpu_within_one_lsb() {
     let extent = Extent {
@@ -782,17 +786,168 @@ fn semi_transparent_text_matches_cpu_within_one_lsb() {
     let Some(mut pair) = text_pair(extent, 20.0) else {
         return;
     };
-    let mut l = DrawList::new();
-    l.push(DrawCmd::Text {
+    let alpha_text = |a: f32| DrawCmd::Text {
         rect: RectI::new(4, 4, 110, 36),
         text: "Fade".into(),
-        color: Color::rgba(255, 80, 0, 0.5),
+        color: Color::rgba(255, 80, 0, a),
         size: 20.0,
         align: 0,
+    };
+
+    // ① 背景 + α=0.5
+    let mut l = DrawList::new();
+    l.push(alpha_text(0.5));
+    let worst1 = compare_text(&mut pair, "text-semi-transparent-0.5", &l, 1);
+
+    // ② 形状之上 α=0.5（嵌套混合：先不透明形状、再半透明文本）
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(0, 0, 128, 48),
+        color: Color::rgb(40, 90, 160),
     });
-    let worst = compare_text(&mut pair, "text-semi-transparent", &l, 1);
-    println!("半透明文本最大通道差 = {worst}（要求 ≤1）");
-    assert!(worst <= 1, "半透明文本最大通道差 {worst} 超过 1 LSB");
+    l.push(alpha_text(0.5));
+    let worst2 = compare_text(&mut pair, "text-semi-over-shape", &l, 1);
+
+    // ③ 背景 + α=0.25
+    let mut l = DrawList::new();
+    l.push(alpha_text(0.25));
+    let worst3 = compare_text(&mut pair, "text-semi-transparent-0.25", &l, 1);
+
+    println!("半透明文本最大通道差：{worst1} / {worst2} / {worst3}（要求 ≤1）");
+    for (name, w) in [("0.5", worst1), ("over-shape", worst2), ("0.25", worst3)] {
+        assert!(w <= 1, "半透明文本（{name}）最大通道差 {w} 超过 1 LSB");
+    }
+}
+
+/// **嵌套裁剪 × 文本**（review M4）：两层/三层 `PushClip` 相交之后才轮到文本。
+///
+/// 覆盖的是「裁剪栈被逐命令翻译拆开之后，**多层**求交是否仍与整份列表一致」——
+/// 单层裁剪已有用例，多层是另一条路径（`full ∩ r1 ∩ r2 [∩ r3]`），而且第 ② 例是
+/// 「求交**之后**才为空」这种假阳性（单层裁空已有用例，求交为空是新的一类）。
+#[test]
+fn nested_clips_around_text_match_cpu() {
+    let extent = Extent {
+        width: 128,
+        height: 48,
+    };
+    let Some(mut pair) = text_pair(extent, 20.0) else {
+        return;
+    };
+
+    // ① 两层相交后仍留出文本的一部分
+    let mut l = DrawList::new();
+    l.push(DrawCmd::PushClip {
+        rect: RectI::new(8, 4, 100, 40),
+    });
+    l.push(DrawCmd::PushClip {
+        rect: RectI::new(24, 10, 60, 28),
+    });
+    l.push(text_cmd("Nested", RectI::new(4, 4, 110, 36), 20.0, 0));
+    l.push(DrawCmd::PopClip);
+    l.push(DrawCmd::PopClip);
+    assert_eq!(compare_text(&mut pair, "text-nested-clip", &l, 0), 0);
+
+    // ② 两层**求交之后为空** ⇒ 跳过 + 计数，不报错
+    let mut l = DrawList::new();
+    l.push(DrawCmd::PushClip {
+        rect: RectI::new(0, 0, 20, 20),
+    });
+    l.push(DrawCmd::PushClip {
+        rect: RectI::new(60, 30, 40, 18), // 与上一层不相交
+    });
+    l.push(text_cmd("Nested", RectI::new(4, 4, 110, 36), 20.0, 0));
+    l.push(DrawCmd::PopClip);
+    l.push(DrawCmd::PopClip);
+    let before = pair.0.text_skipped();
+    let gpu = pair.0.render(&l).expect("两层裁剪求交为空 ⇒ 跳过，不报错");
+    assert!(
+        pair.0.unsupported().is_empty(),
+        "求交为空的文本不该进 unsupported"
+    );
+    assert_eq!(
+        pair.0.text_skipped(),
+        before + 1,
+        "求交为空的那条文本应被计入 skipped"
+    );
+    let clear = [CLEAR.r, CLEAR.g, CLEAR.b, 255];
+    assert!(
+        gpu.chunks_exact(4).all(|px| px == clear),
+        "求交为空 ⇒ 帧里不该有被画过的像素"
+    );
+
+    // ③ 三层，且形状与文本都在嵌套裁剪里（顺带确认形状路径的裁剪栈不受拆分影响）
+    let mut l = DrawList::new();
+    l.push(DrawCmd::PushClip {
+        rect: RectI::new(4, 2, 120, 44),
+    });
+    l.push(DrawCmd::PushClip {
+        rect: RectI::new(10, 6, 110, 38),
+    });
+    l.push(DrawCmd::PushClip {
+        rect: RectI::new(16, 10, 96, 30),
+    });
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(0, 0, 128, 48),
+        color: Color::rgb(30, 30, 90),
+    });
+    l.push(text_cmd("Deep", RectI::new(4, 4, 110, 36), 20.0, 0));
+    l.push(DrawCmd::PopClip);
+    l.push(DrawCmd::PopClip);
+    l.push(DrawCmd::PopClip);
+    assert_eq!(compare_text(&mut pair, "text-nested-3-with-shape", &l, 0), 0);
+}
+
+/// **M2 护栏**：文本顶点缓冲的 host→vertex 屏障**必须真的发出来**。
+///
+/// 背景：文本路径引入了第二块顶点缓冲，而它那条屏障一度**只有实现、没有护栏** ——
+/// reviewer 把发射整体删掉，`cargo test -p deer-vk` **17 靶全绿**（总数计数器只有形状帧的
+/// 断言在驱动）。这条测试用**差值**断言三种帧各自的屏障增量。
+#[test]
+fn text_barriers_are_emitted_per_buffer() {
+    let extent = Extent {
+        width: 64,
+        height: 32,
+    };
+    let Some(mut pair) = text_pair(extent, 16.0) else {
+        return;
+    };
+    let counters = |r: &GpuGeometryRenderer| {
+        (
+            r.host_to_vertex_barrier_count(),
+            r.shape_host_to_vertex_barrier_count(),
+            r.text_host_to_vertex_barrier_count(),
+        )
+    };
+    let t0 = counters(&pair.0);
+
+    // ① 文本单管线帧 ⇒ 总数 +1 且**全部记在文本分项**上
+    let mut l = DrawList::new();
+    l.push(text_cmd("Bar", RectI::new(2, 2, 60, 28), 16.0, 0));
+    pair.0.render(&l).expect("文本帧");
+    let t1 = counters(&pair.0);
+    assert_eq!(t1.0, t0.0 + 1, "文本帧应当发出 1 条屏障（总数）");
+    assert_eq!(t1.2, t0.2 + 1, "那条屏障必须记在**文本**分项上（review M2 的护栏）");
+    assert_eq!(t1.1, t0.1, "文本帧不该动形状分项");
+
+    // ② 形状+文本交错 ⇒ 两块缓冲各一条 ⇒ 总数 +2，两个分项各 +1
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(0, 0, 64, 32),
+        color: Color::rgb(10, 10, 40),
+    });
+    l.push(text_cmd("Bar", RectI::new(2, 2, 60, 28), 16.0, 0));
+    pair.0.render(&l).expect("交错帧");
+    let t2 = counters(&pair.0);
+    assert_eq!(t2.0, t1.0 + 2, "两块独立顶点缓冲各要一条屏障");
+    assert_eq!(t2.1, t1.1 + 1, "形状分项 +1");
+    assert_eq!(t2.2, t1.2 + 1, "文本分项 +1");
+
+    // ③ 文本全被跳过（没有顶点）⇒ 不该发文本屏障，也不该发形状屏障
+    let mut l = DrawList::new();
+    l.push(text_cmd("", RectI::new(2, 2, 60, 28), 16.0, 0));
+    pair.0.render(&l).expect("空串帧");
+    let t3 = counters(&pair.0);
+    assert_eq!(t3, t2, "没有顶点要画 ⇒ 屏障计数不该动（实测：{:?} vs {:?}）", t3, t2);
 }
 
 /// **假阳性已修**：空串 / `size <= 0` / 被裁空的文本**不再报错**，而是被跳过并计数
