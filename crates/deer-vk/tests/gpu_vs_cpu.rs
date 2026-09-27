@@ -663,8 +663,52 @@ fn interleaved_shapes_and_text_are_not_reordered_by_merging() {
         "每次换管线都要重新绑定"
     );
     let _ = gpu;
-    // 像素判据：与 CPU 逐字节相同（顺序若被改动，这里会红）
+    // 像素判据：与 CPU 逐字节相同。
+    //
+    // ⚠️ **诚实说明（review 覆盖漏洞）**：本用例的矩形在 `y∈[2,10)`、文本在 `y∈[12,30)`，
+    // **两者在像素上不重叠** ⇒ 就算实现把「形状全部提前、文本全部置后」这种重排做出来，
+    // 这里的像素**也可能全绿** —— 所以本用例对 z 序而言**实质是计数护栏**
+    // （那句「顺序若改动这里会红」的旧注释与事实不符，已删）。
+    // **真正的像素级 z 序护栏是下面 `overlapping_shape_after_text_is_detected_by_pixels_*`**。
     assert_eq!(compare_text(&mut pair, "interleaved-not-reordered", &l, 0), 0);
+}
+
+/// **z 序的像素级护栏（review 覆盖漏洞的补丁）**：形状与文本在**像素上重叠**，形状后画。
+///
+/// 为什么必须补：上面那条交错用例的矩形与文本**不重叠** ⇒ 「允许重排的合段」这类变异
+/// 只在计数上露馅、**像素全绿**（reviewer 用重叠语料做探针，红了 255）。
+/// 本用例让**不透明矩形完整盖住文本**：
+/// - 顺序 = 文本先、矩形后 ⇒ 文本必须被完全盖住；
+/// - 顺序 = 矩形先、文本后 ⇒ 文本必须可见（两条都查，避免「永远盖住」的假实现）。
+///
+/// 任何「为了少一次 draw 而重排绘制顺序」的实现都会在这里的像素上红（RGB 差可达 255）。
+#[test]
+fn overlapping_shape_after_text_is_detected_by_pixels_not_only_counts() {
+    let extent = Extent {
+        width: 96,
+        height: 40,
+    };
+    let Some(mut pair) = text_pair(extent, 20.0) else {
+        return;
+    };
+    // ① 文本先画
+    let mut l = DrawList::new();
+    l.push(text_cmd("Wg", RectI::new(4, 4, 88, 32), 20.0, 0));
+    // ② **同一块区域**再盖一个不透明矩形 ⇒ 文本必须被完全盖住
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(0, 0, 96, 40),
+        color: Color::rgb(200, 30, 30),
+    });
+    assert_eq!(compare_text(&mut pair, "z-order-overlap-shape-wins", &l, 0), 0);
+
+    // 反向顺序：矩形先、文本后 ⇒ 文本必须可见
+    let mut l2 = DrawList::new();
+    l2.push(DrawCmd::FillRect {
+        rect: RectI::new(0, 0, 96, 40),
+        color: Color::rgb(200, 30, 30),
+    });
+    l2.push(text_cmd("Wg", RectI::new(4, 4, 88, 32), 20.0, 0));
+    assert_eq!(compare_text(&mut pair, "z-order-overlap-text-wins", &l2, 0), 0);
 }
 
 /// **R1-3**：「上次提交未确认完成」之后，`render` 必须**必定报错**，且不去碰任何资源。

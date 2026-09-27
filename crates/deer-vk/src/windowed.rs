@@ -144,13 +144,13 @@ struct UiResources {
     texture: Option<Texture>,
     /// 已上传图集的指纹 `(宽, 高, 已光栅化字形数)`；`None` = 还没传过。
     uploaded: Option<(u32, u32, usize)>,
-    /// **上一次实际上传的顶点字节**（M3+ B3；`None` = 缓冲里没有可信数据）。
+    /// **上一次实际上传的字节 + 当时那块缓冲的句柄**（M3+ B3）。
     ///
-    /// 逐字节精确比较（不用哈希：那有碰撞概率）；缓冲被重建/资源被释放时随
-    /// `UiResources` 一起作废（释放 ⇒ 整个结构析构；重建 ⇒ 由 `ensure_ui_vertex_capacity`
-    /// 的返回值清空）。
-    uploaded_shape: Option<Vec<u8>>,
-    uploaded_text: Option<Vec<u8>>,
+    /// ⚠️ **记句柄是关键（review I-1）**：跳过重传的条件是「**同一块缓冲** + 字节相同」；
+    /// 缓冲一旦换新（容量增长、`release_ui_resources()` 之后重建），句柄就不匹配 ⇒
+    /// **自动作废**，不依赖任何调用方记得清记录。
+    uploaded_shape: Option<(vk::BufferHandle, Vec<u8>)>,
+    uploaded_text: Option<(vk::BufferHandle, Vec<u8>)>,
 }
 
 /// 存活中的 [`UiResources`] 实例数（进程级）。
@@ -649,6 +649,15 @@ pub struct WindowedRenderer {
     stats: RenderStats,
     /// 本帧是否**真的上传**了形状/文本顶点（M3+ B3）：决定要不要发 host→vertex 屏障。
     ui_barriers: (bool, bool),
+    /// 累计发出的 host→vertex 屏障里，属于**形状**顶点缓冲的条数（review I-2 的护栏）。
+    shape_host_to_vertex_barriers: u64,
+    /// 累计发出的 host→vertex 屏障里，属于**文本**顶点缓冲的条数。
+    ///
+    /// 为什么必须有（review I-2）：窗口路径的屏障一度**没有计数、没有测试** ——
+    /// reviewer 变异「窗口从不发屏障」后 `window_parity` 与 `swapchain_smoke` **全绿**。
+    /// 计数写在**发屏障的同一处**（`record_ui` 里的 `cmd_pipeline_barrier` 旁），
+    /// 删掉发射就必然删掉计数。
+    text_host_to_vertex_barriers: u64,
 }
 
 impl WindowedRenderer {
@@ -759,6 +768,8 @@ impl WindowedRenderer {
             ui_builds: 0,
             stats: RenderStats::default(),
             ui_barriers: (false, false),
+            shape_host_to_vertex_barriers: 0,
+            text_host_to_vertex_barriers: 0,
         })
     }
 
@@ -1157,6 +1168,16 @@ impl WindowedRenderer {
         self.stats
     }
 
+    /// 累计发出的 host→vertex 屏障里属于**形状**顶点缓冲的条数（review I-2 的护栏）。
+    pub fn shape_host_to_vertex_barrier_count(&self) -> u64 {
+        self.shape_host_to_vertex_barriers
+    }
+
+    /// 累计发出的 host→vertex 屏障里属于**文本**顶点缓冲的条数（review I-2 的护栏）。
+    pub fn text_host_to_vertex_barrier_count(&self) -> u64 {
+        self.text_host_to_vertex_barriers
+    }
+
     /// **主动释放**界面资源（两条管线 + 描述符集 + 图集纹理 + 两块顶点缓冲）；
     /// 下一次 `draw_and_present` 会按当前交换链尺寸/格式重建。
     ///
@@ -1324,18 +1345,23 @@ impl WindowedRenderer {
             let dev = &self.device;
             let stats = &mut self.stats;
             let ui = self.ui.as_mut().expect("ensure_ui 之后必有资源");
-            let created = ensure_ui_vertex_capacity(dev, &mut ui.shape_vb, bytes as u64, stats)?;
-            if created {
-                ui.uploaded_shape = None;
-            }
+            ensure_ui_vertex_capacity(dev, &mut ui.shape_vb, bytes as u64, stats)?;
             // SAFETY: `GpuVertex` 是 `#[repr(C)]` 纯 `f32`（无指针、无 Drop）⇒ 字节视图合法。
             let src = unsafe {
                 std::slice::from_raw_parts(shape_verts.as_ptr() as *const u8, bytes)
             };
-            if ui.uploaded_shape.as_deref() != Some(src) {
+            let handle = ui
+                .shape_vb
+                .as_ref()
+                .expect("刚 ensure 过")
+                .buffer
+                .handle();
+            // 跳过条件：**同一块缓冲**（句柄相等）且字节相同 —— 句柄一变就自动作废（I-1）
+            let same = matches!(&ui.uploaded_shape, Some((h, b)) if *h == handle && b.as_slice() == src);
+            if !same {
                 let vb = ui.shape_vb.as_ref().expect("刚 ensure 过");
                 upload_ui_vertices(dev, vb, src, "vkMapMemory(窗口形状顶点)", stats)?;
-                ui.uploaded_shape = Some(src.to_vec());
+                ui.uploaded_shape = Some((handle, src.to_vec()));
                 uploaded_shape_now = true;
             }
         }
@@ -1344,18 +1370,22 @@ impl WindowedRenderer {
             let dev = &self.device;
             let stats = &mut self.stats;
             let ui = self.ui.as_mut().expect("ensure_ui 之后必有资源");
-            let created = ensure_ui_vertex_capacity(dev, &mut ui.text_vb, bytes as u64, stats)?;
-            if created {
-                ui.uploaded_text = None;
-            }
+            ensure_ui_vertex_capacity(dev, &mut ui.text_vb, bytes as u64, stats)?;
             // SAFETY: `TextVertex` 是 `#[repr(C)]` 纯 `f32` ⇒ 字节视图合法。
             let src = unsafe {
                 std::slice::from_raw_parts(text_verts.as_ptr() as *const u8, bytes)
             };
-            if ui.uploaded_text.as_deref() != Some(src) {
+            let handle = ui
+                .text_vb
+                .as_ref()
+                .expect("刚 ensure 过")
+                .buffer
+                .handle();
+            let same = matches!(&ui.uploaded_text, Some((h, b)) if *h == handle && b.as_slice() == src);
+            if !same {
                 let vb = ui.text_vb.as_ref().expect("刚 ensure 过");
                 upload_ui_vertices(dev, vb, src, "vkMapMemory(窗口文本顶点)", stats)?;
-                ui.uploaded_text = Some(src.to_vec());
+                ui.uploaded_text = Some((handle, src.to_vec()));
                 uploaded_text_now = true;
             }
         }
@@ -1501,13 +1531,15 @@ impl WindowedRenderer {
             (
                 self.ui_barriers.0,
                 ui.shape_vb.as_ref().map(|v| v.buffer.handle()),
+                true,
             ),
             (
                 self.ui_barriers.1,
                 ui.text_vb.as_ref().map(|v| v.buffer.handle()),
+                false,
             ),
         ];
-        for (used, buffer) in used {
+        for (used, buffer, is_shape) in used {
             let (true, Some(buffer)) = (used, buffer) else {
                 continue;
             };
@@ -1536,6 +1568,12 @@ impl WindowedRenderer {
                     0,
                     ptr::null(),
                 );
+            }
+            // 计数与真实调用同处（review I-2）：删掉发射就必然删掉计数
+            if is_shape {
+                self.shape_host_to_vertex_barriers += 1;
+            } else {
+                self.text_host_to_vertex_barriers += 1;
             }
         }
 
