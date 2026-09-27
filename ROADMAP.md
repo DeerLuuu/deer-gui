@@ -10,7 +10,7 @@
 |---|---|---|---|
 | **M1** | **核心 + HAL + Vulkan 设备枚举** | 节点树、布局代数、命中测试、`.dui` 解析；GPU HAL + CPU 参考后端；Vulkan 实例与物理设备枚举（自己声明符号 + 动态加载） | ✅ **完成** |
 | **M2** | Vulkan 逻辑设备 + 交换链 | M2a：逻辑设备/管线/命令/离屏回读；M2b：窗口 + `VkSurfaceKHR` + 交换链 + 帧同步 + 呈现 | ✅ **完成（M2a + M2b）** |
-| **M3** | 渲染器 + 管线（矩形/圆角/裁剪/文本） | M3a：非文本几何的 `DrawList` → GPU（顶点缓冲 + 静态管线 + 与 CPU 逐像素对照）；M3b：文本/字形上 GPU；M3c：窗口里显示界面；还欠批处理优化 | 🔄 **进行中（M3a 完成，M3b/M3c 未做）** |
+| **M3** | 渲染器 + 管线（矩形/圆角/裁剪/文本） | M3a：形状的 `DrawList` → GPU（顶点缓冲 + 静态管线 + 与 CPU 逐像素对照）；M3b：文本/字形 → GPU（第二条管线 + 图集纹理 + 逐像素对照）；M3c：窗口里显示界面；还欠批处理优化 | 🔄 **进行中（M3a + M3b 完成，M3c/M3+ 未做）** |
 | **M4** | 文本 | 字体解析（TTF/OTF）+ 字形光栅化 + 图集 + 文本度量（替换 `ApproxMeasure`）+ 换行 | 🔄 **进行中（解析 / 光栅化 / 图集 / 度量与换行 / CPU 真实字形 ✅；hinting 与亚像素待做）** |
 | **M5** | 输入 + 焦点 + dock | 事件循环、命中测试路由（`hit_test` 已就位）、焦点系统（含方向键）、**可停靠面板布局**（拖动改位置 / 边缘折叠） | ⬜ |
 | **M6** | 控件族 | 从 `deer-ui` 迁移 12 个控件的**语义**：`Btn`/`ChipGroup`/`Segmented`/`TabBar`/`Switch`/`NumberField`/`ScrubNum`/`ColorField`/`Dialog`/`Overlay`/`DropMenu`/`HoverTip`/`Icon`/`Row`/`RowActions`/`Keep` | ⬜ |
@@ -59,8 +59,8 @@ $env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo test -p deer-v
 > HAL 路径的真人肉验收是上面的 `hal_window_path` 示例（`DEER_HAL_FRAMES` 可改帧数，默认 30）。
 
 > **M2b 的边界**：它只保证「GPU 画的像素能出现在窗口上」—— 窗口里是清屏色 + M2a 验证过的几何。
-> 把 `DrawList` 送上 GPU 属于 **M3**：**M3a 已完成**（非文本几何，离屏、与 CPU 逐字节对齐）；
-> 文本是 **M3b**、窗口里显示界面是 **M3c**；输入事件属于 **M5**。
+> 把 `DrawList` 送上 GPU 属于 **M3**：**M3a（形状）与 M3b（文本）都已完成**（离屏、与 CPU 逐像素对齐）；
+> 窗口里显示界面是 **M3c**；输入事件属于 **M5**。
 
 ### M3 的子步与状态
 
@@ -71,22 +71,28 @@ M3 原写成一条「渲染器 + 管线（矩形/圆角/裁剪/文本）」。�
 | **M3a-1** | **顶点流 + 着色器**：`gpu_geom.rs`（`DrawList` → `GpuVertex` 流，CPU 侧几何裁剪）、`spirv.rs` 的矩形属性 VS/FS | ✅ 完成 | 顶点布局 `#[repr(C)]` stride 44（`pos`/`rect`/`radius_kind`/`color`）；**静态** viewport/scissor；着色器经 `spirv-val` |
 | **M3a-2** | **离屏 GPU 几何渲染器**：`gpu_render.rs` 的 `GpuGeometryRenderer`（顶点缓冲 + 静态管线 + 回读） | ✅ 完成 | `cargo run -p deer-gui --example gpu_geometry` → `exit=0`；与 CPU **逐字节相同** |
 | **M3a-3** | **与 CPU 逐像素对照**：`crates/deer-vk/tests/gpu_vs_cpu.rs` | ✅ 完成 | 不透明语料**最大通道差 0**（逐字节相同）；半透明语料**最大差 1 LSB**（实测仅 `alpha-clip` 非 0，**是实测上限不是证明上界**）；覆盖矩形/圆角（含超大半径）/描边（含带宽 > 边长）/裁剪/**嵌套裁剪**/退化 extent/清屏/连续多帧；`DEER_VK_VALIDATION=1` 下 parity **零校验消息**（**「层确实在跑」与「消息为零」都是可回归断言** —— 进程级计数 + parity 用例里的 `assert_no_validation_messages`，当前覆盖单帧/不透明/半透明/越界 alpha；但 VVL 不做通用同步验证 ⇒ 零消息**不能**证明内存域依赖正确） |
-| **M3b** | **文本 / 字形上 GPU** | ⬜ | `DrawCmd::Text` 目前明确 `Unsupported`；需要纹理（字形图集）与采样。**已知限制（本轮 defer）**：这个 `Unsupported` 是**无条件**的 —— 空串 / 零面积 / 整块被 clip 裁掉时 GPU 也报错，而 CPU 能正常出图（**假阳性**）；M3b 做文本时必须一并处理，详见 [`docs/features/gpu-geometry.md`](docs/features/gpu-geometry.md) 第 6 节的「做不到」 |
-| **M3c** | **窗口里显示界面** | ⬜ | M2b 能上屏、M3a 能离屏画出界面几何，但两者还没接起来（窗口里仍只有清屏色 + M2a 几何） |
-| **M3+** | **批处理优化** | ⬜ | 当前**每帧一个顶点缓冲、一次 draw**；属性能项，不影响正确性 |
+| **M3b-1** | **文本顶点流**：`gpu_text.rs`（`DrawCmd::Text` → `TextVertex` 四边形流，图集 `uv` + 屏幕 `pos` + 颜色） | ✅ 完成 | 顶点布局 `#[repr(C)]` **stride 32**（`pos`/`uv`/`color`）；空串 / `size <= 0` / 被裁空 / 图集放不下 ⇒ **跳过并计入 `skipped`，不报错**（修掉 M3a 的假阳性） |
+| **M3b-2** | **R8 覆盖率纹理 + 最近邻采样 + 描述符集**（`device.rs`） | ✅ 完成 | 图集纹理 `R8_UNORM`、`mip_levels = 1`、**NEAREST + ClampToEdge**；采样着色器过官方 `spirv-val` |
+| **M3b-3** | **第二条管线 + 单次遍历保 z 序**（`gpu_render.rs::with_text`） | ✅ 完成 | 独立顶点缓冲/管线/描述符集；文本与形状**交错**时按命令顺序绘制；图集只在**指纹变化**时重传（指纹 = `(图集宽, 图集高, 已光栅化字形数)`） |
+| **M3b-4** | **文本与 CPU 逐像素对照**（`tests/gpu_vs_cpu.rs`） | ✅ 完成 | 不透明文本**逐字节相同（最大通道差 0）**、半透明文本 **≤ 1 LSB**；语料含单/多字符、`align=0/1/2`、超大 size、空串、零面积、被裁空、局部裁剪、缺字豆腐、z 序、连续 4 帧；**假阳性三类 ⇒ 跳过并计数**；图集零重传有护栏 |
+| **M3b-5** | **文档 + 示例**（本指南 + `gpu_geometry` 示例扩成含文本） | ✅ 完成 | `cargo run -p deer-gui --example gpu_geometry` → `exit=0`（形状 + 文本仍与 CPU 逐字节相同） |
+| **M3c** | **窗口里显示界面** | ⬜ | M2b 能上屏、M3a/M3b 能**离屏**画出形状与文本，但两者还没接起来（窗口里仍只有清屏色 + M2a 几何） |
+| **M3+** | **批处理优化** | ⬜ | 形状与文本**各自**每帧一个顶点缓冲、一次 draw；属性能项，不影响正确性 |
 
-**M3a 的四条不可回退前提**（细节见 [`docs/features/gpu-geometry.md`](docs/features/gpu-geometry.md) 第 3 节）：
+**M3 的不可回退前提**（细节见 [`docs/features/gpu-geometry.md`](docs/features/gpu-geometry.md) 第 3 节）：
 
 1. **静态 viewport/scissor** —— 动态版在本机 Intel 核显上**画不出任何像素**（M2a 实测），
    故管线写死静态状态、录制时不调 `vkCmdSetViewport`/`vkCmdSetScissor`；换 extent 就新建渲染器。
 2. **颜色附件必须 `R8G8B8A8_UNORM`（不是 `_SRGB`）** —— CPU 基准不做 gamma，用 SRGB 会系统性偏差。
 3. **「零校验消息」是可回归断言，但有明确覆盖边界** —— 「层确实在跑」由
    `validation_layer_state_matches_the_request` 钉住；「消息为零」由 `ffi::validation_message_count()`
-   （进程级计数）配合 parity 用例里的 `assert_no_validation_messages`（单帧/不透明/半透明/越界 alpha）钉住（不再靠人眼看 stderr）。
+   （进程级计数）配合 parity 用例里的 `assert_no_validation_messages`（单帧/不透明/半透明/越界 alpha/文本）钉住（不再靠人眼看 stderr）。
    **限制仍在**：计数只在 `DEER_VK_VALIDATION=1` 时有判别力，且 **VVL 不做通用同步验证** ⇒
    「零消息」**不能**证明内存域依赖正确（如 host→vertex 屏障；那条由
    `host_to_vertex_barrier_is_emitted_once_per_non_empty_frame` 单独守）。
 4. **半透明 1 LSB 是实测上限而非证明上界**。
+5. **文本必须用「最近邻 + ClampToEdge + `R8_UNORM` + `mip_levels = 1`」这一组**：
+   CPU 是**整数查表**，线性过滤会把邻居纹素混进来；换成别的采样方式就不再逐像素等价。
 
 ### M4 的细步与状态
 
@@ -103,8 +109,8 @@ M4 当时还没有窗口层的 `winit` 例外 —— 该例外是 M2b 引入的�
 | **M4-5** | **CPU 后端真实字形**（`text.rs` + `null.rs` + 门面 + 示例） | ✅ 完成 | `TextEngine` 串起度量/光栅化/图集；`CpuRenderer::with_text` 贴真实字形，`CpuRenderer::new()` 旧占位行为不变 |
 | **M4-6** | **hinting 与亚像素定位** | ⬜ | 现在用**超采样抗锯齿** + **整数像素落位**代替；不做 `glyph` instructions、不做 LCD 子像素 |
 
-> **GPU 侧文本不在这张表里**：它属于 **M3b**（M3a 已把**非文本**几何送上 GPU 并与 CPU 逐字节对齐）。
-> 本里程碑交付的**字形图集已就绪**，正是它的前置依赖 —— 参见 `FEATURES.md` 第四节。
+> **GPU 侧文本不在这张表里**：它属于 **M3b，且已完成**（第二条管线 + 图集纹理，与 CPU 逐像素对齐；
+> 见上面「M3 的子步与状态」）。本里程碑交付的**字形图集**正是它的前置依赖。
 
 ## 依赖纪律（硬性）
 
@@ -173,4 +179,4 @@ deer-window v0.0.0
 | Q-2 | ~~SPIR-V 来源~~ | ✅ **已解决（M2a-1）**：自写极简 SPIR-V 汇编器（`crates/deer-vk/src/spirv.rs`），**零外部依赖**，产物已被真机驱动接受（3 支着色器）。附带一条经验：`vkCreateShaderModule` **很宽容**（连 `bound=0` 都接受），所以「驱动接受」≠「SPIR-V 正确」，必须自己加结构护栏。 |
 | Q-3 | ~~文本度量与布局的耦合~~ | ✅ **已落实（M4-4/M4-5）**：`FontMeasure` 通过 `Measure` 注入点接入布局；`ApproxMeasure` 保留为**确定性测试用**实现（不带字体的 `render_tree_to_png` 仍用它）。**新纪律**：布局、绘制列表、光栅化必须用同一个字号、同一个度量。 |
 | Q-4 | 线程模型 | HAL 故意不实现 `Send`/`Sync`；M2 需要定「渲染线程 vs UI 线程」的边界。 |
-| Q-5 | **推送常量矩形着色器损坏（遗留缺陷，M2b 登记）** | **现象**：`crates/deer-vk/src/spirv.rs::vertex_shader_rect_pushconstant` 产出的 SPIR-V 被校验层判 `VUID-StandaloneSpirv-PushConstant-06808`（源码里已标「已知不工作，不要用它建管线」）。**影响**：普通驱动会「宽容接受」（不带校验层的验收照跑）；**请求校验层时**该 SPIR-V 会让进程 **`0xc0000005` 访问违例崩溃** —— 所以从 **t15** 起，`tests/device_smoke.rs` 与 `tests/pipeline_smoke.rs` 里涉及它的测试在**请求了校验层时显式跳过**（stderr 写明「这不是通过，是被显式跳过」），于是 `DEER_VK_VALIDATION=1` 跑全量 deer-vk 是安全动作。**现状（task-18 后）**：设备/离屏路径曾经**故意不读**这个环境变量，是因为 offscreen 侧有 3 个真缺陷（barrier `sType` 写成 47、`oldLayout` 与渲染通道 `finalLayout` 不符、图像内存 `mem::forget` 泄漏）；**t18 已全部修掉**，所以现在 `VkBackend::new`、设备/离屏路径与窗口路径 `WindowedRenderer` **三条路一致尊重** `DEER_VK_VALIDATION`。本机实测：`DEER_VK_VALIDATION=1 cargo test -p deer-vk` → **167 passed / 0 failed、零条校验消息**（数字随测试增减漂移，**以运行输出为准**）；`DEER_VK_VALIDATION=1` 跑窗口示例 30 帧 → 零消息、`exit=0`。**修好它**归属 **M3**：矩形绘制改走**顶点缓冲**（与 M2a-3 记录的同一根因）。 |
+| Q-5 | **推送常量矩形着色器损坏（遗留缺陷，M2b 登记）** | **现象**：`crates/deer-vk/src/spirv.rs::vertex_shader_rect_pushconstant` 产出的 SPIR-V 被校验层判 `VUID-StandaloneSpirv-PushConstant-06808`（源码里已标「已知不工作，不要用它建管线」）。**影响**：普通驱动会「宽容接受」（不带校验层的验收照跑）；**请求校验层时**该 SPIR-V 会让进程 **`0xc0000005` 访问违例崩溃** —— 所以从 **t15** 起，`tests/device_smoke.rs` 与 `tests/pipeline_smoke.rs` 里涉及它的测试在**请求了校验层时显式跳过**（stderr 写明「这不是通过，是被显式跳过」），于是 `DEER_VK_VALIDATION=1` 跑全量 deer-vk 是安全动作。**现状（task-18 后）**：设备/离屏路径曾经**故意不读**这个环境变量，是因为 offscreen 侧有 3 个真缺陷（barrier `sType` 写成 47、`oldLayout` 与渲染通道 `finalLayout` 不符、图像内存 `mem::forget` 泄漏）；**t18 已全部修掉**，所以现在 `VkBackend::new`、设备/离屏路径与窗口路径 `WindowedRenderer` **三条路一致尊重** `DEER_VK_VALIDATION`。本机实测：`DEER_VK_VALIDATION=1 cargo test -p deer-vk` → **200 passed / 0 failed、零条校验消息**（M3b 冻结 HEAD 实测；数字随测试增减漂移，**以运行输出为准**）；`DEER_VK_VALIDATION=1` 跑窗口示例 30 帧 → 零消息、`exit=0`。**修好它**归属 **M3**：矩形绘制改走**顶点缓冲**（与 M2a-3 记录的同一根因）。 |

@@ -338,8 +338,8 @@ deer-gui = { path = "Z:/deer-gui/crates/deer-gui" }
 | 想做的事 | 现状 |
 |---|---|
 | 界面显示在**窗口**里 | ✅ **能开窗**（M2b，**仅 Windows**）：窗口里是 GPU 清屏色 + 几何；**界面（控件/文字）上屏是 M3** |
-| **GPU 渲染**出图 | ✅ 离屏 Vulkan 已画出正确像素（M2a-6 修复了 SPIR-V 段序缺陷）；✅ 窗口呈现已打通（M2b）；❌ **消费 `DrawList`（界面）是 M3** |
-| 图片里的字是**真字体** | ✅ **离屏**已支持（第 11 章）；**GPU 侧文本**仍 ❌（M3） |
+| **GPU 渲染**出图 | ✅ 离屏 Vulkan 已画出正确像素（M2a-6 修复了 SPIR-V 段序缺陷）；✅ 窗口呈现已打通（M2b）；✅ **消费 `DrawList`（形状 M3a + 文本 M3b）**：离屏、与 CPU 逐像素对照（第 13 章）；❌ 把它呈到窗口里是 M3c |
+| 图片里的字是**真字体** | ✅ **离屏**已支持（第 11 章 CPU 侧、第 13 章 **GPU 侧 M3b**）：GPU 画真字形与 CPU 逐字节相同 |
 | **鼠标点击 / 键盘输入** | ❌ M5（`hit_test` 有了，但没有事件派发） |
 | **Tab 焦点** / 方向键导航 | ❌ M5 |
 | **可停靠面板 dock** | ❌ M5 |
@@ -391,7 +391,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 - 想深入底层（自己把字形打进图集）：`cargo run -p deer-gui --example glyph_atlas`，
   配合 [`features/glyph-raster.md`](features/glyph-raster.md) 与 [`features/glyph-atlas.md`](features/glyph-atlas.md)。
 
-**仍然做不到**：GPU 侧文本（M3）、**窗口里显示界面**（M3：窗口能开，但里面还没有控件/文字）、
+**仍然做不到**：**窗口里显示界面**（M3c：窗口能开，但里面还没有控件/文字；离屏的 GPU 形状 + 文本见第 13 章）、
 子像素定位、多字体回退、富文本/图标字体、hinting、CFF 字体。完整边界见
 [`features/text-rendering.md`](features/text-rendering.md) 第 6 节。
 
@@ -430,8 +430,8 @@ $env:DEER_WINDOW_HOLD='1'; cargo run -p deer-gui --features window --example win
 - **事件循环必须在主线程**：窗口与事件循环由 `deer_window::run(config, app)` 管，
   你实现 `App`（`init` 建渲染器 / `redraw` 画一帧 / 可选 `resized`）。
 - **窗口里还不是界面**：M2b 只保证「GPU 画的像素能出现在窗口上」——现在显示的是清屏色 + M2a
-  验证过的几何。**M3a 已能把非文本界面几何画到 GPU（离屏，见第 13 章）**，但把它呈到窗口里是 **M3c**、
-  文本上 GPU 是 **M3b**。
+  验证过的几何。**M3a（形状）与 M3b（文本）都已能把界面画到 GPU（离屏，见第 13 章）**，
+  但把它呈到窗口里仍是 **M3c**。
 - **交换链会过期**：`render_and_present()` 返回 `OutOfDate` 时**必须 resize 后重试**，不许当成功。
 - **第一帧会回读像素核对**（`read_back_last_frame()`）：终端里能看到
   `像素回读 : 四角 [71, 79, 105, 255] = sRGB 编码后的清屏色 rgb(0x10,0x14,0x24)` ——
@@ -445,9 +445,9 @@ $env:DEER_WINDOW_HOLD='1'; cargo run -p deer-gui --features window --example win
 
 ---
 
-## 13. 用 GPU 画界面
+## 13. 用 GPU 画界面（形状 + 文本）
 
-**目标**：让 **Vulkan** 画出界面树的几何（**不含文本**），并且与 CPU 参考实现**逐像素一致**（M3a）。
+**目标**：让 **Vulkan** 画出界面树（**形状 + 真实字形文本**），并且与 CPU 参考实现**逐像素一致**（M3a + M3b）。
 
 ```powershell
 cargo run -p deer-gui --example gpu_geometry
@@ -456,48 +456,65 @@ cargo run -p deer-gui --example gpu_geometry
 **你会看到**（本机实测）：
 
 ```text
-画布        : 320×200
-绘制命令    : 14 条（填充 0 / 圆角 7 / 描边 7 / 裁剪 0 对 / 文本 0）
-顶点数      : 210（每帧一个顶点缓冲、一次 draw）
-非清屏色像素: 3152 / 64000
+字体        : C:\Windows\Fonts\consola.ttf
+画布        : 360×220（字号 16px）
+绘制命令    : 17 条（填充 0 / 圆角 7 / 描边 5 / 裁剪 0 对 / 文本 5）
+文本管线    : 已接管（with_text）
+跳过文本    : 1（空串 / size<=0 / 被裁空 / 图集放不下）
+非清屏色像素: 10324 / 79200
 最大通道差  : 0（要求 0，逐字节相同）
-额外场景    : 裁剪 + 嵌套裁剪 + 粗描边（带宽 > 边长）→ 最大通道差 0
+额外场景    : 裁剪 + 嵌套裁剪 + 粗描边 + 被裁空文本 → 最大通道差 0
+重复渲染    : 像素逐字节相同、图集**零重传**（上传计数差 0）
+产物        : render_out/gpu_geometry.png 与 render_out/gpu_geometry_cpu.png（两份文件逐字节相同）
 ```
 
-产物：`render_out/gpu_geometry.png`（GPU 回读）与 `render_out/gpu_geometry_cpu.png`（CPU 基准）——
-两张图逐字节相同（可以直接用看图工具对比）。
+产物两张 PNG **逐字节相同**（可以直接用看图工具对比；示例里直接断言了两份文件相等）。
 
 ```rust
-// 片段（放在返回 Result<(), String> 的函数里）：extent / theme / list 见上一段
+// 片段（放在返回 Result<(), String> 的函数里）：extent / theme / list 见上文
 use deer_gui::prelude::*;
 use deer_gui::vk::GpuGeometryRenderer;
+use std::path::Path;
 
-// 同一份 DrawList：GPU 画一遍，CPU 画一遍，再逐字节比
-let mut gpu = GpuGeometryRenderer::new(0, extent, theme.surface).map_err(|e| e.to_string())?;
-let gpu_px = gpu.render(&list).map_err(|e| e.to_string())?;
-let mut cpu_renderer = CpuRenderer::new();
-let cpu = cpu_renderer
-    .render(extent, &list, theme.surface)
+// 同源的两个引擎：同一字体、同一字号（图集槽位才会一致）
+let engine_gpu = TextEngine::from_font_file(Path::new(&font_path), 16.0).map_err(|e| e.to_string())?;
+let engine_cpu = TextEngine::from_font_file(Path::new(&font_path), 16.0).map_err(|e| e.to_string())?;
+
+let mut gpu = GpuGeometryRenderer::new(0, extent, theme.surface)
+    .map_err(|e| e.to_string())?
+    .with_text(engine_gpu)            // ← 文本管线（不调它 ⇒ Text 报 Unsupported）
     .map_err(|e| e.to_string())?;
-assert_eq!(gpu_px, cpu.pixels, "不透明几何必须逐字节相同");
+let gpu_px = gpu.render(&list).map_err(|e| e.to_string())?;
+
+let mut cpu_renderer = CpuRenderer::with_text(engine_cpu);   // ← 必须 with_text（new() 是占位格模型）
+let cpu = cpu_renderer.render(extent, &list, theme.surface).map_err(|e| e.to_string())?;
+assert_eq!(gpu_px, cpu.pixels, "不透明内容（形状 + 文本）必须逐字节相同");
 ```
 
 **这一章的关键概念**：
-- **这条链不含文本**：`DrawCmd::Text` 目前明确 `Unsupported`（文本上 GPU 是 **M3b**）。
-  示例的树只用带 `pad` 的容器 —— 它们只产生 `FillRoundRect` / `StrokeRect`。
-- **硬判据是与 CPU 逐字节相同**：不透明几何最大通道差 **0**；半透明场景实测最大差 **1 LSB**
+- **文本要 `with_text`**：`GpuGeometryRenderer::new(..)` 之后不调 `with_text` ⇒ `DrawCmd::Text` 仍按 M3a 行为报
+  `Unsupported`（刻意不静默丢弃）；调了之后由**第二条管线**绘制（字形四边形 + 图集纹理 + 最近邻采样）。
+- **CPU 侧必须 `CpuRenderer::with_text`**：`CpuRenderer::new()` 是**占位格**模型（0.6em 方块 + i32 截断除法），
+  拿它跟 GPU 的真字形比会「全红且难定位」。
+- **硬判据是与 CPU 逐字节相同**：不透明内容（形状 + 文本）最大通道差 **0**；半透明 ≤ **1 LSB**
   （**实测上限，不是证明上界**），全量对照见 `crates/deer-vk/tests/gpu_vs_cpu.rs`。
+- **空串 / 零面积 / 被裁空的文本**（CPU 一个像素都不画）在 M3b 里是**跳过并计入 `text_skipped()`**，不再报错
+  —— 这修掉了 M3a 那条「无条件 `Unsupported`」的假阳性。
+- **有一条有意差异**：`size <= 0` 的文本 GPU **跳过**，而 CPU 会把字号夹到 `>= 1` **画出 1px 字形** ⇒
+  这种场景两边**不会**逐字节相同（parity 语料刻意不含它）。见 [`features/gpu-geometry.md`](features/gpu-geometry.md) 第 6 节。
 - **静态 viewport/scissor**：动态版在本机 Intel 核显上**画不出任何像素**（M2a 实测），
   所以管线把 viewport/scissor 写死；**换画布尺寸要新建渲染器**。
-- **颜色附件是线性 `R8G8B8A8_UNORM`**（不是 `_SRGB`）：CPU 基准不做 gamma，用 SRGB 会系统性偏差。
+- **颜色附件是线性 `R8G8B8A8_UNORM`**（不是 `_SRGB`）：CPU 基准不做 gamma，用 SRGB 会系统性偏差；
+  字形图集是 **`R8_UNORM`**、**NEAREST + ClampToEdge**、`mip_levels = 1`，且**只在图集指纹变化时重传**。
+- **`align` 未定义值（`>= 3`）⇒ 左对齐**（与 CPU 相同的契约）。
 - **`DEER_VK_VALIDATION=1` 下 parity 零校验消息是「可回归断言」**：「层确实在跑」与「消息为零」
-  都有断言（`validation_layer_state_matches_the_request` + `ffi::validation_message_count()` 的三处
+  都有断言（`validation_layer_state_matches_the_request` + `ffi::validation_message_count()` 配合
    `assert_no_validation_messages`）。但**它不能证明内存域依赖正确**：VVL 不做通用同步验证，
    删掉 host→vertex 屏障它也不报错（那条由 `host_to_vertex_barrier_is_emitted_once_per_non_empty_frame` 守）。
-- 当前**每帧一个顶点缓冲、一次 draw**（没有批处理优化），属性能项、不影响正确性。
+- 当前形状与文本**各自**每帧一个顶点缓冲、一次 draw（没有批处理优化），属性能项、不影响正确性。
 
-**仍然做不到**：文本/字形（M3b）、纹理、窗口里显示界面（M3c）、批处理优化、sRGB/色彩管理、MSAA。
-完整边界见 [`features/gpu-geometry.md`](features/gpu-geometry.md) 第 6 节。
+**仍然做不到**：通用 RGBA 图像/纹理、窗口里显示界面（M3c）、批处理优化、sRGB/色彩管理、MSAA，
+以及「`size <= 0` 与 CPU 一致」。完整边界见 [`features/gpu-geometry.md`](features/gpu-geometry.md) 第 7 节。
 
 ---
 
@@ -515,5 +532,5 @@ assert_eq!(gpu_px, cpu.pixels, "不透明几何必须逐字节相同");
 | 真实文字 | `cargo run -p deer-gui --example text_render` | 真字形界面图 + 度量/像素自检 |
 | 字形光栅化 + 图集 | `cargo run -p deer-gui --example glyph_atlas` | 图集 PNG + 覆盖率/利用率统计 |
 | 真窗口预览 | `cargo run -p deer-gui --features window --example window_preview` | 一个真窗口（GPU 清屏色 + 几何）+ 帧数统计 |
-| GPU 画界面（非文本） | `cargo run -p deer-gui --example gpu_geometry` | GPU 出的界面图 + 与 CPU 逐字节对照 |
+| GPU 画界面（形状 + 文本） | `cargo run -p deer-gui --example gpu_geometry` | GPU 出的界面图 + 与 CPU 逐字节对照 |
 | Vulkan 现状 | `cargo run -p deer-gui --example vulkan_devices` | 本机 GPU + 着色器验收 |
