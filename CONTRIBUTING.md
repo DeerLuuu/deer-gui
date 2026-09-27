@@ -122,6 +122,20 @@ Do **not** rewrite repository files with a shell text pipeline — `Get-Content 
 cargo run -p deer-vk --example <file name without .rs> -- --group=0
 ```
 
+### Assert the precondition, or the guard silently disables itself
+
+When you write a guard (including a mutation case), **first assert that the code actually reached the branch you are guarding**. A false precondition **does not error** — the guard just stops testing anything.
+
+State the precondition explicitly, right next to the assertion it protects:
+
+- "the first frame performs **exactly one** upload" (rather than "an upload happened at some point");
+- "the buffer handle **actually changed** here, and the bytes are **identical**" (rather than "a new buffer exists");
+- "this frame **does**/does **not** emit a barrier" before asserting the count delta.
+
+**This has already bitten us once**: a case built to exercise buffer replacement via *capacity growth* passed even after mutation, because an **intermediate render overwrote the recorded state** — the third step never reached the target branch. The mutation stayed green, and the guard was worthless until the precondition was asserted.
+
+Corollary: for two-way mutations ("never emit" ⇒ red, "emit when it should not" ⇒ red), assert **both** the reaching condition and the count delta — one-sided guards hide exactly this class of failure.
+
 ## Design constraints and known traps
 
 These are not suggestions. Each one exists because a defect was found, and each is guarded by a test. Read this section before changing layout, rendering, or text code.
