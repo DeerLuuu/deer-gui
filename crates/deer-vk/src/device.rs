@@ -101,6 +101,13 @@ pub struct VkDevice {
     fns: DeviceFns,
     adapter: deer_gpu::AdapterInfo,
     memory_type_count: u32,
+    /// **校验层是否真的启用**（不是「是否请求」）。
+    ///
+    /// 存在的理由（T3 review F7）：校验层是 GPU 正确性的主要证据来源，但
+    /// 「跑起来没看到消息」**不等于**「校验层在跑」—— 层没装好、或有人把
+    /// `create_with_extensions` 的 `Err` 改成静默降级，都会让「零消息」变成空话。
+    /// 让测试能**断言**这个事实，比让评审人肉眼看输出可靠。
+    validation_enabled: bool,
     /// 物理设备的内存属性（挑内存类型时必需）
     mem_props: vk::PhysicalDeviceMemoryProperties,
     /// 停止信号：`Drop` 时 `send` 让后台线程销毁实例与设备
@@ -178,6 +185,7 @@ impl VkDevice {
                 fns: info.fns,
                 adapter: info.adapter,
                 memory_type_count: info.memory_type_count,
+                validation_enabled: info.validation_enabled,
                 mem_props: info.mem_props,
                 stop: Some(stop_tx),
                 thread: Some(thread),
@@ -310,6 +318,26 @@ impl VkDevice {
     /// 探测可用内存类型数（诊断/测试用）。
     pub fn memory_type_count(&self) -> u32 {
         self.memory_type_count
+    }
+
+    /// **校验层是否真的启用**（不是「是否请求」）。
+    ///
+    /// ## 为什么需要它（T3 review F7）
+    ///
+    /// 「`DEER_VK_VALIDATION=1` 跑起来没看到校验消息」是一份很弱的证据：如果层没装好、
+    /// 或者将来有人把 [`ffi::Instance::create_with_extensions`] 里「层缺失就报错」的逻辑
+    /// 改成静默降级，**测试会照样全绿**，而校验层其实什么都没查。把这个事实暴露出来，
+    /// 测试就能硬断言「请求了就必须真的启用」。
+    ///
+    /// ## `Own` 与 `Borrowed` 的差别（诚实说明）
+    ///
+    /// - `VkDevice::open`（`Own`）：实例由本设备创建并持有 ⇒ 返回**实例的事实**
+    ///   （[`ffi::Instance::validation_enabled`]）；
+    /// - `VkDevice::open_with_present`（`Borrowed`）：实例归调用方（[`crate::surface::Surface`]
+    ///   只存句柄，查不到层的状态）⇒ 只能返回**请求值** `validation_from_env()`。
+    ///   窗口路径（`windowed.rs`）正是用这个判据建实例的，所以两者一致。
+    pub fn validation_enabled(&self) -> bool {
+        self.validation_enabled
     }
 
     /// **物理设备**的内存属性。挑内存类型时必需（逻辑设备上拿不到）。
@@ -454,6 +482,85 @@ impl VkDevice {
         })
     }
 
+    /// 创建一个**用真实顶点输入**的图形管线（M3a 的顶点缓冲路径）。
+    ///
+    /// 与 [`VkDevice::create_graphics_pipeline`] 的差别只有两点：
+    /// 1. **声明顶点缓冲与属性**（那个版本的 `vertex_binding_description_count = 0`）；
+    /// 2. **静态 viewport/scissor**（尺寸 = `extent`）—— 实测动态版在本机 Intel 驱动上
+    ///    画不出任何像素（见 [`VkDevice::create_graphics_pipeline_static_viewport`]）。
+    ///
+    /// ## 调用方的两条硬约束
+    ///
+    /// - **不要再调 `vkCmdSetViewport` / `vkCmdSetScissor`**：本管线没有声明这两个动态状态，
+    ///   对静态状态发动态设置命令会触发校验层报错（`vbo_probe.rs` 里踩过）。
+    /// - `attrs[].offset` 必须与 `stride` 描述的那个顶点结构**逐字节**一致。
+    ///   M3a 的顶点是 [`crate::gpu_geom::GpuVertex`]（`#[repr(C)]`，stride 44）——
+    ///   `gpu_render.rs` 用 `offset_of!` 取偏移，所以这里不靠手抄数字。
+    ///
+    /// `VertexAttr` 比 `vk::VertexInputAttributeDescription` 少一个字段：`binding` 恒为 0
+    /// （只有一个顶点缓冲）。少一个「忘了写 binding 于是读到别的缓冲」的机会。
+    ///
+    /// ## 参数校验（5 条错误路径）
+    ///
+    /// 校验逻辑抽在纯函数 [`validate_vertex_pipeline_args`] 里（**不碰 Vulkan**），
+    /// 所以 5 条错误路径有无 GPU 都能回归（`device.rs` 末尾的单元测试 +
+    /// `tests/pipeline_smoke.rs` 走真实 `VkDevice` 的那条各覆盖一遍）。
+    pub fn create_vertex_pipeline(
+        &self,
+        stages: &[vk::PipelineShaderStageCreateInfo],
+        layout: &PipelineLayout,
+        render_pass: &RenderPass,
+        extent: vk::Extent2D,
+        stride: u32,
+        attrs: &[VertexAttr],
+    ) -> GpuResult<Pipeline> {
+        validate_vertex_pipeline_args(extent, stride, attrs)?;
+        // `binding` 恒为 0；`input_rate` = 每顶点。
+        let binding = vk::VertexInputBindingDescription {
+            binding: 0,
+            stride,
+            input_rate: vk::VK_VERTEX_INPUT_RATE_VERTEX,
+        };
+        let attr_descs: Vec<vk::VertexInputAttributeDescription> = attrs
+            .iter()
+            .map(|a| vk::VertexInputAttributeDescription {
+                location: a.location,
+                binding: 0,
+                format: a.format,
+                offset: a.offset,
+            })
+            .collect();
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            vertex_binding_description_count: 1,
+            p_vertex_binding_descriptions: &binding,
+            vertex_attribute_description_count: attr_descs.len() as u32,
+            p_vertex_attribute_descriptions: attr_descs.as_ptr(),
+        };
+        let viewport = vk::Viewport {
+            x: 0.0,
+            y: 0.0,
+            width: extent.width as f32,
+            height: extent.height as f32,
+            min_depth: 0.0,
+            max_depth: 1.0,
+        };
+        let scissor = vk::Rect2D {
+            offset: vk::Offset2D { x: 0, y: 0 },
+            extent,
+        };
+        self.build_pipeline(
+            stages,
+            layout,
+            render_pass,
+            Some((&viewport, &scissor)),
+            &vertex_input,
+            true,
+        )
+    }
+
     /// 创建一个**图形管线**（单颜色附件、无顶点输入、动态 viewport/scissor、alpha 混合开）。
     ///
     /// **这是 SPIR-V 的真正验收关**：`vkCreateShaderModule` 很宽容（实测连 `bound = 0`
@@ -565,7 +672,14 @@ impl VkDevice {
             offset: vk::Offset2D { x: 0, y: 0 },
             extent: vk::Extent2D { width, height },
         };
-        self.build_pipeline(&stages, layout, render_pass, Some((&viewport, &scissor)), blend_enable)
+        self.build_pipeline(
+            &stages,
+            layout,
+            render_pass,
+            Some((&viewport, &scissor)),
+            &empty_vertex_input(),
+            blend_enable,
+        )
     }
 
     /// 用**显式给定**的阶段列表建管线。
@@ -579,16 +693,22 @@ impl VkDevice {
         layout: &PipelineLayout,
         render_pass: &RenderPass,
     ) -> GpuResult<Pipeline> {
-        self.build_pipeline(stages, layout, render_pass, None, true)
+        self.build_pipeline(stages, layout, render_pass, None, &empty_vertex_input(), true)
     }
 
     /// 建管线的核心：`static_viewport = None` ⇒ 动态 viewport/scissor；`Some` ⇒ 写死。
+    ///
+    /// `vertex_input` 由调用方给：M2a 的路径传 [`empty_vertex_input`]（位置来自着色器里的
+    /// 常量表），M3a 的 [`VkDevice::create_vertex_pipeline`] 传**真实的** binding + attribute
+    /// （顶点缓冲路径）。之所以做成参数而不是两个函数：其余 20 多项管线状态**完全相同**，
+    /// 复制一份就等于复制一份「以后只改了一边」的风险。
     fn build_pipeline(
         &self,
         stages: &[vk::PipelineShaderStageCreateInfo],
         layout: &PipelineLayout,
         render_pass: &RenderPass,
         static_viewport: Option<(&vk::Viewport, &vk::Rect2D)>,
+        vertex_input: &vk::PipelineVertexInputStateCreateInfo,
         blend_enable: bool,
     ) -> GpuResult<Pipeline> {
         if stages.is_empty() {
@@ -596,16 +716,6 @@ impl VkDevice {
                 "图形管线至少要有一个着色器阶段".to_string(),
             ));
         }
-        // 顶点完全由着色器内的常量表 + 推送常量决定 ⇒ 无需顶点缓冲/属性
-        let vertex_input = vk::PipelineVertexInputStateCreateInfo {
-            s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
-            p_next: std::ptr::null(),
-            flags: 0,
-            vertex_binding_description_count: 0,
-            p_vertex_binding_descriptions: std::ptr::null(),
-            vertex_attribute_description_count: 0,
-            p_vertex_attribute_descriptions: std::ptr::null(),
-        };
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo {
             s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
             p_next: std::ptr::null(),
@@ -705,7 +815,7 @@ impl VkDevice {
             flags: 0,
             stage_count: stages.len() as u32,
             p_stages: stages.as_ptr(),
-            p_vertex_input_state: &vertex_input,
+            p_vertex_input_state: vertex_input,
             p_input_assembly_state: &input_assembly,
             p_tessellation_state: std::ptr::null(),
             p_viewport_state: &viewport_state,
@@ -755,6 +865,78 @@ impl VkDevice {
             destroy: self.fns.destroy_pipeline,
         })
     }
+}
+
+/// 一个顶点属性（`vk::VertexInputAttributeDescription` 的项目内形态）。
+///
+/// 比原生结构少一个 `binding` 字段：顶点缓冲只有 0 号一个，写死比「每次都写对」可靠。
+/// `offset` 是**相对顶点起点**的字节偏移，必须落在 `stride` 之内（[`VkDevice::create_vertex_pipeline`] 会检查）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VertexAttr {
+    /// 着色器里的 `layout(location = N)`。
+    pub location: u32,
+    /// `VkFormat`（例如 `VK_FORMAT_R32G32B32A32_SFLOAT`）。
+    pub format: i32,
+    /// 相对顶点起点的字节偏移。
+    pub offset: u32,
+}
+
+/// 「没有顶点输入」的顶点输入状态。
+///
+/// M2a 的着色器把顶点位置写在 SPIR-V 的常量表里（不碰顶点缓冲），
+/// 所以那条路径声明 `count = 0`；M3a 的顶点缓冲路径用
+/// [`VkDevice::create_vertex_pipeline`] 传真实的 binding + attribute。
+fn empty_vertex_input() -> vk::PipelineVertexInputStateCreateInfo {
+    vk::PipelineVertexInputStateCreateInfo {
+        s_type: vk::VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO,
+        p_next: std::ptr::null(),
+        flags: 0,
+        vertex_binding_description_count: 0,
+        p_vertex_binding_descriptions: std::ptr::null(),
+        vertex_attribute_description_count: 0,
+        p_vertex_attribute_descriptions: std::ptr::null(),
+    }
+}
+
+/// 校验 [`VkDevice::create_vertex_pipeline`] 的参数（**纯函数**：不碰 Vulkan、不碰设备）。
+///
+/// 抽出来的理由（T3 review **F6**，上一轮被静默丢掉的那条）：这 5 条错误路径原本埋在
+/// 一个需要真实 `VkDevice` 的方法里，于是**一条测试都没有** —— 而「负例没有测试」等于没有
+/// 负例。抽成纯函数后，单元测试在任何机器上都能跑（含无 GPU 的 CI）。
+fn validate_vertex_pipeline_args(
+    extent: vk::Extent2D,
+    stride: u32,
+    attrs: &[VertexAttr],
+) -> GpuResult<()> {
+    if stride == 0 {
+        return Err(GpuError::Unsupported("顶点 stride 不能为 0".to_string()));
+    }
+    if attrs.is_empty() {
+        return Err(GpuError::Unsupported(
+            "顶点管线至少要有一个属性（否则顶点缓冲毫无意义）".to_string(),
+        ));
+    }
+    if extent.width == 0 || extent.height == 0 {
+        return Err(GpuError::Unsupported(format!(
+            "静态 viewport 的宽高必须 > 0，实际 {}×{}",
+            extent.width, extent.height
+        )));
+    }
+    for (i, a) in attrs.iter().enumerate() {
+        if a.offset >= stride {
+            return Err(GpuError::Unsupported(format!(
+                "属性 {}（location {}）的 offset {} 超出 stride {}",
+                i, a.location, a.offset, stride
+            )));
+        }
+        if attrs[..i].iter().any(|b| b.location == a.location) {
+            return Err(GpuError::Unsupported(format!(
+                "属性 location {} 重复声明",
+                a.location
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// 一个渲染通道。`Drop` 时销毁。
@@ -886,6 +1068,8 @@ struct ReadyInfo {
     fns: DeviceFns,
     adapter: deer_gpu::AdapterInfo,
     memory_type_count: u32,
+    /// 见 [`VkDevice::validation_enabled`]（`Own` 是实例的**事实**，`Borrowed` 是**请求值**）。
+    validation_enabled: bool,
 }
 
 // SAFETY: Vulkan 句柄是**进程级的不透明值**（`VK_NULL_HANDLE` 之外的任何句柄都可跨线程
@@ -929,6 +1113,7 @@ fn lifetime_thread(
         }
     };
     let destroy_device = info.fns.destroy_device;
+    let device_wait_idle = info.fns.device_wait_idle;
     let device = info.handle;
 
     if ready.send(Ok(info)).is_err() {
@@ -940,6 +1125,23 @@ fn lifetime_thread(
 
     // 等停止信号（`recv` 在发送端析构时也会返回，避免永久阻塞）
     let _ = stop.recv();
+
+    // ⚠️ **必须先 `vkDeviceWaitIdle` 再销毁设备**（T3 fix round 2 / R3）。
+    //
+    // 存在的理由：`VkDevice` 的 `Drop` 只是「发停止信号 + join 本线程」，它**不知道**
+    // 队列上还有没有在飞的提交。正常路径下调用方已经等到栅栏，但**异常路径**（栅栏超时、
+    // 设备丢失）下可能有提交仍在执行，此时销毁仍在被 GPU 使用的对象是**未定义行为** ——
+    // 也就是说「超时后不再复用」这条修复只是把 UB 从「复用」搬到了「销毁」。
+    //
+    // 失败不报错：设备可能已经丢失（那时 `VK_ERROR_DEVICE_LOST`），而我们此时除了销毁别无他法。
+    // SAFETY: 设备由本线程创建、尚未销毁。
+    let idle_rc = unsafe { (device_wait_idle)(device) };
+    if idle_rc != ffi::VK_SUCCESS {
+        eprintln!(
+            "[deer-vk] 销毁设备前 vkDeviceWaitIdle 失败（{}）—— 按可能的设备丢失处理，继续销毁",
+            vk_result_name(idle_rc)
+        );
+    }
 
     // 销毁顺序：设备 → 实例（Own 时 `owned_instance` 的 Drop 负责后者；
     // Borrowed 时它是 None —— 例 **不属于我们**，绝不能在这里销毁）。
@@ -971,6 +1173,12 @@ fn create_device(
             ffi::Instance::validation_from_env(),
         )?),
         InstancePlan::Borrowed(_) => None,
+    };
+    // 校验层「真的启用了没有」：`Own` 时问实例（**事实**）；`Borrowed` 时只能给出**请求值**
+    // （借来的实例归调用方，句柄里查不到层状态 —— 见 `VkDevice::validation_enabled`）。
+    let validation_enabled_fact = match &owned_instance {
+        Some(inst) => inst.validation_enabled(),
+        None => ffi::Instance::validation_from_env(),
     };
     let (instance_handle, core) = match plan {
         InstancePlan::Own => {
@@ -1162,6 +1370,8 @@ fn create_device(
             fns,
             adapter,
             memory_type_count,
+            // `Own` 时这是**实例的事实**；`Borrowed` 时是**请求值**（见 `validation_enabled`）。
+            validation_enabled: validation_enabled_fact,
             mem_props: mem_props_value,
         },
         owned_instance,
@@ -1248,5 +1458,114 @@ pub fn vk_result_name(rc: i32) -> &'static str {
         -11 => "VK_ERROR_FORMAT_NOT_SUPPORTED",
         -12 => "VK_ERROR_FRAGMENTED_POOL",
         _ => "未知 VkResult",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 好参数：1 个 binding、属性 offset 落在 stride 内、extent 非零。
+    fn good_attrs() -> [VertexAttr; 2] {
+        [
+            VertexAttr {
+                location: 0,
+                format: vk::VK_FORMAT_R32G32_SFLOAT,
+                offset: 0,
+            },
+            VertexAttr {
+                location: 1,
+                format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
+                offset: 8,
+            },
+        ]
+    }
+
+    /// **F6 的 5 条错误路径**（T3 review 点名、上一轮被静默丢掉的那条）。
+    ///
+    /// 一条一个断言，且都断言**错误信息**（不只是 `is_err()`）—— 否则「拒了但拒错原因」也算通过。
+    #[test]
+    fn vertex_pipeline_args_reject_all_five_bad_inputs() {
+        let ok_extent = vk::Extent2D {
+            width: 16,
+            height: 16,
+        };
+        let attrs = good_attrs();
+
+        // ① stride == 0
+        let e = validate_vertex_pipeline_args(ok_extent, 0, &attrs).expect_err("stride 0 必须被拒");
+        assert!(format!("{e}").contains("stride"), "{e}");
+
+        // ② attrs 为空
+        let e = validate_vertex_pipeline_args(ok_extent, 44, &[]).expect_err("空属性表必须被拒");
+        assert!(format!("{e}").contains("属性"), "{e}");
+
+        // ③ extent 有 0 边（宽为 0）
+        let e = validate_vertex_pipeline_args(
+            vk::Extent2D {
+                width: 0,
+                height: 8,
+            },
+            44,
+            &attrs,
+        )
+        .expect_err("viewport 宽为 0 必须被拒");
+        assert!(format!("{e}").contains("viewport"), "{e}");
+
+        // ③b extent 有 0 边（高为 0）—— 两个方向都试，避免只查了一个字段
+        let e = validate_vertex_pipeline_args(
+            vk::Extent2D {
+                width: 8,
+                height: 0,
+            },
+            44,
+            &attrs,
+        )
+        .expect_err("viewport 高为 0 必须被拒");
+        assert!(format!("{e}").contains("viewport"), "{e}");
+
+        // ④ 某个属性的 offset ≥ stride
+        let bad_offset = [
+            VertexAttr {
+                location: 0,
+                format: vk::VK_FORMAT_R32G32_SFLOAT,
+                offset: 0,
+            },
+            VertexAttr {
+                location: 1,
+                format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
+                offset: 44, // == stride ⇒ 已越界（记录从 stride 起就走出了本顶点）
+            },
+        ];
+        let e = validate_vertex_pipeline_args(ok_extent, 44, &bad_offset)
+            .expect_err("offset ≥ stride 必须被拒");
+        assert!(format!("{e}").contains("offset"), "{e}");
+
+        // ⑤ location 重复
+        let dup = [
+            VertexAttr {
+                location: 1,
+                format: vk::VK_FORMAT_R32G32_SFLOAT,
+                offset: 0,
+            },
+            VertexAttr {
+                location: 1,
+                format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
+                offset: 8,
+            },
+        ];
+        let e = validate_vertex_pipeline_args(ok_extent, 44, &dup).expect_err("location 重复必须被拒");
+        assert!(format!("{e}").contains("重复"), "{e}");
+    }
+
+    /// 好参数必须**通过**（否则上面 5 条可能是「永远报错」的假绿）。
+    #[test]
+    fn vertex_pipeline_args_accept_good_input() {
+        let extent = vk::Extent2D {
+            width: 16,
+            height: 16,
+        };
+        validate_vertex_pipeline_args(extent, 44, &good_attrs())
+            .expect("合法参数（stride 44 / offset 0,8 / extent 16×16）必须通过");
     }
 }

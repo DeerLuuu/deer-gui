@@ -33,6 +33,7 @@ const OP_STRING: u16 = 7;
 const OP_LINE: u16 = 8;
 const OP_EXTENSION: u16 = 10;
 const OP_EXT_INST_IMPORT: u16 = 11;
+const OP_EXT_INST: u16 = 12;
 const OP_MEMORY_MODEL: u16 = 14;
 const OP_ENTRY_POINT: u16 = 15;
 const OP_EXECUTION_MODE: u16 = 16;
@@ -73,6 +74,11 @@ const OP_SELECT: u16 = 169;
 const OP_F_ADD: u16 = 129;
 const OP_F_SUB: u16 = 131;
 const OP_F_MUL: u16 = 133;
+const OP_F_NEGATE: u16 = 127;
+const OP_F_ORD_LESS_THAN: u16 = 184;
+const OP_F_ORD_GREATER_THAN: u16 = 186;
+const OP_LOGICAL_OR: u16 = 166;
+const OP_LOGICAL_AND: u16 = 167;
 const OP_LABEL: u16 = 248;
 const OP_RETURN: u16 = 253;
 const OP_RETURN_VALUE: u16 = 254;
@@ -99,6 +105,12 @@ const DECORATION_IN_BOUNDS: u32 = 16;
 const BUILTIN_POSITION: u32 = 0;
 /// `BuiltIn VertexIndex`（顶点输入 `gl_VertexIndex`）
 pub const BUILTIN_VERTEX_INDEX: u32 = 42;
+/// `BuiltIn FragCoord`（片段输入 `gl_FragCoord`）。
+///
+/// M3a 的片元判据以**整数像素**坐标为准 ⇒ 片元着色器必须能拿到窗口空间的
+/// 像素坐标，`gl_FragCoord` 是唯一途径（不能用插值属性代替：插值会在像素间
+/// 连续变化，而 CPU 参考实现是按整数像素判定的）。
+pub const BUILTIN_FRAG_COORD: u32 = 15;
 /// `ExecutionModel Vertex`
 const EXECUTION_MODEL_VERTEX: u32 = 0;
 /// `ExecutionModel Fragment`
@@ -109,6 +121,42 @@ const EXECUTION_MODE_ORIGIN_UPPER_LEFT: u32 = 7;
 const CAPABILITY_SHADER: u32 = 1;
 
 pub const SPIRV_VERSION_1_0: u32 = 0x0001_0000;
+
+// ── GLSL.std.450 扩展指令集 ──────────────────────────────────────────────────
+
+/// `GLSL.std.450` 扩展指令集的**导入名字符串**（`OpExtInstImport` 用）。
+pub const EXT_INST_GLSL_STD_450: &str = "GLSL.std.450";
+
+/// `GLSLstd450Floor`（**扩展**指令编号）。
+///
+/// ## ⚠️ 一条必须记住的教训：core SPIR-V **没有** `OpFloor`
+///
+/// M3a 的计划初稿写着「`OP_FLOOR=8`，照 `f_mul` 同构写一个 `op_floor`」——
+/// 这是**两处错**，而且错法很隐蔽：
+///
+/// 1. **8 不是 `OpFloor`**。core SPIR-V 的操作码里 `8` 是 `OpLine`
+///    （`OpLine <文件名 Id> <行号> <列号>`），本文件上面已有 `OP_LINE = 8`。
+///    若真按「同构」发出 `[8, ty, result, operand]`，那是一条 `OpLine`，
+///    会被 [`section_of_opcode`] 路由到**调试段**、操作数全被当成文件名/行号 ——
+///    校验器只会报一堆无关的段序错误。
+/// 2. **更根本的是 core SPIR-V 根本没有 `OpFloor`**（也没有 `OpSqrt`/`OpSin` …）。
+///    这类数学函数全在 **`GLSL.std.450` 扩展指令集**里，必须
+///    `OpExtInstImport` 一个 `"GLSL.std.450"` 串，再用
+///    `OpExtInst resultType result set instruction operands...`
+///    引用它。`8` 是**扩展指令编号** `GLSLstd450Floor`（见 SDK 的
+///    `Include/spirv/unified1/GLSL.std.450.h`：`Round=1, RoundEven=2, Trunc=3, …, Floor=8`）
+///    —— 「8」这个数字是对的，只是它**不是 opcode 而是 ext-inst 编号**。
+///
+/// 这正是本任务「必须过官方 `spirv-val`、不能只看 `vkCreateShaderModule` 成功」
+/// 的价值所在：这两处错**都不会让建模块失败**，实测是 `spirv-val` 报
+/// `error: line 38: Invalid opcode: 9`（连试 9 也一样报）才暴露出来。
+///
+/// 编号已对照 SDK 头文件核对。基准（[`OP_F_ORD_LESS_THAN`] 等）也一并核对过：
+/// `OpFNegate = 127`、`OpFAdd = 129`、`OpFSub = 131`、`OpFMul = 133`、
+/// `OpLogicalOr = 166`、`OpLogicalAnd = 167`、`OpFOrdLessThan = 184`、
+/// `OpFOrdGreaterThan = 186`、`OpExtInst = 12`。
+pub const GLSL_STD_450_FLOOR: u32 = 8;
+
 const GENERATOR: u32 = 0;
 
 /// SPIR-V 模块的**逻辑布局段**。
@@ -551,6 +599,80 @@ impl Module {
         r
     }
 
+    /// `OpFNegate`（浮点取负：`OpFNegate resultType result operand`）
+    pub fn op_fnegate(&mut self, ty: u32, value: u32) -> u32 {
+        let r = self.id();
+        self.op(OP_F_NEGATE, &[ty, r, value]);
+        r
+    }
+
+    /// `OpExtInstImport result "GLSL.std.450"`，返回该扩展指令集的 Id。
+    ///
+    /// 只能调用一次（每个模块每个扩展指令集一个 Id），且必须在
+    /// `OpMemoryModel` **之前** —— 段序由 [`Section`] 自动保证。
+    pub fn ext_inst_import_glsl_std_450(&mut self) -> u32 {
+        let r = self.id();
+        let lit = Self::literal_string(EXT_INST_GLSL_STD_450);
+        let mut ops = vec![r];
+        ops.extend_from_slice(&lit);
+        self.op(OP_EXT_INST_IMPORT, &ops);
+        r
+    }
+
+    /// `OpExtInst resultType result set instruction operands...`
+    ///
+    /// `instruction` 是**扩展指令集内**的编号（不是 opcode）。
+    pub fn op_ext_inst(&mut self, ty: u32, set: u32, instruction: u32, operands: &[u32]) -> u32 {
+        let r = self.id();
+        let mut ops = vec![ty, r, set, instruction];
+        ops.extend_from_slice(operands);
+        self.op(OP_EXT_INST, &ops);
+        r
+    }
+
+    /// `GLSL.std.450` 的 `Floor`（向下取整，一元浮点）。
+    ///
+    /// ⚠️ **不是** `self.op(8, ...)`：core SPIR-V 没有 `OpFloor`，见
+    /// [`GLSL_STD_450_FLOOR`] 的说明。`set` 由
+    /// [`Module::ext_inst_import_glsl_std_450`] 产生。
+    pub fn op_floor(&mut self, ty: u32, set: u32, value: u32) -> u32 {
+        self.op_ext_inst(ty, set, GLSL_STD_450_FLOOR, &[value])
+    }
+
+    /// `OpFOrdLessThan`（有序浮点比较 `<`，结果类型必须是 `OpTypeBool`）。
+    ///
+    /// ⚠️ **有序**（Ordered）版本：任一操作数是 NaN 时结果为 `false`。
+    /// 不能用无序版本（`OpFUnordLessThan`）替代 —— 语义不同。
+    pub fn op_ford_less_than(&mut self, bool_ty: u32, a: u32, b: u32) -> u32 {
+        let r = self.id();
+        self.op(OP_F_ORD_LESS_THAN, &[bool_ty, r, a, b]);
+        r
+    }
+
+    /// `OpFOrdGreaterThan`（有序浮点比较 `>`，结果类型必须是 `OpTypeBool`）。
+    pub fn op_ford_greater_than(&mut self, bool_ty: u32, a: u32, b: u32) -> u32 {
+        let r = self.id();
+        self.op(OP_F_ORD_GREATER_THAN, &[bool_ty, r, a, b]);
+        r
+    }
+
+    /// `OpLogicalOr`（**标量** `bool` 的逻辑或；结果类型必须是 `OpTypeBool`）。
+    ///
+    /// ⚠️ 向量布尔（`OpTypeVector` of `bool`）需要 `Vector16` 能力，本模块不开，
+    /// 所以只能逐标量 `|` 再串起来（片元判据就是这么用的）。
+    pub fn op_logical_or(&mut self, bool_ty: u32, a: u32, b: u32) -> u32 {
+        let r = self.id();
+        self.op(OP_LOGICAL_OR, &[bool_ty, r, a, b]);
+        r
+    }
+
+    /// `OpLogicalAnd`（标量 `bool` 的逻辑与）。
+    pub fn op_logical_and(&mut self, bool_ty: u32, a: u32, b: u32) -> u32 {
+        let r = self.id();
+        self.op(OP_LOGICAL_AND, &[bool_ty, r, a, b]);
+        r
+    }
+
     pub fn type_bool(&mut self) -> u32 {
         let r = self.id();
         self.op(OP_TYPE_BOOL, &[r]);
@@ -744,6 +866,12 @@ fn opcode_name(op: u16) -> String {
         OP_F_ADD => "OpFAdd",
         OP_F_SUB => "OpFSub",
         OP_F_MUL => "OpFMul",
+        OP_F_NEGATE => "OpFNegate",
+        OP_EXT_INST => "OpExtInst",
+        OP_F_ORD_LESS_THAN => "OpFOrdLessThan",
+        OP_F_ORD_GREATER_THAN => "OpFOrdGreaterThan",
+        OP_LOGICAL_OR => "OpLogicalOr",
+        OP_LOGICAL_AND => "OpLogicalAnd",
         OP_LABEL => "OpLabel",
         OP_RETURN => "OpReturn",
         OP_RETURN_VALUE => "OpReturnValue",
@@ -1271,6 +1399,460 @@ pub fn vertex_shader_rect_pushconstant() -> Vec<u8> {
     m.finish()
 }
 
+/// 顶点着色器（**矩形属性透传**）：M3a 的顶点流 → 光栅化的入口。
+///
+/// ## 顶点布局（**与 `deer-gpu` 顶点流层共用，不允许实现时改**）
+///
+/// | location | 类型 | 含义 |
+/// |---|---|---|
+/// | 0 | `vec2` | 位置（NDC，y 向下） |
+/// | 1 | `vec4` | `rect = (x, y, w, h)`，像素单位 |
+/// | 2 | `float` | `radius_kind`：`0` = 普通填充；`>0` = 圆角半径；**`<0` = 描边（带宽 = `-radius_kind`）**。`width == 1` 时取 `-1.0`，更宽的描边取 `-width`（见 `gpu_geom::radius_kind_for_stroke`） |
+/// | 3 | `vec4` | 颜色（预乘不做，直接 src-alpha 混合） |
+///
+/// ## 两支着色器之间的接口
+///
+/// | VS 输出 location | 类型 | FS 输入 |
+/// |---|---|---|
+/// | 0 | `vec4` | `rect` |
+/// | 1 | `float` | `radius_kind` |
+/// | 2 | `vec4` | `color` |
+///
+/// FS 自己从 `gl_FragCoord` 拿像素坐标 ⇒ **VS 不传位置**（`gl_Position` 是
+/// 内建输出，不占 location）。这样「位置」只存在于光栅化器里，FS 拿到的
+/// `rect` 属性是**插值后恒定**的（每个顶点都写同一个值，插值结果就是这个值）。
+///
+/// ## 实现要点
+///
+/// 全部是「逐属性 `OpLoad` + `OpStore`」，没有 `OpSelect`、没有动态索引
+/// （与 [`vertex_shader_from_vertex_buffer`] 同一条路；动态索引是硬教训，
+/// 见 [`vertex_shader_triangle`] 的说明）。
+///
+/// `color` 是 `vec4`，与 `rect` 表达式类型相同 ⇒ `types.push` 必须**推两次**
+/// （同一个类型 Id 复用），否则 `OpStore` 的类型对不上。
+pub fn vertex_shader_rect_attrs() -> Vec<u8> {
+    let mut m = Module::new();
+    m.shader_capability().memory_model_glsl450().source_unknown();
+
+    let void = m.type_void();
+    let f32_ty = m.type_float();
+    let v2 = m.type_vector(f32_ty, 2);
+    let v4 = m.type_vector(f32_ty, 4);
+    let ptr_in_v2 = m.type_pointer(SC_INPUT, v2);
+    let ptr_in_v4 = m.type_pointer(SC_INPUT, v4);
+    let ptr_in_f32 = m.type_pointer(SC_INPUT, f32_ty);
+    let ptr_out_v4 = m.type_pointer(SC_OUTPUT, v4);
+    let ptr_out_f32 = m.type_pointer(SC_OUTPUT, f32_ty);
+    let fn_ty = m.type_function(void, &[]);
+
+    let out_pos = m.variable(ptr_out_v4, SC_OUTPUT);
+    let out_rect = m.variable(ptr_out_v4, SC_OUTPUT);
+    let out_rk = m.variable(ptr_out_f32, SC_OUTPUT);
+    let out_color = m.variable(ptr_out_v4, SC_OUTPUT);
+    let in_pos = m.variable(ptr_in_v2, SC_INPUT);
+    let in_rect = m.variable(ptr_in_v4, SC_INPUT);
+    let in_rk = m.variable(ptr_in_f32, SC_INPUT);
+    let in_color = m.variable(ptr_in_v4, SC_INPUT);
+
+    let z = m.constant_f32(f32_ty, 0.0);
+    let w = m.constant_f32(f32_ty, 1.0);
+
+    let fn_id = m.id();
+    let block = m.id();
+    m.entry_point(
+        EXECUTION_MODEL_VERTEX,
+        fn_id,
+        "main",
+        &[out_pos, out_rect, out_rk, out_color, in_pos, in_rect, in_rk, in_color],
+    );
+
+    // 输入 location 0/1/2/3（顺序必须与顶点布局表一致）
+    m.debug_name(in_pos, "in_pos");
+    m.decorate(in_pos, DECORATION_LOCATION, &[0]);
+    m.debug_name(in_rect, "in_rect");
+    m.decorate(in_rect, DECORATION_LOCATION, &[1]);
+    m.debug_name(in_rk, "in_radius_kind");
+    m.decorate(in_rk, DECORATION_LOCATION, &[2]);
+    m.debug_name(in_color, "in_color");
+    m.decorate(in_color, DECORATION_LOCATION, &[3]);
+
+    // 内建输出
+    m.debug_name(out_pos, "gl_Position");
+    m.decorate(out_pos, DECORATION_BUILT_IN, &[BUILTIN_POSITION]);
+
+    // 输出 location 0/1/2（与片段着色器的输入对齐）
+    m.debug_name(out_rect, "out_rect");
+    m.decorate(out_rect, DECORATION_LOCATION, &[0]);
+    m.debug_name(out_rk, "out_radius_kind");
+    m.decorate(out_rk, DECORATION_LOCATION, &[1]);
+    m.debug_name(out_color, "out_color");
+    m.decorate(out_color, DECORATION_LOCATION, &[2]);
+
+    m.function(void, fn_id, fn_ty, block);
+
+    // gl_Position = vec4(pos, 0, 1)
+    let p = m.load(v2, in_pos);
+    let px = m.composite_extract(f32_ty, p, &[0]);
+    let py = m.composite_extract(f32_ty, p, &[1]);
+    // px/py 是运行时值 ⇒ 必须 OpCompositeConstruct（不能用 OpConstantComposite）
+    let pos4 = m.composite_construct(v4, &[px, py, z, w]);
+    m.store(out_pos, pos4);
+
+    // 透传属性：rect(vec4) / radius_kind(float) / color(vec4)
+    let rect = m.load(v4, in_rect);
+    m.store(out_rect, rect);
+    let rk = m.load(f32_ty, in_rk);
+    m.store(out_rk, rk);
+    let color = m.load(v4, in_color);
+    m.store(out_color, color);
+
+    m.return_void();
+    m.function_end();
+    m.finish()
+}
+
+/// 片段着色器（**矩形形状判据**）：复刻 `deer-gpu` CPU 参考后端的 `fill` /
+/// `inside_rounded` / `stroke`。
+///
+/// ## 为什么必须逐字等价
+///
+/// M3a 的验收是「GPU 画面与 CPU 后端**逐像素**一致」。片元着色器就是那个
+/// 「像素级判据」：任何一处朴素写法（例如把 `>=` 写成 `>`、或者圆角用浮点距离
+/// 但圆心取矩形角点）都会让边界像素对不上，而 GPU 与 CPU 的差异会表现为
+/// 「差一列像素」这种极难定位的现象。
+///
+/// ## 判据（与 `crates/deer-gpu/src/null.rs` 的 CPU 版逐字对应）
+///
+/// ```text
+/// px = floor(frag.x); py = floor(frag.y)
+/// dl = px - rect.x ; dr = (rect.x + rect.w) - 1 - px
+/// dt = py - rect.y ; db = (rect.y + rect.h) - 1 - py
+/// out_rect  = (dl<0) | (dr<0) | (dt<0) | (db<0)
+/// r_eff     = select(rk < 0, 0.0, rk)          // 描边不做圆角（rk == -1）
+/// corner_fail = (dl<r_eff) & (dt<r_eff) & (((dl-r_eff)^2 + (dt-r_eff)^2) > r_eff^2)
+///               | … 另三角同理用 (dr,dt)/(dl,db)/(dr,db)
+/// fill_mask = !(out_rect | corner_fail_TL | corner_fail_TR | corner_fail_BL | corner_fail_BR)
+/// bw        = -rk                              // 描边带宽（Ruling 6：rk == -1 ⇒ 1px）
+/// stroke_mask = (py < rect.y+bw) | (py > rect.y+rect.h-bw-1)
+///             | (px < rect.x+bw) | (px > rect.x+rect.w-bw-1)
+/// mask = select(rk < 0, stroke_mask, fill_mask)
+/// out_color = select(mask, color, vec4(0,0,0,0))
+/// ```
+///
+/// ## 三处刻意的写法（都有理由，不要「优化」掉）
+///
+/// 1. **`!x` 不引入 `OpLogicalNot`**：两处逻辑非都用「把 `OpSelect` 的
+///    true/false 两支对调」实现 —— `fill_mask` 是「全零 vs 掩码」，
+///    `stroke_mask` 是「与 `bw` 比大小」。少一个算子就少一个出错面，
+///    也避免控制流（本着色器**完全无分支**）。
+/// 2. **四角都算、再并起来**：CPU 版 `inside_rounded` 是循环里第一个失败就
+///    `return false`（短路），数学上等价于「四个 corner_fail 的或」。这里展开成
+///    四条并列的表达式，语义与 CPU 完全一致，而非依赖求值顺序。
+/// 3. **圆角圆心带 `r_eff` 偏移**（`ccx = rect.x + r_eff`、`ccy = rect.y + r_eff`）：
+///    这是 CPU 版的原式。写成「以矩形角点为圆心」在 `r = 0` 时恰好等价，
+///    但 `r > 0` 时**整个角区都会被判掉**（边长 `r` 的角区与角点为圆心、半径 `r`
+///    的圆不相交），会画出「十字」而不是圆角矩形 —— 一个只在大圆角下暴露的错。
+///
+/// ## 与 CPU 版的已知差异（诚实记录）
+///
+/// - CPU 版 `fill` 的 `radius` 已被调用方 `max(0)`，且只在 `r > 0` 时才做圆角；
+///   本着色器把 `rk <= 0` 统一当作 `r_eff = 0`（判定恒真，不裁剪）—— 等价。
+/// - 混合/格式转换不在本着色器内（那是管线状态），所以「逐像素一致」还需要
+///   管线侧配置匹配（由后续任务负责）。
+///
+/// ## gl_FragCoord
+///
+/// 片段着色器必须声明 `OriginUpperLeft`（已声明）—— 与 CPU 参考实现的
+/// 「y 向下、左上为原点」坐标系一致。`gl_FragCoord.xy` 在像素中心取值
+/// （`x.5`），`OpFloor` 之后正是整数像素坐标。
+pub fn fragment_shader_rect_shape() -> Vec<u8> {
+    let mut m = Module::new();
+    m.shader_capability().memory_model_glsl450().source_unknown();
+    // `glsl450` 是内存模型，**不是**扩展指令集；`OpFloor` 需要另外导入
+    // `GLSL.std.450`（见 GLSL_STD_450_FLOOR 的说明）。
+    let glsl = m.ext_inst_import_glsl_std_450();
+
+    let void = m.type_void();
+    let f32_ty = m.type_float();
+    let bool_ty = m.type_bool();
+    let v4 = m.type_vector(f32_ty, 4);
+    let ptr_in_v4 = m.type_pointer(SC_INPUT, v4);
+    let ptr_in_f32 = m.type_pointer(SC_INPUT, f32_ty);
+    let ptr_out_v4 = m.type_pointer(SC_OUTPUT, v4);
+    let fn_ty = m.type_function(void, &[]);
+
+    let out_color = m.variable(ptr_out_v4, SC_OUTPUT);
+    let in_rect = m.variable(ptr_in_v4, SC_INPUT);
+    let in_rk = m.variable(ptr_in_f32, SC_INPUT);
+    let in_color = m.variable(ptr_in_v4, SC_INPUT);
+    let in_frag = m.variable(ptr_in_v4, SC_INPUT);
+
+    let fn_id = m.id();
+    let block = m.id();
+    m.entry_point(
+        EXECUTION_MODEL_FRAGMENT,
+        fn_id,
+        "main",
+        &[out_color, in_rect, in_rk, in_color, in_frag],
+    );
+    m.execution_mode(fn_id, EXECUTION_MODE_ORIGIN_UPPER_LEFT, &[]);
+
+    // 输出 location 0
+    m.debug_name(out_color, "out_color");
+    m.decorate(out_color, DECORATION_LOCATION, &[0]);
+    // 输入 location 0/1/2（与顶点着色器的输出对齐）
+    m.debug_name(in_rect, "in_rect");
+    m.decorate(in_rect, DECORATION_LOCATION, &[0]);
+    m.debug_name(in_rk, "in_radius_kind");
+    m.decorate(in_rk, DECORATION_LOCATION, &[1]);
+    m.debug_name(in_color, "in_color");
+    m.decorate(in_color, DECORATION_LOCATION, &[2]);
+    // 内建输入：gl_FragCoord（**不能**同时有 Location 装饰）
+    m.debug_name(in_frag, "gl_FragCoord");
+    m.decorate(in_frag, DECORATION_BUILT_IN, &[BUILTIN_FRAG_COORD]);
+
+    m.function(void, fn_id, fn_ty, block);
+
+    // ── 常量 ─────────────────────────────────────────────────────────────────
+    let f0 = m.constant_f32(f32_ty, 0.0);
+    let f1 = m.constant_f32(f32_ty, 1.0);
+    // `OpConstantTrue` / `OpConstantFalse`：给 `not_bool` 的两支用
+    let b_true = m.id();
+    m.op(OP_CONSTANT_TRUE, &[bool_ty, b_true]);
+    let b_false = m.id();
+    m.op(OP_CONSTANT_FALSE, &[bool_ty, b_false]);
+
+    // ── px / py ──────────────────────────────────────────────────────────────
+    let frag = m.load(v4, in_frag);
+    let fx = m.composite_extract(f32_ty, frag, &[0]);
+    let fy = m.composite_extract(f32_ty, frag, &[1]);
+    let px = m.op_floor(f32_ty, glsl, fx);
+    let py = m.op_floor(f32_ty, glsl, fy);
+
+    // ── rect 属性 ────────────────────────────────────────────────────────────
+    let rect = m.load(v4, in_rect);
+    let rx = m.composite_extract(f32_ty, rect, &[0]);
+    let ry = m.composite_extract(f32_ty, rect, &[1]);
+    let rw = m.composite_extract(f32_ty, rect, &[2]);
+    let rh = m.composite_extract(f32_ty, rect, &[3]);
+    let rk = m.load(f32_ty, in_rk);
+    let color = m.load(v4, in_color);
+
+    // ── 四边距离（与 CPU 的 right()-1 / bottom()-1 一致） ────────────────────
+    let dl = m.f_sub(f32_ty, px, rx);
+    let dr = {
+        let x1 = m.f_add(f32_ty, rx, rw);
+        let x1m1 = m.f_sub(f32_ty, x1, f1);
+        m.f_sub(f32_ty, x1m1, px)
+    };
+    let dt = m.f_sub(f32_ty, py, ry);
+    let db = {
+        let y1 = m.f_add(f32_ty, ry, rh);
+        let y1m1 = m.f_sub(f32_ty, y1, f1);
+        m.f_sub(f32_ty, y1m1, py)
+    };
+
+    // out_rect = (dl<0) | (dr<0) | (dt<0) | (db<0)
+    let out_rect = {
+        let a = m.op_ford_less_than(bool_ty, dl, f0);
+        let b = m.op_ford_less_than(bool_ty, dr, f0);
+        let c = m.op_ford_less_than(bool_ty, dt, f0);
+        let d = m.op_ford_less_than(bool_ty, db, f0);
+        let ab = m.op_logical_or(bool_ty, a, b);
+        let cd = m.op_logical_or(bool_ty, c, d);
+        m.op_logical_or(bool_ty, ab, cd)
+    };
+
+    // r_eff = select(rk < 0, 0.0, rk) —— 描边（rk < 0）不做圆角
+    let rk_neg = m.op_ford_less_than(bool_ty, rk, f0);
+    let r_eff = m.op_select(f32_ty, rk_neg, f0, rk);
+    let r_sq = m.f_mul(f32_ty, r_eff, r_eff);
+
+    // corner_fail(axis_a, axis_b) —— 轴须为有序对 (dl, dt) / (dr, dt) /
+    // (dl, db) / (dr, db)，顺序与 CPU `corners` 数组一致。
+    //
+    //   in_corner = (a < r_eff) & (b < r_eff)
+    //   outside   = ((a - r_eff)^2 + (b - r_eff)^2) > r_eff^2
+    //   fail      = in_corner & outside
+    let mut corner_fail = |a: u32, b: u32| -> u32 {
+        let in_a = m.op_ford_less_than(bool_ty, a, r_eff);
+        let in_b = m.op_ford_less_than(bool_ty, b, r_eff);
+        let in_corner = m.op_logical_and(bool_ty, in_a, in_b);
+        let da = m.f_sub(f32_ty, a, r_eff);
+        let dbv = m.f_sub(f32_ty, b, r_eff);
+        let da2 = m.f_mul(f32_ty, da, da);
+        let db2 = m.f_mul(f32_ty, dbv, dbv);
+        let dist2 = m.f_add(f32_ty, da2, db2);
+        let outside = m.op_ford_greater_than(bool_ty, dist2, r_sq);
+        m.op_logical_and(bool_ty, in_corner, outside)
+    };
+    let fail_tl = corner_fail(dl, dt);
+    let fail_tr = corner_fail(dr, dt);
+    let fail_bl = corner_fail(dl, db);
+    let fail_br = corner_fail(dr, db);
+
+    // fill_mask = !(out_rect | fail_tl | fail_tr | fail_bl | fail_br)
+    // 把「逻辑非」折进 OpSelect 的两支对调（true=0.0、false=1.0），省掉 OpLogicalNot。
+    let bad = {
+        let a = m.op_logical_or(bool_ty, out_rect, fail_tl);
+        let b = m.op_logical_or(bool_ty, fail_tr, fail_bl);
+        let c = m.op_logical_or(bool_ty, a, b);
+        m.op_logical_or(bool_ty, c, fail_br)
+    };
+    let fill_mask = m.op_select(f32_ty, bad, f0, f1);
+
+    // 逻辑非的小工具：`!b` = `OpSelect %bool b false true`（不引入 `OpLogicalNot`）。
+    // 结果的类型必须是 `OpTypeBool`（与判据同类型）。
+    let not_bool = |m: &mut Module, b: u32| -> u32 { m.op_select(bool_ty, b, b_false, b_true) };
+
+    // ── 描边判据（rk < 0 ⇒ bw = -rk；Ruling 6：rk == -1 即 1px 带宽） ───────
+    //
+    // ## ⚠️ 这里**没有**照抄任务书给的 stroke_mask 公式（两个必须记录的原因）
+    //
+    // **原因 1：任务书给的是「四条半平面的或」，不是四条「矩形边」。**
+    //   `(py < ry+bw) | (py > bottom-bw-1) | (px < rx+bw) | (px > right-bw-1)`
+    // 半平面在另一个轴上无限延伸 ⇒ 矩形上下左右整片外部都被判成描边。
+    // CPU 参考 `null.rs::stroke` 只涂 4 条**被矩形裁剪过的边**。
+    //
+    // **原因 2：边带会沿短边向矩形外伸出 bw。** `null.rs::stroke` 是
+    // `for k in 0..w` 反复填 4 条 1px 线，**没有**把 k 限制在矩形内：
+    // `(2,3,9,7)`、宽度 8 时，下边框在 `k=7` 那轮填的是 `y == bottom-1-7 == 2`
+    // —— 矩形上方一行（`ry == 3`）。左/右边框在 `k ≥ rh` 时同样涂到左右之外。
+    // 所以「只涂矩形内」这个直觉在 `带宽 > 矩形尺寸` 时是**错**的。
+    //
+    // ## 与 `null.rs::stroke` 逐字对应的闭式（四带并集）
+    //
+    //   x_span = px ∈ [rx, right)      y_span = py ∈ [ry, bottom)
+    //   上带 = x_span & y ∈ [ry,        ry+bw)
+    //   下带 = x_span & y ∈ [bottom-bw, bottom)
+    //   左带 = y_span & x ∈ [rx,        rx+bw)
+    //   右带 = y_span & x ∈ [right-bw, right)
+    //   stroke_mask = 上带 | 下带 | 左带 | 右带
+    //
+    // **上/下带只受 x_span 约束（不受 y_span 约束）**，所以能向矩形上下各伸出 bw；
+    // 左/右带只受 y_span 约束，同理向左右伸出。反过来说：上/下带的 y 只能是
+    // `[ry, ry+bw)`（不能是「矩形内」）—— 这是踩了五次才定的形式，别改。
+    //
+    // ## 验证（穷举，不是推理）
+    //
+    // 用 Rust 程序对 CPU 原式逐像素核对：**17 组 `(rect, radius_kind)`**（普通填充 / 圆角
+    // 1·2·4·12 / 描边 -1·-3·-6·-8·-40 / 退化 1×1、1×20、20×1、2×50 …）× 采样外扩
+    // `pad = |radius_kind| + 3` 的**全部**整数像素 = **20,663 个采样点，零不一致**。
+    // `cpu_reference_mask_matches_null_rs` 把该核对固化进 CI，`--nocapture` 会**打印实测点数**
+    // ⇒ 这个数字**可复现**：
+    //
+    // ```text
+    // $ cargo test -p deer-vk --lib cpu_reference_mask_matches_null_rs -- --nocapture
+    // GPU 片元判据与 null.rs 参考逐像素一致（20663 个采样点）✅
+    // ```
+    //
+    // ⚠️ **别把别的数字写进这里**：本注释曾经写「14 个矩形 × 13 种宽度 = **466,901** 个采样点」，
+    // 而提交 `0b07997` 的信息里还有第三个数字 **523,248** —— 那两个来自**早期一次性裸程序**
+    // 的更大规模统计（口径与本测试不同，且**在本仓库里复现不出来**）。它们与
+    // `cases` 数组（17 组）和 `pad` 公式（`|rk| + 3`）都对不上，属**历史记录，不再引用**；
+    // 以 CI 打印的 **20,663** 为准（同一类「手写汇总数错」在本分支出现过两次，见 ledger 的
+    // 数字核对条目）。
+    //
+    // ⚠️ 过程中先后有 5 个「看起来对」的候选公式被穷举推翻（半平面版、
+    // 先裁矩形再算带宽版、blob 减内矩形版、两矩形并集版、带不互相约束版）。
+    // **别凭直觉改这段**，改完必须重跑 `cargo test -p deer-vk --lib`。
+    let bw = m.op_fnegate(f32_ty, rk);
+    let stroke_mask = {
+        let right = m.f_add(f32_ty, rx, rw); // right() = rx + rw
+        let bottom = m.f_add(f32_ty, ry, rh); // bottom() = ry + rh
+
+        // x_span = px ∈ [rx, right) ：`px >= rx` 用 `!(px < rx)` 表达（不引入 OpLogicalNot）
+        let x_span = {
+            let lt = m.op_ford_less_than(bool_ty, px, rx); // px < rx
+            let ge = not_bool(&mut m, lt); // px >= rx
+            let lt_r = m.op_ford_less_than(bool_ty, px, right); // px < right
+            m.op_logical_and(bool_ty, ge, lt_r)
+        };
+        // y_span = py ∈ [ry, bottom)
+        let y_span = {
+            let lt = m.op_ford_less_than(bool_ty, py, ry);
+            let ge = not_bool(&mut m, lt);
+            let lt_b = m.op_ford_less_than(bool_ty, py, bottom);
+            m.op_logical_and(bool_ty, ge, lt_b)
+        };
+
+        // 上带 = x_span & (py ∈ [ry, ry+bw))：`py >= ry` 与 `py < bottom` 已由 x_span
+        // 之外的 y_span 提供（x_span 只是 px 的区间；这里 y 的下界必须显式给）
+        let band_top = {
+            let lt_ry = m.op_ford_less_than(bool_ty, py, ry); // py < ry
+            let ge_ry = not_bool(&mut m, lt_ry); // py >= ry
+            let t = m.f_add(f32_ty, ry, bw);
+            let lt_t = m.op_ford_less_than(bool_ty, py, t); // py < ry+bw
+            let c = m.op_logical_and(bool_ty, ge_ry, lt_t);
+            m.op_logical_and(bool_ty, x_span, c)
+        };
+        // 下带 = x_span & (py ∈ [bottom-bw, bottom))
+        let band_bottom = {
+            let t = m.f_sub(f32_ty, bottom, bw);
+            let lt = m.op_ford_less_than(bool_ty, py, t); // py < bottom-bw
+            let ge = not_bool(&mut m, lt); // py >= bottom-bw
+            let lt_b = m.op_ford_less_than(bool_ty, py, bottom); // py < bottom
+            let c = m.op_logical_and(bool_ty, ge, lt_b);
+            m.op_logical_and(bool_ty, x_span, c)
+        };
+        // 左带 = y_span & (px ∈ [rx, rx+bw))
+        let band_left = {
+            let lt_rx = m.op_ford_less_than(bool_ty, px, rx); // px < rx
+            let ge_rx = not_bool(&mut m, lt_rx); // px >= rx
+            let t = m.f_add(f32_ty, rx, bw);
+            let lt_t = m.op_ford_less_than(bool_ty, px, t); // px < rx+bw
+            let c = m.op_logical_and(bool_ty, ge_rx, lt_t);
+            m.op_logical_and(bool_ty, y_span, c)
+        };
+        // 右带 = y_span & (px ∈ [right-bw, right))
+        let band_right = {
+            let t = m.f_sub(f32_ty, right, bw);
+            let lt = m.op_ford_less_than(bool_ty, px, t); // px < right-bw
+            let ge = not_bool(&mut m, lt); // px >= right-bw
+            let lt_r = m.op_ford_less_than(bool_ty, px, right); // px < right
+            let c = m.op_logical_and(bool_ty, ge, lt_r);
+            m.op_logical_and(bool_ty, y_span, c)
+        };
+
+        let tb = m.op_logical_or(bool_ty, band_top, band_bottom);
+        let lr = m.op_logical_or(bool_ty, band_left, band_right);
+        m.op_logical_or(bool_ty, tb, lr)
+    };
+    // stroke_mask 是「**在**描边上」的判定（与 CPU 取真方向一致），不需取反；
+    // fill_mask 的「逻辑非」折进了下面的 OpSelect。
+    let stroke_f = m.op_select(f32_ty, stroke_mask, f1, f0);
+
+    // mask = select(rk < 0, stroke_mask, fill_mask)
+    //
+    // 两个掩码都是 float（0.0 / 1.0）而不是 bool：让最后的判据直接就是
+    // `mask > 0.5`，省掉一次 bool 中转（也少一个出错面）。
+    let mask = m.op_select(f32_ty, rk_neg, stroke_f, fill_mask);
+    let half = m.constant_f32(f32_ty, 0.5);
+    let hit = m.op_ford_greater_than(bool_ty, mask, half);
+
+    // out_color = select(hit, color, vec4(0,0,0,0))
+    //
+    // ⚠️ **必须逐分量选，不能对 `vec4` 直接 `OpSelect` 标量条件**：
+    // 本机 `spirv-val`（SDK 1.4.357.0）实测拒绝
+    //   `OpSelect %v4float %scalar_bool %color %zero`
+    // 并报 `Expected vector sizes of Result Type and the condition to be equal: Select`。
+    // 所以走与 [`vertex_shader_select_full_vec4`] 相同的稳妥写法：
+    // 抽出分量 → 逐分量 `OpSelect` → `OpCompositeConstruct` 组回。
+    let hit_vec = {
+        let mut comps = Vec::with_capacity(4);
+        for c in 0..4u32 {
+            let v = m.composite_extract(f32_ty, color, &[c]);
+            comps.push(m.op_select(f32_ty, hit, v, f0));
+        }
+        m.composite_construct(v4, &comps)
+    };
+    m.store(out_color, hit_vec);
+
+    m.return_void();
+    m.function_end();
+    m.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1408,6 +1990,230 @@ mod tests {
                 }
                 i += wc;
             }
+        }
+    }
+
+    // ── M3a：片元判据的语义回归 ──────────────────────────────────────────────
+
+    /// GPU 片元掩码判据的**可直接执行**版本。
+    ///
+    /// ⚠️ 这是 [`fragment_shader_rect_shape`] 里那串运算的**忠实转写**
+    /// （同样的运算顺序、同样的 float 语义），不是重写的第二套实现 ——
+    /// 它的价值在于把「只能在 GPU 上跑、错了只会看到差一列像素」的判据
+    /// 变成可在 CI 里断言的纯函数。它与着色器的对应关系由
+    /// `gpu_mask_predicate_matches_cpu_reference` 的断言与注释固定下来；
+    /// 每加一个算子都要同步这两处。
+    ///
+    /// 语义确认（与 `crates/deer-gpu/src/null.rs` 对照）：
+    /// - `fill(...)`: `for y in [rect.y, rect.y+h)`、`for x in [rect.x, rect.x+w)`
+    ///   ⇒ 整矩形减去 `(dl<0)|(dr<0)|(dt<0)|(db<0)`（`dr`/`db` 带 `- 1`）；
+    /// - `fill(..., radius = r > 0)`: `inside_rounded` 四角
+    ///   `(x - ccx)^2 + (y - ccy)^2 > r^2`，圆心 `cc = rect.角 + r`，
+    ///   角区由 `(dx < 0 / > 0)` 判定 ⇒ `(a < r_eff) & (b < r_eff)`；
+    /// - `stroke(..., width = w)`: 4 条 `w` 宽的**矩形边**：
+    ///   `x_span = [rx,right)`、`y_span = [ry,bottom)`，
+    ///   `上带 = x_span & y∈[ry,ry+w)`、`下带 = x_span & y∈[bottom-w,bottom)`、
+    ///   `左带 = y_span & x∈[rx,rx+w)`、`右带 = y_span & x∈[right-w,right)`，
+    ///   `stroke_mask = 四条带的并集`。
+    ///   **注意两点**：(a) 上/下带**不受** `y_span` 约束，所以能向矩形上下各伸出 `w`
+    ///   （`null.rs::stroke` 的 `for k in 0..w` 没有把 k 限制在矩形内）；
+    ///   (b) 但每条带**必须**受另一轴的 `x_span`/`y_span` 约束，否则矩形外整片
+    ///   都会被判成描边。见 `fragment_shader_rect_shape` 的说明。
+    ///
+    /// `px`/`py` 是整数像素坐标，等价于 `floor(gl_FragCoord.xy)`（像素中心 `x.5` 向下取整）。
+    fn gpu_mask_predicate(rect: [i32; 4], radius_kind: f32, px: i32, py: i32) -> bool {
+        let f = |v: i32| v as f32;
+        let [rx, ry, rw, rh] = rect;
+        let (pxf, pyf) = (f(px), f(py));
+
+        let f0 = 0.0f32;
+        let f1 = 1.0f32;
+        let dl = pxf - f(rx);
+        let dr = (f(rx) + f(rw)) - f1 - pxf;
+        let dt = pyf - f(ry);
+        let db = (f(ry) + f(rh)) - f1 - pyf;
+
+        // out_rect = (dl<0) | (dr<0) | (dt<0) | (db<0)
+        let out_rect = (dl < f0) | (dr < f0) | (dt < f0) | (db < f0);
+
+        // r_eff = select(rk < 0, 0.0, rk)
+        let r_eff = if radius_kind < f0 { f0 } else { radius_kind };
+        let r_sq = r_eff * r_eff;
+
+        let corner_fail = |a: f32, b: f32| -> bool {
+            let in_corner = (a < r_eff) & (b < r_eff);
+            let (da, dbv) = (a - r_eff, b - r_eff);
+            let outside = (da * da + dbv * dbv) > r_sq;
+            in_corner & outside
+        };
+        let fail_tl = corner_fail(dl, dt);
+        let fail_tr = corner_fail(dr, dt);
+        let fail_bl = corner_fail(dl, db);
+        let fail_br = corner_fail(dr, db);
+        let fill_mask = !(out_rect | fail_tl | fail_tr | fail_bl | fail_br);
+
+        // bw = -rk；right() = rx+rw、bottom() = ry+rh
+        let bw = -radius_kind;
+        let right = f(rx) + f(rw);
+        let bottom = f(ry) + f(rh);
+        let x_span = (pxf >= f(rx)) & (pxf < right);
+        let y_span = (pyf >= f(ry)) & (pyf < bottom);
+        let band_top = x_span & (pyf >= f(ry)) & (pyf < f(ry) + bw);
+        let band_bottom = x_span & (pyf >= bottom - bw) & (pyf < bottom);
+        let band_left = y_span & (pxf >= f(rx)) & (pxf < f(rx) + bw);
+        let band_right = y_span & (pxf >= right - bw) & (pxf < right);
+
+        // mask = select(rk < 0, stroke_mask, fill_mask)
+        if radius_kind < f0 {
+            band_top | band_bottom | band_left | band_right
+        } else {
+            fill_mask
+        }
+    }
+
+    /// **端口自检**：`gpu_mask_predicate` 是否忠实于 `null.rs` 的 CPU 参考判据。
+    ///
+    /// 这里按 `null.rs` 的**原式**独立写一遍 CPU 版（整数坐标、整数半径），
+    /// 逐像素比对。两处若漂移（例如圆角圆心忘了加 `r`、或下/右边框忘了 `- 1`），
+    /// 这条测试会红。
+    #[test]
+    fn cpu_reference_mask_matches_null_rs() {
+        // null.rs::fill 的坐标范围：for y in rect.y..rect.bottom()、x 同理
+        fn cpu_fill(rect: [i32; 4], radius: i32, x: i32, y: i32) -> bool {
+            let [rx, ry, rw, rh] = rect;
+            let (right, bottom) = (rx + rw, ry + rh);
+            if !(x >= rx && x < right && y >= ry && y < bottom) {
+                return false;
+            }
+            let r = radius.max(0);
+            if r > 0 && !cpu_inside_rounded(rect, x, y, r) {
+                return false;
+            }
+            true
+        }
+
+        // null.rs::inside_rounded 的逐字转写
+        fn cpu_inside_rounded(rect: [i32; 4], x: i32, y: i32, r: i32) -> bool {
+            let [rx, ry, rw, rh] = rect;
+            let (right, bottom) = (rx + rw, ry + rh);
+            let corners = [
+                (rx + r, ry + r, -1, -1),
+                (right - 1 - r, ry + r, 1, -1),
+                (rx + r, bottom - 1 - r, -1, 1),
+                (right - 1 - r, bottom - 1 - r, 1, 1),
+            ];
+            for (ccx, ccy, sx, sy) in corners {
+                let in_corner_x = if sx < 0 { x < ccx } else { x > ccx };
+                let in_corner_y = if sy < 0 { y < ccy } else { y > ccy };
+                if in_corner_x && in_corner_y {
+                    let dx = (x - ccx) as f32;
+                    let dy = (y - ccy) as f32;
+                    if dx * dx + dy * dy > (r * r) as f32 {
+                        return false;
+                    }
+                }
+            }
+            true
+        }
+
+        // null.rs::stroke：4 条 1px 边叠加 w 次
+        fn cpu_stroke(rect: [i32; 4], width: i32, x: i32, y: i32) -> bool {
+            let [rx, ry, rw, rh] = rect;
+            let (right, bottom) = (rx + rw, ry + rh);
+            let w = width.max(1);
+            for k in 0..w {
+                let top = y == ry + k && x >= rx && x < right;
+                let bot = y == bottom - 1 - k && x >= rx && x < right;
+                let left = x == rx + k && y >= ry && y < bottom;
+                let rig = x == right - 1 - k && y >= ry && y < bottom;
+                if top || bot || left || rig {
+                    return true;
+                }
+            }
+            false
+        }
+
+        // (rect = (x, y, w, h), radius_kind)
+        let cases: [([i32; 4], i32); 17] = [
+            ([2, 3, 9, 7], 0),   // 普通填充
+            ([2, 3, 9, 7], 1),   // 半径 1 的圆角
+            ([2, 3, 9, 7], 2),   // 圆角填充
+            ([2, 3, 9, 7], 4),   // 大圆角（半径 > 半宽，角区重叠）
+            ([2, 3, 9, 7], -1),  // 描边 1px
+            ([2, 3, 9, 7], -3),  // 描边 3px
+            ([2, 3, 9, 7], -8),  // 带宽 > 高度（边带会延伸到矩形外）
+            ([2, 3, 9, 7], -40), // 带宽远超矩形（最容易暴露错误公式）
+            ([0, 0, 1, 1], 0),   // 退化 1×1
+            ([0, 0, 1, 1], -1),  // 1×1 的 1px 描边（整个矩形）
+            ([0, 0, 1, 1], -4),  // 1×1 的 4px 描边（矩形外一圈）
+            ([5, 5, 1, 20], -3), // 细长矩形（1×20）的 3px 描边
+            ([5, 5, 20, 1], -3), // 细长矩形（20×1）的 3px 描边
+            ([0, 0, 2, 50], -6), // 2×50 的 6px 描边（带宽 > 宽度）
+            ([0, 0, 8, 8], -8),  // 正方形 + 等宽描边
+            ([4, 9, 2, 2], 1),   // 小矩形的 1px 圆角
+            ([0, 0, 30, 30], 12), // 大矩形 + 大圆角
+        ];
+
+        let mut checked = 0usize;
+        for (rect, rk) in cases {
+            // 采样范围要**盖住带宽**：`bw > 矩形尺寸` 时 CPU 会把像素涂到矩形外
+            // （最多外扩 `bw`）—— 只扫矩形附近就会漏掉那类错。
+            let pad = rk.unsigned_abs() as i32 + 3;
+            for y in -pad..(rect[1] + rect[3] + pad) {
+                for x in -pad..(rect[0] + rect[2] + pad) {
+                    let expect = if rk < 0 {
+                        cpu_stroke(rect, -rk, x, y)
+                    } else {
+                        cpu_fill(rect, rk, x, y)
+                    };
+                    let got = gpu_mask_predicate(rect, rk as f32, x, y);
+                    assert_eq!(
+                        got, expect,
+                        "rect={rect:?} rk={rk} 像素=({x},{y})：GPU 判据 {got} != CPU 参考 {expect}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        println!("GPU 片元判据与 null.rs 参考逐像素一致（{checked} 个采样点）✅");
+    }
+
+    /// 结构自检：M3a 的两支着色器必须**只用**声明的算子，且不含控制流（无分支/无循环）。
+    ///
+    /// 为什么单独查「无控制流」：任务的片元判据要求「算掩码 + 一次 `OpSelect`」，
+    /// 一旦有人改成 `OpBranchConditional`，多基本块就会引入 `OpPhi`/变量重载，
+    /// 出错面大得多，而功能测试未必立刻发现。
+    #[test]
+    fn rect_shaders_have_no_control_flow() {
+        const OP_BRANCH: u16 = 249;
+        const OP_BRANCH_CONDITIONAL: u16 = 250;
+        const OP_LOOP_MERGE: u16 = 246;
+        const OP_PHI: u16 = 245;
+        const OP_SWITCH: u16 = 247;
+        for (name, bytes) in [
+            ("vs_rect_attrs", vertex_shader_rect_attrs()),
+            ("fs_rect_shape", fragment_shader_rect_shape()),
+        ] {
+            let w = words(&bytes);
+            // OpLabel 只应出现一次（单个基本块）
+            let mut labels = 0usize;
+            let mut i = 5usize;
+            while i < w.len() {
+                let wc = (w[i] >> 16) as usize;
+                let op = (w[i] & 0xffff) as u16;
+                assert!(
+                    !matches!(
+                        op,
+                        OP_BRANCH | OP_BRANCH_CONDITIONAL | OP_LOOP_MERGE | OP_PHI | OP_SWITCH
+                    ),
+                    "{name}: 不允许控制流指令（opcode {op}）"
+                );
+                if op == OP_LABEL {
+                    labels += 1;
+                }
+                i += wc;
+            }
+            assert_eq!(labels, 1, "{name}: 必须是单基本块（实得 {labels} 个 OpLabel）");
         }
     }
 }

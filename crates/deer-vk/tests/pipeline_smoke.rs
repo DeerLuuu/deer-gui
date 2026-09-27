@@ -240,3 +240,79 @@ fn pipeline_lifecycle_is_stable() {
     dev.wait_idle().expect("空闲等待");
     println!("连续 5 轮 创建/销毁 均正常 ✅");
 }
+
+/// **`create_vertex_pipeline` 的 5 条错误路径**（T3 review **F6** —— 上两轮 review 与 ledger
+/// 都没提到它，属「既没做也没说」的那条；本轮补上）。
+///
+/// 分两层覆盖：
+/// - **纯函数层**：`device.rs` 的 `tests::vertex_pipeline_args_reject_all_five_bad_inputs`
+///   （无需 GPU，任何机器都会跑）；
+/// - **本测试（公开路径层）**：走真实 `VkDevice`，证明校验**确实接在公开入口上**
+///   —— 抽函数时最容易犯的错就是「抽出来了但调用点没接」。
+///
+/// 5 条都由函数**开头**的参数校验返回，不会创建任何 Vulkan 对象（因此无 GPU 时本条跳过，
+/// 而纯函数那层仍然覆盖）。
+#[test]
+fn create_vertex_pipeline_rejects_bad_arguments() {
+    let Some(dev) = open() else { return };
+    let pass = dev
+        .create_render_pass(
+            vk::VK_FORMAT_R8G8B8A8_UNORM,
+            vk::VK_ATTACHMENT_LOAD_OP_CLEAR,
+            vk::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+        )
+        .expect("渲染通道");
+    let layout = dev.create_pipeline_layout(None).expect("管线布局");
+    let extent = vk::Extent2D {
+        width: 16,
+        height: 16,
+    };
+    // 校验发生在 `stages` 被使用之前 ⇒ 空阶段数组就够（也不会走到 build_pipeline）
+    let stages: [vk::PipelineShaderStageCreateInfo; 0] = [];
+    let attr0 = deer_vk::VertexAttr {
+        location: 0,
+        format: vk::VK_FORMAT_R32G32_SFLOAT,
+        offset: 0,
+    };
+    let attr_oob = deer_vk::VertexAttr {
+        location: 0,
+        format: vk::VK_FORMAT_R32G32_SFLOAT,
+        offset: 44, // == stride ⇒ 越界
+    };
+    let attr_dup_a = deer_vk::VertexAttr {
+        location: 1,
+        format: vk::VK_FORMAT_R32G32_SFLOAT,
+        offset: 0,
+    };
+    let attr_dup_b = deer_vk::VertexAttr {
+        location: 1,
+        format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
+        offset: 8,
+    };
+    let zero = vk::Extent2D {
+        width: 0,
+        height: 16,
+    };
+
+    let cases: [(&str, vk::Extent2D, u32, &[deer_vk::VertexAttr], &str); 5] = [
+        ("stride = 0", extent, 0, &[attr0], "stride"),
+        ("attrs 空", extent, 44, &[], "属性"),
+        ("extent 宽为 0", zero, 44, &[attr0], "viewport"),
+        ("offset ≥ stride", extent, 44, &[attr_oob], "offset"),
+        ("location 重复", extent, 44, &[attr_dup_a, attr_dup_b], "重复"),
+    ];
+
+    for (what, e, stride, attrs, needle) in cases {
+        let err = match dev.create_vertex_pipeline(&stages, &layout, &pass, e, stride, attrs) {
+            Ok(_) => panic!("{what} 必须被拒，却建成了管线"),
+            Err(err) => err,
+        };
+        // 不只断言 `is_err()`：还要断言**拒的原因**（否则「拒了但拒错理由」也算通过）
+        let msg = format!("{err}");
+        assert!(
+            msg.contains(needle),
+            "{what}: 错误信息应当提到「{needle}」，实际：{msg}"
+        );
+        println!("  {what} ⇒ 已拒：{msg}");
+    }
+}
