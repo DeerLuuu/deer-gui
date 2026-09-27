@@ -309,13 +309,92 @@ fn vertex_layout_is_stable_for_the_vertex_buffer() {
     assert_eq!(std::mem::offset_of!(gpu_geom::GpuVertex, color), 28, "location 3：vec4");
 }
 
-/// `extent` 为 0 不能除零（CPU 后端把 0 尺寸当 1 —— 这里保持同一约定）。
+/// `extent` 为 0 时按 1 处理（CPU 后端的 `Framebuffer::new(..max(1))` 同一约定）。
+///
+/// **这条断言必须真的会咬人**（fix round 1 / I1）：第一版只写了
+/// `for v in &s.vertices { assert!(v.pos[..].is_finite()) }` —— 而 `2*px/0` 一旦发生，
+/// 裁剪区 `(0,0,0,0)` 会让**每个**四边形求交后为空，`vertices` 是**空的**，
+/// 于是循环一次都不执行、测试假绿（reviewer 用「删掉 `max(1)`」的变异验证抓到）。
+/// 所以这里钉**顶点条数**与**精确 NDC**：退化 extent 必须被当成 1×1 画布。
 #[test]
-fn zero_extent_does_not_produce_nan() {
+fn zero_extent_is_treated_as_one_by_one_canvas() {
     let mut l = DrawList::new();
     l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 1, 1), color: Color::WHITE });
     let s = gpu_geom::build_stream(&l, Extent { width: 0, height: 0 });
+    // 1×1 画布上的 (0,0,1,1) ⇒ 铺满整块画布 ⇒ 两个三角形
+    assert_eq!(s.vertices.len(), 6, "退化 extent 不能被当成「0 尺寸画布」而丢掉几何");
+    assert_eq!(s.vertices[0].pos, [-1.0, -1.0], "左上角");
+    assert_eq!(s.vertices[2].pos, [1.0, 1.0], "右下角（2*1/1 - 1）");
+    assert_eq!(s.vertices[4].pos, s.vertices[2].pos);
+    assert_eq!(s.vertices[5].pos, [-1.0, 1.0], "左下角");
     for v in &s.vertices {
         assert!(v.pos[0].is_finite() && v.pos[1].is_finite(), "NDC 不得为 NaN/Inf：{:?}", v.pos);
     }
+}
+
+/// 退化 extent 下，**超出 1×1 画布**的几何被裁掉 —— 这证明裁剪区真的跟着 `max(1)` 走，
+/// 而不是「恰好因为 rect 本身就是 1×1 才通过」。
+#[test]
+fn zero_extent_still_clips_to_the_one_by_one_canvas() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 8, 8), color: Color::WHITE });
+    let s = gpu_geom::build_stream(&l, Extent { width: 0, height: 0 });
+    assert_eq!(s.vertices.len(), 6);
+    assert_eq!(s.vertices[0].pos, [-1.0, -1.0]);
+    assert_eq!(s.vertices[2].pos, [1.0, 1.0], "光栅化范围被夹进 1×1");
+    assert_eq!(s.vertices[0].rect, [0.0, 0.0, 8.0, 8.0], "rect 属性仍是原始矩形（Ruling 5）");
+}
+
+/// 裁剪栈配平 ⇒ `clip_unbalanced == false`（含嵌套与正常弹出）。
+#[test]
+fn balanced_clip_stack_is_reported_as_balanced() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 4, 4), color: Color::WHITE });
+    l.push(DrawCmd::PushClip { rect: RectI::new(1, 1, 4, 4) });
+    l.push(DrawCmd::PushClip { rect: RectI::new(2, 2, 4, 4) });
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 4, 4), color: Color::WHITE });
+    l.push(DrawCmd::PopClip);
+    l.push(DrawCmd::PopClip);
+    assert!(l.clip_balanced());
+    let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 8 });
+    assert!(!s.clip_unbalanced, "配平的列表不该被标记为不平衡");
+}
+
+/// 少一个 `PopClip` ⇒ 必须被报告（CPU 后端在 `CpuFrame::record` 直接报错，T3 要能对齐）。
+#[test]
+fn missing_pop_clip_is_reported() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::PushClip { rect: RectI::new(1, 1, 4, 4) });
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 8, 8), color: Color::WHITE });
+    let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 8 });
+    assert!(s.clip_unbalanced, "PushClip 未配对必须上报");
+    assert_eq!(s.vertices.len(), 6, "几何照常产出（宽容处理，由调用方决定是否报错）");
+    assert!(s.unsupported.is_empty(), "「列表坏了」不是「命令不支持」");
+}
+
+/// 多余的 `PopClip`（把初始的「全画布」弹出去）⇒ 必须被报告。
+#[test]
+fn extra_pop_clip_is_reported() {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 8, 8), color: Color::WHITE });
+    l.push(DrawCmd::PopClip);
+    l.push(DrawCmd::PushClip { rect: RectI::new(1, 1, 4, 4) });
+    l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 8, 8), color: Color::WHITE });
+    l.push(DrawCmd::PopClip);
+    let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 8 });
+    // 计数最后是配平的（多出的 Pop + Push + Pop ⇒ depth 回到 0），
+    // 但「把全画布弹出栈」这件事本身已经让列表坏了
+    assert!(s.clip_unbalanced, "多出的 PopClip 也算不平衡（计数配对但栈已坏）");
+}
+
+/// 直接改写 `DrawList::cmds`（`pub` 字段）会绕过列表自身的记账 ——
+/// 本层因此**独立数一遍**，不信 `list.clip_balanced()`。
+#[test]
+fn unbalanced_cmds_field_is_still_detected() {
+    let mut l = DrawList::new();
+    l.cmds.push(DrawCmd::PushClip { rect: RectI::new(1, 1, 4, 4) });
+    l.cmds.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 8, 8), color: Color::WHITE });
+    assert!(l.clip_balanced(), "列表自身的记账被绕过了（clip_balance 仍是 0）");
+    let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 8 });
+    assert!(s.clip_unbalanced, "独立计数能抓到被绕过的记账");
 }

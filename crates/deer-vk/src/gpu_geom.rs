@@ -84,16 +84,30 @@ pub struct GpuStream {
     pub vertices: Vec<GpuVertex>,
     /// 每条未能翻译的命令一条说明（人类可读，供上层包成 `GpuError::Unsupported`）。
     pub unsupported: Vec<String>,
+    /// `PushClip`/`PopClip` 是否**不平衡**（判据见 [`build_stream`]）。
+    ///
+    /// 与 [`GpuStream::unsupported`] 分开：一个是「这条命令还不会画」，一个是
+    /// 「这份绘制列表本身就是坏的」。T3 可据此返回 `GpuError::Unsupported`/`Driver`。
+    pub clip_unbalanced: bool,
 }
 
 /// 把绘制列表翻译成顶点流；`extent` 用于像素→NDC 换算与裁剪。
 ///
 /// 语义与 CPU 后端（`deer-gpu/src/null.rs`）**刻意对齐**：
-/// - 裁剪栈初始为全画布，`PushClip` 求交、`PopClip` 出栈（越界即退回全画布；
-///   不平衡的列表不该走到这里 —— `CpuFrame::record` 已在入口报错）；
+/// - 裁剪栈初始为全画布，`PushClip` 求交、`PopClip` 出栈（越界即退回全画布）；
 /// - 与裁剪区求交后为空的几何**整条跳过**（CPU 那边就是画 0 个像素）；
 /// - `NodeHint` 是诊断信息，**安静忽略**；
 /// - `Text` 记入 [`GpuStream::unsupported`]。
+///
+/// **裁剪栈不平衡**：CPU 后端在 `CpuFrame::record` 就把它当错误拒收
+/// （`clip_balanced()` 是绘制列表的结构不变式）。本层不擅自报错（它是纯翻译，
+/// 报错还是降级由调用方决定），但**据实上报**：`clip_unbalanced = true` 当且仅当
+/// ① 帧结束时 `PushClip` 与 `PopClip` 数量不等，或 ② 出现了多余的 `PopClip`
+/// （把初始的「全画布」弹出栈 —— 即使后面再 `PushClip` 把计数配平，这份列表
+/// 仍是坏的）。几何产出保持与 CPU 光栅化器一样「宽容」，不受此标志影响。
+///
+/// 这里**独立数一遍**而不复用 `list.clip_balanced()`：`DrawList::cmds` 是 `pub` 字段，
+/// 直接改写它的列表不会被内部记账看到。
 pub fn build_stream(list: &DrawList, extent: Extent) -> GpuStream {
     // 0 尺寸会让 NDC 换算除零 —— 与 CPU 后端同一约定（`Framebuffer::new(..max(1))`）
     let w = extent.width.max(1);
@@ -105,18 +119,28 @@ pub fn build_stream(list: &DrawList, extent: Extent) -> GpuStream {
     let full = RectI::new(0, 0, w as i32, h as i32);
     let mut clip = full;
     let mut stack: Vec<RectI> = Vec::new();
+    let mut depth: i32 = 0;
+    let mut pop_without_push = false;
     let mut out = GpuStream {
         vertices: Vec::with_capacity(list.len() * 6),
         unsupported: Vec::new(),
+        clip_unbalanced: false,
     };
 
     for cmd in &list.cmds {
         match cmd {
             DrawCmd::PushClip { rect } => {
+                depth += 1;
                 stack.push(clip);
                 clip = intersect(&clip, rect);
             }
-            DrawCmd::PopClip => clip = stack.pop().unwrap_or(full),
+            DrawCmd::PopClip => {
+                depth -= 1;
+                if depth < 0 {
+                    pop_without_push = true;
+                }
+                clip = stack.pop().unwrap_or(full);
+            }
             DrawCmd::FillRect { rect, color } => {
                 emit_quad(&mut out.vertices, *rect, *rect, *color, RADIUS_FILL, &clip, &ndc);
             }
@@ -148,6 +172,7 @@ pub fn build_stream(list: &DrawList, extent: Extent) -> GpuStream {
         }
     }
 
+    out.clip_unbalanced = depth != 0 || pop_without_push;
     out
 }
 
