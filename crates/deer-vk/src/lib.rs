@@ -39,6 +39,7 @@ pub mod pipelines;
 pub mod spirv;
 pub mod surface;
 pub mod swapchain;
+pub mod vertex_unify;
 pub mod windowed;
 
 pub use device::{Pipeline, PipelineLayout, RenderPass, ShaderModule, VertexAttr, VkDevice};
@@ -49,6 +50,7 @@ pub use hal::{VulkanDevice, VulkanFrame, VulkanSwapchain};
 pub use offscreen::{Buffer, CommandPool, Fence, Framebuffer, Image, ImageView, Memory, OffscreenRenderer};
 pub use pipelines::{build_pipelines, PipelineState, PipelineSet, ViewportStrategy};
 pub use surface::Surface;
+pub use vertex_unify::{UnifiedVertex, SHAPE_UV_SENTINEL};
 pub use swapchain::{Acquire, Present, Semaphore, Swapchain, SwapchainConfig};
 pub use windowed::{FrameOutcome, WindowedRenderer};
 
