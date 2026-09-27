@@ -44,6 +44,7 @@ use deer_gui::vk::pipelines::ViewportStrategy;
 use deer_gui::vk::windowed::{
     live_ui_resource_count, viewport_strategy_from_env, FrameOutcome, WindowedRenderer,
 };
+use deer_gui::vk::RenderStats;
 use deer_gui::window::{App, Flow, WindowConfig, WindowInfo, run};
 
 /// 清屏色（线性 UNORM ⇒ 回读到的字节就是它本身）。
@@ -117,6 +118,18 @@ struct ParityResult {
     at: (u32, u32),
     gpu: [u8; 4],
     cpu: [u8; 4],
+    /// **每帧**的渲染统计（两次读取的差值 ÷ 帧数；M3+ B1 的验收量）。
+    stats_per_frame: RenderStats,
+}
+
+/// 两个统计快照的差（都是累计值 ⇒ **差值**才是「这一段」的代价）。
+fn stats_delta(before: RenderStats, after: RenderStats) -> RenderStats {
+    RenderStats {
+        draw_calls: after.draw_calls - before.draw_calls,
+        pipeline_switches: after.pipeline_switches - before.pipeline_switches,
+        buffer_uploads: after.buffer_uploads - before.buffer_uploads,
+        buffer_allocations: after.buffer_allocations - before.buffer_allocations,
+    }
 }
 
 struct Parity {
@@ -148,6 +161,8 @@ impl Parity {
         );
         let r = self.renderer.as_mut().ok_or("还没有渲染器")?;
         let engine = self.engine.as_mut().ok_or("还没有字体引擎")?;
+        // M3+ B1：统计是**累计值** ⇒ 取画这些帧前后的差值、再除以帧数 = 每帧代价
+        let stats_before = r.render_stats();
         for _ in 0..frames {
             match r.draw_and_present(list, Some(engine)) {
                 Ok(FrameOutcome::Presented) => {}
@@ -187,12 +202,20 @@ impl Parity {
         }
         let w = extent.width.max(1);
         let px = (worst / 4) as u32;
+        let delta = stats_delta(stats_before, r.render_stats());
+        let n = frames.max(1) as u64;
         Ok(ParityResult {
             name,
             max_diff,
             differing,
             total: (extent.width as usize) * (extent.height as usize),
             at: (px % w, px / w),
+            stats_per_frame: RenderStats {
+                draw_calls: delta.draw_calls / n,
+                pipeline_switches: delta.pipeline_switches / n,
+                buffer_uploads: delta.buffer_uploads / n,
+                buffer_allocations: delta.buffer_allocations / n,
+            },
             gpu: [gpu[worst], gpu[worst + 1], gpu[worst + 2], gpu[worst + 3]],
             cpu: [
                 cpu_px[worst],
@@ -431,6 +454,13 @@ impl App for Parity {
             println!(
                 "  {}: 最大通道差 {}，不同像素 {} / {}，最差在 ({}, {}) GPU={:?} CPU={:?}",
                 r.name, r.max_diff, r.differing, r.total, r.at.0, r.at.1, r.gpu, r.cpu
+            );
+            println!(
+                "      每帧统计（M3+ B1）：draw_calls {} / pipeline_switches {} / buffer_uploads {} / buffer_allocations {}",
+                r.stats_per_frame.draw_calls,
+                r.stats_per_frame.pipeline_switches,
+                r.stats_per_frame.buffer_uploads,
+                r.stats_per_frame.buffer_allocations
             );
         }
         println!("  {leak}");

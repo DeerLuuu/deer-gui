@@ -185,9 +185,9 @@ pub(crate) fn text_attrs() -> [VertexAttr; 3] {
     ]
 }
 
-/// 一条绘制段属于哪条管线。
+/// 一条绘制段属于哪条管线（顺序即 z 序）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PipelineKind {
+pub(crate) enum PipelineKind {
     Shape,
     Text,
 }
@@ -197,10 +197,67 @@ enum PipelineKind {
 /// `first`/`count` 是**各自顶点缓冲内**的区间（形状与文本各有一块缓冲）——
 /// 两条管线不共用顶点布局，所以用「段」而不是「同一条 `vkCmdDraw` 的偏移」来表达顺序。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DrawCall {
-    kind: PipelineKind,
-    first: u32,
-    count: u32,
+pub(crate) struct DrawCall {
+    pub(crate) kind: PipelineKind,
+    pub(crate) first: u32,
+    pub(crate) count: u32,
+}
+
+/// **渲染统计**（M3+ B1）：全部是**累计值**（自渲染器创建起），测试用两次读取的**差值**断言。
+///
+/// ## 为什么用这些量，而不是 fps（项目既有原则）
+///
+/// 本仓库早先吃过「不可复现的 fps 快照」的亏（被 reviewer 判为缺陷）：fps 依赖机器负载、
+/// 电源状态、窗口是否被遮挡，**不能作为结论**。这四个量都是**可计数、可复现**的：
+///
+/// | 字段 | 含义（与真实 Vulkan 调用一一对应） |
+/// |---|---|
+/// | `draw_calls` | `vkCmdDraw` 的调用次数 |
+/// | `pipeline_switches` | `vkCmdBindPipeline` 的调用次数（每次「切管线」一次） |
+/// | `buffer_uploads` | 主机→顶点缓冲的**上传**次数（map + memcpy + unmap） |
+/// | `buffer_allocations` | 顶点缓冲的**创建**次数（`vkCreateBuffer` + 绑定内存） |
+///
+/// ## 计数位置（**必须与真实调用同处**）
+///
+/// 四个 `+= 1` 都写在**发那条 Vulkan 调用的同一个地方** —— 于是「删掉发射」必然也删掉计数，
+/// 护栏不会退化成「实现者自证」。这是本项目反复验证过的唯一能挡住「把护栏一起删掉」的写法。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RenderStats {
+    pub draw_calls: u64,
+    pub pipeline_switches: u64,
+    pub buffer_uploads: u64,
+    pub buffer_allocations: u64,
+}
+
+/// 把**相邻同管线且区间连续**的绘制段合并成一段（M3+ B2「合段」）。
+///
+/// ## 为什么合并是像素等价的
+///
+/// 每个 `DrawCall` 是「同一块顶点缓冲里从 `first` 开始的 `count` 个顶点」；相邻同管线的
+/// 两段若**区间首尾相接**（`prev.first + prev.count == next.first`），一次
+/// `vkCmdDraw(first, count_a + count_b, …)` 与两次连续 `vkCmdDraw` 光栅化的**图元序列完全相同**
+/// —— 顶点顺序不变 ⇒ 三角形顺序不变 ⇒ z 序与混合结果不变。
+///
+/// **不合并**的两种情况（都由这条不变式兜住）：管线不同（形状↔文本）⇒ 必须切管线；
+/// 区间不连续（中间被别的管线插过）⇒ 一次 draw 画不出来。
+///
+/// 这是纯函数：**无 GPU 就能单测**（见本模块单测）。
+///
+/// ⚠️ **当前未被调用**（B1 只加统计；接上它是 B2 那一步）。加 `allow(dead_code)`
+/// 而不是等到 B2 再写：这段源码与它的单测是**同一条判据**，先落地才能让 B2 的 diff
+/// 只剩「调用它」这一处语义改动。
+#[allow(dead_code)]
+pub(crate) fn merge_adjacent_draw_calls(calls: &[DrawCall]) -> Vec<DrawCall> {
+    let mut out: Vec<DrawCall> = Vec::with_capacity(calls.len());
+    for c in calls {
+        match out.last_mut() {
+            Some(prev) if prev.kind == c.kind && prev.first + prev.count == c.first => {
+                prev.count += c.count;
+            }
+            _ => out.push(*c),
+        }
+    }
+    out
 }
 
 /// 文本管线的全部资源（渲染器以 `Option` 持有：不调 [`GpuGeometryRenderer::with_text`]
@@ -684,6 +741,8 @@ pub struct GpuGeometryRenderer {
     /// 其中属于**文本**顶点缓冲的条数（review M2 的护栏，见
     /// [`GpuGeometryRenderer::text_host_to_vertex_barrier_count`]）。
     text_host_to_vertex_barriers: u64,
+    /// 渲染统计（M3+ B1；累计值，见 [`RenderStats`]）。
+    stats: RenderStats,
     /// **必须最后**（最后析构）。
     device: VkDevice,
 }
@@ -896,6 +955,7 @@ impl GpuGeometryRenderer {
             host_to_vertex_barriers: 0,
             shape_host_to_vertex_barriers: 0,
             text_host_to_vertex_barriers: 0,
+            stats: RenderStats::default(),
             device,
         })
     }
@@ -988,6 +1048,14 @@ impl GpuGeometryRenderer {
     /// 刻意构造的，不在防御范围内。
     pub fn host_to_vertex_barrier_count(&self) -> u64 {
         self.host_to_vertex_barriers
+    }
+
+    /// **渲染统计**（M3+ B1）：draw call / 管线切换 / 缓冲上传 / 缓冲分配（**累计值**）。
+    ///
+    /// 四个量都与真实 Vulkan 调用一一对应，且计数写在**发调用的同一处**（见 [`RenderStats`]）。
+    /// 用法：读两次、取差值 ⇒ 「这一帧/这一段」的代价。
+    pub fn render_stats(&self) -> RenderStats {
+        self.stats
     }
 
     /// 累计发出的 host→VERTEX_INPUT 屏障里，**属于文本顶点缓冲**的那部分（review M2）。
@@ -1177,19 +1245,30 @@ impl GpuGeometryRenderer {
             memory,
             capacity,
         });
+        // 计数与真实调用同处（`vkCreateBuffer` + 绑定内存在上一行刚发生）
+        self.stats.buffer_allocations += 1;
         Ok(())
     }
 
     /// 把一段**已经是 `#[repr(C)]` 纯 `f32`** 的顶点数据写进缓冲（map → memcpy → unmap）。
     ///
     /// `what` 只用于报错里指认是哪个缓冲（形状 / 文本）。
-    fn upload_vertices(&self, vb: &VertexBuffer, src: &[u8], what: &str) -> GpuResult<()> {
+    /// 收 `memory` 句柄（而不是 `&VertexBuffer`）：调用点通常正持有 `self.vertex`/`self.text`
+    /// 的借用，传引用会和 `&mut self`（要自增 `stats`）撞借用检查 —— 句柄是 `Copy` 的普通值。
+    fn upload_vertices(
+        &mut self,
+        memory: vk::DeviceMemoryHandle,
+        src: &[u8],
+        what: &str,
+    ) -> GpuResult<()> {
         // map 的守卫：**任何**提前返回都会 unmap（T3 review F9）。
-        let mapped = map_memory(what, &self.fns, self.device_handle, vb.memory.handle())?;
+        let mapped = map_memory(what, &self.fns, self.device_handle, memory)?;
         // SAFETY: 映射了整块缓冲（≥ src.len()，由 `ensure_vertex_capacity` 保证）；源与目标不重叠。
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr(), mapped.as_mut_ptr() as *mut u8, src.len());
         }
+        // 计数与真实调用同处（memcpy 刚发生、unmap 随 `mapped` 析构）
+        self.stats.buffer_uploads += 1;
         Ok(())
     }
 
@@ -1289,8 +1368,13 @@ impl GpuGeometryRenderer {
             let src = unsafe {
                 std::slice::from_raw_parts(shape_verts.as_ptr() as *const u8, bytes)
             };
-            let vb = self.vertex.as_ref().expect("ensure 之后必有缓冲");
-            self.upload_vertices(vb, src, "vkMapMemory(shape vertex)")?;
+            let mem = self
+                .vertex
+                .as_ref()
+                .expect("ensure 之后必有缓冲")
+                .memory
+                .handle();
+            self.upload_vertices(mem, src, "vkMapMemory(shape vertex)")?;
         }
         if !text_verts.is_empty() {
             let bytes = std::mem::size_of_val(text_verts) as u64;
@@ -1310,12 +1394,14 @@ impl GpuGeometryRenderer {
             let src = unsafe {
                 std::slice::from_raw_parts(text_verts.as_ptr() as *const u8, bytes)
             };
-            let vb = self
+            let mem = self
                 .text
                 .as_ref()
                 .and_then(|r| r.vertex.as_ref())
-                .expect("ensure 之后必有缓冲");
-            self.upload_vertices(vb, src, "vkMapMemory(text vertex)")?;
+                .expect("ensure 之后必有缓冲")
+                .memory
+                .handle();
+            self.upload_vertices(mem, src, "vkMapMemory(text vertex)")?;
             // 图集若变了就重传纹理 + 更新描述符集（**必须在提交之前**）
             self.refresh_atlas_texture()?;
         }
@@ -1401,6 +1487,8 @@ impl GpuGeometryRenderer {
                                 vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 self.pipelines.shape.handle(),
                             );
+                            // 计数与真实调用同处（B1）：删掉这行绑定就必然删掉计数
+                            self.stats.pipeline_switches += 1;
                             let vb = self.vertex.as_ref().expect("形状段 ⇒ 缓冲已上传");
                             let offset: vk::DeviceSize = 0;
                             (self.fns.cmd_bind_vertex_buffers)(
@@ -1418,6 +1506,8 @@ impl GpuGeometryRenderer {
                                 vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 self.pipelines.text.handle(),
                             );
+                            // 计数与真实调用同处（B1）
+                            self.stats.pipeline_switches += 1;
                             let vb = res.vertex.as_ref().expect("文本段 ⇒ 缓冲已上传");
                             let offset: vk::DeviceSize = 0;
                             (self.fns.cmd_bind_vertex_buffers)(
@@ -1443,6 +1533,8 @@ impl GpuGeometryRenderer {
                     bound = Some(call.kind);
                 }
                 (self.fns.cmd_draw)(self.cmd, call.count, 1, call.first, 0);
+                // 计数与真实调用同处（B1）
+                self.stats.draw_calls += 1;
             }
             (self.fns.cmd_end_render_pass)(self.cmd);
         }
@@ -1610,6 +1702,60 @@ mod tests {
     /// **I1 的回归判据（fix round 2 / R1-1）**：屏障的四个掩码必须**确切**是
     /// `HOST` / `VERTEX_INPUT(0x4)` / `HOST_WRITE` / `VERTEX_ATTRIBUTE_READ(0x4)`。
     ///
+    /// **合段（M3+ B2）的纯函数判据**：相邻同管线且区间连续的段合并，其余一律不动。
+    ///
+    /// 这是 B2 唯一改动语义的地方，而它是纯函数 ⇒ **无 GPU 就能回归**
+    /// （`tests/gpu_vs_cpu.rs` 另有一条真机用例断言「合段后像素不变 + 计数下降」）。
+    #[test]
+    fn merge_adjacent_draw_calls_only_merges_contiguous_same_pipeline() {
+        let c = |kind, first, count| DrawCall { kind, first, count };
+
+        // ① 相邻同管线 + 区间连续 ⇒ 合成一段
+        let merged = merge_adjacent_draw_calls(&[
+            c(PipelineKind::Shape, 0, 6),
+            c(PipelineKind::Shape, 6, 6),
+            c(PipelineKind::Shape, 12, 6),
+        ]);
+        assert_eq!(merged, vec![c(PipelineKind::Shape, 0, 18)], "三段应当合成一段");
+
+        // ② 相邻但**区间不连续** ⇒ 不合并（一次 draw 画不出来）
+        let split = merge_adjacent_draw_calls(&[
+            c(PipelineKind::Shape, 0, 6),
+            c(PipelineKind::Shape, 12, 6),
+        ]);
+        assert_eq!(split.len(), 2, "区间有洞时不许合并：{split:?}");
+
+        // ③ 相邻但**管线不同** ⇒ 不合并（必须切管线）
+        let mixed = merge_adjacent_draw_calls(&[
+            c(PipelineKind::Shape, 0, 6),
+            c(PipelineKind::Text, 0, 6),
+            c(PipelineKind::Shape, 6, 6),
+        ]);
+        assert_eq!(mixed.len(), 3, "跨管线不许合并：{mixed:?}");
+
+        // ④ 文本那一路同样合并（两条管线共用这一份实现）
+        let text = merge_adjacent_draw_calls(&[
+            c(PipelineKind::Text, 0, 6),
+            c(PipelineKind::Text, 6, 6),
+        ]);
+        assert_eq!(text, vec![c(PipelineKind::Text, 0, 12)]);
+
+        // ⑤ 空输入 ⇒ 空输出；单段 ⇒ 原样
+        assert!(merge_adjacent_draw_calls(&[]).is_empty());
+        let one = merge_adjacent_draw_calls(&[c(PipelineKind::Text, 30, 6)]);
+        assert_eq!(one, vec![c(PipelineKind::Text, 30, 6)], "单段必须原样保留（含 first 偏移）");
+    }
+
+    /// **B1 的统计字段语义**：默认全 0（新渲染器 = 没画过任何东西）。
+    #[test]
+    fn render_stats_starts_at_zero() {
+        let s = RenderStats::default();
+        assert_eq!(s.draw_calls, 0);
+        assert_eq!(s.pipeline_switches, 0);
+        assert_eq!(s.buffer_uploads, 0);
+        assert_eq!(s.buffer_allocations, 0);
+    }
+
     /// 变异验证：把 `VK_PIPELINE_STAGE_VERTEX_INPUT_BIT` 改成 `1 << 5`（细分求值）⇒ 本测试**变红**。
     /// 之前没有这条断言时，那个变异在 16 个测试靶上全绿（只有校验层刷 VUID-04091）。
     #[test]

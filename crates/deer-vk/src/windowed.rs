@@ -107,20 +107,10 @@ pub enum FrameOutcome {
 // M3c-T3：窗口里画**真实界面树**（形状 + 文本）所需的资源
 // ===========================================================================
 
-/// 一条绘制段属于哪条管线（顺序即 z 序）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum UiPipeline {
-    Shape,
-    Text,
-}
-
-/// 一帧里的一段绘制：`first`/`count` 是**各自顶点缓冲内**的区间。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct UiDrawCall {
-    kind: UiPipeline,
-    first: u32,
-    count: u32,
-}
+// 绘制段类型与「形状/文本」两条管线的身份都取自**共用的一份**
+// （`gpu_render::{DrawCall, PipelineKind}`）：窗口与离屏的「顺序即 z 序」表达必须逐字相同，
+// 各写一份就是「只改了一边」的温床（M3c 收敛过一次，这里沿用同一条规矩）。
+use crate::gpu_render::{DrawCall, PipelineKind, RenderStats};
 
 /// 顶点缓冲（host 可见 + coherent；窗口路径每帧重传）。
 struct UiVertexBuffer {
@@ -216,10 +206,14 @@ fn ui_single_command_in_clip(active_clip: &[RectI], cmd: &DrawCmd) -> DrawList {
 }
 
 /// 建（或扩容）一个 host 可见的顶点缓冲。**先建新的、成功后再换**（失败不破坏旧状态）。
+///
+/// `stats.buffer_allocations` 在**真正创建**的那一步自增（与 `vkCreateBuffer` 同处）——
+/// 计数放被调用方，删掉创建就必然删掉计数。
 fn ensure_ui_vertex_capacity(
     device: &VkDevice,
     slot: &mut Option<UiVertexBuffer>,
     bytes: u64,
+    stats: &mut RenderStats,
 ) -> GpuResult<()> {
     if slot.as_ref().is_some_and(|v| v.capacity >= bytes) {
         return Ok(());
@@ -231,6 +225,8 @@ fn ensure_ui_vertex_capacity(
         memory,
         capacity,
     });
+    // 与 `vkCreateBuffer` + `vkBindBufferMemory` 同处
+    stats.buffer_allocations += 1;
     Ok(())
 }
 
@@ -310,11 +306,14 @@ fn create_host_vertex_buffer(
 }
 
 /// 把一段 `#[repr(C)]` 纯 `f32` 顶点数据写进缓冲（map → memcpy → unmap）。
+///
+/// `stats.buffer_uploads` 在 memcpy 之后自增（与那次主机写入同处）——计数放被调用方。
 fn upload_ui_vertices(
     device: &VkDevice,
     vb: &UiVertexBuffer,
     src: &[u8],
     what: &str,
+    stats: &mut RenderStats,
 ) -> GpuResult<()> {
     let fns = device.fns();
     let mut mapped: *mut c_void = ptr::null_mut();
@@ -343,6 +342,8 @@ fn upload_ui_vertices(
         // HOST_COHERENT ⇒ 不需要 flush，直接解映射。
         (fns.unmap_memory)(device.handle(), vb.memory.handle());
     }
+    // 与那次主机写入（memcpy）同处
+    stats.buffer_uploads += 1;
     Ok(())
 }
 
@@ -636,6 +637,8 @@ pub struct WindowedRenderer {
     /// 与 [`live_ui_resource_count`] 配对使用：`resize` 反复发生时，
     /// 「构建次数 = 1 + 重建次数」且「存活数恒为 1」才是「失效重建不泄漏」的证据。
     ui_builds: u64,
+    /// 渲染统计（M3+ B1；累计值，见 [`RenderStats`]）。三角形路径与界面路径都计入。
+    stats: RenderStats,
 }
 
 impl WindowedRenderer {
@@ -744,6 +747,7 @@ impl WindowedRenderer {
             ui_text_skipped: 0,
             ui_viewport_is_dynamic: true,
             ui_builds: 0,
+            stats: RenderStats::default(),
         })
     }
 
@@ -994,7 +998,9 @@ impl WindowedRenderer {
     /// 与 [`Self::draw_and_present`] 共用同一段「取图 → 录制 → 提交 → 呈现」逻辑
     /// （[`Self::present_frame`]）；区别只有「录什么」。
     pub fn render_and_present(&mut self) -> GpuResult<FrameOutcome> {
-        self.present_frame(Self::record)
+        // 三角形路径的 `record(&self, ..)` 包一层：`present_frame` 现在交的是 `&mut Self`
+        // （界面路径要在发调用的地方自增统计）。
+        self.present_frame(|s, slot, image_index| s.record(slot, image_index))
     }
 
     /// 「取图 → 录制 → 提交 → 呈现」的公共骨架：`record` 决定这一帧录什么。
@@ -1002,9 +1008,13 @@ impl WindowedRenderer {
     /// 抽出来的理由：两条路径（M2b 的三角形、M3c 的界面树）在**同步与呈现**上
     /// 必须逐字相同 —— 复制一份就等于复制一份「只改了一边」的风险（超时/过期/SUBOPTIMAL
     /// 这些分支极易在复制时漏改）。
-    fn present_frame<R>(&mut self, record: R) -> GpuResult<FrameOutcome>
+    ///
+    /// `record` 收 `&mut Self`（M3+ B1）：界面路径要在**发真实绘制调用的地方**自增 `stats`
+    /// （draw call / 管线切换），而那需要可变借用。闭包本身不捕获 `self`（只捕获体外的
+    /// 局部量如 `calls`），所以 `&mut self` 与它不冲突。
+    fn present_frame<R>(&mut self, mut record: R) -> GpuResult<FrameOutcome>
     where
-        R: Fn(&Self, usize, u32) -> GpuResult<()>,
+        R: FnMut(&mut Self, usize, u32) -> GpuResult<()>,
     {
         if self.framebuffers.len() != self.swapchain.image_count() as usize {
             return Err(GpuError::Unsupported(
@@ -1127,6 +1137,15 @@ impl WindowedRenderer {
         self.ui_builds
     }
 
+    /// **渲染统计**（M3+ B1）：draw call / 管线切换 / 缓冲上传 / 缓冲分配（**累计值**）。
+    ///
+    /// 四个量都与真实 Vulkan 调用一一对应，计数写在**发调用的同一处**
+    /// （三角形路径与界面路径都计入）⇒ 删掉发射必然删掉计数。
+    /// 用法：读两次取差值 ⇒ 「这一帧/这一段」的代价。
+    pub fn render_stats(&self) -> RenderStats {
+        self.stats
+    }
+
     /// **主动释放**界面资源（两条管线 + 描述符集 + 图集纹理 + 两块顶点缓冲）；
     /// 下一次 `draw_and_present` 会按当前交换链尺寸/格式重建。
     ///
@@ -1159,8 +1178,7 @@ impl WindowedRenderer {
     }
 
     /// 当前界面管线用的是动态 viewport 吗（实测/诊断用）。
-    pub fn ui_viewport_is_dynamic(&self) -> bool {
-        self.ui_viewport_is_dynamic
+    pub fn ui_viewport_is_dynamic(&self) -> bool {        self.ui_viewport_is_dynamic
     }
 
     /// **画一帧界面树并呈现**（M3c-T3）。
@@ -1220,7 +1238,7 @@ impl WindowedRenderer {
         // ② 单次遍历：按原顺序把每条命令送进对应翻译层，并记录绘制段（保 z 序）
         let mut shape_verts: Vec<GpuVertex> = Vec::new();
         let mut text_verts: Vec<TextVertex> = Vec::new();
-        let mut calls: Vec<UiDrawCall> = Vec::new();
+        let mut calls: Vec<DrawCall> = Vec::new();
         let mut active_clip: Vec<RectI> = Vec::new();
         let mut engine = text;
         let mut skipped = 0usize;
@@ -1251,8 +1269,8 @@ impl WindowedRenderer {
                             GpuError::Unsupported("文本顶点数超出 u32".to_string())
                         })?;
                         text_verts.extend_from_slice(&s.vertices);
-                        calls.push(UiDrawCall {
-                            kind: UiPipeline::Text,
+                        calls.push(DrawCall {
+                            kind: PipelineKind::Text,
                             first,
                             count,
                         });
@@ -1272,8 +1290,8 @@ impl WindowedRenderer {
                             GpuError::Unsupported("形状顶点数超出 u32".to_string())
                         })?;
                         shape_verts.extend_from_slice(&s.vertices);
-                        calls.push(UiDrawCall {
-                            kind: UiPipeline::Shape,
+                        calls.push(DrawCall {
+                            kind: PipelineKind::Shape,
                             first,
                             count,
                         });
@@ -1284,29 +1302,34 @@ impl WindowedRenderer {
         self.ui_text_skipped = skipped;
 
         // ③ 上传：形状与文本各有独立缓冲（每帧重传；容量不足才重建）
+        //
+        // 计数（`buffer_uploads` / `buffer_allocations`）在**被调用方**里自增，
+        // 与真实调用同处 —— 删掉上传就必然删掉计数。
         if !shape_verts.is_empty() {
             let bytes = std::mem::size_of_val(shape_verts.as_slice());
             let dev = &self.device;
+            let stats = &mut self.stats;
             let ui = self.ui.as_mut().expect("ensure_ui 之后必有资源");
-            ensure_ui_vertex_capacity(dev, &mut ui.shape_vb, bytes as u64)?;
+            ensure_ui_vertex_capacity(dev, &mut ui.shape_vb, bytes as u64, stats)?;
             // SAFETY: `GpuVertex` 是 `#[repr(C)]` 纯 `f32`（无指针、无 Drop）⇒ 字节视图合法。
             let src = unsafe {
                 std::slice::from_raw_parts(shape_verts.as_ptr() as *const u8, bytes)
             };
             let vb = ui.shape_vb.as_ref().expect("刚 ensure 过");
-            upload_ui_vertices(dev, vb, src, "vkMapMemory(窗口形状顶点)")?;
+            upload_ui_vertices(dev, vb, src, "vkMapMemory(窗口形状顶点)", stats)?;
         }
         if !text_verts.is_empty() {
             let bytes = std::mem::size_of_val(text_verts.as_slice());
             let dev = &self.device;
+            let stats = &mut self.stats;
             let ui = self.ui.as_mut().expect("ensure_ui 之后必有资源");
-            ensure_ui_vertex_capacity(dev, &mut ui.text_vb, bytes as u64)?;
+            ensure_ui_vertex_capacity(dev, &mut ui.text_vb, bytes as u64, stats)?;
             // SAFETY: `TextVertex` 是 `#[repr(C)]` 纯 `f32` ⇒ 字节视图合法。
             let src = unsafe {
                 std::slice::from_raw_parts(text_verts.as_ptr() as *const u8, bytes)
             };
             let vb = ui.text_vb.as_ref().expect("刚 ensure 过");
-            upload_ui_vertices(dev, vb, src, "vkMapMemory(窗口文本顶点)")?;
+            upload_ui_vertices(dev, vb, src, "vkMapMemory(窗口文本顶点)", stats)?;
         }
 
         // ④ 图集纹理：指纹变化才重传（与离屏同一条契约）
@@ -1403,7 +1426,10 @@ impl WindowedRenderer {
     }
 
     /// 录制第 `slot` 个命令缓冲：清屏 + **按 z 序逐段**绘制界面（+ 可选回读复制）。
-    fn record_ui(&self, slot: usize, image_index: u32, calls: &[UiDrawCall]) -> GpuResult<()> {
+    ///
+    /// 需要 `&mut self`（M3+ B1）：要在**发真实调用的地方**自增 `stats`
+    /// （draw call / 管线切换）——计数与调用同处，删掉发射就必然删掉计数。
+    fn record_ui(&mut self, slot: usize, image_index: u32, calls: &[DrawCall]) -> GpuResult<()> {
         let fns = *self.device.fns();
         let cmd = self.command_buffers[slot];
         let ui = self.ui.as_ref().expect("draw_and_present 已 ensure_ui");
@@ -1436,11 +1462,11 @@ impl WindowedRenderer {
         //   `HOST/HOST_WRITE` → `VERTEX_INPUT/VERTEX_ATTRIBUTE_READ`。
         let used = [
             (
-                calls.iter().any(|c| c.kind == UiPipeline::Shape),
+                calls.iter().any(|c| c.kind == PipelineKind::Shape),
                 ui.shape_vb.as_ref().map(|v| v.buffer.handle()),
             ),
             (
-                calls.iter().any(|c| c.kind == UiPipeline::Text),
+                calls.iter().any(|c| c.kind == PipelineKind::Text),
                 ui.text_vb.as_ref().map(|v| v.buffer.handle()),
             ),
         ];
@@ -1527,26 +1553,30 @@ impl WindowedRenderer {
                 };
                 (fns.cmd_set_scissor)(cmd, 0, 1, &scissor);
             }
-            let mut bound: Option<UiPipeline> = None;
+            let mut bound: Option<PipelineKind> = None;
             for call in calls {
                 if bound != Some(call.kind) {
                     match call.kind {
-                        UiPipeline::Shape => {
+                        PipelineKind::Shape => {
                             (fns.cmd_bind_pipeline)(
                                 cmd,
                                 vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 ui.pipes.shape.handle(),
                             );
+                            // 计数与真实调用同处（B1）
+                            self.stats.pipeline_switches += 1;
                             let vb = ui.shape_vb.as_ref().expect("形状段 ⇒ 缓冲已上传");
                             let offset: vk::DeviceSize = 0;
                             (fns.cmd_bind_vertex_buffers)(cmd, 0, 1, &vb.buffer.handle(), &offset);
                         }
-                        UiPipeline::Text => {
+                        PipelineKind::Text => {
                             (fns.cmd_bind_pipeline)(
                                 cmd,
                                 vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
                                 ui.pipes.text.handle(),
                             );
+                            // 计数与真实调用同处（B1）
+                            self.stats.pipeline_switches += 1;
                             let vb = ui.text_vb.as_ref().expect("文本段 ⇒ 缓冲已上传");
                             let offset: vk::DeviceSize = 0;
                             (fns.cmd_bind_vertex_buffers)(cmd, 0, 1, &vb.buffer.handle(), &offset);
@@ -1565,6 +1595,8 @@ impl WindowedRenderer {
                     bound = Some(call.kind);
                 }
                 (fns.cmd_draw)(cmd, call.count, 1, call.first, 0);
+                // 计数与真实调用同处（B1）
+                self.stats.draw_calls += 1;
             }
             (fns.cmd_end_render_pass)(cmd);
         }

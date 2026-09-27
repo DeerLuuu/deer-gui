@@ -43,7 +43,7 @@ pub mod windowed;
 
 pub use device::{Pipeline, PipelineLayout, RenderPass, ShaderModule, VertexAttr, VkDevice};
 pub use gpu_geom::{GpuStream, GpuVertex};
-pub use gpu_render::GpuGeometryRenderer;
+pub use gpu_render::{GpuGeometryRenderer, RenderStats};
 pub use gpu_text::{build_text_stream, TextStream, TextVertex};
 pub use hal::{VulkanDevice, VulkanFrame, VulkanSwapchain};
 pub use offscreen::{Buffer, CommandPool, Fence, Framebuffer, Image, ImageView, Memory, OffscreenRenderer};
