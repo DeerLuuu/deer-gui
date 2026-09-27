@@ -404,6 +404,13 @@ fn create_and_destroy_texture_pipeline(mut check: impl FnMut(&deer_vk::device::T
         // 要求池此刻仍存活），`pool` 后析构。反过来（`set` 在前）会让
         // `vkFreeDescriptorSets` 拿到已销毁的池 —— reviewer 实测那会
         // **0xc0000005 崩溃**，不是一句清晰的错误码。
+        //
+        // ⚠️⚠️ **别把这条和「结构体字段」的规则混在一起 —— 两者方向相反**：
+        //   · 局部量（`let`）：按声明**逆序**析构，即「后声明的先析构」⇒ 本处池在前。
+        //   · 结构体字段：按声明**顺序**析构，即「先声明的先析构」⇒ 若把池与集放进
+        //     同一个结构体，**池的字段必须声明在集之后**（才能让集先析构）。
+        //   两处结论看似矛盾，其实是两条不同的规则；`device.rs` 的
+        //   `DescriptorSet` 类型文档写的就是「结构体字段」那条。
         let pool = dev.create_descriptor_pool(1).expect("创建描述符池");
         assert_eq!(pool.max_sets(), 1);
         let set = dev.allocate_descriptor_set(&pool, &dsl).expect("分配描述符集");

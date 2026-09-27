@@ -1044,7 +1044,7 @@ fn consecutive_text_frames_stay_in_sync() {
 ///
 /// 也就是说「只在指纹变化时重传」这条**性能前提**此前只有实现、没有护栏 ——
 /// 删掉实现测试照样绿。这条测试补上护栏：用
-/// [`deer_vk::device::texture_r8_upload_count()`]（进程级计数，在被调用方自增）
+/// [`deer_vk::device::texture_r8_upload_count()`]（**按线程**计数，在被调用方自增）
 /// 的**差值**断言「同一图集不应触发上传」。
 ///
 /// ## 为什么是「先渲染一次收干，再连续两次同文本」

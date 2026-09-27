@@ -93,7 +93,11 @@ fn pixels_differing_from(buffer: &[u8], c: Color) -> usize {
         .count()
 }
 
-/// GPU 侧字形图集纹理的**进程级上传计数**（用来断言「图集没变就不重传」）。
+/// GPU 侧字形图集纹理的**按线程上传计数**（用来断言「图集没变就不重传」）。
+///
+/// ⚠️ 是 **`thread_local`** 而不是进程级：本示例的渲染与读取都在 `run()` 所在的
+/// 同一个线程上同步完成，所以这里的差值语义成立（见 `deer_vk::device` 里
+/// `texture_r8_upload_count()` 的说明）。
 fn atlas_upload_count() -> usize {
     deer_gui::vk::device::texture_r8_upload_count()
 }
