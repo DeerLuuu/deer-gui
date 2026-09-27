@@ -499,6 +499,12 @@ impl VkDevice {
     ///
     /// `VertexAttr` 比 `vk::VertexInputAttributeDescription` 少一个字段：`binding` 恒为 0
     /// （只有一个顶点缓冲）。少一个「忘了写 binding 于是读到别的缓冲」的机会。
+    ///
+    /// ## 参数校验（5 条错误路径）
+    ///
+    /// 校验逻辑抽在纯函数 [`validate_vertex_pipeline_args`] 里（**不碰 Vulkan**），
+    /// 所以 5 条错误路径有无 GPU 都能回归（`device.rs` 末尾的单元测试 +
+    /// `tests/pipeline_smoke.rs` 走真实 `VkDevice` 的那条各覆盖一遍）。
     pub fn create_vertex_pipeline(
         &self,
         stages: &[vk::PipelineShaderStageCreateInfo],
@@ -508,35 +514,7 @@ impl VkDevice {
         stride: u32,
         attrs: &[VertexAttr],
     ) -> GpuResult<Pipeline> {
-        if stride == 0 {
-            return Err(GpuError::Unsupported("顶点 stride 不能为 0".to_string()));
-        }
-        if attrs.is_empty() {
-            return Err(GpuError::Unsupported(
-                "顶点管线至少要有一个属性（否则顶点缓冲毫无意义）".to_string(),
-            ));
-        }
-        if extent.width == 0 || extent.height == 0 {
-            return Err(GpuError::Unsupported(format!(
-                "静态 viewport 的宽高必须 > 0，实际 {}×{}",
-                extent.width, extent.height
-            )));
-        }
-        for (i, a) in attrs.iter().enumerate() {
-            if a.offset >= stride {
-                return Err(GpuError::Unsupported(format!(
-                    "属性 {}（location {}）的 offset {} 超出 stride {}",
-                    i, a.location, a.offset, stride
-                )));
-            }
-            if attrs[..i].iter().any(|b| b.location == a.location) {
-                return Err(GpuError::Unsupported(format!(
-                    "属性 location {} 重复声明",
-                    a.location
-                )));
-            }
-        }
-
+        validate_vertex_pipeline_args(extent, stride, attrs)?;
         // `binding` 恒为 0；`input_rate` = 每顶点。
         let binding = vk::VertexInputBindingDescription {
             binding: 0,
@@ -918,6 +896,47 @@ fn empty_vertex_input() -> vk::PipelineVertexInputStateCreateInfo {
         vertex_attribute_description_count: 0,
         p_vertex_attribute_descriptions: std::ptr::null(),
     }
+}
+
+/// 校验 [`VkDevice::create_vertex_pipeline`] 的参数（**纯函数**：不碰 Vulkan、不碰设备）。
+///
+/// 抽出来的理由（T3 review **F6**，上一轮被静默丢掉的那条）：这 5 条错误路径原本埋在
+/// 一个需要真实 `VkDevice` 的方法里，于是**一条测试都没有** —— 而「负例没有测试」等于没有
+/// 负例。抽成纯函数后，单元测试在任何机器上都能跑（含无 GPU 的 CI）。
+fn validate_vertex_pipeline_args(
+    extent: vk::Extent2D,
+    stride: u32,
+    attrs: &[VertexAttr],
+) -> GpuResult<()> {
+    if stride == 0 {
+        return Err(GpuError::Unsupported("顶点 stride 不能为 0".to_string()));
+    }
+    if attrs.is_empty() {
+        return Err(GpuError::Unsupported(
+            "顶点管线至少要有一个属性（否则顶点缓冲毫无意义）".to_string(),
+        ));
+    }
+    if extent.width == 0 || extent.height == 0 {
+        return Err(GpuError::Unsupported(format!(
+            "静态 viewport 的宽高必须 > 0，实际 {}×{}",
+            extent.width, extent.height
+        )));
+    }
+    for (i, a) in attrs.iter().enumerate() {
+        if a.offset >= stride {
+            return Err(GpuError::Unsupported(format!(
+                "属性 {}（location {}）的 offset {} 超出 stride {}",
+                i, a.location, a.offset, stride
+            )));
+        }
+        if attrs[..i].iter().any(|b| b.location == a.location) {
+            return Err(GpuError::Unsupported(format!(
+                "属性 location {} 重复声明",
+                a.location
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// 一个渲染通道。`Drop` 时销毁。
@@ -1439,5 +1458,114 @@ pub fn vk_result_name(rc: i32) -> &'static str {
         -11 => "VK_ERROR_FORMAT_NOT_SUPPORTED",
         -12 => "VK_ERROR_FRAGMENTED_POOL",
         _ => "未知 VkResult",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 好参数：1 个 binding、属性 offset 落在 stride 内、extent 非零。
+    fn good_attrs() -> [VertexAttr; 2] {
+        [
+            VertexAttr {
+                location: 0,
+                format: vk::VK_FORMAT_R32G32_SFLOAT,
+                offset: 0,
+            },
+            VertexAttr {
+                location: 1,
+                format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
+                offset: 8,
+            },
+        ]
+    }
+
+    /// **F6 的 5 条错误路径**（T3 review 点名、上一轮被静默丢掉的那条）。
+    ///
+    /// 一条一个断言，且都断言**错误信息**（不只是 `is_err()`）—— 否则「拒了但拒错原因」也算通过。
+    #[test]
+    fn vertex_pipeline_args_reject_all_five_bad_inputs() {
+        let ok_extent = vk::Extent2D {
+            width: 16,
+            height: 16,
+        };
+        let attrs = good_attrs();
+
+        // ① stride == 0
+        let e = validate_vertex_pipeline_args(ok_extent, 0, &attrs).expect_err("stride 0 必须被拒");
+        assert!(format!("{e}").contains("stride"), "{e}");
+
+        // ② attrs 为空
+        let e = validate_vertex_pipeline_args(ok_extent, 44, &[]).expect_err("空属性表必须被拒");
+        assert!(format!("{e}").contains("属性"), "{e}");
+
+        // ③ extent 有 0 边（宽为 0）
+        let e = validate_vertex_pipeline_args(
+            vk::Extent2D {
+                width: 0,
+                height: 8,
+            },
+            44,
+            &attrs,
+        )
+        .expect_err("viewport 宽为 0 必须被拒");
+        assert!(format!("{e}").contains("viewport"), "{e}");
+
+        // ③b extent 有 0 边（高为 0）—— 两个方向都试，避免只查了一个字段
+        let e = validate_vertex_pipeline_args(
+            vk::Extent2D {
+                width: 8,
+                height: 0,
+            },
+            44,
+            &attrs,
+        )
+        .expect_err("viewport 高为 0 必须被拒");
+        assert!(format!("{e}").contains("viewport"), "{e}");
+
+        // ④ 某个属性的 offset ≥ stride
+        let bad_offset = [
+            VertexAttr {
+                location: 0,
+                format: vk::VK_FORMAT_R32G32_SFLOAT,
+                offset: 0,
+            },
+            VertexAttr {
+                location: 1,
+                format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
+                offset: 44, // == stride ⇒ 已越界（记录从 stride 起就走出了本顶点）
+            },
+        ];
+        let e = validate_vertex_pipeline_args(ok_extent, 44, &bad_offset)
+            .expect_err("offset ≥ stride 必须被拒");
+        assert!(format!("{e}").contains("offset"), "{e}");
+
+        // ⑤ location 重复
+        let dup = [
+            VertexAttr {
+                location: 1,
+                format: vk::VK_FORMAT_R32G32_SFLOAT,
+                offset: 0,
+            },
+            VertexAttr {
+                location: 1,
+                format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
+                offset: 8,
+            },
+        ];
+        let e = validate_vertex_pipeline_args(ok_extent, 44, &dup).expect_err("location 重复必须被拒");
+        assert!(format!("{e}").contains("重复"), "{e}");
+    }
+
+    /// 好参数必须**通过**（否则上面 5 条可能是「永远报错」的假绿）。
+    #[test]
+    fn vertex_pipeline_args_accept_good_input() {
+        let extent = vk::Extent2D {
+            width: 16,
+            height: 16,
+        };
+        validate_vertex_pipeline_args(extent, 44, &good_attrs())
+            .expect("合法参数（stride 44 / offset 0,8 / extent 16×16）必须通过");
     }
 }

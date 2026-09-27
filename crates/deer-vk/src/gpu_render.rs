@@ -915,6 +915,10 @@ impl GpuGeometryRenderer {
         //   因为调用方漏写 `?` 而失效（reviewer 的变异 C 就是这么全绿的）。这里再查一次，
         //   于是「Broken ⇒ 绝不去碰命令缓冲/栅栏」不依赖任何调用方的写法。
         self.sync.ensure_reusable()?;
+        // SAFETY: `self.cmd` 是 `new()` 里从本结构的命令池分配出来的主命令缓冲句柄，仍然有效；
+        // 上一次使用它的提交已经在 `record_and_submit` 末尾等到栅栏（或已被判为 Broken ⇒ 上面
+        // 那行守卫已经返回 Err），所以此刻它**不在**执行中，可以重置。函数指针来自成功解析的
+        // loader（`DeviceFns`），设备比本结构活得久（`device` 字段最后析构）。
         // 上一帧已经等过栅栏 ⇒ 命令缓冲不在执行中，可以重置。
         check("vkResetCommandBuffer", unsafe {
             (self.fns.reset_command_buffer)(self.cmd, 0)
