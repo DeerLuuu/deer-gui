@@ -53,6 +53,9 @@ fn write_all_shaders_for_spirv_val() {
             "fs_solid",
             spirv::fragment_shader_solid([0.0, 1.0, 0.0, 1.0]),
         ),
+        // M3a（矩形属性着色器）：顶点属性透传 + 片元形状判据
+        ("vs_rect_attrs", spirv::vertex_shader_rect_attrs()),
+        ("fs_rect_shape", spirv::fragment_shader_rect_shape()),
     ];
 
     println!("写出 {} 个 .spv 到 spirv_probe/", shaders.len());

@@ -32,6 +32,18 @@ use deer_vk::spirv;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// M3a 新增的两支着色器（名字, 产物）。
+///
+/// 单列成函数是为了让 `all_shaders()`（喂给官方 `spirv-val`）与
+/// `rect_attrs_shaders_validate`（纯字节自检 + 单独校验）用**同一份**定义，
+/// 不会出现「测的是一个、跑的是另一个」。
+fn rect_attrs_shaders() -> [(&'static str, Vec<u8>); 2] {
+    [
+        ("vs_rect_attrs", spirv::vertex_shader_rect_attrs()),
+        ("fs_rect_shape", spirv::fragment_shader_rect_shape()),
+    ]
+}
+
 /// 找一个可用的 `spirv-val`。
 fn find_spirv_val() -> Option<PathBuf> {
     // ① 环境变量优先
@@ -107,6 +119,115 @@ fn all_shaders() -> Vec<(&'static str, Vec<u8>)> {
             spirv::fragment_shader_solid([0.0, 1.0, 0.0, 1.0]),
         ),
     ]
+    .into_iter()
+    .chain(rect_attrs_shaders())
+    .collect()
+}
+
+/// M3a（矩形属性着色器）的专项校验。
+///
+/// 分两层：
+/// 1. **纯字节自检**（任何机器都能跑）：魔数、头部 `bound > 0`、指令流用满整份模块
+///    —— `bound` 合法是那个「驱动不报错也不画」缺陷的第一道防线
+///    （见 `spirv.rs` 模块文档：头部 `bound` 必须 **>** 所有用到的 Id）
+/// 2. **官方 `spirv-val`**：把这两支着色器交给与 `all_shaders()` 同一条流程校验
+///    （`vkCreateShaderModule` 极宽容，只有独立校验器能判合法性）
+#[test]
+fn rect_attrs_shaders_validate() {
+    for (name, code) in rect_attrs_shaders() {
+        // ① 纯字节自检（不依赖 SDK）
+        assert_eq!(code.len() % 4, 0, "{name}: SPIR-V 必须 4 字节对齐");
+        let words: Vec<u32> = code
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(words[0], 0x0723_0203, "{name}: magic");
+        // 头部第 4 个字是 bound，必须 > 0 且大于所有用到的 Id（spirv.rs 模块文档 L23-25）
+        assert!(words[3] > 0, "{name}: 头部 bound 必须 > 0");
+
+        // 指令流必须正好用满整份模块（词数自洽）
+        let mut i = 5usize;
+        while i < words.len() {
+            let wc = (words[i] >> 16) as usize;
+            assert!(wc >= 1, "{name}: 词 {i} 声明词数 0");
+            assert!(i + wc <= words.len(), "{name}: 词 {i} 越界（wc={wc}）");
+            i += wc;
+        }
+        assert_eq!(i, words.len(), "{name}: 指令流必须正好用完整份模块");
+    }
+
+    // ①b 结构专项：用了 GLSL.std.450 扩展指令集的着色器，其 `OpExtInstImport`
+    //     必须落在「扩展指令集导入段」（规范序：Capability → Extension →
+    //     ExtInstImport → MemoryModel → …）。
+    //
+    // 为什么单独查这一条：`OpFloor` **不是** core opcode —— 它来自
+    // `GLSL.std.450` 扩展指令集（编号 8），必须 `OpExtInstImport` 一个
+    // `GLSL.std.450` 串再 `OpExtInst`。这段是 M3a 新增的段序风险点，
+    // 而段序错的表现恰恰是「驱动/校验器报别的错」（见本文件开头的教训）。
+    {
+        let bytes = spirv::fragment_shader_rect_shape();
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        const OP_EXT_INST_IMPORT: u16 = 11;
+        const OP_EXT_INST: u16 = 12;
+        const OP_MEMORY_MODEL: u16 = 14;
+        let mut import_at = None;
+        let mut memory_model_at = None;
+        let mut ext_inst_count = 0usize;
+        let mut i = 5usize;
+        while i < words.len() {
+            let wc = (words[i] >> 16) as usize;
+            let op = (words[i] & 0xffff) as u16;
+            match op {
+                OP_EXT_INST_IMPORT => import_at = import_at.or(Some(i)),
+                OP_MEMORY_MODEL => memory_model_at = memory_model_at.or(Some(i)),
+                OP_EXT_INST => ext_inst_count += 1,
+                _ => {}
+            }
+            i += wc;
+        }
+        let imp = import_at.expect("fs_rect_shape: 用了 GLSL.std.450 就必须有 OpExtInstImport");
+        let mm = memory_model_at.expect("fs_rect_shape: 缺少 OpMemoryModel");
+        assert!(
+            imp < mm,
+            "fs_rect_shape: OpExtInstImport（词 {imp}）必须在 OpMemoryModel（词 {mm}）之前 —— 段序错误"
+        );
+        assert!(
+            ext_inst_count >= 2,
+            "fs_rect_shape: 至少要两条 OpExtInst（px / py 各一次 OpFloor），实得 {ext_inst_count}"
+        );
+    }
+
+    // ② 官方 spirv-val（与 all_shaders 同一条流程、同一个 find_spirv_val）
+    let Some(val) = find_spirv_val() else {
+        println!(
+            "跳过官方 spirv-val 部分：本机没有 spirv-val。\n\
+             装 Vulkan SDK（含 Shader Toolchain）即可用，或设环境变量 SPIRV_VAL 指向它。\n\
+             ⚠️ 纯字节自检**不能**替代 spirv-val —— 它只查词数与 bound，不查语义合法性。"
+        );
+        return;
+    };
+
+    let dir = std::env::temp_dir().join("deer_spirv_val_rect_attrs");
+    std::fs::create_dir_all(&dir).expect("建临时目录");
+    for (name, bytes) in rect_attrs_shaders() {
+        let p = dir.join(format!("{name}.spv"));
+        std::fs::write(&p, &bytes).unwrap_or_else(|e| panic!("写 {} 失败：{e}", p.display()));
+        let out = Command::new(&val)
+            .arg(&p)
+            .output()
+            .unwrap_or_else(|e| panic!("执行 spirv-val 失败：{e}"));
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "{name} 未通过官方 spirv-val（{}）：\n{stderr}",
+            val.display()
+        );
+        println!("  ✅ {name}（{} 字节）", bytes.len());
+    }
+    println!("M3a 矩形属性着色器（顶点 + 片元）通过官方 spirv-val 校验 ✅");
 }
 
 #[test]
