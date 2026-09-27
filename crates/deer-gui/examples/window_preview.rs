@@ -59,6 +59,12 @@ use deer_gui::window::{App, Flow, WindowConfig, WindowInfo, run};
 /// 「窗口像素 == CPU 像素」这条判据在 sRGB 附件上**根本不成立**。
 const CLEAR: Color = Color::rgb(0x08, 0x09, 0x0C);
 
+/// 线性格式的规范值（`VK_FORMAT_B8G8R8A8_UNORM` / `VK_FORMAT_R8G8B8A8_UNORM`）。
+///
+/// `init` 里用它断言「实际格式是线性的」—— 本示例的清屏色基准依赖这一点。
+const FMT_B8G8R8A8_UNORM: i32 = 0x2c;
+const FMT_R8G8B8A8_UNORM: i32 = 0x25;
+
 fn readback_enabled() -> bool {
     std::env::var("DEER_WINDOW_READBACK")
         .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
@@ -186,8 +192,8 @@ impl Preview {
         // 基准 = 「界面没盖上时」应当看到的颜色。
         //
         // 线性 `*_UNORM` 交换链 ⇒ 写入的字节原样出现在回读里（**不再** sRGB 编码）。
-        // 这是可断言的事实：格式若不是线性的，示例会在下面 `assert!(format_is_linear)` 处
-        // 明确报出来，而不是让基准悄悄错。
+        // 这个基准**依赖格式是线性的**，所以 `init` 里有一条 `assert!` 直接钉住它
+        // （review Minor-1：此前注释声称有那条断言，实际不存在 —— 现在真的存在）。
         let clear = [CLEAR.r, CLEAR.g, CLEAR.b, 255];
         let non_clear = px
             .chunks_exact(4)
@@ -263,8 +269,8 @@ impl Preview {
                     p.non_clear, p.total, p.content
                 );
                 println!(
-                    "（「与 CPU 逐像素一致」的判据属 M3c Step 2/3：交换链是 sRGB 附件，\
-                     呈现字节与 CPU 帧缓冲本来就不该逐字节相同）"
+                    "（逐像素与 CPU 对照的判据在 `window_parity` 那个 example：\
+                     本示例只证明「界面真的上屏」，不做像素级判定）"
                 );
             }
             None => {
@@ -313,6 +319,21 @@ impl App for Preview {
             r.format(),
             r.present_mode(),
             r.image_count()
+        );
+        // ★ 本示例的像素基准（「清屏色就是 CLEAR 本身」）**依赖附件是线性的**：
+        //   sRGB 附件会把写入值编码后再回读 ⇒ 基准就错了。所以这里直接钉住它，
+        //   而不是让基准悄悄错（review Minor-1：此前只写在注释里）。
+        let fmt = r.format();
+        let linear = fmt == FMT_B8G8R8A8_UNORM || fmt == FMT_R8G8B8A8_UNORM;
+        println!(
+            "颜色附件    : {fmt:#010x}（{}）",
+            if linear { "线性 UNORM ✅" } else { "⚠️ 非线性" }
+        );
+        assert!(
+            linear,
+            "本示例要求线性 `*_UNORM` 交换链（实测 {fmt:#010x}）：sRGB 附件会编码回读值，\
+             清屏色基准与半透明混合都不再与 CPU 一致。请跑 `window_parity` 看具体差多少，\
+             或确认这台机器的 surface 是否真的只有 sRGB 格式。"
         );
         let extent = r.extent();
         self.renderer = Some(r);
@@ -395,10 +416,10 @@ fn demo_tree() -> deer_gui::layout::Node {
     app.build()
 }
 
-/// 把 `render_tree_to_rgba_with_engine` 的 CPU 结果与 GPU 的按键差异**只报告不判定**。
+/// 窗口预览的入口。
 ///
-/// Step 1 不做逐像素判定（sRGB 附件）—— 这里只打印 CPU 侧的「非背景像素数」，
-/// 便于人对照 GPU 侧的 `non_clear` 是否量级一致（相差数量级说明明显画错）。
+/// 本示例**只**证明「真实界面树上屏」（帧数 + 呈现帧里有非底色像素）；
+/// **逐像素与 CPU 对照在 `window_parity`**（那才需要线性附件与空间约定）。
 fn main() -> ExitCode {
     let target_frames = target_frames_from_env();
     let hold = std::env::var("DEER_WINDOW_HOLD")

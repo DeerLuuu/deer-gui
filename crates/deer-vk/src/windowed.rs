@@ -1117,6 +1117,32 @@ impl WindowedRenderer {
         self.ui_builds
     }
 
+    /// **主动释放**界面资源（两条管线 + 描述符集 + 图集纹理 + 两块顶点缓冲）；
+    /// 下一次 `draw_and_present` 会按当前交换链尺寸/格式重建。
+    ///
+    /// 用途：窗口最小化、长时间空闲，以及**在两种 viewport 策略下都能验证「析构真的发生」**。
+    ///
+    /// ## 必须先 `vkDeviceWaitIdle`（实测踩过：不等就 `VK_ERROR_DEVICE_LOST`）
+    ///
+    /// `FRAMES_IN_FLIGHT = 2` ⇒ 「等当前槽的栅栏」**不等于**「上一帧的提交已经做完」：
+    /// 另一个槽的命令缓冲可能还在跑，而它引用着这些管线/缓冲/纹理。
+    /// 直接析构就是「正在被 GPU 使用的对象被销毁」—— 本机实测直接
+    /// `VK_ERROR_DEVICE_LOST`（`vkQueueSubmit` 失败，随后连 `vkDeviceWaitIdle` 也失败）。
+    /// `resize()` 换交换链时同样先等空闲，理由相同。
+    ///
+    /// ## 为什么需要这个入口（review I-2）
+    ///
+    /// `resize()` 只在**静态**策略下销毁界面资源（动态策略不必重建，见那里的注释）⇒
+    /// 默认（动态）配置下「析构」这条路径**根本不存在**：变异「删掉 `Drop` 里的计数递减」
+    /// 在默认口径下**不会变红**，断言等于空转（reviewer 实测）。
+    /// 有了这个入口，两种策略都能走到析构，「存活资源数」这条护栏才真正咬得住。
+    pub fn release_ui_resources(&mut self) -> GpuResult<()> {
+        // 契约：调用点都在帧与帧之间；这里再等一次空闲，保证没有在飞的提交引用它们。
+        self.device.wait_idle()?;
+        self.ui = None;
+        Ok(())
+    }
+
     /// 当前界面管线用的是动态 viewport 吗（实测/诊断用）。
     pub fn ui_viewport_is_dynamic(&self) -> bool {
         self.ui_viewport_is_dynamic
@@ -1134,16 +1160,18 @@ impl WindowedRenderer {
     /// 4. 图集纹理**只在指纹变化时**重传（与离屏同一条契约）；
     /// 5. 录制：清屏 → 按段切管线/缓冲/描述符集 → 绘制 →（可选）回读复制 → 呈现。
     ///
-    /// ## viewport 用**静态**的，并在 `resize()` 后重建管线（本轮的一处已知偏离）
+    /// ## viewport：默认**动态**（共用层参数化，`DEER_VK_WINDOW_VIEWPORT` 可强制静态）
     ///
-    /// 顶点输入管线在本项目里**只有静态 viewport 的公开构造入口**
-    /// （`VkDevice::create_vertex_pipeline`）——「动态 viewport + 顶点输入」目前没有公开 API
-    /// （`build_pipeline` 是私有的）。`task-26` 正在把管线状态提成共用层，所以本轮先用静态版；
-    /// `resize()` 里把 `self.ui` 置 `None` 保证尺寸变化后按新 extent 重建。
+    /// 两条管线由 `pipelines::build_pipelines` 按 [`viewport_strategy_from_env`] 建：
     ///
-    /// 朝向与离屏**同向**：静态 viewport = `(0, 0, w, h)`、`min_depth 0 / max_depth 1` ⇒
-    /// NDC `y = -1` 在**上**、像素 y 从上往下 —— 正是形状片元着色器里
-    /// `gl_FragCoord`（`OriginUpperLeft`）判据要求的方向。
+    /// - **动态（默认）**：M2b 起窗口路径就是这么用的；尺寸变化**不必**重建管线；
+    /// - **静态**（诊断/实测用）：viewport 写死在管线里 ⇒ `resize()` 必须让界面资源失效
+    ///   （见那里的注释与 `release_ui_resources`）。
+    ///
+    /// 朝向两条策略**一致**：`(0, 0, w, h)`、`min_depth 0 / max_depth 1` ⇒ NDC `y = -1` 在**上**、
+    /// 像素 y 从上往下 —— 正是形状片元着色器里 `gl_FragCoord`（`OriginUpperLeft`）判据要求的方向。
+    /// 实测（本机 Intel 集显）：两种策略**都能上屏且像素完全相同**；
+    /// 「声明动态却从不调 `vkCmdSetViewport`」会直接崩 —— 详见报告 §11.4。
     ///
     /// ## 报错策略（与离屏对齐）
     ///

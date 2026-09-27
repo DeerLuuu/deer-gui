@@ -204,16 +204,75 @@ impl Parity {
     }
 
     /// 反复 `resize` + 每轮画一帧 ⇒ 断言「失效重建不泄漏」。
+    ///
+    /// ## 为什么要先做一次**主动释放**（review I-2）
+    ///
+    /// `resize()` 只在**静态**策略下销毁界面资源（动态不必重建）⇒ 只跑 resize 的话，
+    /// 默认（动态）口径下「析构」这条路径根本不会发生：变异「删掉 `Drop` 里的计数递减」
+    /// 在默认口径下**不会变红**（reviewer 实测）。所以这里在 resize 之前**先主动释放一次**
+    /// 并断言「存活数掉到 0」—— 两种策略下都真的走到析构，断言才咬得住。
     fn resize_leak_check(&mut self, rounds: u32) -> Result<String, String> {
         let dynamic = viewport_strategy_from_env() == ViewportStrategy::Dynamic;
-        let before = self
+        let mut engine = self.engine.take().ok_or("还没有字体引擎")?;
+        let list = semi_transparent_list(self.extent);
+
+        // ⓪ warm-up 一帧：确保资源已建
+        {
+            let r = self.renderer.as_mut().ok_or("还没有渲染器（init 没跑？）")?;
+            r.draw_and_present(&list, Some(&mut engine))
+                .map_err(|e| format!("warm-up 呈现失败：{e}"))?;
+        }
+        let live_before = live_ui_resource_count();
+        if live_before != 1 {
+            return Err(format!("warm-up 之后存活界面资源应为 1，实测 {live_before}"));
+        }
+
+        // ① **主动释放**：两种策略下都必须真的析构
+        let builds_before_release = self
             .renderer
             .as_ref()
-            .ok_or("还没有渲染器（init 没跑？）")?
+            .ok_or("还没有渲染器")?
             .ui_build_count();
-        let mut engine = self.engine.take().ok_or("还没有字体引擎")?;
+        self.renderer
+            .as_mut()
+            .ok_or("还没有渲染器")?
+            .release_ui_resources()
+            .map_err(|e| format!("释放界面资源失败：{e}"))?;
+        let live_after_release = live_ui_resource_count();
+        if live_after_release != 0 {
+            return Err(format!(
+                "调用 release_ui_resources() 之后存活界面资源应为 0，实测 {live_after_release} \
+                 ⇒ **析构/计数没生效**（`UiResources::drop` 或计数递减被删掉了？）"
+            ));
+        }
+
+        // ② 再画一帧 ⇒ 必须**恰好**重建一次（这是「释放后按需重建」的契约）
+        {
+            let r = self.renderer.as_mut().ok_or("还没有渲染器")?;
+            r.draw_and_present(&list, Some(&mut engine))
+                .map_err(|e| format!("释放后重建呈现失败：{e}"))?;
+        }
+        let builds_after_rebuild = self
+            .renderer
+            .as_ref()
+            .ok_or("还没有渲染器")?
+            .ui_build_count();
+        if builds_after_rebuild != builds_before_release + 1 {
+            return Err(format!(
+                "释放后再画一帧应当**恰好**重建 1 次：之前 {}、之后 {}",
+                builds_before_release, builds_after_rebuild
+            ));
+        }
+        if live_ui_resource_count() != 1 {
+            return Err(format!(
+                "重建之后存活数应为 1，实测 {}",
+                live_ui_resource_count()
+            ));
+        }
+
+        // ③ 反复 resize + 每轮画一帧，且**每一轮都查存活数**
+        let before = builds_after_rebuild;
         for i in 0..rounds {
-            let list = semi_transparent_list(self.extent);
             let r = self.renderer.as_mut().ok_or("还没有渲染器")?;
             let w = 640 + (i % 2) * 40;
             let h = 400 + (i % 2) * 40;
@@ -232,6 +291,12 @@ impl Parity {
                 }
                 Err(e) => return Err(format!("resize 后呈现失败：{e}")),
             }
+            let live = live_ui_resource_count();
+            if live != 1 {
+                return Err(format!(
+                    "第 {i} 次 resize 之后存活数应为 1，实测 {live} ⇒ **资源泄漏**"
+                ));
+            }
         }
         self.engine = Some(engine);
         let r = self.renderer.as_ref().ok_or("还没有渲染器")?;
@@ -239,7 +304,8 @@ impl Parity {
         let live = live_ui_resource_count();
         let expect = if dynamic { 0 } else { u64::from(rounds) };
         let msg = format!(
-            "resize×{rounds}（{} 策略）：重建 {rebuilt} 次（期望 {expect}）、存活界面资源 {live} 份（期望 1）",
+            "资源生命周期：主动释放后存活 0 ✅、释放后重建 1 次 ✅；\
+             resize×{rounds}（{} 策略）：重建 {rebuilt} 次（期望 {expect}）、存活界面资源 {live} 份（期望 1）",
             if dynamic { "动态" } else { "静态" }
         );
         if live != 1 {

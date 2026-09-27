@@ -594,10 +594,28 @@ fn run_windowed_e2e() {
 
     // —— 真机值断言 ——
     assert!(r.extent().width > 0 && r.extent().height > 0, "交换链尺寸必须 > 0");
+    // **线性优先**（M3c 裁决，见 `swapchain::pick_config` 的文档）：sRGB 附件连混合都在线性
+    // 空间，而 CPU 基准按字节混合 ⇒ 半透明差几十字节 ⇒ 窗口上屏 parity 只能在**线性**附件上成立。
+    // 这里只断言「格式**要么是线性的、要么是那两种 sRGB 退路**」：
+    // 前者是正常路径，后者是「本机 surface 只有 sRGB」时的如实退回（**退路不许被删掉**）。
+    let fmt = r.format();
+    let linear = fmt == VK_FORMAT_B8G8R8A8_UNORM || fmt == VK_FORMAT_R8G8B8A8_UNORM;
+    let srgb_fallback = fmt == VK_FORMAT_B8G8R8A8_SRGB || fmt == VK_FORMAT_R8G8B8A8_SRGB;
     assert!(
-        r.format() == VK_FORMAT_B8G8R8A8_SRGB || r.format() == VK_FORMAT_R8G8B8A8_SRGB,
-        "首选 sRGB 格式，实际 {:#x}（若本机确实只有线性格式，请连同能力列表一起报告）",
-        r.format()
+        linear || srgb_fallback,
+        "交换链格式必须是线性 *_UNORM（首选）或 sRGB（退路），实际 {fmt:#x} \
+         —— 两者都不是说明 `pick_config` 选错了；若本机能力列表确实只有别的格式，\
+         请连能力列表一起报告"
+    );
+    if !linear {
+        eprintln!(
+            "⚠️ 本机只给到 sRGB 格式（{fmt:#x}）⇒ 走退路：**半透明像素与 CPU 不会逐字节一致**\
+             （sRGB 附件的混合在线性空间），`window_parity` 会直接失败并说明原因"
+        );
+    }
+    println!(
+        "颜色附件        : {fmt:#010x}（{}）",
+        if linear { "线性 UNORM（首选）" } else { "sRGB（退路）" }
     );
     assert_eq!(
         r.present_mode(),
@@ -662,12 +680,18 @@ fn run_windowed_e2e() {
     // 第一版按「直通」写断言，实测读到 [71,79,105] 而假红 —— 现在按编码公式比对
     // （`srgb_encoded_byte` 本身有单测，且与两张卡的实测一致）。
     let clear_linear = [CLEAR_R, CLEAR_G, CLEAR_B, 0xFF];
-    let clear_expected = [
-        deer_vk::windowed::srgb_encoded_byte(CLEAR_R),
-        deer_vk::windowed::srgb_encoded_byte(CLEAR_G),
-        deer_vk::windowed::srgb_encoded_byte(CLEAR_B),
-        0xFF,
-    ];
+    // **线性附件直通、sRGB 附件编码**（M3c 的裁决：线性优先）——
+    // 期望值必须跟着**实际格式**走，否则这条判据会变成「拿 sRGB 的期望值去卡线性附件」。
+    let expected_clear = if linear {
+        [CLEAR_R, CLEAR_G, CLEAR_B, 0xFF]
+    } else {
+        [
+            deer_vk::windowed::srgb_encoded_byte(CLEAR_R),
+            deer_vk::windowed::srgb_encoded_byte(CLEAR_G),
+            deer_vk::windowed::srgb_encoded_byte(CLEAR_B),
+            0xFF,
+        ]
+    };
     let pixels = r.read_back_last_frame().expect("回读最后呈现的那一帧");
     let (rw, rh) = (r.extent().width, r.extent().height);
     assert_eq!(
@@ -679,12 +703,15 @@ fn run_windowed_e2e() {
         let i = ((y as usize) * (rw as usize) + (x as usize)) * 4;
         [pixels[i], pixels[i + 1], pixels[i + 2], pixels[i + 3]]
     };
+    println!("回读 {rw}×{rh}（RGBA8，{} 字节）", pixels.len());
     println!(
-        "回读 {rw}×{rh}（RGBA8，{} 字节）",
-        pixels.len()
-    );
-    println!(
-        "  清屏色（线性）= {clear_linear:?} ⇒ sRGB 附件实测应为 {clear_expected:?}（sRGB 编码，非直通）"
+        "  清屏色（写入值）= {clear_linear:?} ⇒ {} 附件实测应为 {expected_clear:?}（{}）",
+        if linear { "线性" } else { "sRGB" },
+        if linear {
+            "直通，不编码"
+        } else {
+            "sRGB 编码，非直通"
+        }
     );
     for (name, x, y) in [
         ("左上", 0u32, 0u32),
@@ -695,13 +722,14 @@ fn run_windowed_e2e() {
         let c = at(x, y);
         println!("  {name} ({x},{y}) = {c:?}");
         assert_eq!(
-            c, clear_expected,
-            "{name} ({x},{y}) 必须与「清屏色的 sRGB 编码」逐字节相同"
+            c, expected_clear,
+            "{name} ({x},{y}) 必须与「清屏色在该附件格式下的期望值」逐字节相同\
+             （线性直通 / sRGB 编码，取决于实际格式）"
         );
     }
     // R/B 换序的**方向性**证据：三个通道值互不相同且线性序是 16 < 20 < 36，
-    // 所以编码后必须严格递增（71 < 79 < 105）。若把 BGRA 当 RGBA 用（或反过来），
-    // 这里会变成递减 —— 「红蓝互换」在这种图案下一定会现形。
+    // 所以（无论是否编码）必须严格递增（直通 16<20<36；编码后 71<79<105）。
+    // 若把 BGRA 当 RGBA 用（或反过来），这里会变成递减 —— 「红蓝互换」一定会现形。
     let corner = at(0, 0);
     assert!(
         corner[0] < corner[1] && corner[1] < corner[2],
@@ -714,13 +742,13 @@ fn run_windowed_e2e() {
         rh / 2
     );
     assert_ne!(
-        center, clear_expected,
+        center, expected_clear,
         "窗口中间必须画了东西（这是「几何真的进到呈现帧里」的判据）"
     );
     // 三角形覆盖的中心区域里应当能找到不止一种非清屏色（抗锯齿/边界另说，这里只要求「有异色」）
     let differing = pixels
         .chunks_exact(4)
-        .filter(|p| p[..3] != clear_expected[..3])
+        .filter(|p| p[..3] != expected_clear[..3])
         .count();
     println!("  与清屏色不同的像素：{differing} 个（{:.2}% 画面）", differing as f64 * 100.0 / (rw as f64 * rh as f64));
     assert!(differing > 0, "整幅图全是清屏色 ⇒ 几何没画进去");
@@ -741,8 +769,8 @@ fn run_windowed_e2e() {
     assert_eq!(again.len(), pixels.len());
     assert_eq!(
         [again[0], again[1], again[2], again[3]],
-        clear_expected,
-        "重新打开回读后左上角仍应是清屏色（sRGB 编码值）"
+        expected_clear,
+        "重新打开回读后左上角仍应是清屏色（线性直通 / sRGB 编码，取决于附件格式）"
     );
 
     // —— resize：先真的改变窗口尺寸，再让渲染器重建交换链 ——
