@@ -11,7 +11,7 @@
 
 - `deer-window` 只做两件事：**建窗口 + 跑事件循环**，并把原生句柄翻译成 HAL 的**不透明** `RawWindowHandle`（`crates/deer-window/src/lib.rs:1-42`）。
 - `deer-gui` 是**门面 crate**：一条 `use deer_gui::prelude::*` 拿到布局/GPU/Vulkan，另有 5 个 `render_tree_to_*` 便利入口（`crates/deer-gui/src/lib.rs:1-37`、`77-193`）。
-- 工程纪律的可执行形式是**四道门禁**（workspace 测试 / clippy 带 `window` feature / `docs_consistency` / 示例全跑），其中 `docs_consistency` 把「文档与示例必须齐备」变成了 5 条测试（`crates/deer-gui/tests/docs_consistency.rs:1-11`）。
+- 工程纪律的可执行形式是**四道门禁**（workspace 测试 / clippy 带 `window` feature / `docs_consistency` / 示例全跑），其中 `docs_consistency` 把「文档与示例必须齐备」变成了一组可执行的契约测试（`crates/deer-gui/tests/docs_consistency.rs:1-11`；条数以 `cargo test -p deer-gui --test docs_consistency -- --list` 的输出为准）。
 
 ---
 
@@ -207,7 +207,7 @@ pub fn raw_handle_from_rwh06(raw: RwhRawWindowHandle) -> Result<deer_gpu::RawWin
 
 ### 4.1 `crates/deer-gui/tests/*.rs`
 
-**只有一个测试文件**：`crates/deer-gui/tests/docs_consistency.rs`（209 行，5 条测试）。它把「文档契约」变成可执行规则（`:1-11` 的背景：M1 交付后出现过「库能跑，但使用者不知道如何渲染任何东西」）。
+**只有一个测试文件**：`crates/deer-gui/tests/docs_consistency.rs`（209 行；条数以 `--list` 输出为准）。它把「文档契约」变成可执行规则（`:1-11` 的背景：M1 交付后出现过「库能跑，但使用者不知道如何渲染任何东西」）。
 
 它**具体校验什么规则**（逐条带行号）：
 
@@ -223,31 +223,58 @@ pub fn raw_handle_from_rwh06(raw: RwhRawWindowHandle) -> Result<deer_gpu::RawWin
 
 > **注意**：规则 3 只在**行级**要求「同一行里同时有链接和 `--example`」；指南的完整性（「做不到」、勾选项）由规则 4 管；`docs/tour/*` 这类新文档**不在** `docs_consistency` 的扫描范围里（规则 4 只遍历 `docs/features`）。
 
-### 4.2 四道门禁的确切命令与实测规模
+### 4.2 四道门禁的确切命令与取数方法
 
 命令统一按仓库约定写成 `cmd /c "cargo ..."`（`docs/superpowers/plans/2026-09-27-m3a-drawlist-to-gpu-geometry.md:19`）。
 
-| 门禁 | 确切命令 | 本轮实测结果（2026-09-27，本机） | 数字来源 |
-|---|---|---|---|
-| **① workspace 测试** | `cmd /c "cargo test --workspace"` | **321 passed / 0 failed / 2 ignored**，跨 **36** 个二进制（含 doc-tests） | 本轮实跑（M3b 冻结 HEAD；数字随测试增减漂移，**以运行输出为准**） |
-| **② clippy（带 window feature）** | `cmd /c "cargo clippy --workspace --all-targets --features deer-gui/window"` | `Finished dev profile …`，**0 warning / 0 error**，exit code 0 | 本轮实跑 |
-| **③ docs_consistency** | `cmd /c "cargo test -p deer-gui --test docs_consistency"` | **5 passed / 0 failed**（5 条测试全部列名通过） | 本轮实跑，与 `docs/superpowers/plans/2026-09-27-m3a-drawlist-to-gpu-geometry.md:279` 的 `→ 5 passed` 一致 |
-| **④ 示例全跑** | 13 个 `cmd /c "cargo run -q -p deer-gui --example <名>"` + 2 个 `--features window` 示例 + `cargo run -q -p deer-window --example window_smoke` | 15 个 deer-gui 示例**全部 exit=0**（其中 `hal_window_path` 未设 `DEER_VK_WINDOW_TESTS` 时是「显式跳过」，也 exit=0）；`window_smoke` 实测 `exit=0`（`frames=30 … result=ok`），`DEER_WINDOW_FAIL=1` 也 `exit=0`（预期错误路径） | 本轮实跑 |
-| **（附加）deer-vk 带校验层** | `$env:DEER_VK_VALIDATION='1'; cmd /c "cargo test -p deer-vk"` | **205 passed / 0 failed**，跨 17 个 target（lib + 15 个集成测试 + doc-test） | 本轮实跑（M3b 冻结 HEAD；数字随测试增减漂移，**以运行输出为准**），与 `ROADMAP.md:182`、`FEATURES.md:73`、`docs/features/vulkan.md:35`、`docs/features/vulkan-swapchain.md:228` 记录的「205 passed / 0 failed」**一致** |
-| **（附加）真窗口完整门禁** | `$env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cmd /c "cargo test -p deer-vk"` | 本轮**未实测**（见 §8） | `ROADMAP.md:51-55`、`README.md:56-57`、`docs/features/window.md:227` |
+> **本仓库不在文档里固化测试条数**（数字随每次加测试漂移：本会话就漂过多轮）。
+> 下表只给**确切命令**与**怎么取数** —— 一律**以运行输出为准**。
 
-**各 crate 的分解规模（本轮实跑）**：
-
-| crate | 通过数 | 构成 |
+| 门禁 | 确切命令 | 取数方法 / 判据（可直接复制） |
 |---|---|---|
-| `deer-gpu` | 81 | lib 10 + `draw_list_and_cpu_backend` 13 + `font_parse` 8 + `font_synthetic` 7 + `glyph_atlas` 7 + `render_pipeline` 7 + `text_measure` 9 + `text_pixels` 9 + `text_raster` 11 |
-| `deer-gui` | 6 | lib 0 + `docs_consistency` 5 + doc-test 1 |
-| `deer-layout` | 18 | lib 0 + `layout_invariants` 18（doc-test 0 passed / **1 ignored**，就是那 1 个 ignored 的来源） |
-| `deer-vk` | 205 | lib 42 + 15 个集成测试合计 163（`gpu_geom_parity` 29、`gpu_geom_stream` 28、`swapchain_smoke` 25、`gpu_vs_cpu` 20、`gpu_text_stream` 17、`pipeline_smoke` 11、`struct_layout` 8、`offscreen_render` 7、`device_smoke` 6、`spirv_val` 5、`vulkan_smoke` 2、`validation_probe` 2、`export_spirv` 1、`raw_ffi_probe` 1、`vbo_probe` 1） |
-| `deer-window` | 11 | lib 0 + `window_logic` 10 + doc-test 1 |
-| **合计** | **321** | —— |
+| **① workspace 测试** | `cmd /c "cargo test --workspace"` | `cargo test --workspace 2>&1 \| Select-String "^test result:"`（每个 target 一行汇总；判据：全 `0 failed`） |
+| **② clippy（带 window feature）** | `cmd /c "cargo clippy --workspace --all-targets --features deer-gui/window"` | 判据：**0 warning / 0 error** 且 exit code 0 |
+| **③ docs_consistency** | `cmd /c "cargo test -p deer-gui --test docs_consistency"` | 判据：`test result:` 行全过（这份文档契约测试的条数同样以输出为准） |
+| **④ 示例全跑** | 13 个 `cmd /c "cargo run -q -p deer-gui --example <名>"` + 2 个 `--features window` 示例 + `cargo run -q -p deer-window --example window_smoke` | 判据：逐个 `exit=0`（`hal_window_path` 未设 `DEER_VK_WINDOW_TESTS` 时是「显式跳过」，也算 `exit=0`） |
+| **（附加）deer-vk 带校验层** | `$env:DEER_VK_VALIDATION='1'; cmd /c "cargo test -p deer-vk"` | `$env:DEER_VK_VALIDATION='1'; cargo test -p deer-vk 2>&1 \| Select-String "^test result:"`；消息计数见下方**精确命令** |
+| **（附加）真窗口完整门禁** | `$env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cmd /c "cargo test -p deer-vk"` | 本轮**未实测**（见 §8）；依据 `ROADMAP.md` 的 M2b 门禁段、`README.md`、`docs/features/window.md` |
 
-> **「以运行输出为准」是本仓库的明文规矩**：`ROADMAP.md:182`、`FEATURES.md:73`、`docs/features/vulkan.md:35`、`docs/features/vulkan-swapchain.md:228/281` 都写着「数字随测试增减漂移，以运行输出为准」。`docs/superpowers/plans/2026-09-27-m3a-drawlist-to-gpu-geometry.md:37-38` 还留了一条历史：计划里写 `203 passed`，实测基线是 `277 passed`（后来变成今天的 321）。
+**校验消息计数：必须用「行首括号前缀 + 大小写敏感」**（本轮踩过的坑）：
+
+`Select-String` **默认不区分大小写**，用松散模式（例如 `VALIDATION|VK ERROR`）数消息会**假命中** ——
+实测命中 **5** 条，**全是用例名/靶名**（`validation_probe`、`text_is_reported_...` 之类），一条真校验消息都没有。
+判据必须是 0，命令照抄：
+
+```powershell
+# 真校验消息（行首 [VK ERROR] / [VALIDATION] 前缀、区分大小写）
+$env:DEER_VK_VALIDATION='1'
+cargo test -p deer-vk 2>&1 |
+  Select-String -CaseSensitive -Pattern '^\[VK ERROR\]|^\[VALIDATION\]' |
+  Measure-Object | Select-Object -ExpandProperty Count   # 判据：0
+```
+
+**各 crate 的测试靶构成（结构，不是条数）** —— 要知道某个靶多少条，用 `--list` 现取：
+
+| crate | 测试靶（`tests/*.rs`）与 lib |
+|---|---|
+| `deer-gpu` | lib + `draw_list_and_cpu_backend`、`font_parse`、`font_synthetic`、`glyph_atlas`、`render_pipeline`、`text_measure`、`text_pixels`、`text_raster` |
+| `deer-gui` | lib + `docs_consistency`（文档契约） + doc-test |
+| `deer-layout` | lib + `layout_invariants`（doc-test 里有 1 条 **ignored**，是 workspace `ignored` 计数的来源之一） |
+| `deer-vk` | lib + `device_smoke`、`export_spirv`、`gpu_geom_parity`、`gpu_geom_stream`、`gpu_text_stream`、`gpu_vs_cpu`、`offscreen_render`、`pipeline_smoke`、`raw_ffi_probe`、`spirv_val`、`struct_layout`、`swapchain_smoke`、`validation_probe`、`vbo_probe`、`vulkan_smoke` + doc-test |
+| `deer-window` | lib + `window_logic` + doc-test |
+
+取数示例（照抄即可）：
+
+```powershell
+cargo test -p deer-vk --test gpu_vs_cpu -- --list                 # 末尾一行 "N tests, 0 benchmarks"
+cargo test --workspace 2>&1 | Select-String "^test result:"       # 每个靶一行汇总
+```
+
+> **「以运行输出为准」是本仓库的明文规矩**：`ROADMAP.md` 的 Q-5、`FEATURES.md` 的推送常量着色器行、
+> `docs/features/vulkan.md`、`docs/features/vulkan-swapchain.md` 现在都写成
+> 「**全部通过 / 0 failed（具体条数以运行输出为准）**」。`docs/superpowers/plans/2026-09-27-m3a-drawlist-to-gpu-geometry.md:37-38`
+> 还留了一条历史：计划里写 `203 passed`，实测基线却是 `277 passed` —— 这类被固化的数字迟早会撒谎，
+> 所以**本文不再持有它们**（要数字就现跑，commands 见上）。
 
 ---
 
@@ -348,7 +375,7 @@ pub fn raw_handle_from_rwh06(raw: RwhRawWindowHandle) -> Result<deer_gpu::RawWin
 | `vulkan-pipeline.md` | 渲染通道 → 管线布局 → 着色器模块 → `vkCreateGraphicsPipelines` | 排查管线创建问题时 |
 | `gpu-offscreen.md` | 离屏 image + 渲染通道 + 提交 + 栅栏 + `copyImageToBuffer` 回读；含一份完整排查方法论 | 想在无窗口环境验证 GPU 渲染时 |
 | `vulkan-swapchain.md` | `VkSurfaceKHR` + 交换链 + 帧同步 + 呈现；`OutOfDate` 的处理 | 要让 GPU 画面出现在窗口里时 |
-| `gpu-geometry.md` | `GpuGeometryRenderer`：`DrawList` 非文本命令上 GPU + 与 CPU 逐像素对照（12 条测试清单） | 做 GPU 几何/parity 相关改动时 |
+| `gpu-geometry.md` | `GpuGeometryRenderer`：`DrawList` 的形状与**文本**命令上 GPU + 与 CPU 逐像素对照（用例清单见该指南第 4 节） | 做 GPU 几何/文本/parity 相关改动时 |
 | `window.md` | `deer-window` 用法 + 环境变量 + **「为什么真窗口不是 `#[test]`」** + 8 条常见坑 | 开窗口/接表面时 |
 
 ### 6.4 `docs/TUTORIAL.md` 的章节标题列表（带行号）
@@ -411,7 +438,7 @@ pub fn raw_handle_from_rwh06(raw: RwhRawWindowHandle) -> Result<deer_gpu::RawWin
 3. **检查清单里不能留 `- [ ]`**，否则报 `检查清单里还有未勾选项（- [ ]）`（`:172-175`）。
 4. 指南里每个 `--example <名>` 都必须有对应源码，否则报 `提到示例 … 但没有 examples/….rs`（`:162-166`）。
 5. 在 `FEATURES.md` 的 ✅ 行里加上指向它的 `.md` 链接（否则测试 3 报 `缺少指南链接`，`:122-124`）。
-6. **必须跑**：`cmd /c "cargo test -p deer-gui --test docs_consistency"`（期望 `5 passed`）。注意测试 4 还有下限「至少 6 份指南」、测试 3 有「至少 8 行 ✅」（`:178`、`:131-134`）。
+6. **必须跑**：`cmd /c "cargo test -p deer-gui --test docs_consistency"`（期望 `test result:` 行全过；条数以输出为准）。注意测试 4 还有下限「至少 6 份指南」、测试 3 有「至少 8 行 ✅」（`:178`、`:131-134`）。
 
 ### 7.3 把某个第三方依赖引进来：先做什么登记
 
@@ -437,7 +464,7 @@ pub fn raw_handle_from_rwh06(raw: RwhRawWindowHandle) -> Result<deer_gpu::RawWin
 3. 纯逻辑部分必须能单测：把状态机放进像 `FrameCounter`（`:143-179`）那样的「不碰窗口」结构，测试写进 `crates/deer-window/tests/window_logic.rs`。
 4. 真窗口行为只能靠**示例**验证：`crates/deer-window/examples/window_smoke.rs` 或 `crates/deer-gui/examples/window_preview.rs`（原因见 §1.5）。
 5. 文档：`docs/features/window.md`（含常见坑表 `:216-227`）；若涉及上屏/交换链，还要动 `docs/features/vulkan-swapchain.md`。
-6. **必须跑**：`cmd /c "cargo test -p deer-window"`（期望 11 passed）→ `cmd /c "cargo run -q -p deer-window --example window_smoke"` → `cargo run -p deer-gui --features window --example window_preview`（`exit=0`、帧数达标、像素核对通过）→ 门禁①②③。
+6. **必须跑**：`cmd /c "cargo test -p deer-window"`（期望 `test result:` 行全过；条数以输出为准）→ `cmd /c "cargo run -q -p deer-window --example window_smoke"` → `cargo run -p deer-gui --features window --example window_preview`（`exit=0`、帧数达标、像素核对通过）→ 门禁①②③。
 
 ### 7.6 新增一项 ✅ 功能（完整「四件事」）
 
