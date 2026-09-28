@@ -101,6 +101,16 @@ const QUIET: Duration = Duration::from_millis(400);
 /// 安静窗口的**下限比例**：墙钟到点了才算数（winit 的定时器可能早一点点醒）。
 const QUIET_MIN_RATIO: f64 = 0.8;
 
+/// 安静窗口的**兜底宽限**（M5c fix）：早于下限来的帧不判红，而是「报一笔 + 补排等到点」；
+/// 但拖过 `deadline + QUIET_GRACE` 还没等到「到点」那一帧 ⇒ 判红（那是唤醒链坏了，
+/// **不是**「被外来帧打断」）。
+///
+/// 取 2s：正常路径永远到不了这里（到点帧只会迟到几毫秒），它只用于把「唤醒链坏掉」与
+/// 「窗口被系统事件反复打断」从「假红」里分出来。
+/// **已知边界**：如果**连一帧都不再来**，本示例没有看门狗 ⇒ 会一直开着窗口（与改前一致；
+/// 唤醒链整体坏掉这种情形由 `wake_probe` 的档先把关）。
+const QUIET_GRACE: Duration = Duration::from_millis(2000);
+
 /// 内置脚本（没设 `DEER_INPUT_SCRIPT` 时用它）—— 它**有期望终态**，所以是断言的一部分。
 ///
 /// `move @button_1` 读作「指针移到 button_1 的中心」（坐标由布局算，不写死）。
@@ -295,12 +305,28 @@ struct Form {
     ///
     /// 用 `Cell`：问它的地方是 `wants_redraw(&self)` —— 那里改不了自己的字段（接口事实）。
     wants_asked: std::cell::Cell<u64>,
+    /// 安静窗口期间收到的**外来输入**条数（本档不注入输入 ⇒ 每条都是环境噪声）。
+    ///
+    /// 它不是省电失效的证据（`wants_redraw` 答假 ⇒ 一帧都不画），但会让 `wants_redraw` 的
+    /// **增量口径**被污染 ⇒ `finish_quiet` 据此把那一**条**判据显式跳过并写明「这不是通过」。
+    quiet_inputs: u64,
+    /// 安静窗口期间**早于 `deadline`** 来的帧数（系统事件 / 外来输入 / 上一个没兑现的 `STEP`）。
+    ///
+    /// M5c 复审 I2：这类帧**不是**「QUIET 到点那一帧」，不能拿它判「窗口结束」。
+    quiet_interruptions: u64,
 }
 
-/// 安静窗口的现场：起点 + 起点时的帧数（用来证明「窗口内**零**重绘」）。
+/// 安静窗口的现场：起点 + **到点时刻** + 起点时的帧数/计数。
+///
+/// `deadline` 是 M5c fix 的关键：**早于它来的帧一律不是 QUIET 到点那一帧**（别的来源），
+/// 于是「墙钟」这条代理判据不再被一次外来帧误判成「事件循环在打转」（复审 I2 的假红）。
 struct Quiet {
     started: Instant,
+    /// `started + QUIET`（绝对时刻；补排时用它算剩余时间，所以窗口**不会**被反复打断而无限延长）。
+    deadline: Instant,
     frames_at_start: u64,
+    /// 进安静窗口时 `wants_asked` 的快照（M5c 复审 M4：进程级计数不能用来对「安静窗口里」下结论）。
+    wants_asked_at_start: u64,
 }
 
 impl Form {
@@ -416,8 +442,10 @@ impl Form {
             return;
         }
         // ⚠️ 收尾之后**不许**再排「下一步」的唤醒：`exit_or_quiet` 已经排了安静窗口那一次，
-        // 再插一个更早的（`STEP` < `QUIET`）会让安静窗口提前结束 —— 那条判据（窗口时长 ≥ 0.8×QUIET）
-        // 就是逮这个的（本地实测：漏了这一行时窗口只有 20ms ⇒ 判据红，措辞是「更可能是事件循环在打转」）。
+        // 再插一个更早的（`STEP` < `QUIET`）会让安静窗口的**上界**变成那个 STEP（窗口层取
+        // `earliest`）⇒ 安静窗口被一次「**非 deadline** 的帧」打断（M5c 复审 I2 实测：15–20ms
+        // 就被打断，当时那被误判成「事件循环在打转」）。`finish_quiet` 现在分得清这种打断
+        // （如实报出 + 按绝对值补排到点），但这条护栏仍然保留：**别**在收尾之后再排唤醒。
         if self.done || self.quiet.is_some() {
             return;
         }
@@ -433,9 +461,10 @@ impl Form {
     /// 脚本**喂完**之后的收尾：先断言（[`Form::finish_script`]），再按档决定怎么退。
     ///
     /// - `Continuous` 档（默认）：直接 `Flow::Exit`（与 M5b 行为逐字一致）；
-    /// - `OnDemand` 档：进**安静窗口** —— 排**唯一**一次 `wake_after(QUIET)`，期间不排任何别的
-    ///   唤醒、也没有输入。**窗口内一帧都不许画**，窗口到点那一帧进来时在 `redraw` 顶部
-    ///   的 `done` 分支里处理（只断言、不画、不碰 GPU）。
+    /// - `OnDemand` 档：进**安静窗口** —— 排**唯一**一次 `wake_after(QUIET)`（唯一指的是
+    ///   「为推进脚本」；被一次**非 deadline** 的帧打断时会为「等到到点」按绝对值**补排**一次，
+    ///   见 [`Form::finish_quiet`]），期间不排任何别的唤醒、也没有输入。**窗口内一帧都不许画**，
+    ///   窗口到点那一帧进来时在 `redraw` 顶部的 `done` 分支里处理（只断言、不画、不碰 GPU）。
     fn exit_or_quiet(&mut self) -> Result<Flow, String> {
         self.finish_script()?;
         if !self.ondemand {
@@ -446,12 +475,20 @@ impl Form {
                 "{ONDEMAND_ENV} 档必须先拿到 Waker（App::wake_handle 没被调用？）"
             ));
         };
-        self.quiet = Some(Quiet { started: Instant::now(), frames_at_start: self.rendered });
+        let started = Instant::now();
+        self.quiet = Some(Quiet {
+            started,
+            // **到点的绝对时刻**：判「这一帧是不是 QUIET 到点那一帧」全靠它（复审 I2）。
+            deadline: started + QUIET,
+            frames_at_start: self.rendered,
+            // 增量口径的快照（复审 M4）。
+            wants_asked_at_start: self.wants_asked.get(),
+        });
         self.wake_after_calls += 1;
         waker.wake_after(QUIET);
         println!();
         println!(
-            "[interactive_form] 安静窗口：{}ms —— 期间**不排任何**唤醒、没有输入、不碰 GPU；\
+            "[interactive_form] 安静窗口：{}ms —— 期间**不为推进脚本**排任何唤醒、没有输入、不碰 GPU；\
              到点那一帧只做断言（wake_after 累计 {} 次）",
             QUIET.as_millis(),
             self.wake_after_calls
@@ -459,34 +496,94 @@ impl Form {
         Ok(Flow::Continue)
     }
 
-    /// 安静窗口**结束**那一帧（`redraw` 顶部 `done` 分支调用）：只断言，不画。
+    /// 安静窗口**收尾**那一帧（`redraw` 顶部 `done` 分支调用）：只断言，不画。
     ///
-    /// 两条判据（都是可数的）：
+    /// **M5c fix（复审 I2）**：先按 `quiet.deadline` **区分这一帧的来源**，再判老判据 ——
+    ///
+    /// - 帧来得**早**（`elapsed < QUIET_MIN_RATIO × QUIET`）⇒ 它**不是**「QUIET 到点」那一帧
+    ///   （来源：系统事件 / 外来输入 / 上一个还没兑现的 `STEP`，「deadline 到点 ⇒ 一定画一帧」
+    ///   这条本层语义保证了「到点帧」不会这么早）。**照实报一笔**、把到点那一刻按**绝对值**
+    ///   补排（残留 STEP 被兑现后窗口层手里已经没有 deadline 了，不补排就没人再叫醒事件循环），
+    ///   窗口**继续**等 —— 不再像改前那样把任何一帧都当成「窗口结束」，也不再误诊成
+    ///   「事件循环在打转」（复审 I2 的假红现场就是 15ms 被一次外来帧判红）。
+    /// - 帧来得**不早** ⇒ 这才是「睡到点」（允许 winit 定时器早一点点醒 ⇒ 用同一个下限比例）。
+    ///
+    /// 判据（两条，都可数）：
     ///
     /// 1. **窗口内重绘 = 0 帧**（`rendered` 在这段时间里一次都没涨）；
-    /// 2. 墙钟**真的等够**了（≥ [`QUIET_MIN_RATIO`] × [`QUIET`]）—— 否则「零重绘」可能只是因为
-    ///    事件循环根本没睡。
-    ///
-    /// 另外报出 `wants_redraw` 被问了几次：`OnDemand` 档没输入、没 `wake()` ⇒ 必须是 **0**
-    /// （窗口层只在「输入」与「`wake()`」两处问它）。
+    /// 2. **`wants_redraw` 增量 = 0**（进窗口时的快照 ⇒ 只在安静窗口内问才算数）。
+    ///    若窗口期间有**外来输入**（环境噪声，不是产品缺陷）⇒ 这一条**显式跳过**并打印
+    ///    「这不是通过，是被跳过」，其余判据照判。
     fn finish_quiet(&mut self) -> Result<Flow, String> {
-        let quiet = self.quiet.take().expect("调用方已确认 quiet 是 Some");
-        let elapsed = quiet.started.elapsed();
-        let painted = self.rendered - quiet.frames_at_start;
+        // 显式前置断言：只有 `quiet` 是 Some 时才该走到这里（调用方查过，这里再钉一次 ——
+        // 本项目纪律：前置不成立不许静默）。
+        let Some(quiet) = self.quiet.as_ref() else {
+            return Err("内部错误：finish_quiet 被调用时安静窗口已经结束".to_string());
+        };
+        let started = quiet.started;
+        let deadline = quiet.deadline;
+        let frames_at_start = quiet.frames_at_start;
+        let asked_at_start = quiet.wants_asked_at_start;
+
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(started);
         let floor = QUIET.mul_f64(QUIET_MIN_RATIO);
+
+        // ★ 帧来源判定：早于下限 ⇒ 它**不是**「QUIET 到点」那一帧。
+        //
+        // 但**不能**把它当「窗口结束」（改前的假红就是这么来的）。处理：
+        // 如实报一笔 + 把到点那一刻按**绝对值**补排；只有拖过 `deadline + QUIET_GRACE` 还这样，
+        // 才落到下面的红（那时说明「到点帧」根本没来 —— 唤醒链坏了，而不是「睡到点」）。
+        let early = elapsed < floor;
+        let over_grace = now.saturating_duration_since(deadline) >= QUIET_GRACE;
+        if early && !over_grace {
+            self.quiet_interruptions += 1;
+            println!();
+            println!(
+                "⚠️  安静窗口被一次**非 deadline** 的帧打断（第 {} 次，{}ms < 下限 {}ms）——\
+                 这不是省电失效（`rendered` 没涨、GPU 没碰）；来源是系统事件 / 外来输入 / \
+                 上一个还没兑现的 STEP（窗口层的 `earliest` 会保留更早的那个）。窗口继续等到点。",
+                self.quiet_interruptions,
+                elapsed.as_millis(),
+                floor.as_millis()
+            );
+            let remain = deadline.saturating_duration_since(now);
+            let Some(waker) = self.waker.clone() else {
+                return Err("安静窗口被打断后要补排 wake_after，但唤醒句柄不见了".to_string());
+            };
+            self.wake_after_calls += 1;
+            waker.wake_after(remain);
+            println!(
+                "[interactive_form] 补排一次 wake_after({}ms) 到安静窗口到点（wake_after 累计 {} 次）",
+                remain.as_millis(),
+                self.wake_after_calls
+            );
+            return Ok(Flow::Continue);
+        }
+
+        // 到这里有两种可能：① 真的到点了（`elapsed >= floor`，正常路径）；② 早到 **且** 已经拖过
+        // `deadline + QUIET_GRACE`（唤醒链没把「到点帧」叫来 ⇒ 下面判红）。
+        // 两种都先**消费**掉安静窗口、把数字打出来，再判。
+        self.quiet = None;
+        let painted = self.rendered - frames_at_start;
+        let asked_delta = self.wants_asked.get().saturating_sub(asked_at_start);
         println!();
         println!("—— 安静窗口结束（OnDemand：由一次 wake_after 到点叫醒）——");
         println!(
-            "窗口时长    : {}ms（要求 ≥ {}ms = {}×{}ms）",
+            "窗口时长    : {}ms（要求 ≥ {}ms = {}×{}ms；超过 deadline + {}ms 视为唤醒链坏了）",
             elapsed.as_millis(),
             floor.as_millis(),
             QUIET_MIN_RATIO,
-            QUIET.as_millis()
+            QUIET.as_millis(),
+            QUIET_GRACE.as_millis()
         );
         println!("窗口内重绘  : {painted} 帧（要求 **0**）");
         println!(
-            "wants_redraw 被问 : {} 次（要求 **0** —— 没输入、没 wake()）",
-            self.wants_asked.get()
+            "wants_redraw 被问 : {asked_delta} 次（**进窗口后的增量**，要求 **0** —— 没输入、没 wake()）"
+        );
+        println!(
+            "期间未到点的帧 / 外来输入 : {} 次 / {} 条（如实报出）",
+            self.quiet_interruptions, self.quiet_inputs
         );
         println!("wake_after 累计   : {} 次", self.wake_after_calls);
         if painted != 0 {
@@ -494,22 +591,46 @@ impl Form {
                 "安静窗口内重绘了 {painted} 帧 —— OnDemand 下空闲**必须零重绘**（有人在凭空唤它）"
             ));
         }
-        if elapsed < floor {
+        if early {
+            // 这条判据就是改前那句「窗口时长 ≥ 0.8×QUIET」，只是**只在真的没等到点时才红**
+            // （改前把任何一帧都当窗口结束 ⇒ 一次外来帧就假红，复审 I2 的现场是 15ms）。
             return Err(format!(
-                "安静窗口只等了 {}ms（要求 ≥ {}ms）⇒ 这不是「睡到点」，更可能是事件循环在打转",
+                "安静窗口在 {}ms（< 下限 {}ms）就被判为结束，而且已经超过 deadline + {}ms 还没等到\
+                 「到点」那一帧（被打断 {} 次、外来输入 {} 条）⇒ 不是「睡到点」，是唤醒链没把到点\
+                 那一帧叫来",
                 elapsed.as_millis(),
-                floor.as_millis()
+                floor.as_millis(),
+                QUIET_GRACE.as_millis(),
+                self.quiet_interruptions,
+                self.quiet_inputs
             ));
         }
-        if self.wants_asked.get() != 0 {
-            return Err(format!(
-                "安静窗口里 wants_redraw 被问了 {} 次（要求 0）—— 本档没有输入、也没叫 wake()",
-                self.wants_asked.get()
-            ));
+        let mut asked_skipped = false;
+        if asked_delta != 0 {
+            if self.quiet_inputs > 0 {
+                // 污染 ≠ 失败：这条判据的**前提**（「安静窗口里没有输入」）不成立 ⇒ 显式跳过。
+                asked_skipped = true;
+                println!(
+                    "⏭️  **这不是通过，是被跳过**：「wants_redraw 增量 0」这条没验到 —— 安静窗口\
+                     期间进来了 {} 条**外来输入**（环境噪声，不是产品缺陷）。请重跑（重跑时别碰\
+                     鼠标/键盘）。",
+                    self.quiet_inputs
+                );
+            } else {
+                return Err(format!(
+                    "安静窗口内 wants_redraw 被问了 {asked_delta} 次（**增量**，要求 0）—— \
+                     本档没有输入、也没叫 wake()，是有人凭空问了它"
+                ));
+            }
         }
         println!(
-            "空闲期零重绘断言 ✅：{painted} 帧 / {}ms 空闲，事件循环真的睡着（OnDemand 没被削弱）",
-            elapsed.as_millis()
+            "空闲期零重绘断言 ✅：{painted} 帧 / {}ms 空闲，事件循环真的睡着（OnDemand 没被削弱）{}",
+            elapsed.as_millis(),
+            if asked_skipped {
+                "（「wants_redraw 增量 0」那条**被跳过**：外来输入污染 —— 这不是通过，是被跳过）"
+            } else {
+                ""
+            }
         );
         Ok(Flow::Exit)
     }
@@ -699,6 +820,19 @@ impl App for Form {
     /// 脚本模式下窗口事件被忽略 ⇒ 状态不会被真实输入改脏 ⇒ 返回 `Continue` 时 `dirty` 不变。
     fn input(&mut self, _info: &WindowInfo, ev: &InputEvent) -> Result<Flow, String> {
         if self.done {
+            // **M5c fix（复审 I2 的衍生缺口）**：安静窗口里的外来输入**不能**像改前那样直接
+            // `Flow::Exit` —— 那会让安静窗口的两条判据**一条都不跑**（`finish_quiet` 永远不被
+            // 调用、`run()` 照样 Ok）⇒ **静默通过**，比假红更坏。这里数一笔、如实报出来，
+            // 把窗口留给 deadline（`wants_redraw` 那条判据会按「被污染 ⇒ 跳过」处理）。
+            if self.quiet.is_some() {
+                self.quiet_inputs += 1;
+                println!(
+                    "[interactive_form] ⚠️ 安静窗口期间收到**外来输入**（第 {} 条）：{ev:?} \
+                     —— 如实报出；它不是省电失效（答假就不画），但会污染 wants_redraw 的增量口径",
+                    self.quiet_inputs
+                );
+                return Ok(Flow::Continue);
+            }
             return Ok(Flow::Exit);
         }
         if !self.queue.is_empty() {
@@ -1000,6 +1134,8 @@ fn main() -> ExitCode {
         wake_after_calls: 0,
         quiet: None,
         wants_asked: std::cell::Cell::new(0),
+        quiet_inputs: 0,
+        quiet_interruptions: 0,
     };
     let result = run(
         WindowConfig::new("M5-4 交互闭环（输入 → 命中 → 状态 → 重绘）", WIDTH, HEIGHT),

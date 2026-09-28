@@ -404,18 +404,23 @@ set "DEER_WINDOW_REDRAW=continuous" && cargo run -q -p deer-window --example <�
 而**声明这个动作是 App 主动做的**：**它不声明，本层就在 `Wait` 上睡死 —— 开机不会自己醒来，
 只有 App 说「那个时刻叫我」才醒。**
 
-**`iters` 是观测值，不是判据**（这条**已修正过一次**，别再把它当证据）：
+**`iters` 的最终口径（M5c 复审 I1 + fix 轮）：它是观测值，但「空闲档的上界」是**判据**：
 
 - 账本行：`[deer-window] 唤醒账本：wake=… wake_after=… fired=… requested=… skipped=… iters=…`。
-- **缺口（必须写明）**：**当前仓库里没有任何断言读 `iters`** ⇒ **它不能用来判断是否空转**。
-  真正有牙的是上面那组**计数门槛**：「`wants_redraw` **答真 0 次** + 画帧 ≤ **1 + 系统帧**」。
-- **反证（复审实测）**：只把事件循环的 `Wait` 换成 `Poll` ⇒ `iters` 从 **5 → 11,695,034**、
-  进程 CPU **4.30 s / 4.5 s**（烧满一核），而**退出码 0、每条判据仍是 ✅** ——
-  即「`iters` 暴涨」**不会让任何东西变红**。
-- **本机实测（仅观测）**：`DEER_WAKE_TICKS=0` 档 `iters=7`（含启动期 3 次 `resized`）、另一次 **5** ⇒
-  连「空闲是个位数」也只是**量级印象**，不是断言。
-- **别误读**：`DEER_WINDOW_REDRAW=continuous` 档下 `iters` 本来就该很高（那一档每画完一帧就续下一帧）
-  ⇒ **高 `iters` 不等于 bug**；是否空转要看**计数门槛**，不看这个数。
+- **本层刻意不设全局阈值**：`DEER_WINDOW_REDRAW=continuous` 档下 `iters` 与帧数同阶（实测 229365）
+  是**合法**的 ⇒ 把阈值做进 `run()` 的收尾路径会假红。上界只能由**声明了空闲语义的那一档**自己下。
+- **空闲档的上界门槛（2026-09-29 fix 轮补上）**：`App::on_wake_stats(&WakeStats)` 在收尾时把账本
+  交给 App（默认实现什么都不做 ⇒ 老代码一行不用改）⇒ `examples/wake_probe.rs` 的
+  `DEER_WAKE_TICKS=0` 档断言 **`iters ∈ [1, 32]`**（本机实测基线 **5–7**，含启动期 3 次 `resized`）。
+- **缺口 → 已闭环的实证**：复审当年只把 `Wait` 换成 `Poll` ⇒ `iters` **11,695,034**、CPU 4.30 s / 4.5 s、
+  **退出码 0、每条判据 ✅**。现在同样的变异 ⇒ `iters` **11,667,271**，**只有这一条判据 ❌**、`exit=1`；
+  另有单测 `crates/deer-window/src/lib.rs::wake_policy_control_flow_mapping` 直接钉住
+  `WakePlan::Wait ⇒ ControlFlow::Wait`（翻译只有一处，`plan_to_control_flow`）。
+- **已知缺口（诚实，别再当它万能）**：周期 **> ~140 ms** 的慢超时在这条上界里看不出来
+  （32 轮 / 这一档约 4.5 s）；窗口收到**外来输入**时会被 `wake_probe` 的「前置：外来输入」先判成
+  「前置不成立」（措辞与「判据失败」分开），**不会**伪装成通过。
+- **别误读**：高 `iters` 不等于 bug（`continuous` 档）；是否空转要看**空闲档的上界**，以及那组
+  **计数门槛**（「`wants_redraw` **答真 0 次** + 画帧 ≤ **1 + 系统帧**」）。
 
 ⚠️ **两条使用须知**（「App 自己的要求」的直接后果，不是本层的 bug）：
 
@@ -491,4 +496,4 @@ set "DEER_WINDOW_REDRAW=continuous" && cargo run -q -p deer-window --example <�
 - [x] `FEATURES.md` 已登记（状态 / 指南链接 / 示例命令都对）
 - [x] 如果属于新手主线，`docs/TUTORIAL.md` 已更新（第 12 章）
 - [x] 明确写了「做不到什么」
-- [x] 重绘策略已写明（默认省电 / 如何关掉 / 两个自证标记要 grep），并登记 `Occluded` 的 Windows 边界、`DEER_IDLE_REQUIRE` 的删除、M5c 唤醒面（含「`iters` 只是观测值、没有断言读它」、`next_deadline` 陷阱、`Send` vs `Sync` 的上游现状）
+- [x] 重绘策略已写明（默认省电 / 如何关掉 / 两个自证标记要 grep），并登记 `Occluded` 的 Windows 边界、`DEER_IDLE_REQUIRE` 的删除、M5c 唤醒面（含「`iters` 是观测值 + **空闲档 `[1,32]` 上界**（`App::on_wake_stats`）、`next_deadline` 陷阱、`Send` vs `Sync` 的上游现状）

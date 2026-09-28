@@ -18,10 +18,16 @@
 //! ## 这一轮的判据为什么必须自带「迭代次数」
 //!
 //! M5b 立下的省电判据（`wants_redraw` 答真 0 次、画帧 ≤ 1）**抓不住**一种退化：把
-//! `ControlFlow::Wait` 换成「1ms 超时」（凭空造超时）。那种退化**不会多画一帧**（没人
-//! `request_redraw`）⇒ 帧数照旧是 1，只有 CPU 在烧。所以收尾的窗口层账本里有一个
-//! **`iters`**（事件循环迭代次数）：空闲时它必须是**个位数**，空转时一秒涨上千。
-//! 它是本轮唯一的「可数」防空转证据（CPU 是辅助的现场证据，不作门槛）。
+//! `ControlFlow::Wait` 换成「1ms 超时」（凭空造超时），或者干脆换成 `Poll`。那种退化
+//! **不会多画一帧**（没人 `request_redraw`）⇒ 帧数照旧是 1，只有 CPU 在烧。
+//! 所以收尾的窗口层账本里有一个 **`iters`**（事件循环迭代次数），空闲时它应当是**个位数**。
+//!
+//! ⚠️ **M5c 复审 I1 的更正（本节原文曾把它写成「唯一的可数证据」，那是 overclaim）**：
+//! 只把 `Wait` 换成 `Poll` ⇒ `iters` 5 → **11 695 034**、CPU 4.30s/4.5s，而当时
+//! **退出码 0、每条判据仍是 ✅** —— 因为**没有任何断言读它**。现在补上了：
+//! **空闲档**（`DEER_WAKE_TICKS=0`）通过 [`App::on_wake_stats`] 拿到账本，断言
+//! `iters <= IDLE_ITERS_MAX`（= 32，实测基线 5–7）⇒ `Wait => Poll` 这类量级退化**会红**。
+//! 本层**刻意不做全局阈值**：`DEER_WINDOW_REDRAW=continuous` 档下 `iters` 与帧数同阶是合法的。
 //!
 //! ## 前置断言（**0 次唤醒一律判失败**，措辞与「判据失败」分开）
 //!
@@ -35,6 +41,8 @@
 //! - **不投递**（`Waker::wake_after` 里不 `send_event`）⇒ 看门狗先到 ⇒ **前置不成立 ⇒ exit=1**；
 //! - **无条件投递/无条件重绘**（没 deadline 也 `request_redraw` + 超时）⇒ 这一档的
 //!   `定时帧` 会远超 `ticks`、`iters` 暴涨（省电档 `DEER_WAKE_TICKS=0` 尤其明显）。
+//! - **`Wait` → `Poll`**（只空转、不多画帧）⇒ 别的判据**全绿**，只有空闲档的
+//!   `iters ≤ IDLE_ITERS_MAX` 会红（这是 M5c 复审 I1 指出的那个缺口，现已补上）。
 //!
 //! 环境变量（数值一律**先 `trim()` 再 `parse()`**：`cmd` 的 `set X=1 && …` 会把空格算进值里）：
 //!
@@ -63,6 +71,15 @@ const WATCHDOG_LAG: Duration = Duration::from_millis(1500);
 /// 每多少帧打一行（退化时帧数会到几十万 —— 逐帧打会把终端淹了，日志反倒看不见）。
 const PRINT_EVERY_FRAMES: u64 = 1000;
 
+/// **空闲档** `iters` 的**上界**（M5c fix 的 I1 落点：`Wait => Poll` 那种空转必须变红）。
+///
+/// 诚实基线：`DEER_WAKE_TICKS=0` 档实测 **5–7**（含启动期的 `Resized`/`Focused` 等系统批次）
+/// ⇒ 上界取 **32**（≈5× 余量）。它抓的是**量级**退化：复审实测 `Wait => Poll` ⇒ **11 695 034**；
+/// 「凭空造 1ms 超时」兜底 ⇒ 这一档约 4.5s，也会到**数千**。
+/// **已知抓不到的**：周期 > 140ms 的慢超时（32 轮 / 4.5s），以及大量外来输入（每条 +1 轮 ——
+/// 那种情况被 `summarize` 里「前置：外来输入」先拦掉，不会伪装成通过）。
+const IDLE_ITERS_MAX: u64 = 32;
+
 /// 唤醒面（本探针）的账本：全部 `Atomic`，因为 `run()` 拿走了 `App`，`main`/看门狗事后还要读。
 #[derive(Default)]
 struct Ledger {
@@ -88,6 +105,16 @@ struct Ledger {
     looks_seen: AtomicU64,
     /// 看门狗是否已经兜底（它**先**置这一位、再叫那一声 deadline）。
     watchdog_fired: AtomicBool,
+    /// 收尾时 [`App::on_wake_stats`] 报来的 `iters`（窗口层的账本；M5c fix 的 I1 落点）。
+    iters: AtomicU64,
+    /// [`App::on_wake_stats`] 被调了几次。**前置：必须恰好 1 次** —— 没被调就说明账本没到手，
+    /// 上界断言会「拿 0 去比」而**永远绿**（本项目已栽过 4 次「前置不成立 ⇒ 护栏悄悄失效」）。
+    stats_calls: AtomicU64,
+    /// 窗口收到的**外来输入**条数（本探针**不注入**任何输入 ⇒ 每条都是环境噪声）。
+    ///
+    /// 它必须被**先判**：复审实测 2 条误击键就会把「`wants_redraw` 被问 0 次」/`seen == looks`
+    /// 打成 `判据 ❌`（措辞还指向产品缺陷）。那不是产品缺陷，是测量被污染 ⇒ 判「前置不成立」。
+    foreign_inputs: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,10 +252,28 @@ impl App for Probe {
             self.system_pending = true;
             println!("[wake_probe] 焦点变化：{ev:?}（系统事件 ⇒ 会要一帧，不算唤醒）");
         } else {
-            // 本探针**不注入**输入；真收到输入说明有人在动鼠标 —— 如实报出来（否则计数会莫名其妙）。
-            println!("[wake_probe] 收到输入（本档不注入输入）：{ev:?}");
+            // 本探针**不注入**输入；真收到输入说明有人在动鼠标/键盘 —— 如实报出来（否则计数会
+            // 莫名其妙）。M5c fix：**显式计数**，好让 `summarize` 把它当「前置不成立」**先判**
+            // （复审实测：2 条误击键会把与输入相关的判据打成假红，而那不是产品缺陷）。
+            let n = self.ledger.foreign_inputs.fetch_add(1, Ordering::SeqCst) + 1;
+            println!("[wake_probe] ⚠️ 收到**外来输入**（第 {n} 条；本档不注入输入）：{ev:?}");
         }
         Ok(Flow::Continue)
+    }
+
+    /// **M5c fix（复审 I1）**：收尾时窗口层把唤醒账本交过来 ⇒ 存下 `iters`（空闲档的上界判据）。
+    fn on_wake_stats(&mut self, stats: &deer_window::WakeStats) {
+        self.ledger.stats_calls.fetch_add(1, Ordering::SeqCst);
+        self.ledger.iters.store(stats.iters(), Ordering::SeqCst);
+        println!(
+            "[wake_probe] 收尾账本（App::on_wake_stats）：iters={} wake={} wake_after={} fired={} requested={} skipped={}",
+            stats.iters(),
+            stats.looks(),
+            stats.arms(),
+            stats.fired(),
+            stats.requested(),
+            stats.skipped()
+        );
     }
 
     /// **本档的帧只有三个来源**：建窗引导帧、系统事件、唤醒面。这里按来源分类记账。
@@ -347,6 +392,9 @@ fn summarize(ledger: &Ledger, cfg: &Cfg, via_dog: bool) -> bool {
     let wants_true = ledger.wants_true.load(Ordering::SeqCst);
     let schedules = ledger.schedules.load(Ordering::SeqCst);
     let seen = ledger.looks_seen.load(Ordering::SeqCst);
+    let iters = ledger.iters.load(Ordering::SeqCst);
+    let stats_calls = ledger.stats_calls.load(Ordering::SeqCst);
+    let foreign = ledger.foreign_inputs.load(Ordering::SeqCst);
 
     println!();
     println!(
@@ -357,6 +405,10 @@ fn summarize(ledger: &Ledger, cfg: &Cfg, via_dog: bool) -> bool {
     println!(
         "[wake_probe] 预约={schedules}　收到 wake()={seen}　wants_redraw 被问={asked} 答真={wants_true}　收尾={}",
         if via_dog { "看门狗硬收尾（窗口层账本打不出来）" } else { "事件循环自己退" }
+    );
+    println!(
+        "[wake_probe] 窗口层账本（App::on_wake_stats 被调 {stats_calls} 次）：iters={iters}　\
+         外来输入={foreign} 条"
     );
     if cfg.looks == 0 && cfg.ticks > 0 {
         println!(
@@ -371,6 +423,21 @@ fn summarize(ledger: &Ledger, cfg: &Cfg, via_dog: bool) -> bool {
         );
     } else {
         println!("[wake_probe] 期望：**一声都不叫** ⇒ 零唤醒、零 wants_redraw、只有引导帧（+ 系统事件帧）");
+    }
+
+    // ===== 前置断言：**测量环境必须是干净的**（M5c fix / 复审 M6） =====
+    //
+    // 本探针**不注入**任何输入，所以「窗口收到输入」= 有人在动这台机器。复审实测：2 条误击键
+    // 就会把 `wants_redraw 被问 0 次` / `seen == looks` 打成 `判据 ❌`（措辞却指向产品缺陷）。
+    // **先判它**：措辞用「前置不成立」，与「判据失败」分开 —— 这两种红必须能一眼分开。
+    if foreign > 0 {
+        eprintln!(
+            "[wake_probe] 自检失败（**前置不成立**）：本次窗口收到了 {foreign} 条**外来输入**\
+             （本档不注入任何输入 ⇒ 有人在动鼠标/键盘）⇒ 与输入相关的计数（`wants_redraw` 被问\
+             {asked} 次、`wake()` 的 seen={seen}）不再可信。**这不是判据失败，也不是产品缺陷** ——\
+             请重跑（重跑时别碰窗口）。"
+        );
+        return false;
     }
 
     // ===== 前置断言：**这一档必须真的收到过唤醒**（否则下面的判据全是空转的） =====
@@ -417,9 +484,15 @@ fn summarize(ledger: &Ledger, cfg: &Cfg, via_dog: bool) -> bool {
     };
 
     if cfg.looks > 0 {
+        // 口径说清楚（复审 M6）：`seen` 是**发送侧**（叫醒线程数自己叫了几声）、`asked` 是
+        // **接收侧**（窗口层问了 App 几次）—— 两者之间隔一次事件投递，本来就有一个竞态窗口，
+        // 所以在**无外来输入**时它们才应当相等（外来输入会先把这一档判成「前置不成立」）。
         check(
             seen == cfg.looks && asked == cfg.looks,
-            format!("叫了 {} 声 wake() ⇒ 被问 {} 次、收到 {} 声", cfg.looks, asked, seen),
+            format!(
+                "叫了 {} 声 wake()（发送侧 seen={seen}）⇒ 接收侧 wants_redraw 被问 {asked} 次",
+                cfg.looks
+            ),
         );
         check(
             wants_true == 1 && looks == 1,
@@ -462,6 +535,24 @@ fn summarize(ledger: &Ledger, cfg: &Cfg, via_dog: bool) -> bool {
             format!("画帧 {frames} 落在 [引导 1 + 定时 {ticks}] = {lo} .. + 系统事件 {system} = {hi} 之间（没有凭空多出来的帧）"),
         );
     } else {
+        // ===== 空闲档：**唯一**读 `iters` 下断言的地方（M5c fix 的 I1 落点） =====
+        //
+        // 前置（**显式**，否则护栏会悄悄失效）：账本回调必须真的被调过一次 —— 没被调就说明
+        // `iters` 没到手，此时 `iters=0` 会让「≤ 上界」这条**永远绿**（本项目的第 5 次预防）。
+        check(
+            stats_calls == 1,
+            format!(
+                "前置：收尾账本回调 App::on_wake_stats 被调 {stats_calls} 次（要求 **1**）\
+                 —— 没拿到账本就没法对 iters 下断言"
+            ),
+        );
+        check(
+            (1..=IDLE_ITERS_MAX).contains(&iters),
+            format!(
+                "空闲档事件循环迭代 iters={iters} 落在 [1, {IDLE_ITERS_MAX}]（实测基线 5–7）\
+                 —— 退化成空转/超时打转时这里会到百万级（复审实测 Wait⇒Poll = 11 695 034）"
+            ),
+        );
         check(
             ticks == 0 && looks == 0,
             format!("窗口内零唤醒（定时帧 {ticks}、wake() 帧 {looks}）"),
