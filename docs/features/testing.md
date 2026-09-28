@@ -107,7 +107,7 @@ deer-gui = { path = "path/to/crates/deer-gui", features = ["testing"] }
 
 | 项 | 说明 |
 |---|---|
-| `Shot::assert_state_change_only(before, primary)` | **主矩形内必须有差异**（否则「它没画出来」）+ **框外必须为 0**。期望矩形 = `primary` ∪ 所有 `hover/focus/pressed` 真的变了的节点（**自动算，不手抄**） |
+| `Shot::assert_state_change_only(before, primary)` | **主矩形内必须有差异**（否则「它没画出来」）+ **框外必须为 0**。期望矩形 = `primary` ∪ 所有 `hover/focus/pressed` 真的变了的节点（**自动算，不手抄**）。**自动补齐有面积棘轮，且「框外为 0」的判别力有边界 —— 见下面的方框** |
 | `Shot::assert_diff_only_inside(before, primary)` | 同上但**不**要求主矩形内非空 |
 | `Shot::assert_no_diff_outside(before, rects)` | 显式给矩形版的「框外 = 0」 |
 | `Shot::assert_bytes_eq(before)` | **逐字节相同**（不透明语料的判据） |
@@ -116,6 +116,21 @@ deer-gui = { path = "path/to/crates/deer-gui", features = ["testing"] }
 | `Harness::assert_command_count/assert_node_hint_count/assert_clip_nodes/assert_clip_known/assert_counts` | 绘制列表与裁剪快照的计数 |
 | `Harness::assert_drawn_text/assert_drawn_text_contains/assert_text_size` | **画出来的文本**（读绘制列表，不是读树）与字号 |
 | `Harness::require_glyph_pixels()` | 文本类像素断言的**前置**：没有真字形就明确报错（不给假红） |
+
+**⚠️ 「框外为 0」的判别力边界：一个面积棘轮 + 一个**未闭**的残余**
+
+- **棘轮存在，而且会 `Err`**：自动补齐的那些节点**占画布面积 ≥25% ⇒ 直接报错**（`AUTO_PATCH_AREA_RATCHET = 0.25`，判定在 `crates/deer-gui/src/testing.rs` 的自动比较路径上）。
+  阈值 **25% 的依据是实测、不是拍脑袋**：本仓库合法的自动补齐都是**按钮 / 输入框这类小控件**（360×200 画布上占比 **≤ ~3%**），
+  而**根容器 = 100%** ⇒ 取 25% 等于留了**一个量级**的余量。没有它，自动补齐会把判据悄悄放松成「几乎整屏」，而使用者看不出来。
+- **<25% 的已知残余（必须知道：这条**未闭**）**：**任何 ≤25% 的节点，只要它的交互态变了，落在它矩形内、与这次比较无关的差异都会被放行**。
+  `verifier` 已**实测绕过**：**160×120** 画布上 `panel` **40×90 = 18.75%** ⇒ hover 落到它上面时，「**框外为 0**」**失去判别力**
+  （那些差异被自动补进「期望矩形」里了）。⇒ 正确口径：
+  **「框外为 0」只在你显式给的 `primary` + 自动补齐的**小**节点上保证判别力**；
+  **大 / 中等面积节点上，请自己用 `assert_no_diff_outside(before, rects)` 显式给窄矩形。**
+- **完整解法是登记未做的后续（当前实现只是这一档）**：正解应为「**状态差 ∩ 逐节点绘制命令变化**」——
+  只有「这次状态真的变了 **且** 该节点的绘制命令真的变了」的节点才进期望矩形。
+  **代价**：要给 `Shot` 加**逐节点绘制指纹**，那是 **harness 采集侧的新通路**。
+  在它落地之前，**别把面积棘轮当成「中等面积也安全」**。
 
 ### 3.4 CPU↔GPU 对照
 
@@ -141,7 +156,7 @@ deer-gui = { path = "path/to/crates/deer-gui", features = ["testing"] }
 | `gate(name)` / `gate_default_true(name)` | 转发 `deer_gui::env_gate`（**先 `trim()` 再比**，`set X=1 &&` 的值是 `"1 "`） |
 | `print_gate(name)` / `print_gates(&[...])` | 打出**自证行**（含**原始值**）：`TESTKIT-GATE NAME=Some("1 ") ⇒ ON`。验收 `grep TESTKIT-GATE` 就有证据 |
 | `require_gate(name)` | 未设 ⇒ 打印 `TESTKIT-SKIP …（这是跳过，不是通过）` 并返回 `false` |
-| `window::gate()` / `window::require()` / `window::frames_from_env(n)` / `window::frames_from_value(raw, n)` | 窗口档的门槛与帧数（`DEER_VK_WINDOW_TESTS` / `DEER_VK_FRAMES`）；帧数先 `trim()` 再 parse，**解析不出来就报错，不静默退回默认** |
+| `window::gate()` / `window::require()` / `window::frames_from_env(n)` / `window::frames_from_value(raw, n)` | 窗口档的门槛与帧数（`DEER_VK_WINDOW_TESTS` / `DEER_VK_FRAMES`）；帧数先 `trim()` 再 parse（`set X=3 &&` 的值是 `"3 "`），**解析不出来就报错、不静默退回默认** —— `None`/空串 ⇒ 默认值（≥1）、能解析成 ≥1 的整数 ⇒ 用它、**其它一律 `Err`（含 `0`）**。理由：**帧数本身就是这次度量的参数**，静默换成别的值等于「测的不是你要的那件事」。签名是 `Result<u64, String>`，由调用方决定退出码。**实测**：`DEER_VK_FRAMES=abc` + 门槛开 ⇒ **`exit 2`**（打印 `❌ DEER_VK_FRAMES = "abc" 不是合法帧数（要正整数）`）；`=3` ⇒ `exit 0` 且窗口真的跑了 3 帧。另一个消费者 `examples/window_parity.rs` **已同步为同一口径**（`frames_from_env() -> Result<u64, String>`，非法即 `ExitCode::from(2)`） |
 | `Repro::test(pkg, features, test_target, filter, gates)` / `Repro::example(...)` | 生成可复制的复现命令；`gate_prefix(&[...])` 生成 `set "VAR=1" && ` 形态 |
 | `default_repro()` | 没设 `set_repro` 时的兜底（仍然可复制，只是范围粗一点） |
 
