@@ -209,7 +209,7 @@ crates/
 
 ### 可运行示例
 
-[`crates/deer-gui/examples/`](crates/deer-gui/examples/) 是看到功能跑起来的最快方式 —— 15 个示例，每个都带自检断言：
+[`crates/deer-gui/examples/`](crates/deer-gui/examples/) 是看到功能跑起来的最快方式 —— 每个示例都带自检断言。**示例清单请直接读目录**（它会随里程碑增长，所以这行**刻意不写条数**）：
 
 ```sh
 cargo run -p deer-gui --example tutorial        # 导览，产出 render_out/*.png

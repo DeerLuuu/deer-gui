@@ -528,7 +528,7 @@ if self.dirty && !self.done {
 ### 7.1 四条常用命令
 
 ```powershell
-# ① 全套断言（本次实测基线：42 个测试套件、**447 passed / 0 failed**；数字会随里程碑涨，别写死）
+# ① 全套断言（本次实测基线：**447 passed / 0 failed**；**测试套件数与用例数都会随里程碑涨 —— 别写死，以运行输出为准**）
 cargo test --workspace
 
 # ② clippy 干净（本项目 `#![deny(clippy::all)]`；本次实测 0 warning）

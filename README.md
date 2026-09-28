@@ -213,7 +213,7 @@ Behavior that looks surprising is usually deliberate. The full list, with the de
 
 ### Crate-level examples
 
-The [`crates/deer-gui/examples/`](crates/deer-gui/examples/) directory is the fastest way to see a feature working — 15 runnable examples, each with a self-check assertion:
+The [`crates/deer-gui/examples/`](crates/deer-gui/examples/) directory is the fastest way to see a feature working — every example ships with a self-check assertion. **Read the list from the directory rather than from prose** (it grows with each milestone; this line deliberately carries no count):
 
 ```sh
 cargo run -p deer-gui --example tutorial        # guided tour, writes render_out/*.png
