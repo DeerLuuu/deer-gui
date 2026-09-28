@@ -27,6 +27,7 @@ pub mod draw;
 pub mod error;
 pub mod font;
 pub mod glyph;
+pub mod interact;
 pub mod measure;
 pub mod null;
 pub mod png;
@@ -39,6 +40,10 @@ pub use draw::{Color, DrawCmd, DrawList, RectI, TextureId};
 pub use error::{GpuError, GpuResult};
 pub use font::{Contour, Font, Glyph, Point, Segment};
 pub use glyph::{AtlasSlot, GlyphImage, GlyphKey};
+pub use interact::{
+    FieldText, InteractState, InteractiveRenderer, build_interactive_draw_list,
+    build_interactive_draw_list_with_texts,
+};
 pub use measure::FontMeasure;
 pub use raster::Rasterizer;
 pub use render::{DefaultRenderer, NullRenderer, build_draw_list};

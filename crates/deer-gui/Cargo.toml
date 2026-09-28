@@ -33,6 +33,13 @@ required-features = ["window"]
 name = "window_parity"
 required-features = ["window"]
 
+# M5-4：输入 → 命中 → 状态 → 重绘的闭环（真窗口 + 脚本化重放）。窗口路径 ⇒ 要 window feature；
+# 必须显式写 `required-features`，否则默认（无 feature）构建会去编译它而失败
+# —— 那不是「跳过」，是 `cargo test --workspace` 直接红。
+[[example]]
+name = "interactive_form"
+required-features = ["window"]
+
 [lib]
 name = "deer_gui"
 path = "src/lib.rs"

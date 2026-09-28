@@ -55,15 +55,23 @@ fn press(k: Key, shift: bool) -> InputEvent {
 }
 
 /// 脚本化重放：返回（事件日志、最终状态）。
+///
+/// 顺序刻意写成「每个动词各司其职」（M5-4 起 pointer-down 会**聚焦**命中的可聚焦控件，
+/// 所以「Tab 走两格」那种隐式依赖不再是好写法 —— 它会随焦点规则变化而静默失效）：
+///
+/// ① 点 `button_1` ⇒ hover + 点击聚焦 + `Clicked`；
+/// ② 点 `field_1` ⇒ hover + 聚焦它（**直接**，不靠 Tab 计数）；
+/// ③ 打字 + Backspace ⇒ 缓冲变化；④ Escape ⇒ 清焦点；⑤ 移出 ⇒ hover 清空。
 fn replay(t: &Node, g: &Geometry, snap: &ClipSnapshot) -> (Vec<UiEvent>, UiState) {
     let (bx, by) = center(g, "button_1");
+    let (fx, fy) = center(g, "field_1");
     let script: Vec<(&str, InputEvent)> = vec![
         ("move:button_1", InputEvent::PointerMoved { x: bx, y: by }),
         ("down:left", InputEvent::PointerDown { button: PointerButton::Left, x: bx, y: by }),
         ("up:left", InputEvent::PointerUp { button: PointerButton::Left, x: bx, y: by }),
-        ("key:Tab", press(Key::Tab, false)),
-        // 第二次 Tab 直接落到 field_1 —— 中间的 button_2 被禁用，**不在树序里**。
-        ("key:Tab", press(Key::Tab, false)),
+        ("move:field_1", InputEvent::PointerMoved { x: fx, y: fy }),
+        ("down:left", InputEvent::PointerDown { button: PointerButton::Left, x: fx, y: fy }),
+        ("up:left", InputEvent::PointerUp { button: PointerButton::Left, x: fx, y: fy }),
         ("text:hi", InputEvent::TextInput { text: "hi".into() }),
         ("text:你好", InputEvent::TextInput { text: "你好".into() }),
         ("key:Backspace", press(Key::Backspace, false)),
@@ -108,9 +116,13 @@ fn scripted_replay_is_deterministic_and_matches_expected_state() {
 
     let expected = vec![
         UiEvent::HoverChanged(Some("button_1".into())),
-        UiEvent::Clicked("button_1".into()),
+        // M5-4：按下可聚焦控件时**当场**聚焦它（`FocusChanged` 在 `PointerDown` 那一步产生，
+        // 早于 `PointerUp` 才产生的 `Clicked`）。
         UiEvent::FocusChanged(Some("button_1".into())),
+        UiEvent::Clicked("button_1".into()),
+        UiEvent::HoverChanged(Some("field_1".into())),
         UiEvent::FocusChanged(Some("field_1".into())),
+        UiEvent::Clicked("field_1".into()),
         UiEvent::TextChanged { id: "field_1".into(), value: "hi".into() },
         UiEvent::TextChanged { id: "field_1".into(), value: "hi你好".into() },
         UiEvent::TextChanged { id: "field_1".into(), value: "hi你".into() },

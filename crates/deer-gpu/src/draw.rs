@@ -25,6 +25,35 @@ impl Color {
     pub const fn packed(self) -> u32 {
         ((self.r as u32) << 24) | ((self.g as u32) << 16) | ((self.b as u32) << 8) | ((self.a * 255.0) as u32)
     }
+
+    /// 向白色混合 `t`（`0.0` = 原色、`1.0` = 白）。**alpha 不变**。
+    ///
+    /// 用途：交互状态色（hover 提亮）。刻意**不动 alpha** —— 把「提亮」做成不透明叠加，
+    /// 是为了让 CPU / GPU 的逐字节对照在不透明语料上仍然成立（半透明只保证 ≤1 LSB）。
+    pub fn lighten(self, t: f32) -> Color {
+        let t = t.clamp(0.0, 1.0);
+        let mix = |c: u8| (c as f32 + (255.0 - c as f32) * t).round().clamp(0.0, 255.0) as u8;
+        Color {
+            r: mix(self.r),
+            g: mix(self.g),
+            b: mix(self.b),
+            a: self.a,
+        }
+    }
+
+    /// 向黑色混合 `t`（`0.0` = 原色、`1.0` = 黑）。**alpha 不变**。
+    ///
+    /// 用途：交互状态色（pressed 加深）。见 [`Color::lighten`] 关于 alpha 的说明。
+    pub fn darken(self, t: f32) -> Color {
+        let t = t.clamp(0.0, 1.0);
+        let mix = |c: u8| (c as f32 * (1.0 - t)).round().clamp(0.0, 255.0) as u8;
+        Color {
+            r: mix(self.r),
+            g: mix(self.g),
+            b: mix(self.b),
+            a: self.a,
+        }
+    }
 }
 
 /// 整数矩形（几何已在布局阶段取整 ⇒ 绘制也用整数，避免半像素模糊）。

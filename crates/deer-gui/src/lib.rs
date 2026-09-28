@@ -49,6 +49,12 @@ pub use deer_vk::{self as vk, VkBackend};
 /// 的环境里被单测覆盖（`cargo test -p deer-gui --lib interaction`）。
 pub mod interaction;
 
+/// 输入脚本（M5-4，**纯逻辑**）：`DEER_INPUT_SCRIPT` 那种字符串 → 一串
+/// [`interaction::InputEvent`]，外加「脚本 → 状态」的纯逻辑重放。
+///
+/// 窗口侧（`examples/interactive_form.rs`）与测试侧共用这一份解析器 ⇒ 脚本语法只有一处定义。
+pub mod input_script;
+
 /// 窗口层（**需要 `window` feature**）。
 ///
 /// 这是本 workspace 唯一引入第三方依赖（`winit`）的地方，理由是窗口/事件循环的

@@ -154,6 +154,17 @@ pub enum UiEvent {
     TextChanged { id: String, value: String },
 }
 
+impl UiState {
+    /// 三个**视觉**字段（`hover`/`focus`/`pressed`）是否完全一样（`texts` 不参与）。
+    ///
+    /// 窗口层的 dirty 约定靠它：`PointerDown` 这类**不发 `UiEvent`** 却会改 `pressed`
+    /// 的事件，只有比对状态才能判定「这一帧到底要不要重绘」。判据若写成「有没有事件」，
+    /// `pressed` 那条路就会被漏掉（而且漏得很安静 —— 界面看起来只是不响应按下）。
+    pub fn same_visual(&self, other: &UiState) -> bool {
+        self.hover == other.hover && self.focus == other.focus && self.pressed == other.pressed
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 三、裁剪快照（M5-3）
 // ---------------------------------------------------------------------------
@@ -394,6 +405,17 @@ fn node_by_id<'a>(n: &'a Node, id: &str) -> Option<&'a Node> {
     n.children.iter().find_map(|c| node_by_id(c, id))
 }
 
+/// 这个 id 是不是**可聚焦**的控件（`Button`/`Field` 且不在禁用子树里）。
+///
+/// 与 [`focusables`] 的可聚焦集合**共用同一条判据**（`kind` + 禁用），所以
+/// 「点击能聚焦谁」与「`Tab` 能走到谁」不会分叉 —— 否则会出现
+/// 「`Tab` 走不到的控件，点一下就能聚焦」这种两套规则。
+fn node_is_focusable(root: &Node, id: &str) -> bool {
+    node_by_id(root, id)
+        .filter(|n| matches!(n.kind, Kind::Button | Kind::Field))
+        .is_some_and(|n| !path_is_dead(root, n))
+}
+
 /// 指针位置上的节点 id（`hit` 的薄封装，省得每个分支都写一遍）。
 fn node_id_at(root: &Node, geo: &Geometry, clip: ClipSnapshot, x: f32, y: f32) -> Option<String> {
     hit(root, geo, clip, x, y).map(|n| n.id.clone())
@@ -454,7 +476,7 @@ fn next_focus(ids: &[String], current: Option<&str>, back: bool) -> Option<Strin
 /// | 事件 | 效果 |
 /// |---|---|
 /// | `PointerMoved` | 同步 `hover`（变了才发 `HoverChanged`） |
-/// | `PointerDown { Left }` | 同步 `hover`，记 `pressed` |
+/// | `PointerDown { Left }` | 同步 `hover`；**命中的可聚焦控件 ⇒ 聚焦它**（变了才发 `FocusChanged`）；记 `pressed` |
 /// | `PointerUp { Left }` | 同步 `hover`；**抬起处的节点 == 按下时的节点** ⇒ `Clicked`；无论如何清 `pressed` |
 /// | `KeyDown { Tab }` | 树序循环焦点（`Shift` 反向）⇒ `FocusChanged` |
 /// | `KeyDown { Escape }` | 清焦点 ⇒ `FocusChanged(None)` |
@@ -497,6 +519,21 @@ pub fn handle(
         } => {
             let id = node_id_at(root, geo, clip, *x, *y);
             sync_hover(state, &mut out, id.clone());
+            // **点击可聚焦控件 ⇒ 聚焦它**（M5-4）。`id` 来自 `hit`，所以它已经过了
+            // 「禁用子树」与「裁剪」两道判据 —— 被裁掉/被禁用的点根本拿不到 id。
+            //
+            // 只认 `Button`/`Field`（与 `focusables` 的可聚焦集合逐字一致）：点到容器或
+            // 文本上**不改焦点**（那会让 `App` 的 `hover` 语义悄悄变成第二套焦点规则）。
+            if let Some(id) = id
+                .as_deref()
+                .filter(|id| node_is_focusable(root, id))
+                .map(str::to_string)
+            {
+                if state.focus.as_deref() != Some(id.as_str()) {
+                    state.focus = Some(id.clone());
+                    out.push(UiEvent::FocusChanged(Some(id)));
+                }
+            }
             state.pressed = id;
         }
         // 右/中键不参与按下与点击（右键菜单/中键滚动是 M6+ 的事）。
@@ -807,9 +844,17 @@ mod tests {
             ClipSnapshot::unclipped(),
             &InputEvent::PointerDown { button: PointerButton::Left, x, y },
         );
-        println!("按下：event={down:?} pressed={:?}", s.pressed);
-        assert_eq!(down, vec![UiEvent::HoverChanged(Some("btn_ok".into()))]);
+        println!("按下：event={down:?} pressed={:?} focus={:?}", s.pressed, s.focus);
+        // M5-4：按下可聚焦控件同时**聚焦它**（顺序：hover 先、focus 后，与事件表一致）。
+        assert_eq!(
+            down,
+            vec![
+                UiEvent::HoverChanged(Some("btn_ok".into())),
+                UiEvent::FocusChanged(Some("btn_ok".into())),
+            ]
+        );
         assert_eq!(s.pressed.as_deref(), Some("btn_ok"));
+        assert_eq!(s.focus.as_deref(), Some("btn_ok"), "点击可聚焦控件 ⇒ 它拿到焦点");
 
         let up = handle(
             &mut s,
@@ -852,6 +897,11 @@ mod tests {
         println!("按下后移出：event={moved:?} hover={:?} pressed={:?}", s.hover, s.pressed);
         assert_eq!(moved, vec![UiEvent::HoverChanged(Some("btn_last".into()))]);
         assert_eq!(s.pressed.as_deref(), Some("btn_ok"), "移动不该清 pressed");
+        assert_eq!(
+            s.focus.as_deref(),
+            Some("btn_ok"),
+            "移动不改焦点（只有按下才聚焦）"
+        );
 
         let up = handle(
             &mut s,
@@ -889,8 +939,130 @@ mod tests {
         assert!(up2.is_empty(), "移出树外抬起不该有 Clicked，实际 {up2:?}");
     }
 
-    // ---- 规则 4：禁用节点（及其子树）不响应 --------------------------------
+    // ---- 规则 3b（M5-4）：点击可聚焦控件 ⇒ 聚焦它 --------------------------
 
+    /// 点击聚焦必须与 `focusables` 同集合、且**只在真的变了**时才发 `FocusChanged`
+    /// （否则窗口层每按一下都会白置一次 dirty）。
+    #[test]
+    fn r3b_pointer_down_focuses_the_clicked_focusable_widget() {
+        let (t, g) = fixture();
+        let focusable = focusables(&t);
+        println!("焦点树序={focusable:?}");
+
+        // ① 点在**输入框**上 ⇒ 焦点变成它，并且**紧接着就能打字**（这才是「点击可聚焦」的用处）。
+        let (fx, fy) = ev_at("name", &g);
+        let mut s = UiState::default();
+        let down = handle(
+            &mut s,
+            &t,
+            &g,
+            ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Left, x: fx, y: fy },
+        );
+        println!("点输入框：event={down:?} focus={:?} pressed={:?}", s.focus, s.pressed);
+        assert_eq!(
+            down,
+            vec![
+                UiEvent::HoverChanged(Some("name".into())),
+                UiEvent::FocusChanged(Some("name".into())),
+            ]
+        );
+        assert_eq!(s.focus.as_deref(), Some("name"));
+        assert_eq!(s.pressed.as_deref(), Some("name"));
+        let typed = handle(
+            &mut s,
+            &t,
+            &g,
+            ClipSnapshot::unclipped(),
+            &InputEvent::TextInput { text: "hi".into() },
+        );
+        assert_eq!(
+            typed,
+            vec![UiEvent::TextChanged { id: "name".into(), value: "hi".into() }],
+            "点击聚焦之后必须能直接输入"
+        );
+
+        // ② 点在**容器**上（app 的空白处，不在任何子节点里）⇒ 焦点**不变**。
+        //    前置：这个点确实落在 app 上、且不在两个按钮/输入框上。
+        let container_pt = (110.0f32, 90.0f32);
+        assert_eq!(
+            deer_layout::hit_test(&t, &g, container_pt.0, container_pt.1).map(|n| n.id.as_str()),
+            Some("app"),
+            "测试前置：这个点必须命中容器 app"
+        );
+        assert!(
+            !focusable.contains(&"app".to_string()),
+            "测试前置：app 不在焦点序列里"
+        );
+        let down2 = handle(
+            &mut s,
+            &t,
+            &g,
+            ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown {
+                button: PointerButton::Left,
+                x: container_pt.0,
+                y: container_pt.1,
+            },
+        );
+        println!("点容器：event={down2:?} focus={:?}", s.focus);
+        assert_eq!(
+            down2,
+            vec![UiEvent::HoverChanged(Some("app".into()))],
+            "点容器只改 hover，**不许**改焦点（不许有第二套焦点规则）"
+        );
+        assert_eq!(s.focus.as_deref(), Some("name"), "焦点停在原处");
+
+        // ③ 再点**已经聚焦**的那个控件 ⇒ 只发 hover（焦点没变 ⇒ **不发** `FocusChanged`，
+        //    所以窗口层不会因为「焦点事件」而白重绘一帧）。
+        let again = handle(
+            &mut s,
+            &t,
+            &g,
+            ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Left, x: fx, y: fy },
+        );
+        println!("再点同一处：event={again:?}");
+        assert_eq!(
+            again,
+            vec![UiEvent::HoverChanged(Some("name".into()))],
+            "已聚焦控件上的重复按下不该再发 FocusChanged"
+        );
+        assert_eq!(s.focus.as_deref(), Some("name"));
+
+        // ④ **点击能聚焦的集合 == `Tab` 能走到的集合**（同一条判据，不分叉）。
+        for id in &focusable {
+            let (x, y) = ev_at(id, &g);
+            let mut s2 = UiState::default();
+            handle(
+                &mut s2,
+                &t,
+                &g,
+                ClipSnapshot::unclipped(),
+                &InputEvent::PointerDown { button: PointerButton::Left, x, y },
+            );
+            println!("点 {id} ⇒ focus={:?}", s2.focus);
+            assert_eq!(s2.focus.as_deref(), Some(id.as_str()), "点 {id} 应当聚焦它");
+        }
+        // 反向：禁用按钮点不出焦点。
+        let (nx, ny) = (45.0f32, 50.0f32);
+        assert_eq!(
+            deer_layout::hit_test(&t, &g, nx, ny).map(|n| n.id.as_str()),
+            Some("btn_no"),
+            "测试前置：这个点命中禁用按钮 btn_no"
+        );
+        let mut s3 = UiState::default();
+        handle(
+            &mut s3,
+            &t,
+            &g,
+            ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Left, x: nx, y: ny },
+        );
+        assert_eq!(s3.focus, None, "禁用按钮点不出焦点（与 focusables 一致）");
+    }
+
+    // ---- 规则 4：禁用节点（及其子树）不响应 --------------------------------
     #[test]
     fn r4_disabled_node_and_subtree_ignore_input() {
         let (t, g) = fixture();
@@ -925,14 +1097,16 @@ mod tests {
         assert_eq!(s.hover, None);
 
         // 按下 + 抬起都不成点击。
-        handle(
+        let down = handle(
             &mut s,
             &t,
             &g,
             ClipSnapshot::unclipped(),
             &InputEvent::PointerDown { button: PointerButton::Left, x: dx, y: dy },
         );
+        assert!(down.is_empty(), "禁用节点不该产生 FocusChanged/HoverChanged，实际 {down:?}");
         assert_eq!(s.pressed, None, "禁用节点不该进入 pressed");
+        assert_eq!(s.focus, None, "禁用节点不该拿到焦点（点击聚焦也不越权）");
         let up = handle(
             &mut s,
             &t,
