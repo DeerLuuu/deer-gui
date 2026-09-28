@@ -453,9 +453,13 @@ set "DEER_WINDOW_REDRAW=continuous" && cargo run -q -p deer-window --example <�
   - **只有 Windows 的句柄映射**：winit 在别的平台也能开窗，但「原生句柄 → HAL 句柄」未实现 ⇒ `run()` 明确返回 `Err`（不静默填 0）。
   - **输入事件**：**已支持**（M5-1..M5-4：`InputEvent` + winit 映射 + `App::input` → 命中/状态机 → 重绘；
     见 [`input.md`](input.md)）。**M5b 起重绘也改成事件驱动**（默认省电，见第 6 节）；
-    **仍未做**：方向键 / 滚动 / 右键中键 / IME 预编辑。
+    **仍未做**：方向键导航 / 右键中键 / IME 预编辑。（**滚轮已消费**：`MouseWheel` → `InputEvent::Wheel`
+    → 滚动偏移 → 几何/绘制/命中，见 [`scroll-and-multiline.md`](scroll-and-multiline.md)；
+    仍未做的是**滚动条**、惯性滚动与按键滚动。）
   - **窗口里显示的界面**：**已支持**（M3c，见第 5 节）——窗口里是真实的形状 + 文本，且上屏像素与 CPU 逐像素对照过
-    （不透明 0、半透明 ≤1 LSB）。窗口里画的是**当前帧的界面快照**：没有滚动/动画系统（按时间的动画需自行声明 `Continuous`，见第 6 节）。
+    （不透明 0、半透明 ≤1 LSB）。窗口里画的是**当前帧的界面快照**：**没有动画/时间系统**（按时间的动画需自行声明
+    `Continuous`，见第 6 节）；**滚动容器已有**，但滚动偏移要由应用自己喂进布局（见
+    [`scroll-and-multiline.md`](scroll-and-multiline.md)）。
   - **不支持多窗口、全屏 / 无边框、HDR**，也**没有帧率上限**。
   - **DPI**：`Resized` 给的是物理像素，直接透传；不做额外的缩放换算。
   - **⚠️ 窗口侧 host→vertex 屏障只有计数、没有断言（覆盖缺口，不是正确性缺陷）**：

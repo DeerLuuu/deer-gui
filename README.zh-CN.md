@@ -38,7 +38,7 @@ deer-gui 是一个以**节点树**为核心的 GUI 运行时：你描述一棵�
 | `deer-window` —— 窗口层（winit） | ✅ **Windows** 上可建真窗口 + 事件循环；本 workspace 唯一第三方依赖 |
 | 真实字形 —— 字体解析、光栅化、图集、真实度量、换行 | ✅ 离屏 CPU 能出真字，GPU 侧也走通了（`R8_UNORM` 覆盖率纹理 + 最近邻采样，与 CPU 后端逐像素对照）。hinting、亚像素定位仍未做 |
 | 窗口里显示界面 | ✅ 形状与文本经共用管线层呈到线性交换链，上屏像素与 CPU 后端逐像素对照 |
-| 输入与焦点 | ✅ 事件通路（`InputEvent` + winit 映射 + `App::input`）、命中与状态机（含裁剪与禁用）、点击 / `Tab` / `Shift+Tab` / `Escape` 焦点、文本输入（追加 + `Backspace` 按 Unicode 字符删末尾）、脚本化事件重放、**事件驱动重绘（默认省电：`ControlFlow::Wait` + `App::wants_redraw()` + `RedrawPolicy::OnDemand`，可用 `DEER_WINDOW_REDRAW=continuous` 关掉）**；**仍未做**：停靠 / 多窗口、滚动与方向键、右键 / 中键、IME 预编辑（见 [`docs/features/input.md`](docs/features/input.md) 第 6 节） |
+| 输入与焦点 | ✅ 事件通路（`InputEvent` + winit 映射 + `App::input`）、命中与状态机（含裁剪与禁用）、点击 / `Tab` / `Shift+Tab` / `Escape` 焦点、文本输入（追加 + `Backspace` 按 Unicode 字符删末尾）、脚本化事件重放、**事件驱动重绘（默认省电：`ControlFlow::Wait` + `App::wants_redraw()` + `RedrawPolicy::OnDemand`，可用 `DEER_WINDOW_REDRAW=continuous` 关掉）**；**仍未做**：停靠 / 多窗口、方向键导航、滚动条 / 惯性滚动、右键 / 中键、IME 预编辑（见 [`docs/features/input.md`](docs/features/input.md) 第 6 节）；滚轮驱动的垂直滚动已落地（[`docs/features/scroll-and-multiline.md`](docs/features/scroll-and-multiline.md)） |
 | 批处理（统一管线 + 跨帧复用顶点缓冲） | 🔄 **统一管线已落地**：形状与文本合成**一条**顶点流、**一条**管线 ⇒ 每帧**一次** `vkCmdDraw`、**一次**管线切换（原「合段」函数已随之删除）；另有**跨帧复用缓冲**。仍未做：间接绘制 / 多批次提交 / 通用纹理、`unify` 的每帧 `Vec` 分配、窗口侧屏障断言缺口 |
 | 停靠面板 / 多窗口 | ⬜ 未实现（M6）；输入的剩余部分见上一行 |
 
@@ -209,7 +209,7 @@ crates/
 
 ### 可运行示例
 
-[`crates/deer-gui/examples/`](crates/deer-gui/examples/) 是看到功能跑起来的最快方式 —— 15 个示例，每个都带自检断言：
+[`crates/deer-gui/examples/`](crates/deer-gui/examples/) 是看到功能跑起来的最快方式 —— 可直接运行的示例（条数以 `crates/deer-gui/examples/` 里的源码文件为准），每个都带自检断言：
 
 ```sh
 cargo run -p deer-gui --example tutorial        # 导览，产出 render_out/*.png

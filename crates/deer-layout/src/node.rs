@@ -112,6 +112,17 @@ pub struct LayoutProps {
     pub cross_axis: Option<Align>,
     /// 生长权重（分配剩余空间）。
     pub grow: f32,
+    /// **垂直滚动容器**（只对 `Column` 有意义；`Row` 上设了会被**忽略** —— 本期只做垂直滚动）。
+    ///
+    /// 语义：内容主轴尺寸不再按视口夹取，`max_scroll = max(0, 内容高 − 视口高)`，
+    /// 子节点整体位移 `-滚动偏移`，视口外的内容由渲染器的裁剪栈挡掉。
+    /// **默认 `false`** ⇒ 既有语料一个像素都不变。
+    pub scroll: bool,
+    /// **文本按宽度换行**（只对 `Kind::Text` 有意义）。
+    ///
+    /// 换行宽度 = 节点自己的**像素**宽度（`width: Some(Size::Px(..))`）—— 测量阶段
+    /// 只知道这一个宽度。**默认 `false`** ⇒ 既有语料一行、一个字节都不变（opt-in）。
+    pub wrap: bool,
 }
 
 /// 结构 / 内容参数。
@@ -175,6 +186,20 @@ impl Node {
 
     pub fn is_container(&self) -> bool {
         self.kind.is_container()
+    }
+
+    /// **垂直可滚动容器**：`Column` + `layout.scroll`。
+    ///
+    /// 这是「什么算可滚动容器」的**唯一判据** —— 布局（不夹取子节点主轴、算 `max_scroll`）、
+    /// 渲染（在视口上推裁剪栈）、交互（滚轮找目标容器）都用它，免得三处各写一份条件而在
+    /// 某处悄悄分叉。`Row` 上的 `scroll` 被**忽略**（本期只做垂直滚动；这是被测试钉住的行为）。
+    pub fn is_scroll_container(&self) -> bool {
+        self.layout.scroll && self.kind == Kind::Column
+    }
+
+    /// **需要换行的文本节点**：`Text` + `layout.wrap`。
+    pub fn wraps_text(&self) -> bool {
+        self.layout.wrap && self.kind == Kind::Text
     }
 
     /// 前序遍历（父先于子）。

@@ -141,8 +141,25 @@ fn parse_attrs(s: &str, line: usize, source: &str) -> Result<Vec<(String, AttrVa
 }
 
 const KNOWN_ATTRS: &[&str] = &[
-    "name", "w", "h", "pad", "gap", "main", "cross", "grow", "label", "disabled",
+    "name", "w", "h", "pad", "gap", "main", "cross", "grow", "scroll", "wrap", "label", "disabled",
 ];
+
+/// 开关属性（裸属性 = 真；**带值就报错**）。
+///
+/// 为什么带值要报错而不是「看不懂就当假」：`scroll=1` 这种写法看起来生效、实际没生效，
+/// 属于 `scene-file.md` 明说的那一类最难查的 bug（**写错了但不生效**）。
+/// `disabled` 也走这一条：它以前默默把任何值当假。
+fn as_flag(v: Option<&AttrVal>, key: &str, line: usize, source: &str) -> Result<bool, SceneError> {
+    match v {
+        None => Ok(false),
+        Some(AttrVal::Bare) => Ok(true),
+        Some(AttrVal::Str(s)) => Err(err(
+            format!("{key} 是开关属性，不接受值（写成裸属性 `{key}`），实际 \"{s}\""),
+            line,
+            source,
+        )),
+    }
+}
 
 fn as_num(v: &AttrVal, key: &str, line: usize, source: &str) -> Result<f32, SceneError> {
     match v {
@@ -270,12 +287,16 @@ pub fn parse_scene(src: &str, source: &str) -> Result<Node, SceneError> {
         if let Some(v) = get("grow") {
             layout.grow = as_num(v, "grow", line, source)?;
         }
+        // 垂直滚动容器（只对 `column` 有意义；`row` 上设了会被布局忽略 —— 与命令式 API 同语义）。
+        layout.scroll = as_flag(get("scroll"), "scroll", line, source)?;
+        // 文本按宽度换行（只对 `text` 有意义；换行宽度取节点的 `w=`）。
+        layout.wrap = as_flag(get("wrap"), "wrap", line, source)?;
 
         let mut nprops = NodeProps::default();
         if let Some(AttrVal::Str(s)) = get("label") {
             nprops.label = Some(s.clone());
         }
-        nprops.disabled = matches!(get("disabled"), Some(AttrVal::Bare));
+        nprops.disabled = as_flag(get("disabled"), "disabled", line, source)?;
 
         let node = Node::new(kind, id).with_layout(layout).with_props(nprops);
 
@@ -361,6 +382,14 @@ pub fn encode_scene(root: &Node) -> String {
         }
         if l.grow != 0.0 {
             attrs.push(format!("grow={}", fmt_num(l.grow)));
+        }
+        // 开关属性：**必须编码**，否则 `parse_scene(encode_scene(t))` 会丢掉它们
+        // （往返结构相等是 `t10_scene_roundtrip` 的判据）。
+        if l.scroll {
+            attrs.push("scroll".to_string());
+        }
+        if l.wrap {
+            attrs.push("wrap".to_string());
         }
         if let Some(label) = &n.props.label {
             attrs.push(format!("label={}", quote(label)));

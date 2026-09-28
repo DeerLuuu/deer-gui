@@ -274,17 +274,24 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
                     }
                 }
                 Kind::Text => {
-                    list.push(DrawCmd::Text {
-                        rect,
-                        text: n.props.label.clone().unwrap_or_default(),
-                        color: if n.props.disabled {
-                            self.theme.text_dim
-                        } else {
-                            self.theme.text
-                        },
-                        size: self.theme.font_size,
-                        align: 0,
-                    });
+                    // 多行：每行一条命令（`wrap` 关 ⇒ 恰好一条、矩形不变 ⇒ 既有语料逐字节不变）。
+                    // 换行点与布局预留高度同源（`Measure::wrap`），见 `render::text_lines`。
+                    let color = if n.props.disabled {
+                        self.theme.text_dim
+                    } else {
+                        self.theme.text
+                    };
+                    for (line_rect, line) in
+                        crate::render::text_lines(self.measure, n, rect, self.text_style())
+                    {
+                        list.push(DrawCmd::Text {
+                            rect: line_rect,
+                            text: line,
+                            color,
+                            size: self.theme.font_size,
+                            align: 0,
+                        });
+                    }
                 }
                 Kind::Button => {
                     let base = if n.props.disabled {
@@ -358,8 +365,23 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
             }
         }
 
+        // 滚动容器：视口裁剪把子节点（含它们的 `NodeHint`）包在里面 ——
+        // `ClipSnapshot::from_draw_list` 于是把「视口矩形」绑成子节点的有效裁剪，
+        // **视口外的点自动不命中**（与既有「裁剪外的点不命中」同一条语义，没有第二套规则）。
+        // 容器自己的提示已经发过了（在裁剪**之前**）⇒ 容器自身不被自己的视口裁掉。
+        let clip = n.is_scroll_container();
+        if clip {
+            list.push(DrawCmd::PushClip {
+                rect: RectI::new(r, ry, rw, rh),
+            });
+        }
+
         for c in &n.children {
             self.walk(c, geo, dead, list);
+        }
+
+        if clip {
+            list.push(DrawCmd::PopClip);
         }
     }
 
@@ -999,5 +1021,168 @@ mod tests {
         let f = InteractState::focused("zero");
         let focused = InteractiveRenderer::new(Theme::default(), &ApproxMeasure, &f).build(&t, &g);
         assert_eq!(focused.counts().stroke_rect, 1, "零面积的焦点节点也要有描边");
+    }
+
+    // ---- 剩余工作第 1 项：滚动容器的视口裁剪 / 多行文本 ----
+
+    /// 本模块的列表是**裁剪感知命中的唯一输入**（`ClipSnapshot::from_draw_list` 的绑定协议），
+    /// 所以「滚动容器把视口裁剪推在子节点的提示之前」必须在这里钉住。
+    ///
+    /// 三条：① 可滚动容器**恰好一对** `PushClip`/`PopClip`；② 容器自己的 `NodeHint` 在
+    /// `PushClip` **之前**（否则容器自身会被自己的视口裁掉）；③ 子节点的提示在裁剪**里面**。
+    #[test]
+    fn scroll_container_clips_its_children_but_not_itself() {
+        let theme = Theme::default();
+        let s = InteractState::default();
+        let build = |scroll: bool| {
+            let mut b = deer_layout::builder::Builder::new(Kind::Column, "app");
+            b.container_opts(
+                Kind::Column,
+                "outer",
+                deer_layout::builder::L::new()
+                    .w(200.0)
+                    .h(100.0)
+                    .scroll(scroll)
+                    .to_props(),
+                |o| {
+                    for i in 1..=3 {
+                        o.button(format!("{i}"));
+                    }
+                },
+            );
+            let tree = b.build();
+            let geo = deer_layout::layout::layout(
+                &tree,
+                Rect::new(0.0, 0.0, 200.0, 100.0),
+                deer_layout::TextStyle::default(),
+                &ApproxMeasure,
+            );
+            let list = InteractiveRenderer::new(theme.clone(), &ApproxMeasure, &s).build(&tree, &geo);
+            (tree, geo, list)
+        };
+
+        let (tree, geo, list) = build(true);
+        assert!(list.clip_balanced(), "裁剪栈必须平衡（否则 CPU/GPU 后端会直接报错）");
+        let c = list.counts();
+        println!(
+            "滚动容器：hint {}｜push_clip {} / pop_clip {}｜命令 {}",
+            c.node_hint,
+            c.push_clip,
+            c.pop_clip,
+            list.len()
+        );
+        assert_eq!((c.push_clip, c.pop_clip), (1, 1), "恰好一对视口裁剪");
+        assert_eq!(c.node_hint, geo.len(), "每个有几何的节点一条提示（既有协议不变）");
+
+        let viewport = {
+            let r = geo["outer"];
+            RectI::new(r.x as i32, r.y as i32, r.w as i32, r.h as i32)
+        };
+        let hint_at = list
+            .cmds
+            .iter()
+            .position(|cmd| matches!(cmd, DrawCmd::NodeHint { rect, .. } if *rect == viewport))
+            .expect("outer 的提示");
+        let push_at = list
+            .cmds
+            .iter()
+            .position(|cmd| matches!(cmd, DrawCmd::PushClip { .. }))
+            .expect("有 PushClip");
+        let pop_at = list
+            .cmds
+            .iter()
+            .position(|cmd| matches!(cmd, DrawCmd::PopClip))
+            .expect("有 PopClip");
+        match &list.cmds[push_at] {
+            DrawCmd::PushClip { rect } => assert_eq!(*rect, viewport, "裁剪矩形 = 视口矩形"),
+            _ => unreachable!(),
+        }
+        println!("outer 提示 #{hint_at}｜PushClip #{push_at}｜PopClip #{pop_at}");
+        assert!(hint_at < push_at, "容器自己的提示必须在裁剪之前");
+        assert!(push_at < pop_at);
+        // 子节点（按钮）的提示在裁剪里面 ⇒ 它们的有效裁剪 = 视口。
+        let child_hints = (push_at + 1..pop_at)
+            .filter(|i| matches!(list.cmds[*i], DrawCmd::NodeHint { .. }))
+            .count();
+        println!("裁剪之内的子节点提示 = {child_hints}");
+        assert_eq!(child_hints, 3, "三个按钮的提示都在视口裁剪里面");
+
+        // 对照组：不滚动 ⇒ **一条裁剪命令都没有**（「不动滚动时输出不变」的最直接证据）。
+        let (_, geo_plain, plain) = build(false);
+        assert_eq!(geo_plain["outer"], geo["outer"], "容器几何相同（只有子节点顺序无位移）");
+        let cp = plain.counts();
+        println!("不滚动的对照：push_clip {} / pop_clip {}", cp.push_clip, cp.pop_clip);
+        assert_eq!((cp.push_clip, cp.pop_clip), (0, 0));
+        assert_eq!(cp.node_hint, list.counts().node_hint);
+        let _ = tree;
+    }
+
+    /// 换行文本：**每行一条命令**，且每条命令的矩形都落在节点自己的矩形内。
+    #[test]
+    fn wrapped_text_emits_one_command_per_line_inside_the_node_rect() {
+        let theme = Theme::default();
+        let s = InteractState::default();
+        let build = |wrap: bool| {
+            let mut b = deer_layout::builder::Builder::new(Kind::Column, "app");
+            b.text_opts("alpha beta gamma delta", |n| {
+                n.layout.width = Some(deer_layout::node::Size::Px(60.0));
+                n.layout.wrap = wrap;
+            });
+            let tree = b.build();
+            let geo = deer_layout::layout::layout(
+                &tree,
+                Rect::new(0.0, 0.0, 200.0, 260.0),
+                deer_layout::TextStyle::default(),
+                &ApproxMeasure,
+            );
+            let list = InteractiveRenderer::new(theme.clone(), &ApproxMeasure, &s).build(&tree, &geo);
+            let node = {
+                let r = geo["text_1"];
+                RectI::new(r.x as i32, r.y as i32, r.w as i32, r.h as i32)
+            };
+            (list, node)
+        };
+
+        let (list, node) = build(true);
+        let texts: Vec<(RectI, String)> = list
+            .cmds
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Text { rect, text, .. } => Some((*rect, text.clone())),
+                _ => None,
+            })
+            .collect();
+        println!("节点 {node:?}｜换行 ⇒ {texts:?}");
+        assert_eq!(node, RectI::new(0, 0, 60, 72), "前置：4 行 × 18");
+        assert_eq!(texts.len(), 4);
+        for (i, (rect, text)) in texts.iter().enumerate() {
+            assert_eq!(
+                *rect,
+                RectI::new(0, 18 * i as i32, 60, 18),
+                "第 {i} 行的矩形"
+            );
+            assert!(!text.is_empty(), "第 {i} 行不该是空串");
+            assert!(
+                rect.x >= node.x
+                    && rect.y >= node.y
+                    && rect.right() <= node.right()
+                    && rect.bottom() <= node.bottom(),
+                "第 {i} 行 {rect:?} 越出了节点矩形 {node:?}"
+            );
+        }
+
+        // 不换行 ⇒ 恰好一条，矩形 = 节点矩形（既有语料的前提）。
+        let (plain, node_p) = build(false);
+        let texts_p: Vec<(RectI, String)> = plain
+            .cmds
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::Text { rect, text, .. } => Some((*rect, text.clone())),
+                _ => None,
+            })
+            .collect();
+        println!("节点 {node_p:?}｜不换行 ⇒ {texts_p:?}");
+        assert_eq!(texts_p.len(), 1);
+        assert_eq!(texts_p[0], (node_p, "alpha beta gamma delta".to_string()));
     }
 }

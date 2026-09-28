@@ -132,7 +132,9 @@ assert_eq!(a, b);
 - 像素处理：[`pixels.md`](pixels.md)
 - 绘制列表：[`draw-list.md`](draw-list.md)
 - 主题：[`theme.md`](theme.md)
-- **做不到**：本页这条**离屏 CPU** 路径**不**负责窗口与输入 —— 界面呈到窗口是 [M3c 已落地](window.md)、输入与焦点是 [M5 已落地](input.md)、GPU 侧文本也已落地（[`gpu-geometry.md`](gpu-geometry.md)）；仍缺的是圆角/字形之外的抗锯齿、滚动容器等
+- 多行文本 / 滚动容器：[`scroll-and-multiline.md`](scroll-and-multiline.md)（换行 ⇒ **每行一条**
+  `DrawCmd::Text`；滚动容器 ⇒ 在视口上 `PushClip`/`PopClip`；两者都**不新增命令变体**，所以后端不用改）
+- **做不到**：本页这条**离屏 CPU** 路径**不**负责窗口与输入 —— 界面呈到窗口是 [M3c 已落地](window.md)、输入与焦点是 [M5 已落地](input.md)、GPU 侧文本也已落地（[`gpu-geometry.md`](gpu-geometry.md)）；仍缺的是圆角/字形之外的抗锯齿、**滚动条**（滚动容器本身已落地，见 [`scroll-and-multiline.md`](scroll-and-multiline.md)）
 
 ## 7. 检查清单
 

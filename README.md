@@ -39,7 +39,7 @@ The layout algebra comes from a TypeScript validation prototype (which ran 28 as
 | Real glyphs — font parsing, rasterization, atlas, real metrics, line breaking | ✅ Offscreen on the CPU, and on the GPU as a coverage-texture pass (`R8_UNORM` atlas, nearest sampling, compared pixel-for-pixel against the CPU backend). Hinting and subpixel positioning are still not done |
 | On-screen rendering in a window | ✅ Shapes and text are presented through a shared pipeline layer on a linear swapchain, compared pixel-for-pixel against the CPU backend |
 | Batch optimization (unified pipeline, cross-frame buffer reuse) | 🔄 The **unified pipeline** has landed — shapes and text feed **one** vertex stream and **one** pipeline, so a frame issues **one** `vkCmdDraw` and **one** pipeline switch (the old "segment merging" helper was deleted with it) — plus **cross-frame buffer reuse**. Still open: other advanced forms (indirect draws / multi-batch submission / general textures), the per-frame `Vec` allocation in `unify`, and the window-side barrier assertion gap |
-| Input and focus | ✅ Event path (`InputEvent` + winit mapping + `App::input`), hit-testing and state machine (clip- and disabled-aware), click / `Tab` / `Shift+Tab` / `Escape` focus, text input (append + `Backspace` deleting one Unicode char), scripted replay, and **event-driven redraw (power-saving by default: `ControlFlow::Wait` + `App::wants_redraw()` + `RedrawPolicy::OnDemand`; `DEER_WINDOW_REDRAW=continuous` turns it off)**. Still open: dockable/multi-window, scrolling and arrow keys, right/middle buttons, IME pre-edit — see [`docs/features/input.md`](docs/features/input.md) §6 |
+| Input and focus | ✅ Event path (`InputEvent` + winit mapping + `App::input`), hit-testing and state machine (clip- and disabled-aware), click / `Tab` / `Shift+Tab` / `Escape` focus, text input (append + `Backspace` deleting one Unicode char), scripted replay, and **event-driven redraw (power-saving by default: `ControlFlow::Wait` + `App::wants_redraw()` + `RedrawPolicy::OnDemand`; `DEER_WINDOW_REDRAW=continuous` turns it off)**. Still open: dockable/multi-window, arrow-key navigation, scrollbars/inertial scrolling, right/middle buttons, IME pre-edit — see [`docs/features/input.md`](docs/features/input.md) §6; wheel-driven vertical scrolling has landed ([`docs/features/scroll-and-multiline.md`](docs/features/scroll-and-multiline.md)) |
 
 See [`FEATURES.md`](FEATURES.md) for the per-feature breakdown and [`ROADMAP.md`](ROADMAP.md) for milestones.
 
@@ -213,7 +213,7 @@ Behavior that looks surprising is usually deliberate. The full list, with the de
 
 ### Crate-level examples
 
-The [`crates/deer-gui/examples/`](crates/deer-gui/examples/) directory is the fastest way to see a feature working — 15 runnable examples, each with a self-check assertion:
+The [`crates/deer-gui/examples/`](crates/deer-gui/examples/) directory is the fastest way to see a feature working — runnable examples (the exact count is whatever `crates/deer-gui/examples/` holds), each with a self-check assertion:
 
 ```sh
 cargo run -p deer-gui --example tutorial        # guided tour, writes render_out/*.png
