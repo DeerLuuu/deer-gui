@@ -66,3 +66,25 @@ git worktree list    # 看全部；下面只列"在飞"的
 1. **把门禁证据建立在空转的门槛上**（`"1 "` 尾空格 + 严格比较）⇒ 报过的「开开关档」长期无效（已修 + 已立规矩）。
 2. **在派活前没问「这个目录还有谁在写」** ⇒ deer-hello 交付被并发写者反复踩掉。
 3. **整块 dump 工具输出**（`team_task_list` 一次吐 39 KB 溢出到临时文件）⇒ 污染上下文。
+
+## 8. 本轮进度（滚动更新 —— 以 `git log` 与任务板为准）
+
+**已进主干并推送**（`master` = 见 `git log --oneline -1`）：
+- **第 2 项** 两条已知缺陷 → `570e917`：`NodeHint` 增 `node_id_fp`（FNV-1a 64）堵住「等长 id 互换静默错快照」；`Field` 焦点环内缩（框内 684→570、**环带外 464→0**、方角补块 32→0）。
+- **第 4 项上** 亚像素定位 → `a2bfab6`：`rasterize_at`/`rasterize_char_at` + `split_subpixel_x`（opt-in；落位 RMSE **0.2890→0.0733 px**；**代价**：部分覆盖质量 `l` +64.3% ⇒ **间距精度换边缘锐度**；**旧默认 20/20 产物逐字节不变**；hinting 仍不做但有实测依据 + 可重评棘轮）。
+- 文档：`6d77a53`（`iters` 降级为观测值）、`380b928`（亚像素口径 9 处副本）、`7ec38eb`（去掉写死的示例/套件计数）。
+- **判据规模**：`cargo test --workspace` = **462 passed / 0 failed**（本会话起点 205）。
+
+**进行中**（4 名队友在跑）：
+| 内容 | owner | 任务板 |
+|---|---|---|
+| testkit 修复轮（**D6 绕过 HIGH-1** + `DEER_VK_FRAMES` 双口径） | `impl-geom` | task-38 (t40) |
+| M5c fix 轮（`iters` 二选一 + OnDemand 档假红与误诊） | `window-dev` | task-37 (t39) |
+| 第 4 项下 纹理 / 间接绘制 | `vk-surface-dev` | task-36 (t38) |
+| 常驻复审（四条已出结论；等 scroll/indirect 落地） | `verifier` | task-34 (t36) |
+
+**未落地**：`feat/scroll-multiline`（**第 1 项**，一次性 worker，队友面板不可见 ⇒ 只能等它的消息）、`feat/testkit`（`62339a6`，**待 HIGH-1 修复后合并**）。
+
+**停泊**：`docs/features/testing.md:144`（「非法即报错、不静默」那句）—— **该文件只在 testkit 分支上**，等 testkit 合并进 master 后由 `docs-dev` 改。
+
+**等你（使用者）一句**：`crates/deer-layout/src/builder.rs` 的 **+5 行未提交改动**（非任何 agent 所派）—— 保留还是回退。另：`test_project/deer-hello` 的并发写者与可用版 `src/main.rs.new`（sha `CEBF93DE…`）仍未裁决。
