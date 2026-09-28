@@ -40,6 +40,13 @@ required-features = ["window"]
 name = "interactive_form"
 required-features = ["window"]
 
+# 上手教程的主角（`docs/GETTING-STARTED-UI.md`）：最小但有真功能的交互界面。
+# 同样是窗口路径 ⇒ 必须显式写 `required-features`，否则 `cargo test --workspace` 直接红
+# （理由与上面 interactive_form 那段逐字相同）。
+[[example]]
+name = "counter"
+required-features = ["window"]
+
 [lib]
 name = "deer_gui"
 path = "src/lib.rs"
