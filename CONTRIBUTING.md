@@ -78,6 +78,21 @@ Some tests are **skipped by default**. A skip counts as a pass, so a green run w
 
 Quoting matters when you set a gate from `cmd`. `cmd /c "set DEER_VK_WINDOW_TESTS=1 && cargo test …"` puts the space before `&&` **into the value**: the variable is `"1 "`, not `"1"`. Write `set "DEER_VK_WINDOW_TESTS=1" && …` (quoted) or `set DEER_VK_WINDOW_TESTS=1&& …` (no space). Every gate in this repository compares the value **after `trim()`**, so both forms are honored — that tolerance is asserted in `crates/deer-vk/src/ffi.rs` (`env_flag_tests`) and `crates/deer-gui/src/env_gate.rs` (unit tests). Numeric gates (`DEER_HAL_FRAMES`, `DEER_VK_FRAMES`, `DEER_WINDOW_ADAPTER`) trim before parsing for the same reason.
 
+### Every gate must prove it is actually on
+
+A gated case or example must **print the gate state it resolved**, and acceptance must **grep that marker** — not just read the exit code. Follow the validation-layer precedent ("校验层：请求=true 实际=true"): print *what was requested* and *what is actually in effect*.
+
+**Why this is not optional.** A gate that reports `ok` while never having run is **far more dangerous than a failing gate**: a failure is seen immediately, whereas a silently-disabled gate **contaminates an entire evidence tier** — and worse, makes everyone believe that tier is covered.
+
+**How it went wrong (with numbers).** `cmd /c "set DEER_VK_WINDOW_TESTS=1 && cargo test …"` produced the value `"1 "` (**length 2**). The gate check was a strict `v == "1"` (**no trim**), so the variable was read as *unset*: the case **early-returned and printed `ok`**. The whole "gate-on" tier had been idling. Discriminating evidence worth remembering:
+
+- the same case took **0.00 s** in the broken form vs **1.57 s** in the correct form;
+- the default tier and the gate tier printed **identical** numbers — which is itself a symptom worth investigating, not a coincidence.
+
+**Fix (`d90732e`).** A shared `env_flag` / `truthy` helper (**`trim()` first, then compare**) plus unit tests on both sides: `"1 "`, `" 1 "`, `"\t1\t"`, `"true"`, `"TRUE"`, `"0"`, `""` are listed as cases, including a named one asserting that **`"1 "` must be judged exactly like `"1"`**. Numeric gates trim before parsing for the same root cause.
+
+⇒ When you add a gate: **print the resolved state**, grep it during acceptance, and state in your report which marker you grepped.
+
 The full M2b gate:
 
 ```powershell
