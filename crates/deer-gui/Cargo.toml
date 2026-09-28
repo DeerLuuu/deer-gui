@@ -18,6 +18,16 @@ deer-window = { workspace = true, optional = true }
 default = []
 # 真窗口预览（M2b）：`cargo run -p deer-gui --features window --example window_preview`
 window = ["dep:deer-window"]
+# **测试接口（testkit）**：`deer_gui::testing` 模块（见该模块文档）。
+#
+# 为什么做成 feature 而不是恒编译：它是一个**给测试用的**面（建面 / 输入注入 /
+# 像素断言 / CPU↔GPU 对照），生产构建里不该出现。开着它零成本 —— testkit 只用
+# 本 workspace 的 crate 与 std，**不引入任何第三方依赖**。
+#
+# 为什么 `src/lib.rs` 里那段是 `#[cfg(any(test, feature = "testing"))]`：
+# `test` 那一支让 `cargo test --workspace`（默认 feature）**自动跑 testkit 自身的单测**
+# （否则「testkit 自己有没有护栏」就没人管了）；`feature` 那一支给下游用。
+testing = []
 
 [[example]]
 name = "window_preview"
@@ -54,6 +64,14 @@ required-features = ["window"]
 [[example]]
 name = "hello_window"
 required-features = ["window"]
+
+# testkit 的**可运行示例**（`docs/features/testing.md` 的最小示例的「跑起来」版）。
+# 它需要 `testing` feature ⇒ 必须显式写 `required-features`，否则默认（无 feature）
+# 构建会去编译它而失败 —— 那不是「跳过」，是 `cargo test --workspace` 直接红
+# （理由与上面 interactive_form 那段逐字相同）。
+[[example]]
+name = "testkit_demo"
+required-features = ["testing"]
 
 [lib]
 name = "deer_gui"
