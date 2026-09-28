@@ -23,7 +23,9 @@
 
 use std::collections::BTreeMap;
 
-use deer_gpu::interact::{FieldText, InteractState, InteractiveRenderer};
+use deer_gpu::interact::{
+    FOCUS_RING_INSET, FOCUS_STROKE_WIDTH, FieldText, InteractState, InteractiveRenderer,
+};
 use deer_gui::gpu::null::CpuRenderer;
 use deer_gui::gpu::{Color, DrawList, Extent, TextEngine, Theme};
 use deer_gui::input_script;
@@ -533,8 +535,10 @@ fn four_states_differ_only_inside_the_expected_rectangles() {
         let (in_field, _) = diff_split(idle, mine, ext, field);
         let total = mine.iter().zip(idle.iter()).filter(|(a, b)| a != b).count();
         let outside = total - in_btn - in_field;
+        let px_btn = diff_pixels(idle, mine, ext, btn);
+        let px_field = diff_pixels(idle, mine, ext, field);
         println!(
-            "  {name:<8} 与 idle 的差异：共 {total} 字节（按钮内 {in_btn}｜输入框内 {in_field}｜**矩形外 {outside}**）\
+            "  {name:<8} 与 idle 的差异：共 {total} 字节（按钮内 {in_btn} 字节/{px_btn} px｜输入框内 {in_field} 字节/{px_field} px｜**矩形外 {outside}**）\
              ｜命令 {} 条（hint {}）",
             f.list.len(),
             f.list.counts().node_hint
@@ -544,13 +548,86 @@ fn four_states_differ_only_inside_the_expected_rectangles() {
             "{name}: 有 {outside} 个字节的差异落在 button_1 {btn:?} 与 field_1 {field:?} **之外** \
              ⇒ 状态视觉溢出到别的控件上了"
         );
-        // 这一档必须**真的**画出了东西（否则「越界 = 0」这种断言会因为「什么都没画」而平凡成立）。
-        let expected_region = if *name == "typed" { in_field } else { in_btn };
+        // 这一档必须**真的**画出了**够多**的东西 —— 判据是「差异 ≥ 明确下限」，**不是**「差异 > 0」。
+        //
+        // 为什么「> 0」不够：按钮的焦点环改前与填充**同色**（`tint(accent, Idle) == accent`），
+        // 差异仍有 144 字节 / 56 px（32 px 方角补角 + 24 px 描边压字形）⇒ 「focused 有差异」一直绿着，
+        // 而屏幕上根本没有焦点环（独立复审 F-2）。各档下限的出处见 `STATE_MIN_PX`。
+        let expected_region = if *name == "typed" { px_field } else { px_btn };
+        let floor = STATE_MIN_PX
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("状态 `{name}` 没有登记下限 —— 新增状态必须显式给下限，否则它在空转"))
+            .1;
+        println!("           └ 期望区域 {expected_region} px｜下限 {floor}");
         assert!(
-            expected_region > 0,
-            "{name}: 期望变化的那个矩形里**没有**差异 ⇒ 这一档状态根本没画出来"
+            expected_region >= floor,
+            "{name}: 期望变化的那个矩形里只有 {expected_region} px 差异 < 下限 {floor} \
+             ⇒ 这一档状态视觉等于没画出来（「> 0」抓不住这种情况）"
         );
     }
+
+    // ---- 反向自检：`focused` 那条下限必须能拒绝「环与填充同色」（改前那一版）----
+    //
+    // 同一份语料里当场把按钮焦点环的**颜色**换成按钮填充色（几何、宽度、其他命令一字不动），
+    // 再看下限会不会拒绝它。不拒绝 ⇒ 这条下限抓不住本次要修的缺陷，等于没加。
+    let focused_frame = cases
+        .iter()
+        .find(|(n, _, _)| *n == "focused")
+        .expect("focused 在列表里");
+    let btn = rect_i(&geo, "button_1");
+    let band = RectI::new(
+        btn.x + FOCUS_RING_INSET,
+        btn.y + FOCUS_RING_INSET,
+        btn.w - 2 * FOCUS_RING_INSET,
+        btn.h - 2 * FOCUS_RING_INSET,
+    );
+    let mut owner: Option<RectI> = None;
+    let mut fill = None;
+    let mut hits = 0;
+    let mut same_color = focused_frame.1.list.clone();
+    for cmd in same_color.cmds.iter_mut() {
+        match cmd {
+            DrawCmd::NodeHint { rect, .. } => owner = Some(*rect),
+            DrawCmd::FillRoundRect { color, .. } if owner == Some(btn) => fill = Some(*color),
+            DrawCmd::StrokeRect {
+                rect,
+                color,
+                width,
+            } if owner == Some(btn) => {
+                assert_eq!(*width, FOCUS_STROKE_WIDTH, "按钮上只允许焦点环这一条描边");
+                assert_eq!(*rect, band, "前置：焦点环的矩形就是按钮内缩 FOCUS_RING_INSET 的那一圈");
+                *color = theme.accent; // = 按钮填充色（下面显式断言）
+                hits += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(hits, 1, "前置：`focused` 那一帧里按钮的焦点环必须恰好一条（否则这条自检测的是空气）");
+    assert_eq!(
+        fill.expect("按钮必须有填充命令"),
+        theme.accent,
+        "前置：按钮填充就是 accent ⇒ 「环 = accent」等于「环与填充同色」"
+    );
+    let same_px = CpuRenderer::new()
+        .render(ext, &same_color, CLEAR)
+        .expect("CPU 渲染失败")
+        .pixels;
+    let idle_px: &Vec<u8> = &px.iter().find(|(n, _)| *n == "idle").expect("idle 已渲染").1;
+    let focused_px: &Vec<u8> = &px
+        .iter()
+        .find(|(n, _)| *n == "focused")
+        .expect("focused 已渲染")
+        .1;
+    let d_same = diff_pixels(idle_px, &same_px, ext, btn);
+    println!(
+        "  反向自检（按钮焦点环改回填充色）：按钮内差异 {d_same} px（可见时 {} px，下限 {FOCUS_MIN_PX}）",
+        diff_pixels(idle_px, focused_px, ext, btn),
+    );
+    assert!(
+        d_same < FOCUS_MIN_PX,
+        "下限 {FOCUS_MIN_PX} 抓不住「环与填充同色」（同色时仍有 {d_same} px 差异）⇒ 这条下限在空转"
+    );
 
     // 反向自检：五档状态**两两不同**（否则「状态之间可区分」是空话）。
     for (i, (n1, p1)) in px.iter().enumerate() {
@@ -561,6 +638,58 @@ fn four_states_differ_only_inside_the_expected_rectangles() {
         }
     }
     println!("四档状态：越界字节 = 0，且五档两两不同 ✅");
+}
+
+/// 每档状态**差异像素数**的下限（判据是「差异 ≥ 明确下限」，**不是**「差异 > 0」）。
+///
+/// 出处：这三档像素判据跑的是 `ApproxMeasure`（占位度量）+ 固定窗口 `420×220` + 固定树
+/// ⇒ 完全确定，所以每个数字都是**实测值向下取整**并留出余量；「上限」是几何上界（被字形盖住的
+/// 部分不产生差异）：
+///
+/// | 状态 | 期望矩形 | 上限（几何） | 实测 | 下限 |
+/// |---|---|---|---|---|
+/// | `hover` | 按钮 | 1092 px（按钮 42×26） | 628 | 600 |
+/// | `pressed` | 按钮 | 1092 | 628 | 600 |
+/// | `focused` | 按钮 | 焦点环环带 324 px | 228 | [`FOCUS_MIN_PX`] = 180 |
+/// | `typed` | 输入框 | 2860 px（输入框 110×26） | 816 | 500 |
+///
+/// `typed` 的下限留得多（816 → 500）是有意的：它数的是「占位标签换成缓冲内容」的占位格差异，
+/// 随度量模型而变；而「什么都没画出来」是 **0 px**，所以 500 仍然有判别力。
+/// `hover`/`pressed` 的下限（628 → 600）离实测更近，因为它们的上界是**几何**给的
+/// （整块填充 = 按钮面积减去被字形盖住的部分），不是模型给的。
+const STATE_MIN_PX: [(&str, usize); 4] = [
+    ("hover", 600),
+    ("pressed", 600),
+    ("focused", FOCUS_MIN_PX),
+    ("typed", 500),
+];
+
+/// 按钮**焦点环**的差异像素数下限（本次从「> 0」加严出来的那一条）。
+///
+/// 出处（不是随手填的数字）：
+/// - 环带 = 按钮 42×26 内缩 `FOCUS_RING_INSET`=2、宽 `FOCUS_STROKE_WIDTH`=3 ⇒
+///   `38×22 − 32×16 = 324` px；
+/// - 环画在标签**之上**，标签与环同色（都是 `theme.on_accent`）的地方**不产生差异** ⇒ 实测 **228** px；
+/// - 下限取 **180**：落在**同一份语料里当场实测**的两个锚点之间 ——「可见环 228 px」与
+///   「环与填充同色 36 px」（后者由本测试最后那段反向自检打印）。两侧余量 48 / 144，
+///   而改前那条判据（`> 0`）在同色环的 36 px 面前**永远是绿的**。
+const FOCUS_MIN_PX: usize = 180;
+
+/// 在 `rect` 内逐**像素**比较（4 字节一组），返回差异像素数。
+fn diff_pixels(a: &[u8], b: &[u8], ext: Extent, rect: RectI) -> usize {
+    let w = ext.width.max(1) as usize;
+    let mut n = 0usize;
+    for i in (0..a.len().min(b.len())).step_by(4) {
+        if a[i..i + 4] == b[i..i + 4] {
+            continue;
+        }
+        let x = ((i / 4) % w) as i32;
+        let y = ((i / 4) / w) as i32;
+        if rect.contains(x, y) {
+            n += 1;
+        }
+    }
+    n
 }
 
 /// 把差异按「按钮矩形内 / 输入框矩形内 / 其它」分开计数。
