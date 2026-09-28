@@ -202,6 +202,24 @@ Same author also hit both wrong ways of the underlying fixed-point iteration: **
 - After any in-place restore, run **`cargo clean -p <crate>`**, or **confirm in the output that it really recompiled** (watch for `Compiling <crate>`).
 - **`git status` being clean does not mean `target/` is clean.** A clean worktree says nothing about what the compiler will reuse.
 
+### `target/` is shared mutable state — the feature combination is part of the cache key
+
+`target/` is shared between members and between **build configurations**. A build without a feature **does not rebuild** the artifacts of a build with it (and vice versa), so a "successful build" can hand you a **stale binary**.
+
+**Case (144 vs 456 bytes).** After the M5b merge, the window examples in `target/` were still **old binaries**: running
+`cargo build -p deer-gui --examples` **without** `--features window` does **not** rebuild them, so the focus ring still
+looked like the old **144-byte** version (the correct value is **456 bytes**). Only after rebuilding **with** `--features window`
+did it match.
+
+⇒ Rules:
+
+- When the criterion depends on `--features`, a gate variable, or `cfg`, **build with exactly the feature and gate combination your acceptance uses**. Do **not** infer feature-on behavior from a feature-off build.
+- **"The build succeeded" ≠ "the build built the artifact you meant."** Check *which* artifact ran (path, timestamp), or clean first.
+- If you suspect code did not take effect, run **`cargo clean -p <crate>`** (or verify the built binary/timestamp) **before** drawing a conclusion.
+  Every conclusion drawn before that check is provisional.
+
+This belongs to the same family as the other shared-mutable-state rules above (no shell text pipelines; verify a bulk rewrite's shape; commit with explicit pathspec; clean after an in-place restore).
+
 ## Design constraints and known traps
 
 These are not suggestions. Each one exists because a defect was found, and each is guarded by a test. Read this section before changing layout, rendering, or text code.
