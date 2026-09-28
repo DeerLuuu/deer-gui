@@ -135,9 +135,11 @@ fn run() -> Result<(), String> {
     assert!(list.clip_balanced(), "绘制列表的裁剪栈必须平衡");
 
     // ⑤ GPU：几何管线 + **文本管线**（`with_text`）
+    // 数值门槛先 `trim()`：`cmd /c "set DEER_GPU_ADAPTER=1 && …"` 的值是 `"1 "`，
+    // 不 trim 则 `parse()` 失败 ⇒ **静默退回适配器 0**（以为在测指定 GPU，实际测的是另一块）。
     let adapter = std::env::var("DEER_GPU_ADAPTER")
         .ok()
-        .and_then(|v| v.parse::<usize>().ok())
+        .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(0);
     let base = GpuGeometryRenderer::new(adapter, extent, theme.surface)
         .map_err(|e| format!("建 GPU 渲染器失败（adapter={adapter}）：{e}"))?;

@@ -76,6 +76,8 @@ Some tests are **skipped by default**. A skip counts as a pass, so a green run w
 | `DEER_WINDOW_FRAMES`, `DEER_WINDOW_HOLD=1` | example frame count / keep the window open | human observation only |
 | `DEER_FONT_DEBUG` | verbose font parsing output | debugging only |
 
+Quoting matters when you set a gate from `cmd`. `cmd /c "set DEER_VK_WINDOW_TESTS=1 && cargo test …"` puts the space before `&&` **into the value**: the variable is `"1 "`, not `"1"`. Write `set "DEER_VK_WINDOW_TESTS=1" && …` (quoted) or `set DEER_VK_WINDOW_TESTS=1&& …` (no space). Every gate in this repository compares the value **after `trim()`**, so both forms are honored — that tolerance is asserted in `crates/deer-vk/src/ffi.rs` (`env_flag_tests`) and `crates/deer-gui/src/env_gate.rs` (unit tests). Numeric gates (`DEER_HAL_FRAMES`, `DEER_VK_FRAMES`, `DEER_WINDOW_ADAPTER`) trim before parsing for the same reason.
+
 The full M2b gate:
 
 ```powershell

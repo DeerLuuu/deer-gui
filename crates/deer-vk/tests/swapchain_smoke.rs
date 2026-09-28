@@ -517,16 +517,28 @@ fn win32_surface_extension_is_available_on_windows() {
 // 5. 真窗口端到端（默认跳过）
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// 门槛判定：`DEER_VK_WINDOW_TESTS` 有没有（真的）打开 —— 本文件**两层里的第二层**都用它。
+///
+/// **本文件只此一处判据**（曾经是两处内联副本）：判据分叉过一次就会出现
+/// 「同一个命令，一个用例认为设了门槛、另一个认为没设」，而这个方向恰好是**静默**的。
+///
+/// **为什么不能写严格 `== "1"`**（实测，不是猜的）：`cmd` 的
+/// `set DEER_VK_WINDOW_TESTS=1 && cargo test …` 会把 `&&` 前的空格也算进变量值 ——
+/// `cmd /c "set X=1 && set X"` 实测打印 `X=1 `（**带一个尾空格**），于是
+/// `windowed_chain_end_to_end` 会**早退跳过**（0.00s）却仍然报 ok；写成
+/// `set "X=1" && …` 或 `set X=1&& …` 才是不带空格的 `1`。
+/// 判定委托给 [`ffi::env_flag`]（先 `trim()` 再比；断言在 `src/ffi.rs` 的单测里）。
+fn window_tests_enabled() -> bool {
+    ffi::env_flag("DEER_VK_WINDOW_TESTS")
+}
+
 /// **默认跳过**：需要真实窗口/桌面（`DEER_VK_WINDOW_TESTS=1` 才跑）。
 ///
 /// 跑的是完整链：原生 Win32 窗口 → `VkSurfaceKHR` → 设备（图形 + 呈现队列，设备扩展
 /// `VK_KHR_swapchain`）→ 交换链 → 逐帧 `acquire`/画/`submit`/`present` → `resize` → `Drop`。
 #[test]
 fn windowed_chain_end_to_end() {
-    let enabled = std::env::var("DEER_VK_WINDOW_TESTS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
-    if !enabled {
+    if !window_tests_enabled() {
         eprintln!("跳过：需要真实窗口（设 DEER_VK_WINDOW_TESTS=1 启用）");
         return;
     }
@@ -552,9 +564,11 @@ fn run_windowed_e2e() {
         return;
     }
 
+    // 数值门槛也要先 `trim()`：`cmd /c "set DEER_WINDOW_ADAPTER=1 && …"` 的值是 `"1 "`，
+    // 不带 `trim` 时 `parse()` 失败 ⇒ **静默退回适配器 0**（以为在测指定 GPU、实际测的是另一块）。
     let adapter: usize = std::env::var("DEER_WINDOW_ADAPTER")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.trim().parse().ok())
         .unwrap_or(0);
 
     let win = Win32TestWindow::create("deer-vk-swapchain-smoke", 640, 480)
@@ -1120,13 +1134,6 @@ fn pump_messages() {
 
 /// 子进程探针成功跑完时打印的哨兵（父进程用它区分「真的跑了」与「0 tests run」）。
 const DTOR_WINDOW_SENTINEL: &str = "【DTOR 窗口探针】";
-
-/// `DEER_VK_WINDOW_TESTS=1` 是否打开（与 `windowed_chain_end_to_end` 同一判据）。
-fn window_tests_enabled() -> bool {
-    std::env::var("DEER_VK_WINDOW_TESTS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-}
 
 /// **子进程探针**：建真窗口 → 建 [`WindowedRenderer`] → 画一帧（建出 `UiResources`）
 /// → **主动释放** → 析构 → 进程正常退出。

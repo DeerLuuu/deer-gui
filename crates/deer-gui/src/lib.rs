@@ -55,6 +55,13 @@ pub mod interaction;
 /// 窗口侧（`examples/interactive_form.rs`）与测试侧共用这一份解析器 ⇒ 脚本语法只有一处定义。
 pub mod input_script;
 
+/// **环境变量门槛**判定（`DEER_VK_WINDOW_TESTS` 这类开关，**纯逻辑**）。
+///
+/// 门槛判据必须只有一处定义，且必须先 `trim()` 再比 —— `cmd` 的 `set X=1 && …` 会把
+/// `&&` 前的空格算进变量值（实测 `"1 "`），严格判等会把「已启用」判成「未启用」
+/// ⇒ **静默跳过却报 pass**（一整档验证证据因此失效）。完整实测说明与断言见模块文档。
+pub mod env_gate;
+
 /// 窗口层（**需要 `window` feature**）。
 ///
 /// 这是本 workspace 唯一引入第三方依赖（`winit`）的地方，理由是窗口/事件循环的

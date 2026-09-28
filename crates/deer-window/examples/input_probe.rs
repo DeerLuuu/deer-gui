@@ -172,11 +172,17 @@ fn mods_name(mods: Mods) -> String {
 }
 
 fn main() -> ExitCode {
-    let hold = std::env::var("DEER_INPUT_HOLD").as_deref() == Ok("1");
-    let require_events = std::env::var("DEER_INPUT_REQUIRE").as_deref() == Ok("1");
+    // 门槛判定先 `trim()`：`cmd` 的 `set DEER_INPUT_HOLD=1 && cargo run …` 会把 `&&` 前的
+    // 空格也算进变量值 —— `cmd /c "set X=1 && set X"` 实测打印 `X=1 `（**带一个尾空格**）⇒
+    // 严格 `== "1"` 会把「设了」判成「没设」（不留窗 / 不做事件断言）却照样 exit=0。
+    // 同一条实测与更完整的理由见 `crates/deer-gui/src/env_gate.rs`（那边的判定有单测守着）。
+    let hold = std::env::var("DEER_INPUT_HOLD").is_ok_and(|v| v.trim() == "1");
+    let require_events = std::env::var("DEER_INPUT_REQUIRE").is_ok_and(|v| v.trim() == "1");
+    // 数值门槛同样先 `trim()`：`set DEER_INPUT_SECONDS=5 && …` 的值是 `"5 "`，
+    // 不 trim 则 `parse()` 失败 ⇒ 静默跑默认秒数。
     let auto_exit_seconds: f64 = std::env::var("DEER_INPUT_SECONDS")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.trim().parse().ok())
         .unwrap_or(DEFAULT_AUTO_EXIT_SECONDS);
 
     println!(

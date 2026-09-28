@@ -30,10 +30,15 @@ use deer_gui::gpu::{Backend, Color, Device, DrawCmd, DrawList, PresentResult, Re
 use deer_gui::vk::VkBackend;
 use deer_gui::window::{App, Flow, WindowConfig, WindowInfo, run};
 
+/// 门槛判定（`DEER_VK_WINDOW_TESTS`）。判据住在 `deer_gui::env_gate`（有单测守着）。
+///
+/// **为什么不能自己手写严格 `== "1"`**（实测，不是猜的）：`cmd` 的
+/// `set DEER_VK_WINDOW_TESTS=1 && cargo run …` 会把 `&&` 前的空格也算进变量值 ——
+/// `cmd /c "set X=1 && set X"` 实测打印 `X=1 `（**带一个尾空格**）⇒ 本示例会被判成
+/// 「没设门槛」，于是「本次没有验证 HAL 的 create_swapchain / submit_and_present」
+/// 这句话明明**与事实相反**却照样 `exit=0`。`trim` 的完整理由见 `env_gate`。
 fn enabled() -> bool {
-    std::env::var("DEER_VK_WINDOW_TESTS")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    deer_gui::env_gate::flag("DEER_VK_WINDOW_TESTS")
 }
 
 struct HalPath {
@@ -142,9 +147,11 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
+    // 数值门槛先 `trim()`：`set DEER_HAL_FRAMES=10 && …` 的值是 `"10 "`，
+    // 不 trim 则 `parse()` 失败 ⇒ **静默跑默认的 30 帧**（你要的帧数一个也没跑，却看不出来）。
     let target: u64 = std::env::var("DEER_HAL_FRAMES")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.trim().parse().ok())
         .unwrap_or(30);
     println!("HAL 窗口路径：目标呈现 {target} 帧");
 

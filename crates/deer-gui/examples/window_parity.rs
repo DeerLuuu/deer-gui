@@ -69,17 +69,23 @@ const CLEAR: Color = Color::rgb(0x08, 0x09, 0x0C);
 const FMT_B8G8R8A8_UNORM: i32 = 0x2c;
 const FMT_R8G8B8A8_UNORM: i32 = 0x25;
 
+/// 门槛判定（`DEER_VK_WINDOW_TESTS`）。判据住在 `deer_gui::env_gate`（有单测守着）。
+///
+/// **为什么不能自己手写严格 `== "1"`**（实测，不是猜的）：`cmd` 的
+/// `set DEER_VK_WINDOW_TESTS=1 && cargo run …` 会把 `&&` 前的空格也算进变量值 ——
+/// `cmd /c "set X=1 && set X"` 实测打印 `X=1 `（**带一个尾空格**）⇒ 本示例会被判成
+/// 「没设门槛」，于是明明建了窗口、读回并对照完像素、exit=0，却打印
+/// 「这不是通过，是被跳过」，**与事实相反**。`trim` 的完整理由见 `env_gate`。
 fn window_tests_enabled() -> bool {
-    matches!(
-        std::env::var("DEER_VK_WINDOW_TESTS").ok().as_deref(),
-        Some("1") | Some("true")
-    )
+    deer_gui::env_gate::flag("DEER_VK_WINDOW_TESTS")
 }
 
 fn frames_from_env() -> u64 {
+    // 数值门槛同样先 `trim()`：`set DEER_VK_FRAMES=3 && …` 的值是 `"3 "`，不 trim 的话
+    // `parse()` 失败 ⇒ **静默退回默认帧数**（跑了几帧与你要求的不一致，却什么也不说）。
     std::env::var("DEER_VK_FRAMES")
         .ok()
-        .and_then(|v| v.parse::<u64>().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(3)
         .max(1)
 }
@@ -425,9 +431,11 @@ impl App for Parity {
         })?;
         let engine = TextEngine::from_font_file(Path::new(&font_path), 16.0)
             .map_err(|e| format!("解析字体失败（{}）：{e}", font_path.display()))?;
+        // 数值门槛先 `trim()`（`set DEER_WINDOW_ADAPTER=1 && …` 的值是 `"1 "`）：
+        // 不 trim 则 `parse()` 失败 ⇒ 静默退回适配器 0，等于在测另一块 GPU。
         let adapter = std::env::var("DEER_WINDOW_ADAPTER")
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(0);
         let r = WindowedRenderer::new(adapter, info.raw, info.extent, CLEAR)
             .map_err(|e| format!("创建窗口渲染器失败（adapter={adapter}）：{e}"))?;

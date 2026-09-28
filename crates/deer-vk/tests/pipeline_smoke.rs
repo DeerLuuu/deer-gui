@@ -16,10 +16,12 @@ use deer_vk::ffi_dev as vk;
 use deer_vk::spirv;
 
 /// `DEER_VK_VALIDATION=1` 是否被请求（判据与 `deer_vk::ffi::Instance::validation_from_env()` 一致）。
+///
+/// **不再在这里重写一遍判据**：直接调那个共用实现 —— 两处判据分叉过一次就会出现
+/// 「测试以为没开校验、实际开着」的静默错位。它也容忍
+/// `cmd /c "set DEER_VK_VALIDATION=1 && …"` 的尾空格（`"1 "`），见 `deer_vk::ffi::env_flag`。
 fn validation_requested() -> bool {
-    std::env::var("DEER_VK_VALIDATION")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    deer_vk::ffi::Instance::validation_from_env()
 }
 
 fn open() -> Option<VkDevice> {

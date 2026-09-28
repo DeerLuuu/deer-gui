@@ -70,16 +70,17 @@ pub struct VkBackend {
 impl VkBackend {
     /// 打开 Vulkan 实例并枚举设备。
     ///
-    /// 若环境变量 **`DEER_VK_VALIDATION=1`** 被设置，则启用
+    /// 若环境变量 **`DEER_VK_VALIDATION=1`**（或 `true`，大小写不敏感、忽略两侧空白）被设置，则启用
     /// `VK_LAYER_KHRONOS_validation` 并把消息打到 stderr。
     ///
     /// 为什么用环境变量而不是编译期 feature：本项目暂不引任何第三方依赖，
     /// 也没有 feature 开关体系；环境变量能在**不改代码、不重编译**的情况下
     /// 对同一个二进制开诊断 —— 这正是排查驱动「不报错也不画」这类问题时需要的。
     pub fn new() -> GpuResult<VkBackend> {
-        let want_validation = std::env::var("DEER_VK_VALIDATION")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
+        // 判定委托给 `ffi::env_flag`：先 `trim()` 再比 —— `cmd /c "set DEER_VK_VALIDATION=1 && …"`
+        // 的变量值实测带一个尾空格（`"1 "`），严格判等会把「已经请求」判成「没请求」⇒
+        // 校验层静默不开。理由与断言见 `ffi::env_flag`（与 `Instance::validation_from_env` 同一份判据）。
+        let want_validation = ffi::env_flag("DEER_VK_VALIDATION");
         let instance = ffi::Instance::create_with_validation(want_validation)?;
         if instance.validation_enabled() {
             eprintln!("[deer-vk] 已启用 VK_LAYER_KHRONOS_validation（消息将打到 stderr）");

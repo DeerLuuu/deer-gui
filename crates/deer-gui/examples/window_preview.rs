@@ -65,18 +65,24 @@ const CLEAR: Color = Color::rgb(0x08, 0x09, 0x0C);
 const FMT_B8G8R8A8_UNORM: i32 = 0x2c;
 const FMT_R8G8B8A8_UNORM: i32 = 0x25;
 
+/// 回读开关（默认**开**，`DEER_WINDOW_READBACK=0` 关）。判据住在 `deer_gui::env_gate`。
+///
+/// **为什么不能自己手写严格判等**（实测，不是猜的）：`cmd` 的
+/// `set DEER_WINDOW_READBACK=0 && cargo run …` 会把 `&&` 前的空格也算进变量值 ——
+/// `cmd /c "set X=0 && set X"` 实测打印 `X=0 `（**带一个尾空格**）⇒ 显式关掉回读会被判成
+/// 「没关」，像素证据照旧产生（反向的静默偏差）。`trim` 的完整理由见 `env_gate`。
 fn readback_enabled() -> bool {
-    std::env::var("DEER_WINDOW_READBACK")
-        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
-        .unwrap_or(true)
+    deer_gui::env_gate::flag_default_true("DEER_WINDOW_READBACK")
 }
 
 /// 「跑 N 帧就退出」的帧数。两个环境变量名等价（`DEER_VK_FRAMES` 是本轮验收用的名字）。
 fn target_frames_from_env() -> u64 {
+    // 数值门槛先 `trim()`：`set DEER_VK_FRAMES=30 && …` 的值是 `"30 "`，
+    // 不 trim 则 `parse()` 失败 ⇒ **静默退回默认帧数 120**（跑了几帧与要求的不一致）。
     let read = |k: &str| {
         std::env::var(k)
             .ok()
-            .and_then(|v| v.parse::<u64>().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
     };
     read("DEER_VK_FRAMES")
         .or_else(|| read("DEER_WINDOW_FRAMES"))
@@ -307,9 +313,11 @@ impl App for Preview {
         println!("字体        : {}", font_path.display());
         self.engine = Some(engine);
 
+        // 数值门槛先 `trim()`（`set DEER_WINDOW_ADAPTER=1 && …` 的值是 `"1 "`）：
+        // 不 trim 则 `parse()` 失败 ⇒ 静默退回适配器 0，等于在测另一块 GPU。
         let adapter = std::env::var("DEER_WINDOW_ADAPTER")
             .ok()
-            .and_then(|v| v.parse::<usize>().ok())
+            .and_then(|v| v.trim().parse::<usize>().ok())
             .unwrap_or(0);
         let r = WindowedRenderer::new(adapter, info.raw, info.extent, CLEAR)
             .map_err(|e| format!("创建窗口渲染器失败（adapter={adapter}）：{e}"))?;
@@ -425,9 +433,10 @@ fn demo_tree() -> deer_gui::layout::Node {
 /// **逐像素与 CPU 对照在 `window_parity`**（那才需要线性附件与空间约定）。
 fn main() -> ExitCode {
     let target_frames = target_frames_from_env();
-    let hold = std::env::var("DEER_WINDOW_HOLD")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    // `DEER_WINDOW_HOLD` 的判定委托给 `deer_gui::env_gate`：`cmd` 的
+    // `set DEER_WINDOW_HOLD=1 && …` 的值实测是 `"1 "`（带尾空格），严格判等会把
+    // 「设了」判成「没设」⇒ 窗口不留、人肉观察悄悄降级成自动退出。理由见 `env_gate`。
+    let hold = deer_gui::env_gate::flag("DEER_WINDOW_HOLD");
     let readback = readback_enabled();
 
     if hold {

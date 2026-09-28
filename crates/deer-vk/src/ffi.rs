@@ -1104,10 +1104,12 @@ impl Instance {
     /// **公开**（而非 `pub(crate)`）是为了让示例/测试也能用同一份判据 ——
     /// 例如 `vulkan_pipeline` 要在请求校验层时跳过那支已知损坏的推送常量着色器
     /// （见 `ROADMAP.md` Q-5），它不该自己手写一遍 `std::env::var(...)`。
+    ///
+    /// 判定委托给 [`env_flag`]：它先 `trim()` 再比 —— `cmd /c "set DEER_VK_VALIDATION=1 && …"`
+    /// 的变量值实测带一个尾空格（`"1 "`），严格判等会把「已经请求」判成「没请求」⇒
+    /// 校验层静默不开、「零校验消息」的门禁随之失去判别力（理由与断言见 [`env_flag`]）。
     pub fn validation_from_env() -> bool {
-        std::env::var("DEER_VK_VALIDATION")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
+        env_flag("DEER_VK_VALIDATION")
     }
 
     /// 本实例的核心函数副本（供「借用实例」的设备创建路径使用）。
@@ -1263,5 +1265,58 @@ mod layout_tests {
         assert_eq!(std::mem::offset_of!(PhysicalDeviceLimits, max_image_dimension_2d), 4);
         // 整个 limits 结构体是 4 字节对齐的平凡布局
         assert_eq!(std::mem::align_of::<PhysicalDeviceLimits>(), 8);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 环境变量**门槛**判定（一处定义：产品代码 / 测试 / 示例共用）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// 环境变量真值判定：`"1"` / `"true"`（大小写不敏感）⇒ `true`；未设或其它值 ⇒ `false`。
+///
+/// ## 为什么必须**先 `trim()` 再比**（实测，不是猜的）
+///
+/// `cmd` 的 `set DEER_VK_VALIDATION=1 && cargo test …` 会把 `&&` 前的空格也算进变量值：
+/// `cmd /c "set X=1 && set X"` 实测打印 `X=1 `（**带一个尾空格**）；写成
+/// `set X=1&& …`（不留空格）才是不带空格的 `1`；带引号的 `set "X=1" && …` 也不带空格。
+///
+/// 严格 `== "1"` 会把「**已经设了**门槛」判成「没设」⇒ 校验层静默不开、真窗口 e2e 早退，
+/// 而结果**照旧报 ok** —— 于是「一整档验证」看起来是绿的、实际根本没跑。
+/// 所以这里（以及所有用同一个判据的地方）先 `trim()` 再比。断言见 [`env_flag_tests`]。
+pub fn env_flag(name: &str) -> bool {
+    std::env::var(name).map(|v| truthy(&v)).unwrap_or(false)
+}
+
+/// [`env_flag`] 的**纯逻辑**部分（不读环境 ⇒ 可单测）。空白容忍的理由见 [`env_flag`]。
+pub fn truthy(v: &str) -> bool {
+    let v = v.trim();
+    v == "1" || v.eq_ignore_ascii_case("true")
+}
+
+#[cfg(test)]
+mod env_flag_tests {
+    use super::truthy;
+
+    /// **护栏**：`cmd /c "set X=1 && …"` 的实际值是 `"1 "`（带尾空格），
+    /// 必须与带引号的 `set "X=1" && …`（`"1"`）**同判** —— 否则「设了门槛」会被判成
+    /// 「没设」⇒ 用例静默跳过却报 pass。
+    #[test]
+    fn truthy_tolerates_surrounding_whitespace() {
+        for v in [
+            "1", "1 ", " 1", " 1 ", "\t1\t", "true", "TRUE", "True", " true ",
+        ] {
+            assert!(truthy(v), "{v:?} 必须判为「已启用」");
+        }
+        for v in [
+            "", " ", "\t", "0", "0 ", "false", "FALSE", "yes", "on", "2", "1 0",
+        ] {
+            assert!(!truthy(v), "{v:?} 必须判为「未启用」");
+        }
+    }
+
+    /// 实证数据（见 [`super::env_flag`] 文档）：这一档就是 `set X=1 && …` 的实际值。
+    #[test]
+    fn cmd_trailing_space_form_is_the_enabled_one() {
+        assert!(truthy("1 "), "`set X=1 && …` 的变量值 `\"1 \"` 必须判为启用");
     }
 }

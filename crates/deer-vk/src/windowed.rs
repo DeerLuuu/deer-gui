@@ -236,8 +236,20 @@ pub fn live_ui_resource_count() -> usize {
 /// 的时候 —— 离屏的复现是一件**文档待办**。
 ///
 /// 环境变量只作为**诊断/实测开关**，默认值才是产品行为。
+///
+/// **判定先 `trim()` 再比**：`cmd /c "set DEER_VK_WINDOW_VIEWPORT=static && …"` 会把 `&&` 前的
+/// 空格也算进变量值（实测 `"static "`）⇒ 严格判等会**静默退回默认 `dynamic`**：以为在测静态、
+/// 实际测的是动态（默认值才是产品行为，所以症状完全看不出来）。同一条实测与更完整的理由
+/// 见 [`crate::ffi::env_flag`]。断言见本文件 `mod tests` 的 `viewport_strategy_from_value_*`。
 pub fn viewport_strategy_from_env() -> pipelines::ViewportStrategy {
-    match std::env::var("DEER_VK_WINDOW_VIEWPORT").ok().as_deref() {
+    viewport_strategy_from_value(std::env::var("DEER_VK_WINDOW_VIEWPORT").ok().as_deref())
+}
+
+/// [`viewport_strategy_from_env`] 的**纯逻辑**部分（不读环境 ⇒ 可单测）。
+///
+/// 未设、空值或无法识别的值 ⇒ **默认 `dynamic`**（默认值才是产品行为）。
+pub fn viewport_strategy_from_value(v: Option<&str>) -> pipelines::ViewportStrategy {
+    match v.map(str::trim) {
         Some(v) if v.eq_ignore_ascii_case("static") => pipelines::ViewportStrategy::Static {
             width: 1,
             height: 1,
@@ -2199,6 +2211,41 @@ mod tests {
     fn frame_outcome_is_compareable() {
         assert_ne!(FrameOutcome::Presented, FrameOutcome::OutOfDate);
         assert_eq!(FrameOutcome::Presented, FrameOutcome::Presented);
+    }
+
+    /// viewport 诊断开关**必须容忍两侧空白**：`cmd /c "set DEER_VK_WINDOW_VIEWPORT=static && …"`
+    /// 的实际值是 `"static "`（带尾空格），严格判等会静默退回 `dynamic` ⇒
+    /// 「以为在测静态、实际测的是动态」。理由见 [`viewport_strategy_from_env`]。
+    #[test]
+    fn viewport_strategy_from_value_tolerates_surrounding_whitespace() {
+        let statik = pipelines::ViewportStrategy::Static {
+            width: 1,
+            height: 1,
+        };
+        for v in [
+            Some("static"),
+            Some("static "),
+            Some(" static "),
+            Some("STATIC"),
+            Some("\tStatic"),
+        ] {
+            assert_eq!(viewport_strategy_from_value(v), statik, "{v:?} 必须判为静态");
+        }
+        // 默认（未设 / 空 / 其它）⇒ dynamic —— 默认值才是产品行为
+        for v in [
+            None,
+            Some(""),
+            Some(" "),
+            Some("dynamic"),
+            Some("dynamic "),
+            Some("yse"),
+        ] {
+            assert_eq!(
+                viewport_strategy_from_value(v),
+                pipelines::ViewportStrategy::Dynamic,
+                "{v:?} 必须退回默认 dynamic"
+            );
+        }
     }
 
     #[test]

@@ -84,11 +84,17 @@ impl App for Smoke {
 }
 
 fn main() -> ExitCode {
-    let hold = std::env::var("DEER_WINDOW_HOLD").as_deref() == Ok("1");
-    let fail_init = std::env::var("DEER_WINDOW_FAIL").as_deref() == Ok("1");
+    // 门槛判定先 `trim()`：`cmd` 的 `set DEER_WINDOW_HOLD=1 && cargo run …` 会把 `&&` 前的
+    // 空格也算进变量值 —— `cmd /c "set X=1 && set X"` 实测打印 `X=1 `（**带一个尾空格**）⇒
+    // 严格 `== "1"` 会把「设了」判成「没设」（窗口不留 / 故障注入没生效）却照样 exit=0。
+    // 同一条实测与更完整的理由见 `crates/deer-gui/src/env_gate.rs`（那边的判定有单测守着）。
+    let hold = std::env::var("DEER_WINDOW_HOLD").is_ok_and(|v| v.trim() == "1");
+    let fail_init = std::env::var("DEER_WINDOW_FAIL").is_ok_and(|v| v.trim() == "1");
+    // 数值门槛同样先 `trim()`：`set DEER_WINDOW_FRAMES=10 && …` 的值是 `"10 "`，
+    // 不 trim 则 `parse()` 失败 ⇒ 静默跑默认帧数。
     let auto_exit_frames: u64 = std::env::var("DEER_WINDOW_FRAMES")
         .ok()
-        .and_then(|v| v.parse().ok())
+        .and_then(|v| v.trim().parse().ok())
         .unwrap_or(DEFAULT_AUTO_EXIT_FRAMES);
 
     println!(

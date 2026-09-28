@@ -15,12 +15,12 @@ use deer_vk::spirv;
 
 /// `DEER_VK_VALIDATION=1` 是否被请求。
 ///
-/// 判据必须与 `deer_vk::ffi::Instance::validation_from_env()`（crate 内 `pub(crate)`）
-/// **逐字一致** —— 否则会出现「测试以为没开校验、实际开着」的错位。
+/// **不再在这里重写一遍判据**：直接调 `deer_vk::ffi::Instance::validation_from_env()`
+/// （公开的共用实现）—— 否则会出现「测试以为没开校验、实际开着」的错位，而错位是**静默**的。
+/// 它也负责容忍 `cmd /c "set DEER_VK_VALIDATION=1 && …"` 带来的尾空格（`"1 "`），
+/// 理由与断言见 `deer_vk::ffi::env_flag`。
 fn validation_requested() -> bool {
-    std::env::var("DEER_VK_VALIDATION")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
+    deer_vk::ffi::Instance::validation_from_env()
 }
 
 /// **地雷门**：该着色器已知损坏（详见调用点的说明）。
