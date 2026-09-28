@@ -323,6 +323,34 @@ M5b 把事件循环从「一直要下一帧」改成**事件驱动**：
 - **CPU 比例只是本机实测**，**永久不作为断言** —— 理由：CPU 时间依赖**机器 / 驱动 / 负载**，
   写成阈值**必然 flaky**；计数判据是**确定性**的。谁要把 CPU 变断言，先解决 flakiness。
 
+**⚠️ 这个判据有前置：本次必须真的派发过输入** —— 照下面的命令跑，别只把二进制跑起来：
+
+- 一条输入都没有 ⇒ `wants_redraw` **一次都没被问过** ⇒ 「答真 0 次」「画帧 ≤ 1 + 系统帧」**必然成立**：
+  判据在这里**不是变弱，而是空转**（「无条件请求重绘」这种变异都能顶着它绿）。
+  所以探针把前置**显式断言并放在最前面**：**输入 = 0 ⇒ `exit=1`**，stderr 明确写「**前置不成立**」
+  —— 与「**判据失败**」**分开报**，两种红必须能分开看。
+- **行为变化**：默认（`OnDemand`）档**不注入输入现在 `exit=1`** —— 这正是修法的目的
+  （改前它会打一行「自检通过（省电）：0 条输入」的**假绿**）。
+- **不受影响的那一档**：`DEER_WINDOW_REDRAW=continuous` **不下**「输入有没有改状态」的结论
+  （它验的是「策略被环境变量覆盖」，看 `requests`/`frames` 与门槛自证日志）⇒ **0 输入仍 `exit=0`**。
+- **可复现的注入命令**（等价做法：`PostMessage(WM_MOUSEMOVE)` 注入悬停；**不动用户鼠标、不抢焦点**）：
+
+```powershell
+cargo build -p deer-window --examples          # 与验收同一组合（deer-window 无 feature）
+$env:DEER_IDLE_SECONDS='3'
+$p = Start-Process -PassThru .\target\debug\examples\idle_probe.exe
+$h = [IntPtr]::Zero
+for ($i=0; $i -lt 40 -and $h -eq [IntPtr]::Zero; $i++) { Start-Sleep -Milliseconds 100; $h = (Get-Process -Id $p.Id).MainWindowHandle }
+Add-Type -Namespace P -Name W -MemberDefinition '[DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint m, IntPtr w, IntPtr l);'
+1..40 | ForEach-Object { [void][P.W]::PostMessage($h, 0x0200, [IntPtr]::Zero, [IntPtr](30 -shl 16)); Start-Sleep -Milliseconds 15 }
+$p.WaitForExit(); "exit=$($p.ExitCode)"        # 期望 0
+```
+
+> **本机实测**：注入 40 条悬停 ⇒ **`exit=0`**；不注入 ⇒ **`exit=1`**（stderr 首行即「自检失败（**前置不成立**）」）；
+> `DEER_WINDOW_REDRAW=continuous` + 不注入 ⇒ **`exit=0`**。
+> 更完整的跑法（按 **PID** 枚举窗口、逐档抓退出码的 runner）另见 M5b 跟进留下的验证脚本 ——
+> 那是**便利**、不是唯一出处：上面这段**自足**。
+
 **本机实测的省电效果**（同一 5 秒窗口 + 40 条悬停输入；**实测值，不是断言；量级事实，具体数随机器/负载浮动**）：
 
 | 档 | 画帧 | 进程 CPU（每 5 秒窗口） |
@@ -356,7 +384,13 @@ set "DEER_WINDOW_REDRAW=continuous" && cargo run -q -p deer-window --example <�
 **已知边界**：
 
 - `Occluded(false)` 已接线，但 **winit 0.30 文档写明 Windows 不支持该事件** ⇒ **Windows 上未实测**；
-- `OnDemand` 下 `App` **没有**唤醒事件循环的手段（无定时器 / 无用户事件）⇒ **按时间的动画必须声明 `Continuous`**。
+- `OnDemand` 下 `App` **没有**唤醒事件循环的手段（无定时器 / 无用户事件）⇒ **按时间的动画必须声明 `Continuous`**；
+- **`DEER_IDLE_REQUIRE` 已删除**：它的旧语义是「**只有**设了它才把 0 输入判失败，**默认不算失败**」——
+  一个**默认没牙**的旋钮正是上面那个前置漏洞的根源。删掉只会**更严**（0 输入一律 `exit=1`），
+  不会让任何东西**静默变绿**；如果你在脚本里还设着它，那是**无效**的，删掉即可。
+- **真窗口的 `DEER_IDLE_DIRTY=1`（变化档）目前只报数、不下结论** ⇒ 「**从不请求重绘**」这类错误
+  在**真窗口路径**上**只能靠单测**兜住（该档的「0 输入」也已被上面的前置拦掉，所以它至少不会假绿）。
+  这是**已知限制**，不是判据。
 
 ## 7. 常见坑
 
