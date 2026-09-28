@@ -12,7 +12,7 @@
 //! |---|---|
 //! | 默认（`DEER_WAKE_TICKS=5` / `=50ms`，推式 `wake_after`） | **恰好 5 次定时唤醒 / 5 个定时帧**；`wants_redraw` **一次都没被问过**；exit=0 |
 //! | `set DEER_WAKE_PULL=1 && …` | 同上，但走**拉式** `App::next_deadline()`（`wake_after` 一次都不调） |
-//! | `set DEER_WAKE_TICKS=0 && …` | **一声都不叫**（省电档）：事件循环在 `Wait` 上睡死 ⇒ 由**看门狗**兜底收尾；窗口内零唤醒、零 `wants_redraw`；exit=0 |
+//! | `set DEER_WAKE_TICKS=0 && …` | **一声都不叫**（省电档）：本层不排任何唤醒 ⇒ 收尾只能由**看门狗**兜底；窗口内零唤醒、零 `wants_redraw`；exit=0（**是否空转不看这一档的收尾方式** —— 见下面 `iters` 的空闲档上界判据） |
 //! | `set DEER_WAKE_LOOK=20 && …` | 后台线程叫 20 声 `Waker::wake()`；**答真才画** ⇒ 只画 1 帧，其余 19 声记成「唤醒被跳过」 |
 //!
 //! ## 这一轮的判据为什么必须自带「迭代次数」
@@ -65,7 +65,9 @@ const DEFAULT_TICKS: u64 = 5;
 /// 默认间隔（毫秒）。
 const DEFAULT_MS: u64 = 50;
 
-/// 看门狗比预算晚多久醒来：晚这一截 ⇒「看门狗先到」= 事件循环一直没醒的现场证据。
+/// 看门狗比预算晚多久醒来。它只把「本层自己退」与「兜底触发」在时间上分开：
+/// **「兜底先到」≠「事件循环睡在 `Wait` 上」**（打转时兜底同样先到）—— 是否空转看空闲档的
+/// `iters` 上界判据，不看这里。
 const WATCHDOG_LAG: Duration = Duration::from_millis(1500);
 
 /// 每多少帧打一行（退化时帧数会到几十万 —— 逐帧打会把终端淹了，日志反倒看不见）。
@@ -343,8 +345,11 @@ impl App for Probe {
                     println!("[wake_probe] frame {n}：系统事件帧（不看 wants_redraw，不算唤醒）")
                 }
                 (false, false, false) => {
-                    // 没有来源却来了帧 ⇒ 有人凭空请求重绘（这正是要抓的退化的样子）。
-                    println!("[wake_probe] frame {n}：⚠️ **没有任何来源**的帧（凭空重绘？）");
+                    // 观测：这一帧不来自本探针记账的三个来源。它**可能**是别人凭空请求的重绘
+                    // （要抓的那种退化），也**可能**是同一请求的重复投递 —— 这里只报观测，不下结论。
+                    println!(
+                        "[wake_probe] frame {n}：⚠️ **没有任何来源**的帧（本探针记账覆盖不到：可能是别人请求的重绘，也可能是同一请求的重复投递）"
+                    );
                 }
             }
         }
@@ -466,8 +471,10 @@ fn summarize(ledger: &Ledger, cfg: &Cfg, via_dog: bool) -> bool {
         return false;
     } else if cfg.ticks == 0 && exits == 0 {
         eprintln!(
-            "[wake_probe] 自检失败（**前置不成立**）：省电档本该**睡死**到看门狗兜底，\
-             却在预算内自己退了（画帧 {frames}）⇒ 有人在凭空唤醒事件循环。"
+            "[wake_probe] 自检失败（**前置不成立**）：省电档本该由看门狗兜底收尾，\
+             却在预算内自己退了（画帧 {frames}）⇒ 本次测量没按设计跑完。\
+             可能是 ① 有人手动关了这个窗口（`close_requested`）、也可能是 ② 有人在凭空唤醒事件循环 ——\
+             本探针分不清这两者，请重跑（重跑时别碰窗口）。"
         );
         return false;
     }
@@ -567,7 +574,7 @@ fn summarize(ledger: &Ledger, cfg: &Cfg, via_dog: bool) -> bool {
         );
         check(
             exits == 1,
-            format!("收尾帧来自看门狗兜底（{exits} 次）—— 这正是「事件循环在 Wait 上睡死」的现场证据"),
+            format!("收尾帧来自看门狗兜底（{exits} 次）—— 观测：本次收尾由兜底触发。**不**由此推出「事件循环睡在 Wait 上」：循环在打转时兜底同样会先到（复审 I1 的 `Wait⇒Poll` 实测）；是否空转只看下面那条 `iters` 上界判据"),
         );
     }
 
