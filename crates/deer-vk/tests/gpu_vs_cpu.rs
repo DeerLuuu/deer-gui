@@ -249,7 +249,7 @@ fn opaque_corpus() -> Vec<(&'static str, DrawList)> {
             {
                 let mut l = DrawList::new();
                 l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 24, 16), color: w });
-                l.push(DrawCmd::NodeHint { rect: RectI::new(0, 0, 24, 16), node_id_len: 3 });
+                l.push(DrawCmd::node_hint(RectI::new(0, 0, 24, 16), "mix"));
                 l.push(DrawCmd::FillRect { rect: RectI::new(2, 2, 12, 9), color: Color::rgb(0, 0, 0) });
                 l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 20, 13), color: w, width: 2 });
                 l.push(DrawCmd::FillRoundRect { rect: RectI::new(7, 4, 8, 7), radius: 2, color: w });

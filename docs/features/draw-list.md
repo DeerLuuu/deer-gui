@@ -53,7 +53,7 @@ for cmd in &list.cmds {
 | `FillRoundRect` | `rect`, `radius`, `color` | 圆角实心（CPU 后端用四角圆心近似，无抗锯齿） |
 | `Text` | `rect`, `text`, `color`, `size`, `align` | 一段文字。`align`：0=左 1=中 2=右 |
 | `PushClip` / `PopClip` | `rect` | 裁剪区（必须配对） |
-| `NodeHint` | `rect`, `node_id_len` | 节点占位提示（后端可忽略） |
+| `NodeHint` | `rect`, `node_id_len`, `node_id_fp` | 节点占位提示（后端可忽略、不产生像素）。后两个字段是**绑定校验和**：`node_id_fp` = id 的 FNV-1a 64 指纹（只比长度时等长 id 互换会静默错位）。一律用 `DrawCmd::node_hint(rect, id)` 构造 |
 
 `RectI` 的字段是 `i32`（几何在布局阶段已经取整）。
 

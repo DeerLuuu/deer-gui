@@ -298,10 +298,7 @@ mod tests {
         // 空列表 / 只有 NodeHint ⇒ 不报错（M2b 的窗口帧本来就只画清屏 + 几何）
         f.record(&DrawList::new()).expect("空列表应当可以记录");
         let mut hints = DrawList::new();
-        hints.push(DrawCmd::NodeHint {
-            rect: RectI::new(0, 0, 1, 1),
-            node_id_len: 1,
-        });
+        hints.push(DrawCmd::node_hint(RectI::new(0, 0, 1, 1), "h"));
         f.record(&hints).expect("NodeHint 只是诊断信息，应当可以记录");
 
         // 真的绘制命令 ⇒ 明确报错（不许静默忽略）

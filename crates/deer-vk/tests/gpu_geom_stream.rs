@@ -307,7 +307,7 @@ fn degenerate_rect_produces_nothing() {
 #[test]
 fn node_hint_is_ignored_silently() {
     let mut l = DrawList::new();
-    l.push(DrawCmd::NodeHint { rect: RectI::new(0, 0, 8, 8), node_id_len: 7 });
+    l.push(DrawCmd::node_hint(RectI::new(0, 0, 8, 8), "septet!!"));
     let s = gpu_geom::build_stream(&l, Extent { width: 8, height: 8 });
     assert_eq!(s.vertices.len(), 0);
     assert!(s.unsupported.is_empty());
