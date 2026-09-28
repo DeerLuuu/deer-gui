@@ -528,10 +528,25 @@ cargo test -p deer-gpu --test text_raster -- --nocapture   # 看「跳过系统�
 
 ### 7.3 改换行规则（`wrap`）
 
-1. **唯一实现**：`crates/deer-gpu/src/measure.rs:124-179`；规则文档在 `:25-36`（「按空格/制表切词」「行首不留空白」「单词超宽按字符硬切」「`max_width <= 0` 不换行」「空串算 1 行」「不丢字」）。调用点：`measure.rs:194`（`Measure::height` 用它算行数 × `style.line_height`）。
-2. **与布局的耦合**：`deer-layout` 侧只有 `ApproxMeasure::height`（`crates/deer-layout/src/layout.rs:54-61`，用 `(w / max_width).ceil()` 近似），它**故意不被改动**（`crates/deer-gpu/src/measure.rs:5-9`）。若希望布局阶段也按真实换行算高，需要把 `FontMeasure` 注入 `layout`（`deer-gui/src/lib.rs:159` 已经是这么做的）。
-3. **测试必须同步**：`crates/deer-gpu/tests/text_measure.rs:211`（`wrap_respects_max_width_without_losing_characters`，含「不丢字」「行首无空白」「单字符硬切例外」三条）；变异记录 `text_measure.rs:19`（M6：去掉硬切会让第 0 行超宽）；`text_measure.rs:296`（trait 与固有 API 同源）。
-4. 若换行规则影响渲染（多行绘制），还要动 `null.rs:493-553`（当前 `draw_text_real` **只画一行**，不做换行）。
+> **⚠️ 本节的行号与结论已按「剩余工作第 1 项」更新过**（多行文本 + 滚动容器落地后，
+> `measure.rs` 的 `wrap` 改成委托、`layout.rs` 里加了 `wrap_greedy`/`scroll`，行号整体位移：
+> 引用只给**函数名与文件**，不再逐个给行号）。
+
+1. **唯一实现**：`deer_layout::layout::wrap_greedy`（`crates/deer-layout/src/layout.rs`）——
+   按空格/制表切词、行首不留空白、单词超宽按字符硬切、`max_width <= 0` 或非有限 ⇒ 不换行、空串算 1 行、不丢字。
+   两个实现都**委托**给它、只注入「宽度怎么算」：`ApproxMeasure::wrap`（近似）与
+   `FontMeasure::wrap`（真实 advance，`crates/deer-gpu/src/measure.rs`）。
+2. **与布局的耦合**（这条**已经变了**）：`ApproxMeasure::height` 现在是
+   `wrap(..).len() * line_height`（**不再是** `(w / max_width).ceil()` 的宽度比例近似）——
+   理由：度量高度与「画出来的行数」若是两套算法，就会出现「预留 2 行、画出来 3 行」。
+   `deer-gpu/tests/text_measure.rs` 与 `deer-layout/tests/scroll_multiline.rs` 各有一条一致性断言。
+3. **测试必须同步**：`crates/deer-gpu/tests/text_measure.rs`（`wrap_respects_max_width_without_losing_characters`，
+   含「不丢字」「行首无空白」「单字符硬切例外」三条；`measure_trait_matches_inherent_api` 保证 trait 与固有 API 同源）；
+   变异记录在 `text_measure.rs` 文件头。
+4. **多行绘制**（`text` + `layout.wrap`）：行由**渲染器**展开成 N 条 `DrawCmd::Text`
+   （`deer_gpu::render::text_lines`，两个渲染器共用），所以**后端仍然一个 `Text` 命令画一行**
+   ——`null.rs::draw_text_real` 不需要懂换行。详见
+   [`../features/scroll-and-multiline.md`](../features/scroll-and-multiline.md)。
 
 ### 7.4 加一种颜色格式（`TargetFormat`）
 
@@ -575,7 +590,7 @@ cargo test -p deer-gpu --test text_raster -- --nocapture   # 看「跳过系统�
 | 显式尺寸也**不许超过可用空间**（I-6）。 | `layout.rs:216-222` |
 | 场景文件缩进**必须是 2 的倍数**（否则报错带行号）。 | `crates/deer-layout/src/scene.rs:72-78` |
 | 场景**只能有一个根**；叶子节点**不能有子节点**（都报错）。 | `scene.rs:292-295`、`:309-315` |
-| 场景属性白名单（未知属性直接报错）：`name/w/h/pad/gap/main/cross/grow/label/disabled`。 | `scene.rs:143-145`、`:231-239` |
+| 场景属性白名单（未知属性直接报错）：`name/w/h/pad/gap/main/cross/grow/scroll/wrap/label/disabled`（`scroll`/`wrap` 是**裸开关**，带值会被拒绝；剩余工作第 1 项加的）。 | `scene.rs:143-145`、`:231-239` |
 | 场景只支持 `k=v`、裸 `k`、`k="带 空格"`；`#` 注释要求前面是行首或空白（引号内不算注释）。 | `scene.rs:52`、`:94`、`:63` |
 | 显式命名的节点**必须「占号」**（`IdGen::reserve`），否则自动 id 会撞上显式名（B-1 缺陷）。 | `crates/deer-layout/src/node.rs:203-207`、`:219-235` |
 | 树是**纯数据**（不含回调）；事件用 `id` 关联。 | `node.rs:12-15` |

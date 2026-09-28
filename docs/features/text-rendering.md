@@ -84,6 +84,11 @@ FontMeasure::new(font, font_size)
 |---|---|
 | `width(text, style)` | `== text_width(text)`（**同一套算法**，不是另写一份）。**忽略 `style.font_size`**：字号由构造 `FontMeasure` 时给定的那个决定 |
 | `height(text, style, max_width)` | `wrap(text, max_width).len() * style.line_height`（空串也算 1 行）。行数来自 `wrap`，**行距来自样式**（不是字体自带行高） |
+| `wrap(text, style, max_width)` | **换行点的第三处入口**（trait 上的方法，默认实现是「不换行」）；`FontMeasure` 覆盖它并**委托**给上面的固有 `wrap`。布局用它算「预留几行」，渲染器用它算「画出几行」——同一处定义。算法本体在 `deer_layout::layout::wrap_greedy`（`ApproxMeasure` 与 `FontMeasure` 共用，只差「宽度怎么算」） |
+
+> **多行文本节点**（`text` + `layout.wrap`）就是靠这个 trait 方法实现的：`deer_gpu::render::text_lines`
+> 按行展开成 N 条 `DrawCmd::Text` ⇒ 后端**每个命令仍然只画一行**（`draw_text_real` 不需要懂换行）。
+> 见 [`scroll-and-multiline.md`](scroll-and-multiline.md)。
 
 `deer_gpu::measure::find_system_font() -> Option<PathBuf>`：在 `%WINDIR%\Fonts` 里按
 `consola.ttf` → `arial.ttf` → `segoeui.ttf` 找。找不到返回 `None`（**明确失败**，不静默降级）。
@@ -252,7 +257,7 @@ assert!((drawn - layout_w).abs() <= 1.0, "两侧宽度只允许 ≤1px 的取整
 | `from_system_font` 直接 `Err` | 机器上没有 `consola.ttf`/`arial.ttf`/`segoeui.ttf`（或 `%WINDIR%` 异常） | 用 `TextEngine::from_font_bytes(std::fs::read("你的.ttf")?, size)`；**不要**期待静默降级 |
 | 有些字符显示成**豆腐块** | cmap 未命中（字体里没有这个字符）⇒ `glyph()` **回退到 `.notdef`** 并画出来（字体惯例：可见的失败信号，比静默不画诚实） | 这是正常回退；用 `missing_glyphs()` 统计。本项目**不做**多字体回退，要那个字符就换一份含它的字体 |
 | 缺字时**布局宽度与画面宽度对不上**（>1px） | 两个宽度只允许差末尾取整（<1px）：`TextEngine::text_width` 是**落笔宽度**（未取整），`FontMeasure::text_width` **`ceil()`** 成盒子宽度。若差得多，说明两边的**字号/字体**不同（破了第 1 条铁律），不是缺字造成的 | 让 `glyph`/`text_width` 的 `px_size` 与 `measure()` 的字号一致；缺字本身两边都按 `.notdef` 的 advance 算，**不会**造成宽度不一致 |
-| 换行结果和预期不一样 | `wrap` 是**贪心按空白**切，且对超长单词**按字符硬切** | 这是刻意的确定性行为；要别的断行规则得自己写（`Measure::height` 直接依赖 `wrap`） |
+| 换行结果和预期不一样 | `wrap` 是**贪心按空白**切，且对超长单词**按字符硬切**（`ApproxMeasure` 与 `FontMeasure` 共用 `wrap_greedy`，只差宽度算法） | 这是刻意的确定性行为；要别的断行规则得自己写（`Measure::wrap` 是唯一入口，`height` 与多行绘制都依赖它） |
 | `text_width` 比手算的多个 1px | 它 **`ceil()`** 到整数（与 `ApproxMeasure` 的整数友好约定一致） | 断言时按 `ceil` 算期望值 |
 | 小字号看起来发糊/笔画粘连 | 不做 hinting，用超采样抗锯齿代替 | 见 [`glyph-raster.md`](glyph-raster.md) 第 6 节；放大字号或提高 `supersample` |
 | 输出 PNG 很大 | PNG 编码器用 zlib **stored** 块（零依赖的代价） | 正常现象，见 [`pixels.md`](pixels.md) |

@@ -99,6 +99,15 @@ impl Builder {
         self.push_named(n, Kind::Button)
     }
 
+    /// 文本 + 就地改参数（换行等）：`b.text_opts("…", |n| n.layout.wrap = true)`。
+    ///
+    /// 与 `button_opts` 同一个形状：**先设参数、最后定 id**（见 `text` 的注释）。
+    pub fn text_opts(&mut self, label: impl Into<String>, f: impl FnOnce(&mut Node)) -> String {
+        let mut n = Node::new(Kind::Text, "").with_label(label);
+        f(&mut n);
+        self.push_named(n, Kind::Text)
+    }
+
     /// 追加一个叶子控件，返回其 id（事件关联用 id，不进树 —— 树是纯数据）。
     pub fn button_opts(&mut self, label: impl Into<String>, f: impl FnOnce(&mut Node)) -> String {
         let mut n = Node::new(Kind::Button, "").with_label(label);
@@ -205,6 +214,8 @@ pub struct L {
     pub main_axis: Option<Align>,
     pub cross_axis: Option<Align>,
     pub grow: Option<f32>,
+    pub scroll: Option<bool>,
+    pub wrap: Option<bool>,
 }
 
 impl L {
@@ -247,6 +258,16 @@ impl L {
         self.grow = Some(v);
         self
     }
+    /// 垂直滚动容器（只对 `Column` 有意义）。
+    pub fn scroll(mut self, v: bool) -> L {
+        self.scroll = Some(v);
+        self
+    }
+    /// 文本按节点像素宽度换行（只对 `Kind::Text` 有意义）。
+    pub fn wrap(mut self, v: bool) -> L {
+        self.wrap = Some(v);
+        self
+    }
     /// 便捷构造 `LayoutProps`。
     pub fn to_props(self) -> LayoutProps {
         LayoutProps {
@@ -257,6 +278,8 @@ impl L {
             main_axis: self.main_axis,
             cross_axis: self.cross_axis,
             grow: self.grow.unwrap_or(0.0),
+            scroll: self.scroll.unwrap_or(false),
+            wrap: self.wrap.unwrap_or(false),
         }
     }
 }

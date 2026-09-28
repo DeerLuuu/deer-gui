@@ -287,7 +287,8 @@ fn feed(&mut self, ev: &InputEvent) -> Result<bool, String> {
 | `KeyDown { Backspace }` | 焦点是启用的输入框 ⇒ 删**一个 Unicode 字符** ⇒ `TextChanged` |
 | `TextInput` | 焦点是启用的输入框 ⇒ 追加 ⇒ `TextChanged`（**空串不算变化**） |
 | `FocusChanged { focused: false }` | 窗口失焦：清 `hover`/`pressed`（`focus`/`texts` 不动） |
-| 其余（`Wheel`、`KeyUp`、右/中键、方向键、`Key::Char`/`Other`、`focused: true`） | 本里程碑**不消费** |
+| `Wheel { dy }` | 滚 `hover` 所在的可滚动容器（`column` + `scroll`）：偏移 `−dy × 40px`，夹在 `[0, max_scroll]`，变了才发 `UiEvent::Scrolled { id, offset }`（见 [`features/scroll-and-multiline.md`](features/scroll-and-multiline.md)） |
+| 其余（`KeyUp`、右/中键、方向键、`Key::Char`/`Other`、`focused: true`） | 本里程碑**不消费** |
 
 **指针与键盘是两条事件**：文本一律走 `InputEvent::TextInput`；`Key::Char('a')` 是**物理键**，
 状态机**不消费**它（用 `KeyDown { key: Char(..) }` 当打字输入是常见错误）。
@@ -405,7 +406,7 @@ InputEvent::KeyDown { key: Key::Backspace, mods: Mods::default() }
 | `keyup:Char(a)` | `KeyUp` |
 | `text:hi 你好` | 一段文本输入（原样，含空格与中文；**追加**不是覆盖） |
 | `focus:on` / `focus:off` | 窗口失焦 / 重新获得窗口焦点 |
-| `wheel:0,3` | 滚轮（状态机不消费；可用来验证「不消费的事件不改状态」） |
+| `wheel:0,3` | 滚轮（**会被消费**：滚 `hover` 所在的可滚动容器；语料里没有可滚动容器时它是空转 —— 也可用来验证「无事可做的事件不改状态」） |
 
 解析器只有一个：`input_script::parse_script(src) -> Result<Vec<InputEvent>, String>`，
 窗口侧与测试侧共用它 ⇒ 脚本语法只有一处定义。

@@ -31,7 +31,7 @@
 use std::collections::BTreeMap;
 
 use deer_gpu::{DrawCmd, DrawList, RectI};
-use deer_layout::layout::Geometry;
+use deer_layout::layout::{Geometry, ScrollMetrics, ScrollOffsets};
 use deer_layout::node::{Kind, Node};
 
 // ---------------------------------------------------------------------------
@@ -147,6 +147,74 @@ pub struct UiState {
     pub pressed: Option<String>,
     /// 输入框的文本缓冲（id → 内容）。不在里面的输入框视为空串。
     pub texts: BTreeMap<String, String>,
+    /// **滚动状态**（偏移 + 每个容器的上限）。偏移是**布局的输入**（调用方每帧喂给
+    /// `layout_with_scroll`），上限是布局的输出（调用方每帧 `set_metrics` 灌回来）。
+    ///
+    /// 为什么偏移住在 `UiState` 里：滚轮必须在**唯一入口**（[`handle`]）被消费 ——
+    /// 若另开一个「带滚动的 handle」，那条路径上的滚轮就会静默无效，而没人能一眼看出来。
+    pub scroll: ScrollState,
+}
+
+/// 滚动状态：**偏移**（布局的输入）+ **上限**（布局的输出）。
+///
+/// 两者分开存是刻意的：偏移是「状态」，上限是「这一帧的几何事实」。调用方每帧
+/// 把布局结果灌进来（[`ScrollState::set_metrics`]），`handle` 用上限把偏移夹在
+/// `[0, max_scroll]` 内 —— 于是「滚到边界不越界」只有一处实现（不依赖调用方自觉）。
+///
+/// **灌漏了会怎样**：上限表为空 ⇒ 每个容器的 `max_of` 都是 0 ⇒ 滚轮什么都不做
+/// （fail-closed：不会滚进一个「没有上限」的虚空，也不会产生假事件）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScrollState {
+    /// 当前偏移（整数像素）。
+    pub offsets: ScrollOffsets,
+    /// 本帧的滚动上限（来自 [`deer_layout::layout::layout_with_scroll`]）。
+    pub metrics: ScrollMetrics,
+}
+
+impl ScrollState {
+    pub fn new() -> ScrollState {
+        ScrollState::default()
+    }
+
+    /// 某个容器的当前偏移（没滚过 ⇒ 0）。
+    pub fn offset_of(&self, id: &str) -> i32 {
+        self.offsets.get(id)
+    }
+
+    /// 某个容器的滚动上限（没灌 / 不是滚动容器 ⇒ 0）。
+    pub fn max_of(&self, id: &str) -> i32 {
+        self.metrics.max_of(id)
+    }
+
+    /// 灌入本帧的布局结果，并把**已有的偏移夹回新的上限**。
+    ///
+    /// 为什么必须夹：视口/内容一变（窗口缩放、内容增减），旧偏移可能已经越界；
+    /// 不夹就会留下一个「状态里存着、几何里却用不到」的偏移 —— 下一次内容变高时
+    /// 它又会**突然生效**（用户看到界面像被谁滚了一下）。
+    pub fn set_metrics(&mut self, metrics: &ScrollMetrics) {
+        self.metrics = metrics.clone();
+        let ids: Vec<String> = self.offsets.ids().map(str::to_string).collect();
+        for id in ids {
+            let clamped = self.metrics.clamp(&id, self.offsets.get(&id));
+            self.offsets.set(id, clamped);
+        }
+    }
+
+    /// 把某个容器的偏移设成 `v`（夹取）；**真的变了**才返回新值（否则 `None` ⇒ 不发事件）。
+    pub fn scroll_to(&mut self, id: &str, v: i32) -> Option<i32> {
+        let next = self.metrics.clamp(id, v);
+        if next == self.offsets.get(id) {
+            return None;
+        }
+        self.offsets.set(id, next);
+        Some(next)
+    }
+
+    /// 相对滚动：`delta_px > 0` = 内容上移（偏移增大）。
+    pub fn scroll_by(&mut self, id: &str, delta_px: i32) -> Option<i32> {
+        let cur = self.offsets.get(id);
+        self.scroll_to(id, cur.saturating_add(delta_px))
+    }
 }
 
 /// 一次 `handle` 产生的「发生了什么」。窗口层据此置 dirty 并重绘。
@@ -156,7 +224,22 @@ pub enum UiEvent {
     FocusChanged(Option<String>),
     Clicked(String),
     TextChanged { id: String, value: String },
+    /// 某个可滚动容器的偏移变了（滚轮驱动）。`offset` 是**夹取之后**的整数像素值。
+    ///
+    /// 只有**真的变了**才发（到顶/到底再滚、或 `max_scroll == 0` 都是「没变」⇒ 不发），
+    /// 于是窗口层的 dirty 约定照旧：有事件 = 需要重绘。
+    Scrolled { id: String, offset: i32 },
 }
+
+/// 滚轮的**每「一格」对应的像素数**（`InputEvent::Wheel::dy` 的单位由窗口层决定：
+/// winit 的 `LineDelta` 是**行**、`PixelDelta` 是像素，`map_wheel` 原样透传 ⇒ 这里按「行」解释）。
+///
+/// 为什么是常量而不是「主题行高 × dy」：`handle` 拿不到主题，而从别处把主题传进来会让
+/// 「同一份输入滚多远」随主题变化 ⇒ 同一份脚本的判据不再确定。40 px ≈ 两行文本
+/// （`Theme::line_height` = 18）。
+///
+/// **符号约定**：`dy < 0`（滚轮向下拨）⇒ 内容上移 ⇒ 偏移**增大**。
+pub const WHEEL_STEP_PX: i32 = 40;
 
 impl UiState {
     /// 三个**视觉**字段（`hover`/`focus`/`pressed`）是否完全一样（`texts` 不参与）。
@@ -441,6 +524,52 @@ fn node_id_at(root: &Node, geo: &Geometry, clip: ClipSnapshot, x: f32, y: f32) -
 }
 
 // ---------------------------------------------------------------------------
+// 四b、滚轮 → 滚动偏移（剩余工作第 1 项）
+// ---------------------------------------------------------------------------
+
+/// `id` 这条链上**最深**的可滚动容器（含 `id` 自身）；没有 ⇒ `None`。
+///
+/// 判据是 [`Node::is_scroll_container`] —— 布局、渲染、这里三处**同一个条件**，
+/// 免得「谁能被滚动」出现第三种说法。
+fn nearest_scroll_container<'a>(n: &'a Node, id: &str, best: Option<&'a Node>) -> Option<&'a Node> {
+    let best = if n.is_scroll_container() { Some(n) } else { best };
+    if n.id == id {
+        return best;
+    }
+    for c in &n.children {
+        if let Some(found) = nearest_scroll_container(c, id, best) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// 处理一次滚轮：**悬停节点最近的可滚动祖先（含自身）**滚动一个步长。
+///
+/// 为什么目标来自 `hover`：`InputEvent::Wheel` **没有坐标**（M5-1 冻结的事件模型），
+/// 而「滚轮滚谁」必须确定。`hover` 是「指针当前压在谁身上」的唯一真相（由
+/// `PointerMoved`/`PointerDown` 维护），所以它就是唯一合理的答案 —— 而不是另记一个
+/// 「最后一次指针位置」（那会让滚轮在指针从未移动过时命中 `(0,0)`）。
+///
+/// 三道前置（缺一条就 `None`，不改任何状态）：① 有 `hover`；② 该节点不在**禁用子树**里
+/// （与「禁用子树不响应输入」同一条规则）；③ 这条链上有可滚动容器，且偏移**真的变了**
+/// （到顶/到底、`max_scroll == 0`、`dy == 0` 都不发事件）。
+fn wheel_scroll(state: &mut UiState, root: &Node, dy: f32) -> Option<(String, i32)> {
+    let hover = state.hover.clone()?;
+    let node = node_by_id(root, &hover)?;
+    if path_is_dead(root, node) {
+        return None;
+    }
+    let target = nearest_scroll_container(root, &hover, None)?.id.clone();
+    // `dy < 0`（向下拨）⇒ 内容上移 ⇒ 偏移增大。
+    let delta = (-(dy * WHEEL_STEP_PX as f32)).round() as i32;
+    state
+        .scroll
+        .scroll_by(&target, delta)
+        .map(|offset| (target, offset))
+}
+
+// ---------------------------------------------------------------------------
 // 五、焦点顺序（M5-2）
 // ---------------------------------------------------------------------------
 
@@ -503,7 +632,8 @@ fn next_focus(ids: &[String], current: Option<&str>, back: bool) -> Option<Strin
 /// | `KeyDown { Backspace }` | 焦点是启用的输入框 ⇒ 删**一个字符**（Unicode 字符，不是字节）⇒ `TextChanged` |
 /// | `TextInput` | 焦点是启用的输入框 ⇒ 追加 ⇒ `TextChanged` |
 /// | `FocusChanged { focused: false }` | 窗口失焦：清 `hover`/`pressed`（`focus`/`texts` 不动）|
-/// | 其余（`Wheel`、`KeyUp`、右/中键、方向键、`Key::Char`/`Other`、`focused: true`） | 本里程碑不消费（见「已知边界」） |
+/// | `Wheel { dy }` | **滚动**：`hover` 最近的可滚动祖先（含自身）偏移 `-dy ×` [`WHEEL_STEP_PX`]，夹在 `[0, max_scroll]`；变了才发 `Scrolled` |
+/// | 其余（`KeyUp`、右/中键、方向键、`Key::Char`/`Other`、`focused: true`） | 本里程碑不消费（见「已知边界」） |
 ///
 /// 只有**状态真的变了**才产出事件（`M5-4` 的 dirty 约定依赖这一点）。
 ///
@@ -572,7 +702,14 @@ pub fn handle(
             }
         }
         InputEvent::PointerUp { .. } => {}
-        InputEvent::Wheel { .. } => {}
+        InputEvent::Wheel { dy, .. } => {
+            // 滚轮滚「`hover` 最近的可滚动祖先（含自身）」，一个步长见 [`WHEEL_STEP_PX`]。
+            // `dx`（水平）**本期忽略**：只做垂直滚动（`Row` 上的 `scroll` 也被忽略）。
+            // 边界与「没变」都由 `ScrollState::scroll_by` 负责（夹取 + 变了才回 `Some`）。
+            if let Some((id, offset)) = wheel_scroll(state, root, *dy) {
+                out.push(UiEvent::Scrolled { id, offset });
+            }
+        }
         InputEvent::KeyDown {
             key: Key::Tab,
             mods,
@@ -1799,6 +1936,9 @@ mod tests {
 
     // ---- 附：状态机不消费的事件不能悄悄改状态 ------------------------------
 
+    /// 本语料里**没有可滚动容器** ⇒ `Wheel` 也是空转（滚轮**已被消费**，只是这棵树滚不动）。
+    /// 所以这条判据现在覆盖两件事：① 真正「不消费」的事件（`KeyUp`/右中键/方向键…）；
+    /// ② 「消费了但无事可做」的 `Wheel`（没有可滚动祖先 ⇒ 不产生事件、不改状态）。
     #[test]
     fn r18_unconsumed_events_change_nothing() {
         let (t, g) = fixture();
@@ -1808,7 +1948,19 @@ mod tests {
             focus: Some("name".into()),
             pressed: Some("btn_ok".into()),
             texts: BTreeMap::from([("name".to_string(), "hi".to_string())]),
+            scroll: Default::default(),
         };
+        // 前置：这份语料确实一个可滚动容器都没有（否则下面的 `Wheel` 断言在测空气）。
+        let mut scrollers = Vec::new();
+        t.walk(&mut |n, _| {
+            if n.is_scroll_container() {
+                scrollers.push(n.id.clone());
+            }
+        }, 0);
+        assert!(
+            scrollers.is_empty(),
+            "测试前置：这棵树里不该有可滚动容器，实际 {scrollers:?}"
+        );
         let before = s.clone();
         let events = [
             InputEvent::Wheel { dx: 0.0, dy: 3.0 },
@@ -1824,5 +1976,41 @@ mod tests {
             assert!(out.is_empty(), "{e:?} 不该产生事件，实际 {out:?}");
         }
         assert_eq!(s, before, "不消费的事件不得改变任何状态");
+    }
+
+    /// 滚轮的三条前置：**没有 hover / 没有可滚动祖先 / 上限是 0** ⇒ 什么都不做。
+    ///
+    /// （「有 hover 且在可滚动容器里」的完整链路在
+    /// `tests/scroll_multiline.rs` 里跑，那条用真实布局与真实绘制列表。）
+    #[test]
+    fn r19_wheel_needs_a_hover_inside_a_scrollable_container() {
+        let (t, g) = fixture();
+        let (x, y) = ev_at("btn_ok", &g);
+        let wheel = InputEvent::Wheel { dx: 0.0, dy: -1.0 };
+
+        // ① 没有 hover（指针从未移动过）⇒ 不改状态、不发事件。
+        let mut s = UiState::default();
+        let before = s.clone();
+        let out = handle(&mut s, &t, &g, ClipSnapshot::unclipped(), &wheel);
+        println!("无 hover ⇒ {out:?}");
+        assert!(out.is_empty());
+        assert_eq!(s, before);
+
+        // ② 有 hover 但树里没有可滚动容器 ⇒ 同上。
+        let mut s = UiState::default();
+        handle(&mut s, &t, &g, ClipSnapshot::unclipped(), &InputEvent::PointerMoved { x, y });
+        assert_eq!(s.hover.as_deref(), Some("btn_ok"), "前置：悬停在按钮上");
+        let before = s.clone();
+        let out = handle(&mut s, &t, &g, ClipSnapshot::unclipped(), &wheel);
+        println!("无可滚动祖先 ⇒ {out:?}");
+        assert!(out.is_empty());
+        assert_eq!(s, before);
+
+        // ③ `dy = 0`：即使上限非 0 也不是「变化」⇒ 不发事件（`ScrollState` 的判据）。
+        let mut st = ScrollState::new();
+        st.set_metrics(&deer_layout::layout::ScrollMetrics::new());
+        assert_eq!(st.scroll_by("any", 0), None, "dy=0 时偏移没变 ⇒ None");
+        assert_eq!(st.scroll_by("any", 40), None, "上限 0 ⇒ 夹取后仍是 0 ⇒ None（fail-closed）");
+        assert_eq!(st.offset_of("any"), 0);
     }
 }

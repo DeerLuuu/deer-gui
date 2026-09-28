@@ -236,7 +236,7 @@ pub fn raw_handle_from_rwh06(raw: RwhRawWindowHandle) -> Result<deer_gpu::RawWin
 | **① workspace 测试** | `cmd /c "cargo test --workspace"` | `cargo test --workspace 2>&1 \| Select-String "^test result:"`（每个 target 一行汇总；判据：全 `0 failed`） |
 | **② clippy（带 window feature）** | `cmd /c "cargo clippy --workspace --all-targets --features deer-gui/window"` | 判据：**0 warning / 0 error** 且 exit code 0 |
 | **③ docs_consistency** | `cmd /c "cargo test -p deer-gui --test docs_consistency"` | 判据：`test result:` 行全过（这份文档契约测试的条数同样以输出为准） |
-| **④ 示例全跑** | 13 个 `cmd /c "cargo run -q -p deer-gui --example <名>"` + 2 个 `--features window` 示例 + `cargo run -q -p deer-window --example window_smoke` | 判据：逐个 `exit=0`（`hal_window_path` 未设 `DEER_VK_WINDOW_TESTS` 时是「显式跳过」，也算 `exit=0`） |
+| **④ 示例全跑** | 14 个 `cmd /c "cargo run -q -p deer-gui --example <名>"` + 2 个 `--features window` 示例 + `cargo run -q -p deer-window --example window_smoke` | 判据：逐个 `exit=0`（`hal_window_path` 未设 `DEER_VK_WINDOW_TESTS` 时是「显式跳过」，也算 `exit=0`）。**条数会随新示例增长**（「剩余工作第 1 项」加了 `--example scroll`；以 `crates/deer-gui/examples/` 里**非 `required-features` 的源码文件**为准） |
 | **（附加）deer-vk 带校验层** | `$env:DEER_VK_VALIDATION='1'; cmd /c "cargo test -p deer-vk"` | `$env:DEER_VK_VALIDATION='1'; cargo test -p deer-vk 2>&1 \| Select-String "^test result:"`；消息计数见下方**精确命令** |
 | **（附加）真窗口完整门禁** | `$env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cmd /c "cargo test -p deer-vk"` | 本轮**未实测**（见 §8）；依据 `ROADMAP.md` 的 M2b 门禁段、`README.md`、`docs/features/window.md` |
 

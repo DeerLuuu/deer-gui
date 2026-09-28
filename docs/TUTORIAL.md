@@ -212,7 +212,7 @@ let png = render_tree_to_png(&tree, 300, 260, Theme::default())?;
 **写错会报错并给行号**（不静默忽略）：
 
 ```
-bad.dui:2: 未知属性 "nope"（可用：name/w/h/pad/gap/main/cross/grow/label/disabled）
+bad.dui:2: 未知属性 "nope"（可用：name/w/h/pad/gap/main/cross/grow/scroll/wrap/label/disabled）
 ```
 
 > 对应示例：`cargo run -p deer-gui --example scene_file`
@@ -342,7 +342,8 @@ deer-gui = { path = "Z:/deer-gui/crates/deer-gui" }
 | 图片里的字是**真字体** | ✅ **离屏**已支持（第 11 章 CPU 侧、第 13 章 **GPU 侧 M3b**）：GPU 画真字形与 CPU 逐字节相同 |
 | **鼠标点击 / 键盘输入** | ✅ 已支持：悬停 / 按下 / 点击 / 文本输入（追加 + `Backspace` 按 Unicode 字符删末尾）；见 [`features/input.md`](features/input.md) |
 | **Tab 焦点** | ✅ 已支持：`Tab` / `Shift+Tab` 循环（树序）、`Escape` 清焦点、点击可聚焦控件即聚焦 |
-| **方向键导航 / 滚轮 / 滚动容器 / IME 预编辑** | ❌ 未做（M5 剩余，见 [`features/input.md`](features/input.md) 第 6 节） |
+| **滚轮 / 滚动容器 / 多行文本** | ✅ 已支持（剩余工作第 1 项）：`column` + `scroll` ⇒ `max_scroll` + 视口裁剪，`text` + `wrap` ⇒ 每行一条 `DrawCmd::Text`；滚轮滚 `hover` 所在容器、到边界不越界；见 [`features/scroll-and-multiline.md`](features/scroll-and-multiline.md) |
+| **方向键导航 / IME 预编辑 / 滚动条 / 惯性滚动** | ❌ 未做（见 [`features/input.md`](features/input.md) 第 6 节） |
 | **可停靠面板 dock** / 多窗口 | ❌ M6 |
 | 12 个 `deer-ui` 控件的语义 | ❌ M6（现在只有 5 种节点） |
 
@@ -447,7 +448,7 @@ $env:DEER_WINDOW_HOLD='1'; cargo run -p deer-gui --features window --example win
   回读**强制一次 GPU→CPU 同步**，所以只在第一帧做一次。
 - 目前**只有 Windows** 实现了窗口句柄的填充；非 Windows 会明确返回 `Err`。
 
-**仍然做不到**：方向键导航 / 滚动 / 右键中键 / IME 预编辑（M5 剩余）、多窗口 / 全屏 / HDR / 帧率上限、
+**仍然做不到**：方向键导航 / 滚动条 / 惯性滚动 / 右键中键 / IME 预编辑（M5 剩余）、多窗口 / 全屏 / HDR / 帧率上限、
 `size <= 0` 的文本与 CPU 一致（见第 13 章）。输入与焦点**已可用**，**重绘也已是事件驱动（默认省电）**——
 见 [`features/input.md`](features/input.md) 与 [`features/window.md`](features/window.md) 第 6 节。
 完整边界见 [`features/window.md`](features/window.md) 与

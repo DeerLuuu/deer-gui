@@ -121,61 +121,13 @@ impl<'a> FontMeasure<'a> {
     }
 
     /// 贪心换行。规则见[模块文档](self)。
+    ///
+    /// 实现**委托**给 `deer_layout::layout::wrap_greedy`（唯一的词切分/硬切算法），
+    /// 只注入「宽度怎么算」= [`FontMeasure::text_width`]。这样 `ApproxMeasure::wrap`
+    /// （近似度量）与本函数的行为**逐字相同** —— 否则「换行点随度量的类别而分叉」
+    /// 这类问题要在两个实现里各查一遍。
     pub fn wrap(&self, text: &str, max_width: f32) -> Vec<String> {
-        // 非正宽度：不换行（调用方明确表示「不要按宽度切」）
-        if max_width <= 0.0 {
-            return vec![text.to_string()];
-        }
-
-        let mut lines: Vec<String> = Vec::new();
-        // 当前行（不含行尾空白；行首空白在切词时已丢弃）
-        let mut cur = String::new();
-
-        for word in text.split([' ', '\t']).filter(|w| !w.is_empty()) {
-            // 试着把词接到当前行后面（词间补一个空格）
-            let candidate = if cur.is_empty() {
-                word.to_string()
-            } else {
-                format!("{cur} {word}")
-            };
-            if self.text_width(&candidate) <= max_width {
-                cur = candidate;
-                continue;
-            }
-
-            // 接不下：先把当前行收尾
-            if !cur.is_empty() {
-                lines.push(std::mem::take(&mut cur));
-            }
-
-            if self.text_width(word) <= max_width {
-                // 词自己能放下一整行
-                cur = word.to_string();
-            } else {
-                // 词本身超宽 ⇒ 按字符硬切（保证进度，绝不死循环）
-                let mut piece = String::new();
-                for ch in word.chars() {
-                    let mut trial = String::with_capacity(piece.len() + 4);
-                    trial.push_str(&piece);
-                    trial.push(ch);
-                    // 单字符就超宽时允许该行超宽（否则无法前进）
-                    if !piece.is_empty() && self.text_width(&trial) > max_width {
-                        lines.push(std::mem::take(&mut piece));
-                    }
-                    piece.push(ch);
-                }
-                cur = piece;
-            }
-        }
-
-        if !cur.is_empty() {
-            lines.push(cur);
-        }
-        if lines.is_empty() {
-            // 空串 / 全空白 ⇒ 仍然是 1 行
-            lines.push(String::new());
-        }
-        lines
+        deer_layout::layout::wrap_greedy(text, max_width, |s| self.text_width(s))
     }
 }
 
@@ -184,6 +136,11 @@ impl Measure for FontMeasure<'_> {
     /// 忽略 `style.font_size`，字号由构造时给定的 `font_size` 决定。
     fn width(&self, text: &str, _style: TextStyle) -> f32 {
         self.text_width(text)
+    }
+
+    /// 换行点 = [`FontMeasure::wrap`]（多行绘制与布局高度**共用**这一处行数定义）。
+    fn wrap(&self, text: &str, _style: TextStyle, max_width: f32) -> Vec<String> {
+        FontMeasure::wrap(self, text, max_width)
     }
 
     /// 行数 × `style.line_height`。行数来自 [`FontMeasure::wrap`]（空串算 1 行）。

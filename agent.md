@@ -132,7 +132,7 @@
 - **hinting / 字距连字（`kern`/`GSUB`/`GPOS`）/ 竖排 RTL**：都不做（hinting 现在有**实测依据**：最省的 hinting-lite 量下来没有净收益）。
 - **亚像素水平定位**：**光栅化层已落地 opt-in 路径**（1/4 相位档；实测落位误差 RMSE 0.2890→0.0733 px），
   但**默认路径仍整数落位**、**尚未接进文本引擎** ⇒ 产品像素没变；代价是「间距精度换边缘锐度」（不是「清晰度提升」）。
-- **输入与焦点**：**已落地**（`InputEvent` + winit 映射 + `App::input`、命中/状态机（含裁剪与禁用）、点击 / `Tab`·`Shift+Tab`·`Escape` 焦点、文本输入、脚本重放、**事件驱动重绘（默认省电）**）；**仍缺**：dock / 多窗口、滚动与方向键、右键中键、IME 预编辑（见 `docs/features/input.md` 第 6 节）。
+- **输入与焦点**：**已落地**（`InputEvent` + winit 映射 + `App::input`、命中/状态机（含裁剪与禁用）、点击 / `Tab`·`Shift+Tab`·`Escape` 焦点、文本输入、脚本重放、**事件驱动重绘（默认省电）**）；**仍缺**：dock / 多窗口、方向键导航、滚动条 / 惯性滚动、右键中键、IME 预编辑（见 `docs/features/input.md` 第 6 节）；**滚轮驱动的垂直滚动已落地**（`docs/features/scroll-and-multiline.md`）。
 - **12 个控件族、DX12/Metal**：M6/M7，完全没有。
 
 ---

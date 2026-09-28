@@ -6,12 +6,62 @@
 //! 与真实 GUI 的差距（诚实说明）：字形目前是**等宽格占位**，不是排版。
 //! 真实字形需要字体解析 + 图集（里程碑 M4）。但**几何、裁剪、层次、颜色**都是真的，
 //! 所以现在就能用来验证布局是否正确。
+//!
+//! ## 多行文本与滚动容器（剩余工作第 1 项）
+//!
+//! 两件事都**不新增 `DrawCmd` 变体**，因此 CPU / Vulkan 后端一行都不用改：
+//!
+//! - **多行文本**：`Kind::Text` + `layout.wrap` ⇒ 渲染器按 [`text_lines`] 把文本展开成
+//!   **每行一条 `DrawCmd::Text`**（各自矩形 = 节点矩形按行高下移）。单行语料仍然是
+//!   一条命令、矩形不变 ⇒ **既有像素判据逐字节不变**；
+//! - **滚动容器**：`Column` + `layout.scroll` ⇒ 在容器**自己的视觉之后**推
+//!   `PushClip`（= 视口矩形），走完子节点再 `PopClip`。裁剪栈的语义照抄
+//!   `null.rs`（求交 / 出栈），所以 GPU 后端与 CPU 后端看到的完全是同一份数据。
 
 use deer_layout::node::{Kind, Node};
-use deer_layout::layout::{Geometry, Measure};
+use deer_layout::layout::{Geometry, Measure, TextStyle};
 
 use crate::draw::{Color, DrawCmd, DrawList, RectI};
 use crate::Theme;
+
+/// **一个文本节点的每一行**：`(该行的矩形, 该行的文本)`。
+///
+/// 规则（确定性；`wrap` 关闭时**恰好一行**，矩形就是节点矩形 —— 这条让既有语料
+/// 逐字节不变）：
+///
+/// - `wrap` 关闭 ⇒ `vec![(rect, 全文)]`；
+/// - `wrap` 打开 ⇒ 换行点来自 [`Measure::wrap`]（行数与布局预留高度**同源**）；
+/// - 行矩形 = `(rect.x, rect.y + i*line_height, rect.w, 行高夹到节点下边界)`；
+/// - **装不下的行不画**（`y >= rect.bottom()` 即停）：命令矩形绝不越出节点自己的矩形
+///   ——这是列表的几何不变式（统一管线的裁剪建立在它之上）。节点高度 = 行数 × 行高时
+///   一行都不会丢；显式高度更矮时就是「画得下几行画几行」（被测试钉住的行为）。
+pub fn text_lines<M: Measure>(
+    measure: &M,
+    n: &Node,
+    rect: RectI,
+    style: TextStyle,
+) -> Vec<(RectI, String)> {
+    let label = n.props.label.clone().unwrap_or_default();
+    if !n.wraps_text() {
+        return vec![(rect, label)];
+    }
+    let mut lines = measure.wrap(&label, style, rect.w as f32);
+    if lines.is_empty() {
+        // 防御：自定义度量回空 ⇒ 退回「一行空串」（空串也算 1 行，与度量约定一致）。
+        lines.push(String::new());
+    }
+    let line_h = style.line_height.round().max(1.0) as i32;
+    let mut out = Vec::new();
+    for (i, line) in lines.into_iter().enumerate() {
+        let y = rect.y + line_h * i as i32;
+        if y >= rect.bottom() {
+            break;
+        }
+        let h = line_h.min(rect.bottom() - y);
+        out.push((RectI::new(rect.x, y, rect.w, h), line));
+    }
+    out
+}
 
 /// 默认渲染器。`measure` 用于把文本对齐到几何盒里（与布局阶段同一个度量）。
 pub struct DefaultRenderer<'a, M: Measure> {
@@ -57,13 +107,16 @@ impl<'a, M: Measure> DefaultRenderer<'a, M> {
             }
             Kind::Text => {
                 let color = if disabled { self.theme.text_dim } else { self.theme.text };
-                list.push(DrawCmd::Text {
-                    rect,
-                    text: n.props.label.clone().unwrap_or_default(),
-                    color,
-                    size: self.theme.font_size,
-                    align: 0,
-                });
+                // 多行：每行一条命令（`wrap` 关时恰好一条，矩形不变 ⇒ 既有语料逐字节不变）。
+                for (line_rect, line) in text_lines(self.measure, n, rect, self.text_style()) {
+                    list.push(DrawCmd::Text {
+                        rect: line_rect,
+                        text: line,
+                        color,
+                        size: self.theme.font_size,
+                        align: 0,
+                    });
+                }
             }
             Kind::Button => {
                 let bg = if disabled {
@@ -109,8 +162,18 @@ impl<'a, M: Measure> DefaultRenderer<'a, M> {
             }
         }
 
+        // 滚动容器：内容裁剪到视口（与 `null.rs` 的裁剪栈语义一致：求交 / 出栈）。
+        // 位置在**容器自己的视觉之后**、子节点之前 —— 于是视口外的内容画不出来，
+        // 而容器自身（背景/边框）照常画满视口。
+        let clip = n.is_scroll_container();
+        if clip {
+            list.push(DrawCmd::PushClip { rect });
+        }
         for c in &n.children {
             self.emit(c, geo, list);
+        }
+        if clip {
+            list.push(DrawCmd::PopClip);
         }
     }
 
@@ -126,17 +189,28 @@ impl<'a, M: Measure> DefaultRenderer<'a, M> {
 pub struct NullRenderer;
 
 impl NullRenderer {
+    /// 每个有几何的节点一条 `NodeHint`（既有协议）；**可滚动容器另外推一对视口裁剪**，
+    /// 这样从这份列表派生出的 `ClipSnapshot` 也带着「视口外的点不命中」这条语义
+    /// （`interaction::ClipSnapshot::from_draw_list` 的绑定协议：提示顺序不变）。
     pub fn build(tree: &Node, geo: &Geometry) -> DrawList {
         let mut list = DrawList::new();
         fn walk(n: &Node, geo: &Geometry, list: &mut DrawList) {
-            if let Some(f) = geo.get(&n.id) {
-                list.push(DrawCmd::node_hint(
-                    RectI::new(f.x as i32, f.y as i32, f.w as i32, f.h as i32),
-                    &n.id,
-                ));
+            let hint = geo.get(&n.id).map(|f| {
+                RectI::new(f.x as i32, f.y as i32, f.w as i32, f.h as i32)
+            });
+            if let Some(rect) = hint {
+                // `NodeHint` 现在是**三字段**（含 `node_id_fp`）⇒ 必须走构造函数，别手写字面量。
+                list.push(DrawCmd::node_hint(rect, &n.id));
+            }
+            let clip = n.is_scroll_container().then_some(hint).flatten();
+            if let Some(rect) = clip {
+                list.push(DrawCmd::PushClip { rect });
             }
             for c in &n.children {
                 walk(c, geo, list);
+            }
+            if clip.is_some() {
+                list.push(DrawCmd::PopClip);
             }
         }
         walk(tree, geo, &mut list);

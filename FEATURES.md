@@ -38,6 +38,7 @@
 | **主轴分配**（`grow` 权重） | ✅ | [layout](docs/features/layout.md#主轴分配-grow) | `cargo run -p deer-gui --example geometry` |
 | **对齐**（`main` / `cross`：start/center/end/stretch） | ✅ | [layout](docs/features/layout.md#对齐) | `cargo run -p deer-gui --example scene_file`（`main=end`） |
 | **固定与百分比尺寸**（`w` / `h`，`50%`） | ✅ | [layout](docs/features/layout.md#尺寸) | `cargo run -p deer-gui --example geometry` |
+| **多行文本 + 垂直滚动容器**（`text` + `wrap` ⇒ 每行一条 `Text` 命令；`column` + `scroll` ⇒ `max_scroll` + 视口裁剪 + 滚轮驱动偏移，到边界不越界、视口外不命中） | ✅ | [scroll-and-multiline](docs/features/scroll-and-multiline.md) | `cargo run -p deer-gui --example scroll` |
 | **命中测试**（坐标 → 哪个控件） | ✅ | [hit-testing](docs/features/hit-testing.md) | `cargo run -p deer-gui --example geometry` |
 
 ## 三、渲染与自检
@@ -78,7 +79,7 @@
 | **字距与连字**（`kern` / `GSUB` / `GPOS`） | M4 残余 | 不做整形，`advance` 就是 `hmtx` 的原始值 |
 | **CFF / OpenType-CFF 字体**（`OTTO`） | M4 残余 | 解析层直接报错，不静默给空轮廓；只支持 `glyf` 轮廓 |
 | **竖排 / RTL / 复杂脚本整形** | M4 残余 | 完全没有；不读 `GSUB`/`GPOS` |
-| **输入与焦点的剩余部分**（停靠 / 多窗口、滚动与方向键、右键 / 中键、IME 预编辑、`texts` 光标位置、按键重复） | M5/M6 | 输入通路、命中/状态机、Tab/Escape 焦点、文本输入、脚本重放、**事件驱动重绘（默认省电）都已落地**（见第三节）；剩下的见 [`input.md`](docs/features/input.md) 第 6 节「仍未做」 |
+| **输入与焦点的剩余部分**（停靠 / 多窗口、方向键导航、滚动条与惯性滚动、右键 / 中键、IME 预编辑、`texts` 光标位置、按键重复） | M5/M6 | 输入通路、命中/状态机、Tab/Escape 焦点、文本输入、脚本重放、**事件驱动重绘（默认省电）**、**滚轮驱动的垂直滚动**都已落地（见第三节与 [`scroll-and-multiline.md`](docs/features/scroll-and-multiline.md)）；剩下的见 [`input.md`](docs/features/input.md) 第 6 节「仍未做」 |
 | **可停靠面板 dock**（拖动改位置 / 边缘折叠） | M6 | 完全没有 |
 | **控件族**（12 个 `deer-ui` 控件的语义） | M6 | 现在只有 5 种节点：`column`/`row`/`text`/`button`/`field` |
 | **DX12 / Metal 后端** | M7 | 完全没有 |

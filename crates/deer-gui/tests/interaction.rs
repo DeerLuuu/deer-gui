@@ -133,6 +133,7 @@ fn scripted_replay_is_deterministic_and_matches_expected_state() {
         focus: None,
         pressed: None,
         texts: std::collections::BTreeMap::from([("field_1".to_string(), "hi你".to_string())]),
+        scroll: Default::default(),
     };
     assert_eq!(state1, expect_state, "最终状态必须逐字段相等");
 

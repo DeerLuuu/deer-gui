@@ -36,6 +36,82 @@ impl Default for TextStyle {
 pub trait Measure {
     fn width(&self, text: &str, style: TextStyle) -> f32;
     fn height(&self, text: &str, style: TextStyle, max_width: f32) -> f32;
+
+    /// **换行点**（多行文本）：把 `text` 按 `max_width` 切成若干行。
+    ///
+    /// 为什么换行必须住在 `Measure` 里（而不是渲染器自己再写一套）：布局用
+    /// 「行数 × 行高」预留高度、渲染器按「行数」发绘制命令 —— 两者各算各的就会出现
+    /// 「预留 2 行、画出来 3 行」这种**节点高度装不下自己内容**的静默错误。
+    /// 所以行数只有一处定义，`height()` 必须与它一致（两个实现都有一致性测试）。
+    ///
+    /// **默认实现是「不换行」**（一行、原样返回）：实现者不覆盖它就不会有多行绘制 ——
+    /// 这是刻意的保守默认（「不假装能做」），不是遗漏。
+    ///
+    /// 约定（两个实现都遵守）：`max_width <= 0` 或非有限 ⇒ 不换行；空串 ⇒ 一行空串。
+    fn wrap(&self, text: &str, _style: TextStyle, _max_width: f32) -> Vec<String> {
+        vec![text.to_string()]
+    }
+}
+
+/// **贪心的按词换行**（`wrap` 的唯一算法；「宽度怎么算」由调用方注入）。
+///
+/// 规则（确定性、有测试）：
+/// - 按**空格 / 制表**切词（其它空白不切，避免悄悄改变文本）；
+/// - 贪心塞进当前行，**行首不留空白**（切词时空白本身就被丢弃）；
+/// - 单词自身宽度 > `max_width` 时**按字符硬切**（一个字符就超宽时该行允许超宽 ——
+///   唯一例外，否则会死循环）；
+/// - `max_width <= 0` 或非有限 ⇒ 不换行，返回 `vec![text.to_string()]`；
+/// - 空串 / 全空白 ⇒ `vec![String::new()]`（**算 1 行**）。
+///
+/// 为什么注入的是闭包而不是 `&dyn Measure`：两个实现（`ApproxMeasure` 的近似宽度、
+/// `FontMeasure` 的真实 advance）只差「宽度怎么算」，词切分与硬切规则**必须逐字相同** ——
+/// 否则「近似度量下能换行、真实字体下换不了」这类分叉没人能一眼看出来。
+pub fn wrap_greedy(text: &str, max_width: f32, width_of: impl Fn(&str) -> f32) -> Vec<String> {
+    // `is_finite()` 顺手把 `NaN` 也挡掉（NaN 的所有比较都是 false ⇒ 会走进按字符硬切）。
+    if !max_width.is_finite() || max_width <= 0.0 {
+        return vec![text.to_string()];
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+
+    for word in text.split([' ', '\t']).filter(|w| !w.is_empty()) {
+        let candidate = if cur.is_empty() {
+            word.to_string()
+        } else {
+            format!("{cur} {word}")
+        };
+        if width_of(&candidate) <= max_width {
+            cur = candidate;
+            continue;
+        }
+        if !cur.is_empty() {
+            lines.push(std::mem::take(&mut cur));
+        }
+        if width_of(word) <= max_width {
+            cur = word.to_string();
+        } else {
+            let mut piece = String::new();
+            for ch in word.chars() {
+                let mut trial = String::with_capacity(piece.len() + 4);
+                trial.push_str(&piece);
+                trial.push(ch);
+                if !piece.is_empty() && width_of(&trial) > max_width {
+                    lines.push(std::mem::take(&mut piece));
+                }
+                piece.push(ch);
+            }
+            cur = piece;
+        }
+    }
+
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 /// 确定性近似度量：每字符 0.6em。
@@ -51,13 +127,18 @@ impl Measure for ApproxMeasure {
         (chars * style.font_size * 0.6).ceil()
     }
 
+    /// `wrap().len() * line_height` —— **不是**另起一套算法。
+    ///
+    /// 历史：改前这里是 `ceil(width / max_width) * line_height`（宽度比例模型）。
+    /// 那个模型与 `wrap` 的按词换行**必然对不上**（同一段文本 4 行 vs 5 行），
+    /// 于是「布局预留的高度」与「渲染器画出来的行数」会分叉。现在两者同源。
     fn height(&self, text: &str, style: TextStyle, max_width: f32) -> f32 {
-        let w = self.width(text, style);
-        if max_width <= 0.0 {
-            return style.line_height;
-        }
-        let lines = (w / max_width).ceil().max(1.0);
-        lines * style.line_height
+        self.wrap(text, style, max_width).len() as f32 * style.line_height
+    }
+
+    /// 与 `deer_gpu::measure::FontMeasure::wrap` 同一套词切分规则，词宽用本度量的近似宽度。
+    fn wrap(&self, text: &str, style: TextStyle, max_width: f32) -> Vec<String> {
+        wrap_greedy(text, max_width, |s| self.width(s, style))
     }
 }
 
@@ -134,7 +215,17 @@ fn measure_into(n: &Node, style: TextStyle, m: &impl Measure, out: &mut Intrinsi
         }
         Kind::Text => {
             let label = n.props.label.as_deref().unwrap_or("");
-            (m.width(label, style), m.height(label, style, f32::INFINITY))
+            let w = m.width(label, style);
+            // `wrap` 节点的固有高 = **实际行数** × 行高。换行宽度取节点自己声明的像素宽度 ——
+            // 这是唯一能在测量阶段知道的宽度（百分比 / 父容器分配都要到排布阶段才知道）。
+            // 没声明像素宽度 ⇒ 节点宽 = 文本宽 ⇒ 换不了行 ⇒ 1 行（被钉住的边界，见指南）。
+            let h = match n.layout.width {
+                Some(Size::Px(px)) if n.layout.wrap && px > 0.0 => {
+                    m.wrap(label, style, px).len() as f32 * style.line_height
+                }
+                _ => m.height(label, style, f32::INFINITY),
+            };
+            (w, h)
         }
         Kind::Field => {
             let label_w = n
@@ -174,25 +265,146 @@ fn measure_into(n: &Node, style: TextStyle, m: &impl Measure, out: &mut Intrinsi
 /// 几何表：nodeId -> Rect。用 `HashMap` 存，但**取用时按树的顺序**保证遍历确定。
 pub type Geometry = HashMap<String, Rect>;
 
-/// 排布：把树算成几何表。
+// ---------------------------------------------------------------------------
+// 滚动容器（垂直）：偏移是布局的**输入**，上限是布局的**输出**
+// ---------------------------------------------------------------------------
+
+/// 可滚动容器的**滚动偏移**（整数像素 —— 几何本身就是整数像素，见 I-4）。
+///
+/// 为什么是独立类型而不是 `HashMap` 直传：偏移只能来自「状态」，不该与几何混在一个
+/// 返回值里；而且整型让 `Eq` 成立（`UiState` 的 dirty 判据靠逐字段相等）。
+///
+/// **没登记的 id ⇒ 偏移 0**（不是「未知」）：布局永远给出确定结果。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScrollOffsets {
+    offsets: std::collections::BTreeMap<String, i32>,
+}
+
+impl ScrollOffsets {
+    pub fn new() -> ScrollOffsets {
+        ScrollOffsets::default()
+    }
+
+    /// 链式登记一个偏移（测试与调用方构造用）。
+    pub fn with(mut self, id: impl Into<String>, offset_px: i32) -> ScrollOffsets {
+        self.set(id, offset_px);
+        self
+    }
+
+    pub fn set(&mut self, id: impl Into<String>, offset_px: i32) {
+        self.offsets.insert(id.into(), offset_px);
+    }
+
+    /// 该容器的偏移（没登记 ⇒ 0）。
+    pub fn get(&self, id: &str) -> i32 {
+        self.offsets.get(id).copied().unwrap_or(0)
+    }
+
+    pub fn len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.offsets.is_empty()
+    }
+
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.offsets.keys().map(String::as_str)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, i32)> {
+        self.offsets.iter().map(|(k, v)| (k.as_str(), *v))
+    }
+}
+
+/// 布局产出的**每个可滚动容器的 `max_scroll`**（整数像素）。
+///
+/// `max_scroll = max(0, 内容高 − 视口高)`；内容高 = 子节点主轴尺寸之和 + 间隙 + 上下内边距。
+///
+/// **没登记的 id ⇒ 0**（fail-closed）：调用方忘了灌这份表，滚轮就什么都滚不动 ——
+/// 而不是滚到一个「没有上限」的虚空里。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScrollMetrics {
+    max: std::collections::BTreeMap<String, i32>,
+}
+
+impl ScrollMetrics {
+    pub fn new() -> ScrollMetrics {
+        ScrollMetrics::default()
+    }
+
+    /// 该容器的滚动上限（没登记 ⇒ 0）。
+    pub fn max_of(&self, id: &str) -> i32 {
+        self.max.get(id).copied().unwrap_or(0)
+    }
+
+    /// 把偏移夹进 `[0, max_of(id)]`。
+    pub fn clamp(&self, id: &str, offset_px: i32) -> i32 {
+        offset_px.clamp(0, self.max_of(id))
+    }
+
+    pub fn len(&self) -> usize {
+        self.max.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.max.is_empty()
+    }
+
+    pub fn ids(&self) -> impl Iterator<Item = &str> {
+        self.max.keys().map(String::as_str)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, i32)> {
+        self.max.iter().map(|(k, v)| (k.as_str(), *v))
+    }
+
+    /// 布局内部用：登记一个可滚动容器的上限。
+    pub(crate) fn insert(&mut self, id: String, max: i32) {
+        self.max.insert(id, max);
+    }
+}
+
+/// 排布：把树算成几何表（**不滚动** —— 等价于所有偏移为 0）。
 pub fn layout(root: &Node, box_: Rect, style: TextStyle, m: &impl Measure) -> Geometry {
+    layout_with_scroll(root, box_, style, m, &ScrollOffsets::new()).0
+}
+
+/// 排布 **+ 滚动**：把树算成几何表，并回一份「每个可滚动容器的 `max_scroll`」。
+///
+/// - `offsets` 里的偏移**参与几何**（子节点整体位移 `-offset`），容器自身的矩形不受影响；
+/// - 偏移被夹进 `[0, max_scroll]`（滚到边界不越界 —— 越界的偏移是**静默丢弃**的，
+///   不会渗进几何）；
+/// - 偏移为空 ⇒ 与 [`layout`] 逐字段相同（同一条代码路径，滚动只是加法）。
+///
+/// 「可滚动容器」的定义见 [`Node::is_scroll_container`]（`Column` + `layout.scroll`）。
+pub fn layout_with_scroll(
+    root: &Node,
+    box_: Rect,
+    style: TextStyle,
+    m: &impl Measure,
+    offsets: &ScrollOffsets,
+) -> (Geometry, ScrollMetrics) {
     let intrinsic = measure_tree(root, style, m);
     let mut geo = Geometry::new();
+    let mut metrics = ScrollMetrics::new();
     let root_intrinsic = intrinsic.get(&root.id).copied().unwrap_or((0.0, 0.0));
     // 根的「分配尺寸」= 它的固有尺寸（**不撑满盒子**）—— 除非根自己有显式尺寸。
     // 这是 I-5 的体现：宿主给的盒子是上限，不是命令。
     let mut ctx = PlaceCtx {
         intrinsic: &intrinsic,
         geo: &mut geo,
+        offsets,
+        metrics: &mut metrics,
     };
     ctx.place(
         root,
         box_,
         root_intrinsic,
-        box_.w.round().max(0.0),
-        box_.h.round().max(0.0),
+        (box_.w.round().max(0.0), box_.h.round().max(0.0)),
+        (box_.w.round().max(0.0), box_.h.round().max(0.0)),
     );
-    geo
+    (geo, metrics)
 }
 
 /// 排布的递归上下文。
@@ -203,22 +415,38 @@ pub fn layout(root: &Node, box_: Rect, style: TextStyle, m: &impl Measure) -> Ge
 struct PlaceCtx<'a> {
     intrinsic: &'a Intrinsics,
     geo: &'a mut Geometry,
+    /// 滚动偏移（布局的输入）。
+    offsets: &'a ScrollOffsets,
+    /// 滚动上限（布局的输出；每个可滚动容器一条，**含 max = 0 的**）。
+    metrics: &'a mut ScrollMetrics,
 }
 
 impl PlaceCtx<'_> {
-    fn place(&mut self, n: &Node, rect: Rect, assigned: (f32, f32), avail_w: f32, avail_h: f32) {
-        let ex_w = resolve(n.layout.width, avail_w);
-        let ex_h = resolve(n.layout.height, avail_h);
+    /// `avail` = **百分比解析基准**（父的内容盒）；`bound` = **显式尺寸的上限**（I-6）。
+    ///
+    /// 两者平时是同一个值；只有「滚动容器的子节点」在**主轴**上不同：百分比仍然相对
+    /// 视口解析（唯一已知的长度），而显式尺寸**不被视口夹取** —— 否则「内容高于视口」
+    /// 这个前提自己就不成立（`h=300` 的子节点会被压成 100，永远滚不动）。
+    fn place(
+        &mut self,
+        n: &Node,
+        rect: Rect,
+        assigned: (f32, f32),
+        avail: (f32, f32),
+        bound: (f32, f32),
+    ) {
+        let ex_w = resolve(n.layout.width, avail.0);
+        let ex_h = resolve(n.layout.height, avail.1);
 
         // I-7：显式尺寸 > 父分配尺寸；两者都没有才回退固有尺寸。
         let mut w = ex_w.unwrap_or(assigned.0);
         let mut h = ex_h.unwrap_or(assigned.1);
-        // I-6：显式尺寸也不许超出可用空间
+        // I-6：显式尺寸也不许超出可用空间（滚动容器的主轴例外，见上面的 `bound` 说明）
         if ex_w.is_some() {
-            w = w.min(avail_w);
+            w = w.min(bound.0);
         }
         if ex_h.is_some() {
-            h = h.min(avail_h);
+            h = h.min(bound.1);
         }
         let w = w.max(0.0).round();
     let h = h.max(0.0).round();
@@ -239,6 +467,10 @@ impl PlaceCtx<'_> {
     let horizontal = n.kind == Kind::Row;
     let main_avail = if horizontal { inner_w } else { inner_h };
     let cross_avail = if horizontal { inner_h } else { inner_w };
+    // 垂直滚动容器：主轴**不再按视口夹取**子节点（否则「内容高于视口」这个前提本身
+    // 就不成立 —— 内容会被压进视口，永远不会溢出），`grow` 也随之失效（没有「剩余空间」
+    // 可分：可滚动内容本来就不该被压缩，见指南的「滚动容器」一节）。
+    let scrollable = n.is_scroll_container();
 
     // 主轴：先给每个子节点固有主轴尺寸（或显式），剩余按 grow 权重分。
     let fixed: Vec<f32> = n
@@ -252,14 +484,22 @@ impl PlaceCtx<'_> {
                 resolve(c.layout.height, inner_h)
             };
             let base = explicit.unwrap_or(if horizontal { ownk.0 } else { ownk.1 });
-            base.min(main_avail)
+            if scrollable {
+                base
+            } else {
+                base.min(main_avail)
+            }
         })
         .collect();
 
     let total_gap = gap * (n.children.len().saturating_sub(1)) as f32;
     let used: f32 = fixed.iter().sum::<f32>() + total_gap;
     let remaining = (main_avail - used).max(0.0);
-    let grow_sum: f32 = n.children.iter().map(|c| c.layout.grow).sum();
+    let grow_sum: f32 = if scrollable {
+        0.0
+    } else {
+        n.children.iter().map(|c| c.layout.grow).sum()
+    };
 
     let mut main_sizes: Vec<f32> = n
         .children
@@ -300,7 +540,20 @@ impl PlaceCtx<'_> {
     }
 
     let cross_align = n.layout.cross_axis.unwrap_or(Align::Start);
-    let mut cursor = if horizontal { rect.x + pad } else { rect.y + pad } + main_offset;
+    // 滚动：`max_scroll` 由**内容主轴尺寸之和 + 间隙 + 上下内边距**减去**视口**得到；
+    // 偏移被夹进 `[0, max_scroll]`，然后子节点整体位移 `-offset`。
+    //
+    // 注意「容器自身的矩形不动」：`rect` 是几何表里这个节点自己的位置，滚动只改它**内部**
+    // 内容的相对位置 —— 所以 `max_scroll` 与 `rect` 无关，只与 `h`（视口）有关。
+    let offset = if scrollable {
+        let content_main = main_sizes.iter().sum::<f32>() + total_gap;
+        let max_scroll = (content_main + pad * 2.0 - h).max(0.0).ceil() as i32;
+        self.metrics.insert(n.id.clone(), max_scroll);
+        self.offsets.get(&n.id).clamp(0, max_scroll) as f32
+    } else {
+        0.0
+    };
+    let mut cursor = if horizontal { rect.x + pad } else { rect.y + pad } + main_offset - offset;
 
     for (i, c) in n.children.iter().enumerate() {
         let main_size = main_sizes[i];
@@ -332,7 +585,7 @@ impl PlaceCtx<'_> {
             Rect::new(cross_pos, cursor, cross_size, main_size)
         };
         // I-7：把父**分配**的尺寸显式传下去。
-        // 注意 `avail_*` 传的是**父的内容盒**（inner_w / inner_h），不是分配尺寸 ——
+        // 注意 `avail` 传的是**父的内容盒**（inner_w / inner_h），不是分配尺寸 ——
         // 百分比尺寸必须相对父内容盒解析。传分配尺寸会让 `50%` 变成「已分配空间的一半」，
         // 那是个静默错误：布局仍然「有值」，只是值错了。
         let assigned = if horizontal {
@@ -340,8 +593,19 @@ impl PlaceCtx<'_> {
         } else {
             (cross_size, main_size)
         };
+        // 滚动容器的子节点：**主轴**的显式尺寸上限不再等于视口（内容空间是没有上界的），
+        // 交叉轴仍然夹到内容盒（宽度不该超出视口）—— 这是「内容高于视口」能成立的前提。
+        let child_bound = if scrollable {
+            if horizontal {
+                (f32::INFINITY, inner_h)
+            } else {
+                (inner_w, f32::INFINITY)
+            }
+        } else {
+            (inner_w, inner_h)
+        };
 
-        self.place(c, child_rect, assigned, inner_w, inner_h);
+        self.place(c, child_rect, assigned, (inner_w, inner_h), child_bound);
         cursor += main_size + gap;
     }
 }

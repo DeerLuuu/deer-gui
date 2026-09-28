@@ -21,7 +21,7 @@
 
 **什么时候不该用它**：
 - 你只想要一张图 / 一组断言 —— 用离屏出图（[`rendering.md`](rendering.md)），别开窗口；
-- 你想要**滚动、方向键导航、右键/中键语义、IME 预编辑、光标位置** —— 这些**还没做**（第 6 节）；
+- 你想要**方向键导航、滚动条、右键/中键语义、IME 预编辑、光标位置** —— 这些**还没做**（第 6 节）；滚轮驱动的**垂直滚动**已经可用（见 [`scroll-and-multiline.md`](scroll-and-multiline.md)）；
 - 你想把命中测试当**通用碰撞检测** —— 它是**输入路由**，语义见第 3.2 节（禁用子树不回退、半开区间）。
 
 ## 2. 最小示例
@@ -83,7 +83,7 @@ cargo run -q -p deer-gui --features window --example interactive_form
 |---|---|
 | `PointerMoved { x, y }` | **物理像素**、窗口左上角原点（与 `WindowInfo::extent` 同一套） |
 | `PointerDown/Up { button, x, y }` | `button` ∈ `Left` / `Right` / `Middle`；只有**左键**参与点击与按下态 |
-| `Wheel { dx, dy }` | 滚轮；**本期状态机不消费**（见 3.4） |
+| `Wheel { dx, dy }` | 滚轮；**驱动滚动偏移**（见 3.4）：目标 = `hover` 命中节点最近的可滚动祖先（含自身），一格 = `WHEEL_STEP_PX`(40 px)，`dy < 0` ⇒ 偏移增大。`dx`（水平）本期忽略 |
 | `KeyDown/KeyUp { key, mods }` | `key: Key`（`Tab` / `Escape` / `Enter` / `Backspace` / `Left` / `Right` / `Up` / `Down` / `Char(char)` / `Other`），`mods: Mods`（`shift` / `ctrl` / `alt` / `sup`） |
 | `TextInput { text }` | **字符输入**：一段文本（**追加**，不是覆盖） |
 | `FocusChanged { focused }` | **窗口焦点**（不是控件焦点）；`focused: false` 清悬停/按下态 |
@@ -147,10 +147,18 @@ pub fn focusables(root: &Node) -> Vec<String>   // Kind::Button | Kind::Field，
 | `KeyDown { Escape }` | 清焦点 ⇒ `FocusChanged(None)` |
 | `KeyDown { Backspace }` | 焦点是启用的输入框 ⇒ 删**一个 Unicode 字符**（不是字节）⇒ `TextChanged` |
 | `TextInput { text }` | 焦点是启用的输入框 ⇒ **追加**到 `texts[id]` ⇒ `TextChanged` |
-| 其余（`Wheel`、`KeyUp`、右/中键、方向键、`Key::Char`/`Other`、`focused: true`） | **不消费**（有测试钉住：不消费的事件**不得改变任何状态**） |
+| `Wheel { dy }` | **滚动**：`hover` 命中节点**最近的可滚动祖先（含自身）**偏移 `−dy × WHEEL_STEP_PX`，夹进 `[0, max_scroll]`；**变了才发** `Scrolled { id, offset }`。禁用子树不响应；没有可滚动祖先 / 上限为 0 / `dy = 0` ⇒ 空转 |
+| 其余（`KeyUp`、右/中键、方向键、`Key::Char`/`Other`、`focused: true`） | **不消费**（有测试钉住：不消费的事件**不得改变任何状态**） |
 
-**`UiState` 是唯一真相**：`hover` / `focus` / `pressed` / `texts: BTreeMap<String, String>`（不在表里的输入框视为空串）。
-**`UiEvent`** 是「发生了什么」：`HoverChanged` / `FocusChanged` / `Clicked` / `TextChanged`。
+**`UiState` 是唯一真相**：`hover` / `focus` / `pressed` / `texts: BTreeMap<String, String>`（不在表里的输入框视为空串）
+/ `scroll: ScrollState`（**滚动偏移 + 每个容器的 `max_scroll`**）。
+**`UiEvent`** 是「发生了什么」：`HoverChanged` / `FocusChanged` / `Clicked` / `TextChanged` / `Scrolled { id, offset }`。
+
+> **滚动偏移为什么住在 `UiState` 里**：滚轮必须在**唯一入口**（`handle`）被消费。若另开一个
+> 「带滚动的 `handle`」，那条路径上的滚轮会静默无效而没人看得出来。偏移是**布局的输入**
+> （每帧喂给 `layout_with_scroll`），`max_scroll` 是**布局的输出**（每帧 `state.scroll.set_metrics(...)` 灌回来）
+> —— **灌漏了滚轮就完全无效**（上限表为空 ⇒ 一律按 0 夹取，fail-closed）。
+> 完整用法与常见坑见 [`scroll-and-multiline.md`](scroll-and-multiline.md)。
 
 **dirty 判据必须比对状态，不能看「有没有事件」**：
 
@@ -174,7 +182,7 @@ pub fn same_visual(&self, other: &UiState) -> bool   // 只比 hover/focus/press
 | `keyup:Char(a)` | `KeyUp` |
 | `text:hi 你好` | 一段文本输入（原样，含空格与中文；**追加**） |
 | `focus:on` / `focus:off` | 窗口焦点变化 |
-| `wheel:0,3` | 滚轮（状态机不消费；可用来验证「不消费的事件不改状态」） |
+| `wheel:0,3` | 滚轮（**会被消费**：滚 `hover` 所在的可滚动容器；语料里没有可滚动容器时它就是空转 —— 可用来验证「无事可做的事件不改状态」） |
 
 - 语句用 **`;` 或换行**分隔；`#` 到行尾是注释；**空语句被忽略**。
 - **语法错一律 `Err(String)`**，带**语句序号**与原文；**刻意不「跳过看不懂的语句」**（脚本是判据的一部分）。
@@ -263,7 +271,9 @@ assert!(parse_script("# 注释行\nbad:3").unwrap_err().contains("第 2 条"));
   `App::next_deadline`，见 [`window.md`](window.md) 第 6 节），**不再必须**声明 `Continuous`（声明了仍然可以）。
   注意 `next_deadline()` 必须返回**固定时刻并自己往前走**（返回 `now()+50ms` 会永远不到点 ⇒ 空转），
   且**本层不做防护**（那等于凭空造超时）；
-- **停靠面板 / 多窗口**；**滚动**与**方向键导航**；**右键 / 中键**的语义；**IME 预编辑**；
+- **停靠面板 / 多窗口**；**方向键导航**（`hit-testing.md` 记的缺口）；**右键 / 中键**的语义；**IME 预编辑**；
+  （**滚动已落地**：滚轮 → `ScrollState` 偏移 → 几何/绘制/命中，见
+  [`scroll-and-multiline.md`](scroll-and-multiline.md)；仍未做的是**滚动条**、**惯性滚动**与**按键滚动**）；
 - **按键重复未建模**（长按会产生重复 `KeyDown`，状态机不区分「重复」与「新按」）；
 - **`texts` 没有光标位置**：`Backspace` **只删末尾**，不能用方向键移动插入点；
 - **`Focused` / `Ime::Commit` 只能人肉验证**（`DEER_INPUT_HOLD=1` 留窗观察），没有自动判据。
