@@ -98,7 +98,7 @@ pub fn raw_handle_from_rwh06(raw: RwhRawWindowHandle) -> Result<deer_gpu::RawWin
   | `Resized` | `:361-369` | 更新物理 `extent` → `app.resized(w, h)` |
   | `RedrawRequested` | `:370-381` | `app.redraw()` → `FrameCounter::on_redraw` → 若 `Exit` 则 `event_loop.exit()` |
   | `CloseRequested` | `:383-386` | 只有 `app.close_requested() == Flow::Exit` 才退 |
-  | 其它（键盘/鼠标/IME/滚轮） | `:387-388` | **丢弃**，输入层留给 M5 |
+  | 其它（键盘/鼠标/滚轮/焦点） | `deer-window/src/lib.rs:47-53` | **M5-1 起已接入**：`CursorMoved`/`MouseInput`/`MouseWheel`/`KeyboardInput`/`Focused` 翻成 `InputEvent` → `App::input`（见 [`docs/features/input.md`](../features/input.md)）；**仍未接的是 IME 预编辑**（`Ime::Commit` 已直译但只能人肉验证） |
 - **连续重绘**：`ControlFlow::Poll`（`:347`）+ `about_to_wait` 里 `window.request_redraw()`（`:392-399`）形成「一直要下一帧」；文档明说节奏本层不管，真正上屏时由呈现（vsync）决定（`:41-42`）。
 - **退出时的可断言输出**：无论成败都往 stdout 打一行摘要，供脚本断言（`:293-299`）：
   `[deer-window] 事件循环结束：frames=<n> extent=<w>x<h> result=ok|error`
@@ -460,7 +460,7 @@ cargo test --workspace 2>&1 | Select-String "^test result:"       # 每个靶一
 
 ### 7.5 改窗口行为（例如加一个新事件转发 / 加一个环境变量）
 
-1. 事件 → 回调的映射表在 `crates/deer-window/src/lib.rs:351-390`；加事件就在 `window_event` 的 `match` 里加臂，**其余事件仍然丢弃**（`:387-388`，输入层留给 M5）。
+1. 事件 → 回调的映射表在 `crates/deer-window/src/lib.rs:351-390`；加事件就在 `window_event` 的 `match` 里加臂。**注意这句已更新过**：M5-1 起键盘/鼠标/滚轮/焦点**都已接入**（`InputEvent` → `App::input`，见 [`docs/features/input.md`](../features/input.md)），**仍未接的是 IME 预编辑**（`Ime::Commit` 已直译但只能人肉验证）。
 2. 若是新的 `App` 回调：改 `trait App`（`:114-137`）—— 加**带默认实现**的方法可保持既有调用方不破；同时更新 crate 文档里的用法示例（`:12-30`）。
 3. 纯逻辑部分必须能单测：把状态机放进像 `FrameCounter`（`:143-179`）那样的「不碰窗口」结构，测试写进 `crates/deer-window/tests/window_logic.rs`。
 4. 真窗口行为只能靠**示例**验证：`crates/deer-window/examples/window_smoke.rs` 或 `crates/deer-gui/examples/window_preview.rs`（原因见 §1.5）。
