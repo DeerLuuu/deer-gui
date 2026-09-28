@@ -208,6 +208,7 @@ Behavior that looks surprising is usually deliberate. The full list, with the de
 | [Roadmap](ROADMAP.md) | Milestones M1–M7 and their acceptance criteria |
 | [Getting started](docs/GETTING-STARTED.md) | A slower on-ramp if you have never written Rust |
 | [Interactive UI guide (中文)](docs/GETTING-STARTED-UI.md) | From zero to a clickable, typeable, replayable UI — `--example counter` |
+| [Tree → window migration (中文)](docs/GETTING-STARTED-UI-STEPS.md) | 8 steps from "I only have a UI tree" to "a window is on screen" — `--example hello_window` |
 | [Agent notes](agent.md) | Repository rules and traps for AI agents and new maintainers |
 
 ### Crate-level examples

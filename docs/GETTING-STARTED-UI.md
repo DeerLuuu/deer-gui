@@ -7,6 +7,8 @@
 > 前置假设：你已经能在仓库根目录跑 `cargo build`（没装 Rust 请看
 > [`GETTING-STARTED.md`](GETTING-STARTED.md)，那份是「从没写过 Rust」的入门）。
 > 这一份是**界面与交互**的入门：怎么建树、怎么画、怎么接输入、怎么让它**可回归**。
+>
+> **只有一棵树、还没有窗口？** 直接看 [`GETTING-STARTED-UI-STEPS.md`](GETTING-STARTED-UI-STEPS.md)（8 步迁移指南，样板 `--example hello_window`）。
 
 ---
 
