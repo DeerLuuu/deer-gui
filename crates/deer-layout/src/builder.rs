@@ -49,22 +49,26 @@ impl Builder {
         }
     }
 
+    /// 仅对容器有效，内边距。
     pub fn padding(mut self, v: f32) -> Builder {
         self.root.layout.padding = v;
         self
     }
 
+    /// 仅对容器有效，子节点间距。
     pub fn gap(mut self, v: f32) -> Builder {
         self.root.layout.gap = v;
         self
     }
 
+    /// 仅对容器有效，主轴对齐。
     pub fn size(mut self, w: Option<Size>, h: Option<Size>) -> Builder {
         self.root.layout.width = w;
         self.root.layout.height = h;
         self
     }
 
+    /// 仅对容器有效，主轴对齐。
     fn node_at_mut<'a>(root: &'a mut Node, path: &[usize]) -> &'a mut Node {
         let mut cur = root;
         for &i in path {
@@ -73,6 +77,7 @@ impl Builder {
         cur
     }
 
+    /// 挂载一个节点到当前路径的容器下。
     fn push(&mut self, n: Node) {
         let path = self.path.clone();
         let parent = Self::node_at_mut(&mut self.root, &path);
@@ -88,11 +93,13 @@ impl Builder {
         self.push_named(n, Kind::Text)
     }
 
+    /// 追加一个叶子控件，返回其 id（事件关联用 id，不进树 —— 树是纯数据）。
     pub fn button(&mut self, label: impl Into<String>) -> String {
         let n = Node::new(Kind::Button, "").with_label(label);
         self.push_named(n, Kind::Button)
     }
 
+    /// 追加一个叶子控件，返回其 id（事件关联用 id，不进树 —— 树是纯数据）。
     pub fn button_opts(&mut self, label: impl Into<String>, f: impl FnOnce(&mut Node)) -> String {
         let mut n = Node::new(Kind::Button, "").with_label(label);
         f(&mut n);
@@ -201,37 +208,46 @@ pub struct L {
 }
 
 impl L {
+    /// 便捷构造 `LayoutProps`。
     pub fn new() -> L {
         L::default()
     }
+    /// 便捷构造 `LayoutProps`。
     pub fn w(mut self, v: f32) -> L {
         self.width = Some(Size::Px(v));
         self
     }
+    /// 便捷构造 `LayoutProps`。
     pub fn h(mut self, v: f32) -> L {
         self.height = Some(Size::Px(v));
         self
     }
+    /// 便捷构造 `LayoutProps`。
     pub fn pad(mut self, v: f32) -> L {
         self.padding = Some(v);
         self
     }
+    /// 便捷构造 `LayoutProps`。
     pub fn gap(mut self, v: f32) -> L {
         self.gap = Some(v);
         self
     }
+    /// 便捷构造 `LayoutProps`。
     pub fn main(mut self, a: Align) -> L {
         self.main_axis = Some(a);
         self
     }
+    /// 便捷构造 `LayoutProps`。
     pub fn cross(mut self, a: Align) -> L {
         self.cross_axis = Some(a);
         self
     }
+    /// 便捷构造 `LayoutProps`。
     pub fn grow(mut self, v: f32) -> L {
         self.grow = Some(v);
         self
     }
+    /// 便捷构造 `LayoutProps`。
     pub fn to_props(self) -> LayoutProps {
         LayoutProps {
             width: self.width,
