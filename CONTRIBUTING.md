@@ -120,14 +120,18 @@ Test and assertion counts change with every milestone, so **live documentation m
 
 If you want a number to be verifiable, do not freeze it in prose: assert it in a test, or read it from the run output. When you must reference a magnitude in live docs, prefer a **stable structural fact** instead of a count — for example "one test per layout invariant in `crates/deer-layout/tests/layout_invariants.rs`" rather than "18 tests" or "24 assertions".
 
-### Never edit repository files through shell text pipelines
+### Never read or write repository files through the shell
 
-Do **not** rewrite repository files with a shell text pipeline — `Get-Content -Raw … | … | Set-Content`, in-place `-replace`, or `>>` redirection into a source or documentation file. On this machine, Windows PowerShell 5.1 reads UTF-8-without-BOM as ANSI, so **CJK text is silently rewritten as `?` (or U+FFFD), and the damage is irreversible**.
+Do **not** use the shell to read or write repository files — not `Get-Content -Raw … | … | Set-Content`, not in-place `-replace`, not `>>` redirection into a source or documentation file, and **not even a plain `Get-Content` used to check what a file says**.
+
+**The read path is broken too, on this machine.** `pwsh` decodes file reads using the **ANSI code page**, so UTF-8 CJK shows up as **mojibake in the terminal**: you misjudge the file's content, and the "read it back to verify" step becomes useless — it is the verification itself that is lying. Writes through `Set-Content`/redirection are not merely misdisplayed: the content (including a **commit message**) is **really corrupted**.
+
+⇒ Use `read` / `edit` / `write` for **anything involving file content**. Use the shell only for operations that do **not** touch file content (`git status`, `cargo test`, hash comparisons, `git show --stat`).
 
 - Use the **version-guarded editor tools** (`read` / `edit` / `write`) for every file change.
 - If you genuinely need a script, **write to a new file — never overwrite in place** — and specify the encoding explicitly.
-- **Three incidents, all one class of bug**: `crates/deer-vk/src/windowed.rs` (M3a), `crates/deer-vk/src/device.rs` (M3b), and four feature guides (`docs/features/{gpu-geometry,gpu-offscreen,vulkan,window}.md`, C2 — 455 characters became `?`). The last one was caught by reading the file back with the `read` tool (it returned mojibake), then recovered with `git checkout --` and redone with `edit`.
-- **Why this is a rule and not advice**: the damage is invisible in `git diff --stat` (the file still parses and is roughly the right size) and cannot be undone — there is no way to turn a `?` back into the character it replaced.
+- **Cases, all one class of bug**: `crates/deer-vk/src/windowed.rs` (M3a), `crates/deer-vk/src/device.rs` (M3b), and four feature guides (`docs/features/{gpu-geometry,gpu-offscreen,vulkan,window}.md`, C2 — 455 characters became `?`); one **commit message came out corrupted** (it had been written with `Set-Content`); and one round of `Get-Content` printed the mojibake `渚挎嵎鍑芥暟` where the file actually said 「便捷函数」. The C2 incident was caught by reading the file back with the `read` tool (it returned mojibake), then recovered with `git checkout --` and redone with `edit`.
+- **Why this is a rule and not advice**: on the write side the damage is invisible in `git diff --stat` (the file still parses and is roughly the right size) and cannot be undone — there is no way to turn a `?` back into the character it replaced. On the read side the failure is worse in a different way: it produces **confident wrong conclusions** about content that is perfectly fine.
 
 ### After a scripted bulk rewrite, verify the result's *shape*
 
@@ -218,7 +222,7 @@ did it match.
 - If you suspect code did not take effect, run **`cargo clean -p <crate>`** (or verify the built binary/timestamp) **before** drawing a conclusion.
   Every conclusion drawn before that check is provisional.
 
-This belongs to the same family as the other shared-mutable-state rules above (no shell text pipelines; verify a bulk rewrite's shape; commit with explicit pathspec; clean after an in-place restore).
+This belongs to the same family as the other shared-mutable-state rules above (no shell reads/writes of file content; verify a bulk rewrite's shape; commit with explicit pathspec; clean after an in-place restore).
 
 ## Design constraints and known traps
 
@@ -294,7 +298,7 @@ Then **immediately verify with `git show --stat HEAD`** that the commit contains
 
 **Case (`3ea51e9`).** An executor staged its three explicit paths, and — before its `commit` ran — another executor ran `git add` on `crates/deer-gui/**`. The pathless `commit` then committed **both** sets. It was corrected with `git reset --soft HEAD~1` and re-run as `git commit -F <msg> -- <its three paths>`; the other executor's files were left staged, untouched.
 
-This belongs to the same family as "no shell text pipelines" and "verify the result's shape": the working directory and the index are **shared mutable state**, so the result of a write must be **verified after the fact**, not assumed.
+This belongs to the same family as "never read or write file content through the shell" and "verify the result's shape": the working directory and the index are **shared mutable state**, so the result of a write must be **verified after the fact**, not assumed.
 
 Before opening a pull request:
 
