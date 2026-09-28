@@ -36,8 +36,9 @@ deer-gui 是一个以**节点树**为核心的 GUI 运行时：你描述一棵�
 | `deer-gpu` —— GPU HAL + CPU 参考后端（软件光栅化） | ✅ 类型与契约就位；CPU 后端能把绘制列表渲成像素，并能离屏贴真实字形 |
 | `deer-vk` —— Vulkan 后端（自己声明符号 + 运行时动态加载） | ✅ 真机枚举到 2 个 GPU（Intel RaptorLake / NVIDIA RTX 5070 Ti，Vulkan 1.4.341）；设备、管线、离屏回读，以及 surface / 交换链 / 呈现 |
 | `deer-window` —— 窗口层（winit） | ✅ **Windows** 上可建真窗口 + 事件循环；本 workspace 唯一第三方依赖 |
-| 真实字形 —— 字体解析、光栅化、图集、真实度量、换行 | 🔄 离屏 CPU 已能出真字；**GPU 侧文本**、hinting、亚像素未做 |
-| 窗口里显示界面 | 🔄 窗口里目前是清屏色 + 几何，还不是一棵排好版的界面 |
+| 真实字形 —— 字体解析、光栅化、图集、真实度量、换行 | ✅ 离屏 CPU 能出真字，GPU 侧也走通了（`R8_UNORM` 覆盖率纹理 + 最近邻采样，与 CPU 后端逐像素对照）。hinting、亚像素定位仍未做 |
+| 窗口里显示界面 | ✅ 形状与文本经共用管线层呈到线性交换链，上屏像素与 CPU 后端逐像素对照；事件派发与焦点仍属 M5 |
+| 批处理（合段 + 跨帧复用顶点缓冲） | 🔄 相邻同管线合段为一次 `vkCmdDraw`、持久缓冲已落地；管线切换次数与统一管线/单缓冲两段式仍未做 |
 | 输入事件、焦点、可停靠面板 | ⬜ 未实现（里程碑 M5/M6） |
 
 逐功能细节见 [`FEATURES.md`](FEATURES.md)，里程碑与验收判据见 [`ROADMAP.md`](ROADMAP.md)。
@@ -84,6 +85,9 @@ cargo run -p deer-gui --example text_render
 
 # 开一个真窗口（仅 Windows；feature 必须带上）
 cargo run -p deer-gui --features window --example window_preview
+
+# 端到端判据：上屏像素 vs CPU 后端（有门禁；不设门禁时会打印「这不是通过，是被跳过」）
+DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example window_parity
 ```
 
 从没写过 Rust，可以先看更啰嗦的[上手指南](docs/GETTING-STARTED.md)。
@@ -121,9 +125,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | 布局计算、命中测试 | ✅ |
 | 树 + 几何 → 绘制列表 → **像素**（CPU 光栅化） | ✅ |
 | 写 PNG 文件 | ✅ |
-| **真实字形**（字体解析 → 光栅化 → 图集 → 贴像素） | ✅ 仅离屏 / CPU 后端 |
-| **GPU 侧文本**（把字形图集上传给 Vulkan） | ❌ 图集已就绪，后端还没接 |
-| **渲染到窗口 / 屏幕上** | 🔄 目前是清屏色 + 几何，还不是界面 |
+| **真实字形**（字体解析 → 光栅化 → 图集 → 贴像素） | ✅ 离屏 / CPU 后端 |
+| **GPU 侧文本**（字形四边形 + `R8_UNORM` 图集纹理 + 最近邻采样） | ✅ 与 CPU 后端逐字节对照 |
+| **渲染到窗口 / 屏幕上**（形状与文本） | ✅ 经 `window_parity` 与 CPU 后端逐像素对照 |
 | 输入事件与焦点 | ❌ 未实现 |
 
 一个容易踩的点：老入口 `render_tree_to_png` 不加载字体，所以经它画出的「字」仍是等宽占位方块；真实字形来自文本引擎（`text_render`）。两条路径上，几何、层次、颜色都是真的。

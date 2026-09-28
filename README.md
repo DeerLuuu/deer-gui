@@ -36,8 +36,9 @@ The layout algebra comes from a TypeScript validation prototype (which ran 28 as
 | `deer-gpu` — GPU HAL + CPU reference backend (software rasterizer) | ✅ Contract in place; the CPU backend rasterizes draw lists to pixels and can blit real glyphs offscreen |
 | `deer-vk` — Vulkan backend (symbols declared by hand, loaded at runtime) | ✅ Enumerates 2 GPUs on real hardware (Intel RaptorLake / NVIDIA RTX 5070 Ti, Vulkan 1.4.341); device, pipeline, and offscreen readback, plus surface / swapchain / present |
 | `deer-window` — windowing layer (winit) | ✅ Real window and event loop on **Windows**; the only third-party dependency in the workspace |
-| Real glyphs — font parsing, rasterization, atlas, real metrics, line breaking | 🔄 Works offscreen on the CPU; GPU-side text, hinting, and subpixel positioning are not done |
-| On-screen rendering in a window | 🔄 The window presents a clear color and geometry; it does not show a laid-out UI yet |
+| Real glyphs — font parsing, rasterization, atlas, real metrics, line breaking | ✅ Offscreen on the CPU, and on the GPU as a coverage-texture pass (`R8_UNORM` atlas, nearest sampling, compared pixel-for-pixel against the CPU backend). Hinting and subpixel positioning are still not done |
+| On-screen rendering in a window | ✅ Shapes and text are presented through a shared pipeline layer on a linear swapchain, compared pixel-for-pixel against the CPU backend. Event dispatch and focus are still M5 |
+| Batch optimization (segment merging, cross-frame buffer reuse) | 🔄 Segment merging into one `vkCmdDraw` and persistent vertex buffers have landed; the pipeline-switch count and the unified / single-buffer variants are still open |
 | Input events, focus, dockable panels | ⬜ Not implemented (milestones M5/M6) |
 
 See [`FEATURES.md`](FEATURES.md) for the per-feature breakdown and [`ROADMAP.md`](ROADMAP.md) for milestones.
@@ -84,6 +85,9 @@ cargo run -p deer-gui --example text_render
 
 # Open a real window (Windows only; the feature flag is required)
 cargo run -p deer-gui --features window --example window_preview
+
+# End-to-end check: window pixels vs the CPU backend (gated; prints "this is a skip, not a pass" if the gate is unset)
+DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example window_parity
 ```
 
 If you have never written Rust, start with the more verbose [getting-started guide](docs/GETTING-STARTED.md).
@@ -121,9 +125,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | Layout computation and hit testing | ✅ |
 | Tree + geometry → draw list → **pixels** (CPU rasterizer) | ✅ |
 | Write PNG files | ✅ |
-| **Real glyphs** (font parsing → rasterization → atlas → pixels) | ✅ offscreen / CPU backend only |
-| **GPU-side text** (uploading the glyph atlas to Vulkan) | ❌ The atlas is ready; the backend is not wired up |
-| **Rendering into a window on screen** | 🔄 Presents a clear color and geometry, not a laid-out UI |
+| **Real glyphs** (font parsing → rasterization → atlas → pixels) | ✅ offscreen / CPU backend |
+| **GPU-side text** (glyph quads + `R8_UNORM` atlas texture, nearest sampling) | ✅ compared byte-for-byte against the CPU backend |
+| **Rendering into a window on screen** (shapes and text) | ✅ pixel-compared against the CPU backend via `window_parity` |
 | Input events and focus | ❌ Not implemented |
 
 One subtlety worth knowing: the older entry point `render_tree_to_png` does not load a font, so text drawn through it is still evenly spaced placeholder boxes. Real glyphs come from the text engine (`text_render`). Geometry, layering, and color are real on both paths.
