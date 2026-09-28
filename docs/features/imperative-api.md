@@ -141,7 +141,7 @@ std::fs::write("out.png", png)?;
 
 - 场景文件写法：[`scene-file.md`](scene-file.md)
 - 节点树结构：[`node-tree.md`](node-tree.md)
-- **做不到**：没有事件回调（M5）、没有「局部更新」（每次都重建整棵树）、没有组件复用/状态（那是 React 的职责，这里刻意没有）
+- **做不到**：**没有回调式事件**（事件走 [`input.md`](input.md) 的「`hit`/`handle` + `UiState`」值模型，不是注册回调）、没有「局部更新」（每次都重建整棵树）、没有组件复用/状态（那是 React 的职责，这里刻意没有）
 
 ## 8. 检查清单
 

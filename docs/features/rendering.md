@@ -13,8 +13,9 @@
 - 验证布局是否正确（配合 [`geometry.md`](layout.md)）；
 - 做布局实验，快速看结果。
 
-**什么时候不能用它**：想让界面显示在窗口里、让用户点 —— 窗口本身从 M2b 起就能开、也能呈现 GPU 画面，
-但**把界面（`DrawList`）送上 GPU 是 M3**，所以窗口里现在看不到这棵树；输入是 M5。
+**什么时候不能用它**：想让界面显示在窗口里、让用户点 —— 窗口与上屏从 M2b 起就通了，
+**界面（`DrawList`）上屏是 M3c 已落地**（见 [`window.md`](window.md)），**输入与焦点是 M5 已落地**
+（见 [`input.md`](input.md)）；本页讲的是**离屏**出图那条路。
 
 ## 2. 最小示例
 
@@ -131,7 +132,7 @@ assert_eq!(a, b);
 - 像素处理：[`pixels.md`](pixels.md)
 - 绘制列表：[`draw-list.md`](draw-list.md)
 - 主题：[`theme.md`](theme.md)
-- **做不到**：把界面（`DrawList`）送上 GPU（**M3**；窗口与呈现已在 M2b 打通，见 [`window.md`](window.md)）、**GPU 侧文本**（M3：Vulkan 还不消费 `DrawCmd::Text`）、圆角/字形之外的抗锯齿、输入事件（M5）
+- **做不到**：本页这条**离屏 CPU** 路径**不**负责窗口与输入 —— 界面呈到窗口是 [M3c 已落地](window.md)、输入与焦点是 [M5 已落地](input.md)、GPU 侧文本也已落地（[`gpu-geometry.md`](gpu-geometry.md)）；仍缺的是圆角/字形之外的抗锯齿、滚动容器等
 
 ## 7. 检查清单
 

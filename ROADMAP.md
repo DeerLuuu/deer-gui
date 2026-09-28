@@ -12,7 +12,7 @@
 | **M2** | Vulkan 逻辑设备 + 交换链 | M2a：逻辑设备/管线/命令/离屏回读；M2b：窗口 + `VkSurfaceKHR` + 交换链 + 帧同步 + 呈现 | ✅ **完成（M2a + M2b）** |
 | **M3** | 渲染器 + 管线（矩形/圆角/裁剪/文本） | M3a：形状的 `DrawList` → GPU（顶点缓冲 + 静态管线 + 与 CPU 逐像素对照）；M3b：文本/字形 → GPU（第二条管线 + 图集纹理 + 逐像素对照）；M3c：把界面**呈到窗口**（共用管线层 + 线性交换链 + 上屏 parity）；M3+：批处理（**统一管线（形状 + 文本 → 一条管线）+ 跨帧复用缓冲已落地**） | 🔄 **进行中（M3a + M3b + M3c 完成；M3+ 批处理部分完成）** |
 | **M4** | 文本 | 字体解析（TTF/OTF）+ 字形光栅化 + 图集 + 文本度量（替换 `ApproxMeasure`）+ 换行 | 🔄 **进行中（解析 / 光栅化 / 图集 / 度量与换行 / CPU 真实字形 ✅；hinting 与亚像素待做）** |
-| **M5** | 输入 + 焦点 + dock | 事件循环、命中测试路由（`hit_test` 已就位）、焦点系统（含方向键）、**可停靠面板布局**（拖动改位置 / 边缘折叠） | ⬜ |
+| **M5** | 输入 + 焦点 + dock | **已落地**：输入事件通路（`InputEvent` + winit 映射 + `App::input`）、命中与状态机（`hit`/`handle`/`ClipSnapshot`，含裁剪与禁用感知）、点击 / `Tab` / `Shift+Tab` / `Escape` 焦点、文本输入（追加 + `Backspace` 按 Unicode 字符删末尾）、脚本化事件重放、**只在状态变化时重绘**（不脏就不画）。**仍未做**：**事件驱动按需重绘**（窗口仍 `ControlFlow::Poll` 连续重绘）、**dock**、多窗口、滚动与方向键、右键/中键、IME 预编辑、按键重复、`texts` 光标位置 | 🔄 **部分完成（见 [`docs/features/input.md`](docs/features/input.md) 第 6 节）** |
 | **M6** | 控件族 | 从 `deer-ui` 迁移 12 个控件的**语义**：`Btn`/`ChipGroup`/`Segmented`/`TabBar`/`Switch`/`NumberField`/`ScrubNum`/`ColorField`/`Dialog`/`Overlay`/`DropMenu`/`HoverTip`/`Icon`/`Row`/`RowActions`/`Keep` | ⬜ |
 | **M7** | DX12 / Metal 后端 | 各自实现 HAL trait；用 `deer-gpu` 的 CPU 参考后端做像素级对照 | ⬜ |
 
@@ -60,7 +60,7 @@ $env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo test -p deer-v
 
 > **M2b 的边界**：它只保证「GPU 画的像素能出现在窗口上」—— 当窗口里是清屏色 + M2a 验证过的几何。
 > 把 `DrawList` 送上 GPU 属于 **M3**：**M3a（形状）、M3b（文本）、M3c（呈到窗口）都已完成**，
-> 三条都能与 CPU 逐像素对照；输入事件属于 **M5**。
+> 三条都能与 CPU 逐像素对照；**输入与焦点也已落地**（M5，见 [`docs/features/input.md`](docs/features/input.md)）。
 
 ### M3 的子步与状态
 

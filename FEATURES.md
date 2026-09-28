@@ -63,6 +63,7 @@
 | **GPU 几何渲染**（`DrawList` 形状命令 → GPU，与 CPU **逐像素对照**） | ✅ | [gpu-geometry](docs/features/gpu-geometry.md) | `cargo run -p deer-gui --example gpu_geometry` |
 | **GPU 文本渲染**（字形四边形 + 图集纹理 + 最近邻采样，与 CPU **逐字节对照**） | ✅ | [gpu-geometry](docs/features/gpu-geometry.md#3-完整-api) | `cargo run -p deer-gui --example gpu_geometry` |
 | **窗口里显示界面**（把 `DrawList` 的形状与文本**呈到窗口**，上屏像素与 CPU 逐像素对照） | ✅ | [window](docs/features/window.md) | `DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example window_parity` |
+| **输入与焦点**（事件通路 + 命中/状态机（含裁剪与禁用）+ Tab/Shift+Tab/Escape 焦点 + 文本输入（追加、`Backspace` 按 Unicode 字符删末尾）+ 脚本化重放 + **只在状态变化时重绘**） | ✅ | [input](docs/features/input.md) | `cargo run -p deer-gui --features window --example interactive_form` |
 
 ## 四、还没做的（**不要以为能跑**）
 
@@ -76,9 +77,8 @@
 | **字距与连字**（`kern` / `GSUB` / `GPOS`） | M4 残余 | 不做整形，`advance` 就是 `hmtx` 的原始值 |
 | **CFF / OpenType-CFF 字体**（`OTTO`） | M4 残余 | 解析层直接报错，不静默给空轮廓；只支持 `glyf` 轮廓 |
 | **竖排 / RTL / 复杂脚本整形** | M4 残余 | 完全没有；不读 `GSUB`/`GPOS` |
-| **输入事件**（鼠标/键盘点击回调） | M5 | `hit_test` 有了（能算命中），但没有事件派发 |
-| **焦点系统**（Tab / Enter / 方向键） | M5 | 完全没有 |
-| **可停靠面板 dock**（拖动改位置 / 边缘折叠） | M5 | 完全没有 |
+| **输入与焦点的剩余部分**（**事件驱动**按需重绘、停靠 / 多窗口、滚动与方向键、右键 / 中键、IME 预编辑、`texts` 光标位置、按键重复） | M5/M6 | 输入通路、命中/状态机、Tab/Escape 焦点、文本输入、脚本重放、dirty 重绘**都已落地**（见第三节）；剩下的见 [`input.md`](docs/features/input.md) 第 6 节「仍未做」 |
+| **可停靠面板 dock**（拖动改位置 / 边缘折叠） | M6 | 完全没有 |
 | **控件族**（12 个 `deer-ui` 控件的语义） | M6 | 现在只有 5 种节点：`column`/`row`/`text`/`button`/`field` |
 | **DX12 / Metal 后端** | M7 | 完全没有 |
 

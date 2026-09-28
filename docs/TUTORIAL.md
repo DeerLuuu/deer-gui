@@ -340,9 +340,10 @@ deer-gui = { path = "Z:/deer-gui/crates/deer-gui" }
 | 界面显示在**窗口**里 | ✅ **窗口里就是真实界面**（M3c，**仅 Windows**）：形状 + 文本呈现到窗口，且上屏像素与 CPU 逐像素对照（不透明 0 / 半透明 ≤1 LSB）；跑 `--example window_parity` 看判据 |
 | **GPU 渲染**出图 | ✅ 离屏 Vulkan 已画出正确像素（M2a-6 修复了 SPIR-V 段序缺陷）；✅ 窗口呈现已打通（M2b）；✅ **消费 `DrawList`（形状 M3a + 文本 M3b + 上屏 M3c）**：三种路径都能与 CPU 逐像素对照（第 13 章） |
 | 图片里的字是**真字体** | ✅ **离屏**已支持（第 11 章 CPU 侧、第 13 章 **GPU 侧 M3b**）：GPU 画真字形与 CPU 逐字节相同 |
-| **鼠标点击 / 键盘输入** | ❌ M5（`hit_test` 有了，但没有事件派发） |
-| **Tab 焦点** / 方向键导航 | ❌ M5 |
-| **可停靠面板 dock** | ❌ M5 |
+| **鼠标点击 / 键盘输入** | ✅ 已支持：悬停 / 按下 / 点击 / 文本输入（追加 + `Backspace` 按 Unicode 字符删末尾）；见 [`features/input.md`](features/input.md) |
+| **Tab 焦点** | ✅ 已支持：`Tab` / `Shift+Tab` 循环（树序）、`Escape` 清焦点、点击可聚焦控件即聚焦 |
+| **方向键导航 / 滚轮 / 滚动容器 / IME 预编辑** | ❌ 未做（M5 剩余，见 [`features/input.md`](features/input.md) 第 6 节） |
+| **可停靠面板 dock** / 多窗口 | ❌ M6 |
 | 12 个 `deer-ui` 控件的语义 | ❌ M6（现在只有 5 种节点） |
 
 完整清单与每个功能的边界：[`../FEATURES.md`](../FEATURES.md)。
@@ -446,8 +447,8 @@ $env:DEER_WINDOW_HOLD='1'; cargo run -p deer-gui --features window --example win
   回读**强制一次 GPU→CPU 同步**，所以只在第一帧做一次。
 - 目前**只有 Windows** 实现了窗口句柄的填充；非 Windows 会明确返回 `Err`。
 
-**仍然做不到**：鼠标/键盘输入（M5）、多窗口 / 全屏 / HDR / 帧率上限、
-`size <= 0` 的文本与 CPU 一致（见第 13 章）。
+**仍然做不到**：**事件驱动按需重绘**（窗口仍连续重绘，只是不脏就不画）、方向键导航 / 滚动 / 右键中键 / IME 预编辑（M5 剩余）、多窗口 / 全屏 / HDR / 帧率上限、
+`size <= 0` 的文本与 CPU 一致（见第 13 章）。输入与焦点**已可用**，见 [`features/input.md`](features/input.md)。
 完整边界见 [`features/window.md`](features/window.md) 与
 [`features/vulkan-swapchain.md`](features/vulkan-swapchain.md) 第 7 节。
 

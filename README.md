@@ -37,9 +37,9 @@ The layout algebra comes from a TypeScript validation prototype (which ran 28 as
 | `deer-vk` — Vulkan backend (symbols declared by hand, loaded at runtime) | ✅ Enumerates 2 GPUs on real hardware (Intel RaptorLake / NVIDIA RTX 5070 Ti, Vulkan 1.4.341); device, pipeline, and offscreen readback, plus surface / swapchain / present |
 | `deer-window` — windowing layer (winit) | ✅ Real window and event loop on **Windows**; the only third-party dependency in the workspace |
 | Real glyphs — font parsing, rasterization, atlas, real metrics, line breaking | ✅ Offscreen on the CPU, and on the GPU as a coverage-texture pass (`R8_UNORM` atlas, nearest sampling, compared pixel-for-pixel against the CPU backend). Hinting and subpixel positioning are still not done |
-| On-screen rendering in a window | ✅ Shapes and text are presented through a shared pipeline layer on a linear swapchain, compared pixel-for-pixel against the CPU backend. Event dispatch and focus are still M5 |
+| On-screen rendering in a window | ✅ Shapes and text are presented through a shared pipeline layer on a linear swapchain, compared pixel-for-pixel against the CPU backend |
 | Batch optimization (unified pipeline, cross-frame buffer reuse) | 🔄 The **unified pipeline** has landed — shapes and text feed **one** vertex stream and **one** pipeline, so a frame issues **one** `vkCmdDraw` and **one** pipeline switch (the old "segment merging" helper was deleted with it) — plus **cross-frame buffer reuse**. Still open: other advanced forms (indirect draws / multi-batch submission / general textures), the per-frame `Vec` allocation in `unify`, and the window-side barrier assertion gap |
-| Input events, focus, dockable panels | ⬜ Not implemented (milestones M5/M6) |
+| Input and focus | ✅ Event path (`InputEvent` + winit mapping + `App::input`), hit-testing and state machine (clip- and disabled-aware), click / `Tab` / `Shift+Tab` / `Escape` focus, text input (append + `Backspace` deleting one Unicode char), scripted replay, and redraw-only-when-dirty. Still open: event-driven redraw, dockable/multi-window, scrolling and arrow keys, right/middle buttons, IME pre-edit — see [`docs/features/input.md`](docs/features/input.md) §6 |
 
 See [`FEATURES.md`](FEATURES.md) for the per-feature breakdown and [`ROADMAP.md`](ROADMAP.md) for milestones.
 
@@ -128,7 +128,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | **Real glyphs** (font parsing → rasterization → atlas → pixels) | ✅ offscreen / CPU backend |
 | **GPU-side text** (glyph quads + `R8_UNORM` atlas texture, nearest sampling) | ✅ compared byte-for-byte against the CPU backend |
 | **Rendering into a window on screen** (shapes and text) | ✅ pixel-compared against the CPU backend via `window_parity` |
-| Input events and focus | ❌ Not implemented |
+| Input events and focus | ✅ hover / press / click / `Tab`·`Shift+Tab`·`Escape` focus / text input / scripted replay / dirty-only redraw (see [`docs/features/input.md`](docs/features/input.md) §6 for what is left) |
 
 One subtlety worth knowing: the older entry point `render_tree_to_png` does not load a font, so text drawn through it is still evenly spaced placeholder boxes. Real glyphs come from the text engine (`text_render`). Geometry, layering, and color are real on both paths.
 

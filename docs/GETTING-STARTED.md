@@ -24,13 +24,13 @@
 |---|---|
 | 描述界面、算出布局、导出图片 | ✅ **行** |
 | 开一个真窗口，用 GPU 呈现画面 | ✅ **行（M2b，仅 Windows）**：`cargo run -p deer-gui --features window --example window_preview` |
-| 在窗口里显示**界面**（控件/文字） | ❌ 不行：把 `DrawList` 送上 GPU 是 **M3**（窗口现在只有清屏色 + 几何） |
-| 用鼠标点、键盘输入 | ❌ 不行（**M5**） |
+| 在窗口里显示**界面**（控件/文字） | ✅ **行（M3c，仅 Windows）**：`cargo run -p deer-gui --features window --example window_preview`（上屏像素与 CPU 逐像素对照，见 [`features/window.md`](features/window.md) 第 5 节） |
+| 用鼠标点、键盘输入、Tab 聚焦、打字 | ✅ **行**：`cargo run -p deer-gui --features window --example interactive_form`（脚本重放见 [`features/input.md`](features/input.md)） |
 | 图片上的字是真的字体 | ✅ **可以**（离屏 CPU）：带字体入口见[第 11 章](TUTORIAL.md#11-真实文字) / [`features/text-rendering.md`](features/text-rendering.md)。**不带字体的老入口仍是方块占位** |
 
 **所以它现在适合**：验证布局、生成界面设计稿/示意图、给文档配图、做布局算法的实验，
 以及（Windows 上）验证「窗口 + Vulkan 上屏」这条链。
-**不适合**：做一个真正能用的桌面软件（那要等 M3 的界面渲染与 M5 的输入）。
+**不适合**：做一个真正能用的桌面软件（还缺 12 个控件的语义（M6）、停靠/多窗口，以及**事件驱动按需重绘** —— 输入与焦点本身已可用，见 [`features/input.md`](features/input.md)）。
 
 ---
 
@@ -382,5 +382,5 @@ Theme {
 - 想**理解原理**：读 [`M1-report.md`](M1-report.md)（布局不变量与踩过的坑）。
 - 想**看真窗口**（仅 Windows）：`cargo run -p deer-gui --features window --example window_preview`
   —— 见[第 12 章](TUTORIAL.md#12-在窗口里看到画面) 与 [`features/window.md`](features/window.md)。
-- 想**知道路线**：看 [`../ROADMAP.md`](../ROADMAP.md) —— M2（窗口 + 上屏）已完成；
-  窗口里显示界面是 **M3**；真实字形已落地（离屏 CPU，见[第 11 章](TUTORIAL.md#11-真实文字)）；鼠标键盘交互是 M5。
+- 想**知道路线**：看 [`../ROADMAP.md`](../ROADMAP.md) —— M2（窗口 + 上屏）与 M3（界面画到 GPU、呈到窗口）已完成；
+  真实字形已落地（离屏 CPU，见[第 11 章](TUTORIAL.md#11-真实文字)）；**输入与焦点也已可用**（见 [`features/input.md`](features/input.md)）。
