@@ -293,7 +293,61 @@ DEER_VK_WINDOW_TESTS=1 cargo run -q -p deer-gui --features window --example wind
 产品行为以默认值为准）。静态是「写进管线」的策略，所以尺寸一变就必须重建管线 ——
 实测 4 次 resize：动态**重建 0 次**、静态**重建 4 次**，而**存活界面资源恒为 1**（无泄漏）。
 
-## 6. 常见坑
+## 6. 重绘策略：默认**省电**（M5b）
+
+M5b 把事件循环从「一直要下一帧」改成**事件驱动**：
+
+| 项 | 事实 |
+|---|---|
+| 控制流 | `ControlFlow::Poll` → **`Wait`**（**纯阻塞**：没有事件就睡）—— **不用 `WaitUntil` 兜底**，所以没有「超时轮询」 |
+| `App::wants_redraw(&self) -> bool` | **默认 `false`**；语义 = 「**本次输入是否改变了状态**」；只有它为真才请求重绘 |
+| `App::redraw_policy(&self) -> RedrawPolicy` | **默认 `OnDemand`**（省电：空闲时零重绘）；`Continuous` = 每画完一帧再请求下一帧 |
+| **一律**置位的事件 | **系统事件**（`Resized` / `Focused` / `Occluded(false)` 窗口重新暴露）与**建窗引导帧** —— 不经过 `wants_redraw` |
+| `Flow` 枚举 | **未动**（既有 5 个实现零改动） |
+
+**可关闭省电**：环境变量 **`DEER_WINDOW_REDRAW=continuous`** ⇒ **无条件**强制 `Continuous`；
+`on-demand` / `demand` / 未设 / 无法识别 ⇒ 用 `App` 自己声明的策略。
+取值**先 `trim()` 再比、大小写不敏感**（与门槛自证同源的真事故：`cmd` 的 `set X=continuous && …` 会让值是 `"continuous "` 带尾空格）。
+
+**自证标记（验收要 grep 它，而不是只看退出码）**：
+
+```text
+[deer-window] 重绘策略：请求=… 实际=…
+[deer-window] 重绘账本：requests=… skipped=… frames=…
+```
+
+**本机实测的省电效果**（同一 5 秒窗口 + 40 条悬停输入；**实测值，不是断言**）：
+
+| 档 | 画帧 | 进程 CPU |
+|---|---|---|
+| 默认 `OnDemand` | **1** | **0.06 s** |
+| `DEER_WINDOW_REDRAW=continuous` | 约 **27 万** | **4.08 s**（≈ **68×**） |
+
+复现（探针源码：`crates/deer-window/examples/idle_probe.rs`；在 `deer-window` 里跑该示例，
+`--example` 后写该文件名去掉 `.rs` 的部分）：
+
+```powershell
+cargo run -q -p deer-window --example <去掉 .rs 的文件名>                                   # 默认：省电
+set "DEER_IDLE_DIRTY=1" && cargo run -q -p deer-window --example <去掉 .rs 的文件名>         # 每条输入都当「改了状态」
+set "DEER_WINDOW_REDRAW=continuous" && cargo run -q -p deer-window --example <去掉 .rs 的文件名>  # 关掉省电
+```
+
+**谁声明什么**（各示例**显式**声明，不靠默认值隐式生效）：
+
+| 示例 | 策略 | 理由 |
+|---|---|---|
+| `window_preview` / `hal_window_path` / `interactive_form` | **`Continuous`** | 演示类要连续推进；**脚本重放在 `OnDemand` 下接口上做不到** —— 窗口层没有定时器 / 用户事件面（这是**诚实的边界**，不是遗漏） |
+| `window_parity` | **`OnDemand`** | 它只需要 1 帧；判据与退出码**零改动** |
+
+**`skipped_frames` 与重绘策略正交**（别写混）：它的含义是「**派发了输入但没有请求重绘**」的次数，
+属**输入门禁**度量 ⇒ 在 `Continuous` 档**它照样增长**；**不要**写成「连续模式下恒 0」。
+
+**已知边界**：
+
+- `Occluded(false)` 已接线，但 **winit 0.30 文档写明 Windows 不支持该事件** ⇒ **Windows 上未实测**；
+- `OnDemand` 下 `App` **没有**唤醒事件循环的手段（无定时器 / 无用户事件）⇒ **按时间的动画必须声明 `Continuous`**。
+
+## 7. 常见坑
 
 | 现象 | 原因 | 怎么改 |
 |---|---|---|
@@ -309,7 +363,7 @@ DEER_VK_WINDOW_TESTS=1 cargo run -q -p deer-gui --features window --example wind
 | 帧率不受控、风扇狂转 | 事件循环是「请求重绘就画」，**没有帧率上限** | 自己数帧 / 加节流；本项目没有内置 vsync 之外的限帧 |
 | 以为 `cargo test -p deer-vk` 已经验过真窗口链 | 真窗口 e2e **默认跳过**（要 `DEER_VK_WINDOW_TESTS=1`），而**跳过也算 pass** | 门禁用完整形式 `$env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo test -p deer-vk`；HAL 路径另跑 `--example hal_window_path` |
 
-## 7. 相关
+## 8. 相关
 
 - 上屏原理（surface / 交换链 / 呈现）：[`vulkan-swapchain.md`](vulkan-swapchain.md)
 - HAL 路径示例（真窗口 + 真交换链 + 真呈现）：`crates/deer-gui/examples/hal_window_path.rs`
@@ -318,10 +372,10 @@ DEER_VK_WINDOW_TESTS=1 cargo run -q -p deer-gui --features window --example wind
 - **做不到**（本模块的边界）：
   - **只有 Windows 的句柄映射**：winit 在别的平台也能开窗，但「原生句柄 → HAL 句柄」未实现 ⇒ `run()` 明确返回 `Err`（不静默填 0）。
   - **输入事件**：**已支持**（M5-1..M5-4：`InputEvent` + winit 映射 + `App::input` → 命中/状态机 → 重绘；
-    见 [`input.md`](input.md)）。**仍未做**：**事件驱动按需重绘**（本模块仍是 `ControlFlow::Poll` 连续重绘，
-    只是「不脏就不画」）、方向键 / 滚动 / 右键中键 / IME 预编辑。
+    见 [`input.md`](input.md)）。**M5b 起重绘也改成事件驱动**（默认省电，见第 6 节）；
+    **仍未做**：方向键 / 滚动 / 右键中键 / IME 预编辑。
   - **窗口里显示的界面**：**已支持**（M3c，见第 5 节）——窗口里是真实的形状 + 文本，且上屏像素与 CPU 逐像素对照过
-    （不透明 0、半透明 ≤1 LSB）。仍在窗口里画着的是**当前帧的界面快照**：没有滚动/动画系统，也没有按需重绘。
+    （不透明 0、半透明 ≤1 LSB）。窗口里画的是**当前帧的界面快照**：没有滚动/动画系统（按时间的动画需自行声明 `Continuous`，见第 6 节）。
   - **不支持多窗口、全屏 / 无边框、HDR**，也**没有帧率上限**。
   - **DPI**：`Resized` 给的是物理像素，直接透传；不做额外的缩放换算。
   - **⚠️ 窗口侧 host→vertex 屏障只有计数、没有断言（覆盖缺口，不是正确性缺陷）**：
@@ -337,7 +391,7 @@ DEER_VK_WINDOW_TESTS=1 cargo run -q -p deer-gui --features window --example wind
     （**过期尺寸不可信**）。
     **定性**：这是**覆盖缺口**（护栏强度问题），**不是**正确性缺陷 —— 窗口像素仍与 CPU 逐字节对照通过。
 
-## 8. 检查清单（发布前过一遍）
+## 9. 检查清单（发布前过一遍）
 
 - [x] 示例能跑：`cargo run -p deer-gui --features window --example window_preview` → `exit=0`（窗口里是真实界面树）
 - [x] 上屏 parity 示例能跑：`DEER_VK_WINDOW_TESTS=1 cargo run -q -p deer-gui --features window --example window_parity` → `exit=0`（不透明 0 / 半透明 ≤1 LSB）
@@ -346,3 +400,4 @@ DEER_VK_WINDOW_TESTS=1 cargo run -q -p deer-gui --features window --example wind
 - [x] `FEATURES.md` 已登记（状态 / 指南链接 / 示例命令都对）
 - [x] 如果属于新手主线，`docs/TUTORIAL.md` 已更新（第 12 章）
 - [x] 明确写了「做不到什么」
+- [x] 重绘策略已写明（默认省电 / 如何关掉 / 两个自证标记要 grep），并登记 `Occluded` 的 Windows 边界与「`OnDemand` 下无唤醒手段」

@@ -94,12 +94,12 @@ pub fn raw_handle_from_rwh06(raw: RwhRawWindowHandle) -> Result<deer_gpu::RawWin
 - 事件 → `App` 回调的映射表（`:351-390`）：
   | winit 事件 | 行号 | 动作 |
   |---|---|---|
-  | `resumed` | `:308-349` | `create_window`（逻辑尺寸 `LogicalSize`）→ `window_info()` → 打印一行含 HWND/HINSTANCE 的摘要 → `app.init(&info)` → `set_control_flow(ControlFlow::Poll)` |
+  | `resumed` | `:308-349` | `create_window`（逻辑尺寸 `LogicalSize`）→ `window_info()` → 打印一行含 HWND/HINSTANCE 的摘要 → `app.init(&info)` → 按 **M5b 的重绘策略**设控制流：默认 `OnDemand` ⇒ `ControlFlow::Wait`，`Continuous` ⇒ `Poll` |
   | `Resized` | `:361-369` | 更新物理 `extent` → `app.resized(w, h)` |
   | `RedrawRequested` | `:370-381` | `app.redraw()` → `FrameCounter::on_redraw` → 若 `Exit` 则 `event_loop.exit()` |
   | `CloseRequested` | `:383-386` | 只有 `app.close_requested() == Flow::Exit` 才退 |
   | 其它（键盘/鼠标/滚轮/焦点） | `deer-window/src/lib.rs:47-53` | **M5-1 起已接入**：`CursorMoved`/`MouseInput`/`MouseWheel`/`KeyboardInput`/`Focused` 翻成 `InputEvent` → `App::input`（见 [`docs/features/input.md`](../features/input.md)）；**仍未接的是 IME 预编辑**（`Ime::Commit` 已直译但只能人肉验证） |
-- **连续重绘**：`ControlFlow::Poll`（`:347`）+ `about_to_wait` 里 `window.request_redraw()`（`:392-399`）形成「一直要下一帧」；文档明说节奏本层不管，真正上屏时由呈现（vsync）决定（`:41-42`）。
+- **重绘策略（M5b 起默认省电，不再是「连续重绘」）**：`ControlFlow::Wait`（**纯阻塞**、无 `WaitUntil` 兜底）+ `App::wants_redraw()`（只有输入真的改了状态才请求重绘）；`App::redraw_policy()` 默认 `OnDemand`，`Continuous` ⇒ 每画完一帧再请求下一帧（`about_to_wait` 里 `window.request_redraw()`）。`DEER_WINDOW_REDRAW=continuous` 可**无条件**关掉省电。启动打印自证标记 `[deer-window] 重绘策略：请求=… 实际=…`，收尾打印 `[deer-window] 重绘账本：requests=… skipped=… frames=…` —— **验收 grep 这两个标记，别只看退出码**。详见 [`docs/features/window.md`](../features/window.md) 第 6 节。
 - **退出时的可断言输出**：无论成败都往 stdout 打一行摘要，供脚本断言（`:293-299`）：
   `[deer-window] 事件循环结束：frames=<n> extent=<w>x<h> result=ok|error`
   实测（`window_preview`，见 §3）：`[deer-window] 事件循环结束：frames=120 extent=960x600 result=ok`。

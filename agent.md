@@ -130,7 +130,7 @@
 - **CFF / OpenType-CFF（`OTTO`）字体**：解析层直接报错 —— **故意不静默给空轮廓**。
   只支持 `glyf` 轮廓。
 - **hinting / 亚像素定位 / 字距连字（`kern`/`GSUB`/`GPOS`）/ 竖排 RTL**：都不做。
-- **输入与焦点**：**已落地**（`InputEvent` + winit 映射 + `App::input`、命中/状态机（含裁剪与禁用）、点击 / `Tab`·`Shift+Tab`·`Escape` 焦点、文本输入、脚本重放、不脏不画）；**仍缺**：事件驱动按需重绘、dock / 多窗口、滚动与方向键、右键中键、IME 预编辑（见 `docs/features/input.md` 第 6 节）。
+- **输入与焦点**：**已落地**（`InputEvent` + winit 映射 + `App::input`、命中/状态机（含裁剪与禁用）、点击 / `Tab`·`Shift+Tab`·`Escape` 焦点、文本输入、脚本重放、**事件驱动重绘（默认省电）**）；**仍缺**：dock / 多窗口、滚动与方向键、右键中键、IME 预编辑（见 `docs/features/input.md` 第 6 节）。
 - **12 个控件族、DX12/Metal**：M6/M7，完全没有。
 
 ---

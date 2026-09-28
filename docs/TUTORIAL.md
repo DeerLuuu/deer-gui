@@ -447,8 +447,9 @@ $env:DEER_WINDOW_HOLD='1'; cargo run -p deer-gui --features window --example win
   回读**强制一次 GPU→CPU 同步**，所以只在第一帧做一次。
 - 目前**只有 Windows** 实现了窗口句柄的填充；非 Windows 会明确返回 `Err`。
 
-**仍然做不到**：**事件驱动按需重绘**（窗口仍连续重绘，只是不脏就不画）、方向键导航 / 滚动 / 右键中键 / IME 预编辑（M5 剩余）、多窗口 / 全屏 / HDR / 帧率上限、
-`size <= 0` 的文本与 CPU 一致（见第 13 章）。输入与焦点**已可用**，见 [`features/input.md`](features/input.md)。
+**仍然做不到**：方向键导航 / 滚动 / 右键中键 / IME 预编辑（M5 剩余）、多窗口 / 全屏 / HDR / 帧率上限、
+`size <= 0` 的文本与 CPU 一致（见第 13 章）。输入与焦点**已可用**，**重绘也已是事件驱动（默认省电）**——
+见 [`features/input.md`](features/input.md) 与 [`features/window.md`](features/window.md) 第 6 节。
 完整边界见 [`features/window.md`](features/window.md) 与
 [`features/vulkan-swapchain.md`](features/vulkan-swapchain.md) 第 7 节。
 
