@@ -24,10 +24,19 @@
 //!
 //! ## 诚实的边界（**没有**做的事）
 //!
-//! - **不做 hinting**：不读 `glyf` 的 instructions，也不做像素网格拟合。小字号清晰度靠
-//!   超采样抗锯齿，不靠字形指令。
-//! - **不做亚像素水平定位**：字形按**整数像素**落位（`left` 是整数），一行内相邻字形的
-//!   间距只有整数像素精度。次像素定位要把 `left` 拆成整数部分 + 小数位移，属于合成阶段。
+//! - **不做 TrueType hinting（字形指令）**：不读 `glyf` 的 instructions，也不做像素网格拟合。
+//!   小字号清晰度靠超采样抗锯齿 + 亚像素定位，不靠字形指令。
+//!   实测依据：把最省的 hinting-lite（「垂直两极 `y_min`/`y_max` 对齐到整数像素行」）量过 ——
+//!   极值确实贴上网格，但要靠整体垂直缩放（9px 上形变 12.5%），把字形**内部**的水平边缘
+//!   推离网格 ⇒ 逐例部分覆盖质量 −10%..+13%、**均值没有净收益**（见
+//!   `tests/text_raster.rs::simplified_vertical_extent_gridfit_is_not_shipped_measured`）。
+//!   真正的 hinting 需要指令虚拟机 + stem 识别 + CVT，是另一个量级的工程，本轮不做。
+//! - **亚像素水平定位是 opt-in 的新路径**：[`Rasterizer::rasterize_at`] /
+//!   [`Rasterizer::rasterize_char_at`] + [`split_subpixel_x`]（1/4 像素档）。
+//!   默认的 [`Rasterizer::rasterize`] 仍是整数落位，**逐字节不变**（黄金指纹测试钉住）。
+//!   代价：位图可能宽 1px；相位离开 0 时边缘更灰（间距精度换边缘锐度）。
+//! - **不做水平网格对齐**：水平方向靠亚像素定位保间距精度，不做 stem 宽度吸附 ——
+//!   那会与亚像素定位互相打架（吸附必然把笔位置拉回整数）。
 //! - **不支持 CFF / OpenType-CFF 轮廓**：`font.rs` 遇到 `OTTO` 直接报错，本模块只处理
 //!   `glyf` 的直线 / 二次 / 三次段。
 //! - **不做精确曲线极值求解**：bbox 用控制点包围盒（见上）。
@@ -72,6 +81,39 @@ const MAX_BITMAP_DIM: u32 = 4096;
 /// 视为「同一个点」的距离平方阈值（像素）：用来丢掉零长边。
 const DEGENERATE_LEN2: f32 = 1e-12;
 
+/// 亚像素水平定位的量化档位：1/4 像素。
+///
+/// 与主流实现（FreeType 的 `FT_LOAD_NO_HINTING` 亚像素档、Skia 的 1/4 相位）同量级：
+/// 再细（1/8、1/16）只是把图集条数翻倍，肉眼收益递减；`1/4` 已把落位 RMSE 从
+/// 0.2887px（整数落位）压到 0.072px。
+pub const SUBPIXEL_LEVELS: u32 = 4;
+
+/// 把小数笔位置拆成「整数像素落位」+「`[0,1)` 的亚像素偏移（按 `1/levels` 量化）」。
+///
+/// 这是亚像素定位的**调用方算术**：`(whole, sub) = split_subpixel_x(pen_x, 4)` 之后，
+/// 用 `rasterize_at(g, upem, sub)` 取位图、并把它贴在 `whole + image.left` 列上，
+/// 就是「笔在 `pen_x`」的忠实渲染。
+///
+/// 语义：
+/// - 量化是**就近取整**到 `1/levels`；`q == 1.0` 时**进位**到整数部分（`q = 0.0`），
+///   否则 `12.9` 会变成 `12 + 1.0`（差 1px 的经典 bug）；
+/// - `levels == 0` 视为 `1`（退化成整数落位）；
+/// - 非有限 `pen_x` ⇒ 确定地退回 `(0, 0.0)`（不 panic，与其它退化输入一致）；
+/// - `1/4` 是二进制精确值 ⇒ 返回值可逐位比较，结果与平台无关。
+pub fn split_subpixel_x(pen_x: f32, levels: u32) -> (i32, f32) {
+    if !pen_x.is_finite() {
+        return (0, 0.0);
+    }
+    let levels = levels.max(1) as f32;
+    let whole = pen_x.floor();
+    let phase = ((pen_x - whole) * levels).round() / levels;
+    if phase >= 1.0 {
+        (whole as i32 + 1, 0.0)
+    } else {
+        (whole as i32, phase)
+    }
+}
+
 /// 字形光栅化器：把字体 units 的轮廓变成像素覆盖率图。
 ///
 /// 无状态、可复用（`rasterize` 取 `&self`），同一输入的结果**逐字段确定**。
@@ -100,13 +142,43 @@ impl Rasterizer {
         }
     }
 
-    /// 光栅化一个字形（`units_per_em` 来自 `head.unitsPerEm`）。
+    /// 光栅化一个字形（**整数像素落位**）。等价于 `rasterize_at(g, units_per_em, 0.0)`。
     ///
     /// 退化输入的定义（都有测试）：
     /// - `ppem <= 0` / `ppem` 是 NaN / `units_per_em == 0` ⇒ `blank(0.0)`；
     /// - 无轮廓字形 ⇒ `blank(advance)`（advance 按 `ppem / units_per_em` 缩放后保留）；
     /// - 轮廓退化到零宽或零高（单点、水平/垂直直线）⇒ `blank(advance)`。
     pub fn rasterize(&self, g: &Glyph, units_per_em: u16) -> GlyphImage {
+        self.rasterize_at(g, units_per_em, 0.0)
+    }
+
+    /// **亚像素水平定位**：把轮廓整体右移 `subpixel_x` 像素后再光栅化。
+    ///
+    /// 用法（调用方的全部算术只有两行）：
+    ///
+    /// ```text
+    /// let (whole, sub) = split_subpixel_x(pen_x, SUBPIXEL_LEVELS);   // 12.6 → (12, 0.5)
+    /// let img = r.rasterize_at(&glyph, upem, sub);                   // 位图里已烘进 0.5px 相位
+    /// blit(img, x = whole + img.left, y = baseline - img.top);
+    /// ```
+    ///
+    /// 语义：
+    /// - `subpixel_x` 期望 `[0,1)`；其它值先 `rem_euclid(1.0)` 归一，**非有限值退回 `0.0`**；
+    /// - 返回的位图 `left` 已经把相位的整数部分吸收掉，所以调用方贴图时**不需要**再四舍五入；
+    /// - `subpixel_x == 0.0` 与 [`Rasterizer::rasterize`] **逐字节相同**（黄金指纹测试钉住）；
+    /// - 位图可能比整数落位**宽 1px**（相位把左边界推进下一列时）；
+    /// - 覆盖率对平移**守恒**（解析面积不变，只差超采样量化 ≤ 0.05%）。
+    ///
+    /// 代价（实测数字见 `tests/text_raster.rs`）：相位离开 0 时边缘更灰 ——
+    /// 「间距精度换边缘锐度」，平均部分覆盖质量上升，墨迹总量不变。
+    pub fn rasterize_at(&self, g: &Glyph, units_per_em: u16, subpixel_x: f32) -> GlyphImage {
+        // 相位归一：非有限值退回 0.0（不 panic，与其它退化输入一致）；
+        // 12.75 → 0.75 —— 相位的整数部分由调用方用 split_subpixel_x 的另一半负责。
+        let sub_x = if subpixel_x.is_finite() {
+            subpixel_x.rem_euclid(1.0)
+        } else {
+            0.0
+        };
         // NaN 也要挡住（`NaN <= 0.0` 是 false，所以要显式判 NaN）。
         // 注意别写成 `!(ppem > 0.0)`：`clippy::neg_cmp_op_on_partial_ord` 会红。
         if units_per_em == 0 || self.ppem.is_nan() || self.ppem <= 0.0 {
@@ -131,9 +203,10 @@ impl Rasterizer {
         }
 
         // ── 紧致位图范围（见模块文档「落位与紧致」）──
-        let left = (x0 * scale).floor();
+        // `+ sub_x` 把亚像素相位算进左右边界：相位把左边界推进下一列时位图宽 1px。
+        let left = (x0 * scale + sub_x).floor();
         let top = (y1 * scale).ceil();
-        let width = (x1 * scale).ceil() - left;
+        let width = (x1 * scale + sub_x).ceil() - left;
         let height = top - (y0 * scale).floor();
         if width < 1.0 || height < 1.0 {
             // 零宽/零高：没有可着墨的像素。
@@ -145,30 +218,32 @@ impl Rasterizer {
         let w = width as u32;
         let h = height as u32;
         let (left_i, top_i) = (left as i32, top as i32);
+        // 位图内部的采样原点：`left - sub_x` ⇒ `px = x*scale - origin_x` 把相位烘进了 coverage。
+        let origin_x = left - sub_x;
 
         // ── 轮廓 → 像素空间折线 → 边表 ──
         let mut edges: Vec<Edge> = Vec::new();
         for c in &g.contours {
-            let start = to_bitmap(c.start, scale, left, top);
+            let start = to_bitmap(c.start, scale, origin_x, top);
             let mut pts: Vec<Point> = vec![start];
             let mut cur = start;
             for seg in &c.segments {
                 match *seg {
                     Segment::Line { to } => {
-                        let p = to_bitmap(to, scale, left, top);
+                        let p = to_bitmap(to, scale, origin_x, top);
                         push_distinct(&mut pts, p);
                         cur = p;
                     }
                     Segment::Quad { ctrl, to } => {
-                        let ctrl_px = to_bitmap(ctrl, scale, left, top);
-                        let p = to_bitmap(to, scale, left, top);
+                        let ctrl_px = to_bitmap(ctrl, scale, origin_x, top);
+                        let p = to_bitmap(to, scale, origin_x, top);
                         flatten_quad(cur, ctrl_px, p, 0, &mut pts);
                         cur = p;
                     }
                     Segment::Cubic { c1, c2, to } => {
-                        let c1_px = to_bitmap(c1, scale, left, top);
-                        let c2_px = to_bitmap(c2, scale, left, top);
-                        let p = to_bitmap(to, scale, left, top);
+                        let c1_px = to_bitmap(c1, scale, origin_x, top);
+                        let c2_px = to_bitmap(c2, scale, origin_x, top);
+                        let p = to_bitmap(to, scale, origin_x, top);
                         flatten_cubic(cur, c1_px, c2_px, p, 0, &mut pts);
                         cur = p;
                     }
@@ -214,6 +289,22 @@ impl Rasterizer {
         }
 
         GlyphImage::new(w, h, left_i, top_i, advance, coverage)
+    }
+
+    /// 字符 → 字形 → 覆盖率图（**亚像素版**：见 [`Rasterizer::rasterize_at`]）。
+    ///
+    /// `cmap` 里没有这个字符时返回 `Ok(None)`（与整数版语义完全一致）。
+    pub fn rasterize_char_at(
+        &self,
+        font: &Font,
+        ch: char,
+        subpixel_x: f32,
+    ) -> GpuResult<Option<GlyphImage>> {
+        let Some(glyph_index) = font.glyph_index(ch)? else {
+            return Ok(None);
+        };
+        let g = font.glyph(glyph_index)?;
+        Ok(Some(self.rasterize_at(&g, font.units_per_em, subpixel_x)))
     }
 
     /// 字符 → 字形 → 覆盖率图。

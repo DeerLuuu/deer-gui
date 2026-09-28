@@ -13,7 +13,7 @@
 
 use deer_gpu::font::{Contour, Font, Glyph, Segment};
 use deer_gpu::glyph::GlyphImage;
-use deer_gpu::raster::Rasterizer;
+use deer_gpu::raster::{split_subpixel_x, Rasterizer, SUBPIXEL_LEVELS};
 
 // ───────────────────────── 手工构造字形的工具 ─────────────────────────
 
@@ -581,5 +581,777 @@ fn system_font_glyphs_are_plausible() {
             .expect("查询不该报错")
             .is_none(),
         "私用区字符不该有字形"
+    );
+}
+
+// ═══════════ 亚像素水平定位 / hinting 决策 —— 判据与实测记录 ═══════════
+
+/// FNV-1a 64 位：把 `GlyphImage` 的全部字段（含 advance 的位模式、coverage 逐字节）折成一个数。
+fn digest(img: &GlyphImage) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut eat = |b: u8| {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x100_0000_01b3);
+    };
+    for v in [
+        img.width,
+        img.height,
+        img.left as u32,
+        img.top as u32,
+        img.advance.to_bits(),
+        img.coverage.len() as u32,
+    ] {
+        for b in v.to_le_bytes() {
+            eat(b);
+        }
+    }
+    for &c in &img.coverage {
+        eat(c);
+    }
+    h
+}
+
+/// 合成语料（与机器无关）：**默认路径**的黄金指纹。
+///
+/// 指纹是在**改代码之前**、在干净的工作树上 dump 出来的（数值与命令见
+/// `.superpowers/sdd/hinting-report.md`）。它钉的是本任务最容易翻车的一点：
+/// 加了亚像素定位之后，**旧默认路径必须逐字节不变**。
+/// 任何改动默认路径采样数学的动作（相位、四舍五入、y 翻转、展平容差、超采样网格）
+/// 都会让指纹变红 —— 这是「旧默认不变」的证据，而不是靠人眼比对。
+#[test]
+fn legacy_default_path_output_is_byte_frozen() {
+    // (名字, 字形, upem, ppem, 期望指纹（干净树上 dump）)
+    let cases: Vec<(&str, Glyph, u16, f32, u64)> = vec![
+        (
+            "square_0_10",
+            glyph(vec![square_ccw(0.0, 0.0, 10.0)], 10),
+            10,
+            10.0,
+            0x299a_36f0_db60_10a4,
+        ),
+        (
+            "square_half",
+            glyph(vec![square_ccw(0.5, 0.5, 10.0)], 10),
+            10,
+            10.0,
+            0xcf5b_572a_35f0_5d25,
+        ),
+        (
+            "hole_opposite",
+            glyph(vec![square_ccw(0.0, 0.0, 10.0), square_cw(3.0, 3.0, 4.0)], 10),
+            10,
+            10.0,
+            0xda42_b85e_960f_c1b4,
+        ),
+        (
+            "hole_same",
+            glyph(vec![square_ccw(0.0, 0.0, 10.0), square_ccw(3.0, 3.0, 4.0)], 10),
+            10,
+            10.0,
+            0x299a_36f0_db60_10a4,
+        ),
+        (
+            "triangle",
+            glyph(vec![polygon(&[(0.0, 0.0), (10.0, 0.0), (5.0, 10.0)])], 10),
+            10,
+            10.0,
+            0xedc4_ebe1_fb62_c99e,
+        ),
+        (
+            "quad_circle",
+            glyph(vec![quad_circle(40.0)], 80),
+            100,
+            40.0,
+            0xfc65_05a7_bc36_a53c,
+        ),
+        (
+            "cubic_circle",
+            glyph(vec![cubic_circle(40.0)], 80),
+            100,
+            40.0,
+            0xa19c_405f_4219_6cc0,
+        ),
+        (
+            "blank",
+            glyph(Vec::new(), 500),
+            1000,
+            20.0,
+            0x0e0f_a0ee_188e_8a42,
+        ),
+        (
+            "odd_ppem",
+            glyph(vec![quad_circle(40.0)], 80),
+            100,
+            23.5,
+            0xabf2_8382_2918_0ecc,
+        ),
+    ];
+    let mut checked = 0;
+    for (name, g, upem, ppem, want) in cases {
+        let img = Rasterizer::new(ppem).rasterize(&g, upem);
+        assert_eq!(
+            digest(&img),
+            want,
+            "{name}: 默认路径输出变了（w={} h={} left={} top={} adv={} sum={}）—— \
+             新功能必须是新路径，不许动旧数学",
+            img.width,
+            img.height,
+            img.left,
+            img.top,
+            img.advance,
+            img.coverage_sum()
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, 9, "前置条件：9 个合成语料都要被检查");
+}
+
+/// 模拟「垂直两极网格对齐」：把 y ∈ [y_min, y_max] 线性映射到像素行 [a, b]（a、b 为整数）。
+fn grid_fit_glyph_y(g: &Glyph, scale: f32) -> Option<(Glyph, f32)> {
+    let (_, y0, _, y1) = g.outline_bbox()?;
+    // NaN 也要挡住（`y1 <= y0` 对 NaN 为 false），否则下面的比例会算出 NaN。
+    if y1.is_nan() || y0.is_nan() || y1 <= y0 {
+        return None;
+    }
+    let a = (y0 * scale).round();
+    let mut b = (y1 * scale).round();
+    if b <= a {
+        b = a + 1.0;
+    }
+    let k = (b - a) / (y1 - y0); // 新的「像素/字体单位」比例
+    let ratio = k / scale; // 相对原比例的形变
+    let m = |p: (f32, f32)| (p.0, a / scale + (p.1 - y0) * k / scale);
+    Some((
+        Glyph {
+            contours: g
+                .contours
+                .iter()
+                .map(|c| Contour {
+                    start: m(c.start),
+                    segments: c
+                        .segments
+                        .iter()
+                        .map(|s| match *s {
+                            Segment::Line { to } => Segment::Line { to: m(to) },
+                            Segment::Quad { ctrl, to } => Segment::Quad {
+                                ctrl: m(ctrl),
+                                to: m(to),
+                            },
+                            Segment::Cubic { c1, c2, to } => Segment::Cubic {
+                                c1: m(c1),
+                                c2: m(c2),
+                                to: m(to),
+                            },
+                        })
+                        .collect(),
+                })
+                .collect(),
+            bbox: g.bbox,
+            advance_width: g.advance_width,
+            left_side_bearing: g.left_side_bearing,
+        },
+        ratio,
+    ))
+}
+
+/// 墨迹质量（Σ coverage / 255，单位 px²）。
+fn ink_mass(img: &GlyphImage) -> f32 {
+    img.coverage_sum() as f32 / 255.0
+}
+
+/// 部分覆盖（0 < c < 255）的墨迹质量。
+fn partial_mass(img: &GlyphImage) -> f32 {
+    img.coverage
+        .iter()
+        .filter(|&&c| c > 0 && c < 255)
+        .map(|&c| c as f32 / 255.0)
+        .sum()
+}
+
+/// coverage 的 x 质心（像素，相对位图左边缘）。
+fn centroid_x(img: &GlyphImage) -> f32 {
+    let mut num = 0.0f64;
+    let mut den = 0.0f64;
+    for y in 0..img.height {
+        for x in 0..img.width {
+            let c = img.coverage_at(x, y) as f64 / 255.0;
+            num += c * (x as f64 + 0.5);
+            den += c;
+        }
+    }
+    if den == 0.0 { 0.0 } else { (num / den) as f32 }
+}
+
+/// 小数笔位置 → (整数落位, 1/4 像素偏移)：量化、**进位**、退化输入。
+///
+/// 会让这条变红的实现改动：丢掉 `q == 1.0` 的进位（12.9 会被落成 12 + 1.0 → 误差 0.9px）。
+#[test]
+fn split_subpixel_x_quantizes_and_carries() {
+    assert_eq!(
+        SUBPIXEL_LEVELS, 4,
+        "默认档位是 1/4 像素（与 FreeType / Skia 同量级）"
+    );
+    // 前置条件：1/4 的倍数是 f32 精确值 ⇒ 可以用逐位相等断言
+    assert_eq!(0.25f32 + 0.25 + 0.25, 0.75);
+
+    // 相位就近量化
+    assert_eq!(split_subpixel_x(12.0, SUBPIXEL_LEVELS), (12, 0.0));
+    assert_eq!(split_subpixel_x(12.1, SUBPIXEL_LEVELS), (12, 0.0));
+    assert_eq!(split_subpixel_x(12.25, SUBPIXEL_LEVELS), (12, 0.25));
+    assert_eq!(split_subpixel_x(12.5, SUBPIXEL_LEVELS), (12, 0.5));
+    assert_eq!(split_subpixel_x(12.6, SUBPIXEL_LEVELS), (12, 0.5));
+    assert_eq!(split_subpixel_x(12.75, SUBPIXEL_LEVELS), (12, 0.75));
+    assert_eq!(
+        split_subpixel_x(12.9, SUBPIXEL_LEVELS),
+        (13, 0.0),
+        "四舍五入到整数像素时必须进位（否则落位误差接近 1px）"
+    );
+    // 负数：floor + 相位，仍然满足「整数部分 + 相位 ≈ 原值」
+    assert_eq!(split_subpixel_x(-0.25, SUBPIXEL_LEVELS), (-1, 0.75));
+    // levels = 1 ⇒ 只能取整；levels = 0 视为 1
+    assert_eq!(split_subpixel_x(12.6, 1), (13, 0.0));
+    assert_eq!(split_subpixel_x(12.6, 0), (13, 0.0));
+    // 非有限输入：确定地退回 (0, 0.0)，不 panic
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert_eq!(
+            split_subpixel_x(bad, SUBPIXEL_LEVELS),
+            (0, 0.0),
+            "非有限输入 {bad}"
+        );
+    }
+
+    // 不变式（1000 个采样）：落位误差 ≤ 半个档位 = 1/8 px
+    let mut worst = 0.0f32;
+    let mut n = 0;
+    for i in 0..1000 {
+        let pen = -50.0 + i as f32 * 0.1234;
+        let (whole, sub) = split_subpixel_x(pen, SUBPIXEL_LEVELS);
+        worst = worst.max((whole as f32 + sub - pen).abs());
+        n += 1;
+    }
+    assert_eq!(n, 1000, "前置条件：跑满 1000 个采样");
+    assert!(worst <= 0.125 + 1e-6, "落位误差上界是 1/8 px，实测最坏 {worst}");
+}
+
+/// `subpixel_x = 0.0` 必须与默认路径**逐字段相同**（新开关不许悄悄改旧数学）。
+#[test]
+fn rasterize_at_zero_offset_equals_default_path() {
+    let cases: Vec<(&str, Glyph, u16, f32)> = vec![
+        ("square", glyph(vec![square_ccw(0.0, 0.0, 10.0)], 10), 10, 10.0),
+        (
+            "hole",
+            glyph(vec![square_ccw(0.0, 0.0, 10.0), square_cw(3.0, 3.0, 4.0)], 10),
+            10,
+            10.0,
+        ),
+        ("quad_circle", glyph(vec![quad_circle(40.0)], 80), 100, 23.5),
+        ("blank", glyph(Vec::new(), 500), 1000, 20.0),
+    ];
+    let mut checked = 0;
+    for (name, g, upem, ppem) in &cases {
+        let r = Rasterizer::new(*ppem);
+        assert_eq!(
+            r.rasterize(g, *upem),
+            r.rasterize_at(g, *upem, 0.0),
+            "{name}: subpixel_x=0 必须与默认路径逐字段相同（含 coverage 逐字节）"
+        );
+        checked += 1;
+    }
+    // -0.0 也必须落到同一条路径
+    assert_eq!(
+        Rasterizer::new(10.0).rasterize_at(&cases[0].1, 10, -0.0),
+        Rasterizer::new(10.0).rasterize_at(&cases[0].1, 10, 0.0)
+    );
+    checked += 1;
+
+    // 真实字体也验一遍（真实字形的 left/top/advance 路径）
+    if let Some((name, data)) = system_font() {
+        let font = Font::parse(data).expect("解析");
+        let r = Rasterizer::new(16.0);
+        for ch in ['l', 'o', 'H'] {
+            let a = r.rasterize_char(&font, ch).expect("查").expect("字形");
+            let b = r.rasterize_char_at(&font, ch, 0.0).expect("查").expect("字形");
+            assert_eq!(
+                a, b,
+                "{name} '{ch}': 字符路径上 subpixel_x=0 也必须逐字段相同"
+            );
+            checked += 1;
+        }
+    } else {
+        eprintln!("[部分跳过] 没有系统字体：真实字形那一半断言没有执行（不是通过）");
+    }
+    assert!(checked >= 5, "前置条件：至少 5 个组合，实际 {checked}");
+}
+
+/// 亚像素偏移把墨迹**整体平移**那么多：画布上的质心位移 = 偏移量；墨迹质量守恒。
+#[test]
+fn subpixel_offset_translates_ink_by_the_fractional_amount() {
+    let g = glyph(vec![square_ccw(0.0, 0.0, 10.0)], 10);
+    let r = Rasterizer::new(10.0);
+    let base = r.rasterize(&g, 10);
+    let base_mass = ink_mass(&base);
+    let base_canvas = base.left as f32 + centroid_x(&base);
+    assert_eq!(base_canvas, 5.0, "前置条件：单位正方形质心在 5.0");
+
+    let mut n = 0;
+    for &phi in &[0.25f32, 0.5, 0.75] {
+        let img = r.rasterize_at(&g, 10, phi);
+        let canvas = img.left as f32 + centroid_x(&img);
+        assert!(
+            (canvas - (5.0 + phi)).abs() <= 0.01,
+            "phi={phi}: 画布上的墨迹质心 {canvas} 应≈{}（平移必须真的发生）",
+            5.0 + phi
+        );
+        assert!(
+            (ink_mass(&img) - base_mass).abs() <= 0.1,
+            "phi={phi}: 墨迹质量 {} 应≈{base_mass}（解析覆盖率对平移不变，只差超采样量化）",
+            ink_mass(&img)
+        );
+        assert_ne!(img.coverage, base.coverage, "phi={phi}: 平移必须真的改变覆盖率");
+        n += 1;
+    }
+    assert_eq!(n, 3, "前置条件：3 个相位都测了");
+    // 0.25 与 0.75 是镜像相位，输出不能相同（否则说明相位被吞掉了）
+    assert_ne!(r.rasterize_at(&g, 10, 0.25), r.rasterize_at(&g, 10, 0.75));
+    // 相位把左边界推进下一列时，位图允许比默认宽 1px（文档化的代价）
+    assert_eq!(r.rasterize_at(&g, 10, 0.25).width, 11);
+
+    // 真实字形：相对质心位移同样 ≈ 相位。
+    // 注意：ss×ss 超采样把覆盖率量化到 1/ss²，所以**质心**里有一点量化噪声 ——
+    // 默认 ss=4 上实测最坏 ~0.03px。为了证明这确实是量化噪声而不是平移 bug，
+    // 同一组断言在 ss=16 上再跑一遍：偏差必须显著变小。
+    if let Some((name, data)) = system_font() {
+        let font = Font::parse(data).expect("解析");
+        let mut worst = [0.0f32, 0.0f32];
+        for (idx, (ss, label, tol)) in [(4u32, "默认 ss=4", 0.10f32), (16, "ss=16", 0.06)]
+            .into_iter()
+            .enumerate()
+        {
+            let r = Rasterizer::with_supersample(16.0, ss);
+            let mut checked = 0;
+            let mut local_worst = 0.0f32;
+            for ch in ['l', 'o', 'H'] {
+                let Some(gi) = font.glyph_index(ch).expect("查") else {
+                    continue;
+                };
+                let g = font.glyph(gi).expect("取");
+                let b = r.rasterize(&g, font.units_per_em);
+                let bc = b.left as f32 + centroid_x(&b);
+                assert!(b.height > 3, "前置条件：'{ch}' 必须有真实高度");
+                for &phi in &[0.25f32, 0.5, 0.75] {
+                    let img = r.rasterize_at(&g, font.units_per_em, phi);
+                    let c = img.left as f32 + centroid_x(&img);
+                    let dev = (c - bc - phi).abs();
+                    assert!(
+                        dev <= tol,
+                        "{name} '{ch}' phi={phi} [{label}]: 质心位移偏差 {dev:.4} 应 ≤ {tol}"
+                    );
+                    local_worst = local_worst.max(dev);
+                    checked += 1;
+                }
+            }
+            assert!(checked >= 9, "前置条件：真实字形至少 9 个组合，实际 {checked}");
+            worst[idx] = local_worst;
+        }
+        eprintln!(
+            "[质心位移偏差 @16px] {name}: ss=4 最坏 {:.4}px；ss=16 最坏 {:.4}px（细化后必须更小）",
+            worst[0], worst[1]
+        );
+        assert!(
+            worst[1] < worst[0],
+            "细化超采样必须把质心偏差压小（证明偏差来自覆盖率量化，不是平移算错）：ss=4 {:.4} vs ss=16 {:.4}",
+            worst[0],
+            worst[1]
+        );
+    } else {
+        eprintln!("[部分跳过] 没有系统字体：真实字形的质心位移断言没有执行（不是通过）");
+    }
+}
+
+/// 字符路径与字形路径同源；`cmap` 未命中仍然返回 `None`（亚像素不改变这条语义）。
+#[test]
+fn rasterize_char_at_matches_glyph_path_and_keeps_none_semantics() {
+    let Some((name, data)) = system_font() else {
+        eprintln!("[跳过] 没有系统字体：字符路径一致性断言没有执行（不是通过）");
+        return;
+    };
+    let font = Font::parse(data).expect("解析");
+    let r = Rasterizer::new(16.0);
+    let mut n = 0;
+    for ch in ['l', 'H', 'o', '.'] {
+        let Some(gi) = font.glyph_index(ch).expect("查") else {
+            continue;
+        };
+        let g = font.glyph(gi).expect("取");
+        for &phi in &[0.0f32, 0.25, 0.5, 0.75] {
+            let a = r
+                .rasterize_char_at(&font, ch, phi)
+                .expect("查询不该报错")
+                .expect("应有字形");
+            let b = r.rasterize_at(&g, font.units_per_em, phi);
+            assert_eq!(a, b, "{name} '{ch}' phi={phi}: 字符路径必须与字形路径一致");
+            n += 1;
+        }
+    }
+    assert!(n >= 16, "前置条件：至少 16 个组合，实际 {n}");
+    assert!(
+        r.rasterize_char_at(&font, '\u{E000}', 0.25)
+            .expect("查询不该报错")
+            .is_none(),
+        "cmap 未命中在亚像素路径上仍须返回 None（不许退回空位图）"
+    );
+}
+
+/// 统计落位误差 / 相邻间距误差：`(落位 RMSE, 落位最坏, 间距 RMSE, 间距最坏)`。
+fn placement_errors(advance: f32, n: usize, place: impl Fn(f32) -> f32) -> (f64, f64, f64, f64) {
+    let (mut se, mut mx, mut gse, mut gmx) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let mut prev = 0.0f32;
+    for k in 1..=n {
+        let pen = k as f32 * advance;
+        let x = place(pen);
+        let e = (x - pen) as f64;
+        se += e * e;
+        mx = mx.max(e.abs());
+        if k > 1 {
+            let ge = (x - prev - advance) as f64;
+            gse += ge * ge;
+            gmx = gmx.max(ge.abs());
+        }
+        prev = x;
+    }
+    (
+        (se / n as f64).sqrt(),
+        mx,
+        (gse / (n - 1) as f64).sqrt(),
+        gmx,
+    )
+}
+
+/// **清晰度/节奏的前后数字**：小数 advance 下，整数落位 vs 1/4 亚像素落位。
+///
+/// 判据用**生产代码** `split_subpixel_x`（不是测试里重写一遍量化）：
+/// - 整数落位：落位 RMSE ≈ 1/√12 ≈ 0.2887，最坏 0.5px；相邻间距误差最坏可达 ~1px；
+/// - 1/4 落位：落位 RMSE ≈ 0.072，最坏 0.125px；相邻间距误差最坏 ≤ 0.25px。
+#[test]
+fn subpixel_placement_reduces_spacing_error_measured() {
+    let mut advs: Vec<(String, f32)> = vec![
+        (
+            "合成 8.796875（consola@16px 的 advance）".to_string(),
+            8.796875,
+        ),
+        (
+            "合成 17.59375（consola@32px 的 advance）".to_string(),
+            17.59375,
+        ),
+    ];
+    if let Some((name, data)) = system_font() {
+        let font = Font::parse(data).expect("解析");
+        let mut seen = 0;
+        for px in [16.0f32, 32.0] {
+            if let Some(gi) = font.glyph_index('H').expect("查") {
+                let a = font.glyph(gi).expect("取").advance_width as f32 * px
+                    / font.units_per_em as f32;
+                advs.push((format!("{name} 'H'@{px}px 实测 advance {a}"), a));
+                seen += 1;
+            }
+        }
+        assert_eq!(seen, 2, "前置条件：系统字体两档 advance 取样");
+    } else {
+        eprintln!("[部分跳过] 没有系统字体：真实 advance 那两组没有执行（不是通过）");
+    }
+
+    let n = 64usize;
+    let mut ratios = Vec::new();
+    for (label, adv) in &advs {
+        let frac = adv.fract();
+        assert!(
+            frac > 0.05 && frac < 0.95,
+            "前置条件：{label} 的 advance 必须有明显小数部分（实测 {adv}）—— 否则这条判据是空话"
+        );
+        let (ri, mi, gi_, gmi) = placement_errors(*adv, n, |pen| pen.round());
+        let (rq, mq, gq, gmq) = placement_errors(*adv, n, |pen| {
+            let (whole, sub) = split_subpixel_x(pen, SUBPIXEL_LEVELS);
+            // `rasterize_at` 内部会把相位 `rem_euclid(1.0)` 归一，所以「有效落位」是
+            // 整数部分 + 归一后的相位 —— 这也正是 `split_subpixel_x` 必须**进位**的原因。
+            whole as f32 + sub.rem_euclid(1.0)
+        });
+        eprintln!(
+            "[落位] {label}（n={n}）：整数 RMSE={ri:.4} max={mi:.4} 间距 RMSE={gi_:.4} max={gmi:.4} \
+             → 1/4 RMSE={rq:.4} max={mq:.4} 间距 RMSE={gq:.4} max={gmq:.4}（落位 RMSE 改善 {:.2}×）",
+            ri / rq
+        );
+        assert!(ri > 0.25, "整数落位 RMSE 应≈0.2887，实测 {ri}");
+        assert!(rq < 0.09, "1/4 落位 RMSE 应≈0.072，实测 {rq}");
+        assert!(
+            ri / rq >= 3.5,
+            "落位 RMSE 至少改善 3.5×，实测 {:.2}×",
+            ri / rq
+        );
+        assert!(mq <= 0.125 + 1e-6, "1/4 落位最坏误差应 ≤ 1/8 px，实测 {mq}");
+        assert!(gmq <= 0.25 + 1e-6, "相邻间距误差最坏应 ≤ 1/4 px，实测 {gmq}");
+        assert!(
+            gmi > 0.5,
+            "整数落位的相邻间距误差最坏应 > 0.5px（这正是要修的问题），实测 {gmi}"
+        );
+        ratios.push(ri / rq);
+    }
+    assert!(ratios.len() >= 2, "前置条件：至少 2 组 advance");
+}
+
+/// **端到端落位忠实性**：真的调光栅化器，而不是在测试里重算算术。
+///
+/// 正方形（units 0..10、upem=10、ppem=10）的墨迹质心解析上就在 `pen + 5.0`。
+/// 用 `split_subpixel_x` + `rasterize_at` 落位后，画布质心与它的偏差必须只剩
+/// 覆盖率的量化/抗锯齿噪声（≤ 1/8 px 档位 + 一点）；整数落位则必然有 ≤ 0.5px 的误差。
+///
+/// 会变红的实现改动：① 相位被吞（`sub_x = 0`）⇒ 偏差退化成整数落位的量级；
+/// ② `split_subpixel_x` 丢掉进位 ⇒ 相位 1.0 被 `rasterize_at` 归一成 0，落位差整 1px；
+/// ③ `rasterize_at` 里采样原点用 `left` 而不是 `left - sub_x` ⇒ 位图边界动了但墨迹没动。
+#[test]
+fn subpixel_placement_is_faithful_end_to_end() {
+    let g = glyph(vec![square_ccw(0.0, 0.0, 10.0)], 10);
+    let r = Rasterizer::new(10.0);
+    let adv = 8.796875f32; // 小数 advance（consola @16px 的实测值）
+    let n = 64usize;
+    let mut worst_sub = 0.0f32;
+    let mut worst_int = 0.0f32;
+    for k in 0..n {
+        let pen = k as f32 * adv;
+        // 亚像素：split_subpixel_x + rasterize_at（生产路径）
+        let (whole, sub) = split_subpixel_x(pen, SUBPIXEL_LEVELS);
+        let img = r.rasterize_at(&g, 10, sub);
+        let canvas = whole as f32 + img.left as f32 + centroid_x(&img);
+        worst_sub = worst_sub.max((canvas - (pen + 5.0)).abs());
+        // 整数：pen.round() + 整数落位位图
+        let base = r.rasterize(&g, 10);
+        let canvas_i = pen.round() + base.left as f32 + centroid_x(&base);
+        worst_int = worst_int.max((canvas_i - (pen + 5.0)).abs());
+    }
+    eprintln!(
+        "[端到端落位] n={n}：亚像素最坏 {worst_sub:.4}px，整数最坏 {worst_int:.4}px（理论整数上界 0.5）"
+    );
+    assert!(
+        worst_sub <= 0.15,
+        "亚像素落位偏差应只剩「相位量化到 1/4」的噪声（≤1/8px 再加一点抗锯齿），实测 {worst_sub}"
+    );
+    assert!(
+        worst_int > 0.2,
+        "整数落位必须有可见的落位误差（这正是要修的），实测 {worst_int}"
+    );
+    assert!(
+        worst_sub < worst_int / 3.0,
+        "亚像素应把端到端落位误差压到整数的 1/3 以下：{worst_sub} vs {worst_int}"
+    );
+}
+
+/// **诚实记录代价**：亚像素定位把「每字形一个固定相位」变成「按笔位置分布的 4 个相位」，
+/// 相位越靠近 0.5，边缘越灰（同样的墨迹摊到两列）⇒ **部分覆盖质量上升**。
+///
+/// 这条**不**声称清晰度提升：它把「间距正确性」的代价钉成可数的数字，免得报告里
+/// 只讲 4× 间距改善、不提边缘变灰。墨迹质量（Σ coverage）必须仍然守恒（< 1% 漂移）。
+#[test]
+fn subpixel_phase_spread_trades_edge_sharpness_measured() {
+    let Some((name, data)) = system_font() else {
+        eprintln!("[跳过] 没有系统字体：相位边缘灰阶代价没有测量（不是通过）");
+        return;
+    };
+    let font = Font::parse(data).expect("解析");
+    let px = 16.0f32;
+    let r = Rasterizer::new(px);
+    let mut samples = 0;
+    let mut worst_spread = 0.0f32;
+    let mut worst_drift = 0.0f32;
+    let mut worst_edge_penalty = 0.0f32;
+    for ch in ['l', 'H', 'o', 'e'] {
+        let Some(gi) = font.glyph_index(ch).expect("查") else {
+            continue;
+        };
+        let g = font.glyph(gi).expect("取");
+        let mut ratios = Vec::new();
+        let mut masses = Vec::new();
+        for &phi in &[0.0f32, 0.25, 0.5, 0.75] {
+            let img = r.rasterize_at(&g, font.units_per_em, phi);
+            let m = ink_mass(&img);
+            assert!(m > 1.0, "前置条件：'{ch}' 必须有墨（phi={phi}，mass={m}）");
+            ratios.push(partial_mass(&img) / m);
+            masses.push(m);
+        }
+        let fixed = ratios[0]; // 整数落位 = 该字形的自然相位（phi = 0）
+        let mean = ratios.iter().sum::<f32>() / ratios.len() as f32;
+        let hi = ratios.iter().cloned().fold(f32::MIN, f32::max);
+        let lo = ratios.iter().cloned().fold(f32::MAX, f32::min);
+        let drift = masses.iter().cloned().fold(f32::MIN, f32::max)
+            / masses.iter().cloned().fold(f32::MAX, f32::min)
+            - 1.0;
+        eprintln!(
+            "[{name} '{ch}' @{px}px] 部分覆盖质量：固定相位 {fixed:.3} → 4 相位均值 {mean:.3}\
+             （{:+.1}%），区间 [{lo:.3}, {hi:.3}]；墨迹质量漂移 {:.2}%",
+            (mean / fixed - 1.0) * 100.0,
+            drift * 100.0
+        );
+        assert!(
+            hi - lo > 0.05,
+            "四个相位的边缘灰阶必须真的不同（否则这条「代价」是空话）：'{ch}' 区间 [{lo:.3}, {hi:.3}]"
+        );
+        assert!(
+            drift.abs() < 0.01,
+            "墨迹质量对相位守恒（漂移应 <1%），'{ch}' 实测 {:.2}%",
+            drift * 100.0
+        );
+        worst_spread = worst_spread.max(hi - lo);
+        worst_drift = worst_drift.max(drift.abs());
+        worst_edge_penalty = worst_edge_penalty.max(mean / fixed - 1.0);
+        samples += 1;
+    }
+    assert!(samples >= 3, "前置条件：至少 3 个字形，实际 {samples}");
+    eprintln!(
+        "[汇总 @{px}px] 相位造成的部分覆盖质量最大摆幅 {worst_spread:.3}；\
+         固定相位→4 相位均值的最大代价 {:+.1}%；墨迹质量最大漂移 {:.2}%",
+        worst_edge_penalty * 100.0,
+        worst_drift * 100.0
+    );
+}
+
+/// 亚像素路径的确定性：同输入两次逐字节相同；相位按 mod 1 归一；非法输入退回默认相位。
+#[test]
+fn subpixel_path_is_deterministic() {
+    let g = glyph(vec![quad_circle(40.0)], 80);
+    let r = Rasterizer::new(23.5);
+    let mut n = 0;
+    for phi in [
+        0.0f32,
+        0.25,
+        0.5,
+        0.75,
+        1.0,
+        -0.25,
+        12.75,
+        f32::NAN,
+        f32::INFINITY,
+    ] {
+        let a = r.rasterize_at(&g, 100, phi);
+        let b = r.rasterize_at(&g, 100, phi);
+        assert_eq!(a, b, "phi={phi}: 两次必须逐字段相同");
+        assert_eq!(a.coverage, b.coverage, "phi={phi}: coverage 必须逐字节相同");
+        n += 1;
+    }
+    assert_eq!(n, 9, "前置条件：9 个相位（含非法/超范围）都测了");
+    // 归一化：mod 1；非有限 → 0
+    assert_eq!(r.rasterize_at(&g, 100, 1.0), r.rasterize_at(&g, 100, 0.0));
+    assert_eq!(r.rasterize_at(&g, 100, 12.75), r.rasterize_at(&g, 100, 0.75));
+    assert_eq!(r.rasterize_at(&g, 100, -0.25), r.rasterize_at(&g, 100, 0.75));
+    assert_eq!(r.rasterize_at(&g, 100, f32::NAN), r.rasterize_at(&g, 100, 0.0));
+    assert_eq!(
+        r.rasterize_at(&g, 100, f32::INFINITY),
+        r.rasterize_at(&g, 100, 0.0)
+    );
+    // 四个档位必须给出四个不同结果（否则相位没参与采样）
+    let q = [0.0f32, 0.25, 0.5, 0.75].map(|p| r.rasterize_at(&g, 100, p));
+    assert_ne!(q[0], q[1], "0 与 0.25 档必须不同");
+    assert_ne!(q[1], q[2], "0.25 与 0.5 档必须不同");
+    assert_ne!(q[2], q[3], "0.5 与 0.75 档必须不同");
+}
+
+/// **hinting 决策的实测依据**：为什么这一轮**不交**简化网格对齐（不是半成品，是不划算）。
+///
+/// 我把最省的 hinting-lite —— 「把字形垂直两极 `y_min`/`y_max` 对齐到整数像素行」——
+/// 实现在测试里（[`grid_fit_glyph_y`]，**不进产品路径**）并在 consola 上量了 8 个字号 × 6 个字形：
+///
+/// - **声称的收益成立**：极值行确实贴到网格上（下面显式断言 `top`/`height` 都是整数）。
+/// - **代价**：为了对齐两极必须把整条轮廓垂直缩放 `ratio`（9px 上实测形变 12.5%），
+///   这一缩放会把字形**内部**的水平边缘（x-height、横杠）推离网格 ⇒
+///   「部分覆盖质量占比」逐例在 −10%..+13% 之间大幅摆动，**均值没有净收益**。
+/// - 结论：极值对齐不是「文本清晰度」的可数改善；真正的 TrueType hinting 需要指令虚拟机 +
+///   stem 识别 + CVT，是另一个量级的工程 ⇒ **本轮登记不做**，并把这份数据留成决策记录。
+#[test]
+fn simplified_vertical_extent_gridfit_is_not_shipped_measured() {
+    let Some((name, data)) = system_font() else {
+        eprintln!("[跳过] 没有系统字体：hinting 决策的实测依据没有采集（不是通过）");
+        return;
+    };
+    let font = Font::parse(data).expect("解析");
+    let mut deltas = Vec::new();
+    let mut max_distortion = 0.0f32;
+    let mut extremes_aligned = 0usize;
+    for px in [9.0f32, 10.0, 11.0, 12.0, 13.0, 16.0, 20.0, 32.0] {
+        let scale = px / font.units_per_em as f32;
+        let r = Rasterizer::new(px);
+        for ch in ['x', 'H', 'o', 'e', 'n', 'g'] {
+            let Some(gi) = font.glyph_index(ch).expect("查") else {
+                continue;
+            };
+            let g = font.glyph(gi).expect("取");
+            let before = r.rasterize(&g, font.units_per_em);
+            let (gf, ratio) = grid_fit_glyph_y(&g, scale).expect("前置条件：字形有 bbox");
+            let after = r.rasterize(&gf, font.units_per_em);
+
+            // 声称的收益：极值行确实贴到整数像素行。
+            // 注意要走一遍 f32 往返（字体单位 → 像素），所以只能断到 1e-3 px；
+            // `after.top` 偶尔会比整数多 1（恰好 ceil 到一个 1e-6 的余量上），故允许 ±1。
+            let (_, ny0, _, ny1) = gf.outline_bbox().expect("前置条件：变换后仍有轮廓");
+            let (ny0_px, ny1_px) = (ny0 * scale, ny1 * scale);
+            assert!(
+                (ny1_px - ny1_px.round()).abs() < 1e-3,
+                "{name} '{ch}'@{px}px: 对齐后顶边必须落在整数像素行（实测小数部分 {:.6}）",
+                ny1_px.fract()
+            );
+            assert!(
+                (ny0_px - ny0_px.round()).abs() < 1e-3,
+                "{name} '{ch}'@{px}px: 对齐后底边必须落在整数像素行（实测小数部分 {:.6}）",
+                ny0_px.fract()
+            );
+            assert!(
+                (after.top as f32 - ny1_px.round()).abs() <= 1.0,
+                "{name} '{ch}'@{px}px: 对齐后 `top`({}) 应≈整数行 {}",
+                after.top,
+                ny1_px.round()
+            );
+            extremes_aligned += 1;
+
+            let b = partial_mass(&before) / ink_mass(&before).max(1e-6);
+            let a = partial_mass(&after) / ink_mass(&after).max(1e-6);
+            deltas.push(a - b);
+            max_distortion = max_distortion.max((ratio - 1.0).abs());
+        }
+    }
+    assert!(
+        deltas.len() >= 40,
+        "前置条件：样本数应 ≥ 40（8 字号 × 6 字形），实际 {}",
+        deltas.len()
+    );
+    assert_eq!(extremes_aligned, deltas.len(), "前置条件：每个样本都验了极值对齐");
+    let mean = deltas.iter().sum::<f32>() / deltas.len() as f32;
+    let lo = deltas.iter().cloned().fold(f32::MAX, f32::min);
+    let hi = deltas.iter().cloned().fold(f32::MIN, f32::max);
+    eprintln!(
+        "[hinting 决策 @{name}] 极值网格对齐：部分覆盖质量占比逐例变化 均值 {:+.1}%、区间 [{:+.1}%, {:+.1}%]；\
+         最大垂直形变 {:.1}%；样本 {}（极值对齐 {extremes_aligned} 例全部成立）",
+        mean * 100.0,
+        lo * 100.0,
+        hi * 100.0,
+        max_distortion * 100.0,
+        deltas.len()
+    );
+    assert!(
+        mean.abs() <= 0.02,
+        "若这条红了说明极值网格对齐现在有净收益了，应重新评估是否实现：实测均值 {:+.1}%（区间 [{:+.1}%, {:+.1}%]）",
+        mean * 100.0,
+        lo * 100.0,
+        hi * 100.0
+    );
+    assert!(
+        hi - lo >= 0.10,
+        "前置条件：这条「不划算」的结论建立在逐例大幅摆动上（实测摆幅 {:.1}%）",
+        (hi - lo) * 100.0
+    );
+    assert!(
+        max_distortion >= 0.05,
+        "前置条件：极值对齐必须真的带来可见的形变（实测最大 {:.1}%）",
+        max_distortion * 100.0
+    );
+    assert!(
+        deltas.len() == 48,
+        "前置条件：consola 上 8 字号 × 6 字形都应有字形，实际 {}",
+        deltas.len()
     );
 }
