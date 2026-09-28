@@ -247,6 +247,20 @@ docs(m3a): GPU geometry guide + gpu_geometry example + FEATURES/ROADMAP/TUTORIAL
 
 For a bug fix, describe the **root cause** in the body, not only the lines you changed.
 
+### Commit in one step, scoped to explicit paths
+
+**Commit with `git commit -F <msg> -- <explicit paths>` — one step.** An explicit `git add` beforehand is **not enough**: several members share this working directory, and **someone else can add to the index between your `add` and your `commit`**, so a pathless `commit` swallows **their** changes into **your** commit — breaking both attribution and commit granularity.
+
+```sh
+git commit -F .git/COMMIT_MSG -- crates/deer-vk/src/gpu_render.rs docs/features/gpu-geometry.md
+```
+
+Then **immediately verify with `git show --stat HEAD`** that the commit contains **only the files you intended**. If the list is wrong, redo it with `git reset --soft HEAD~1` and commit again with the explicit paths. **Never `--hard`** here, and never discard someone else's staged work to clean up your own commit.
+
+**Case (`3ea51e9`).** An executor staged its three explicit paths, and — before its `commit` ran — another executor ran `git add` on `crates/deer-gui/**`. The pathless `commit` then committed **both** sets. It was corrected with `git reset --soft HEAD~1` and re-run as `git commit -F <msg> -- <its three paths>`; the other executor's files were left staged, untouched.
+
+This belongs to the same family as "no shell text pipelines" and "verify the result's shape": the working directory and the index are **shared mutable state**, so the result of a write must be **verified after the fact**, not assumed.
+
 Before opening a pull request:
 
 - the smallest relevant gate passes (see [Verification](#verification)), and you state which one you ran;
