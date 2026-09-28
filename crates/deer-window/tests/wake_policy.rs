@@ -17,6 +17,18 @@
 //! `about_to_wait` → `refresh_control_flow`），但它调用的是**产品代码里那两个纯函数**
 //! （[`plan_wake`] / [`WakeStats`]）⇒ 数与 `run()` 数的是同一份实现，不是另写一套
 //! 「测试专用逻辑」（那种测试只会自证自己）。
+//!
+//! ⚠️ **本文件管不到的东西（M5c 复审 I1 的教训 —— 别再写「`iters` 有单测」）**：
+//!
+//! - `WakePlan → ControlFlow` 的**翻译**在 `RunHandler::refresh_control_flow` 里，而 harness
+//!   是**复刻** ⇒ 把 `Wait` 那一支改成 `Poll`（复审实测：`iters` 5 → **11 695 034**、CPU 烧满
+//!   一核、退出码仍 0）**本文件一条都抓不住**。抓它的是 `src/lib.rs` 末尾的
+//!   `wake_policy_control_flow_mapping` 单测（直接钉住那次翻译）；
+//! - `iters` 的**运行期上界**只在真窗口里量得到 ⇒ 抓它的是 `examples/wake_probe.rs` 的
+//!   **空闲档**（`DEER_WAKE_TICKS=0`：断言 `iters ∈ [1, 32]`，账本经 `App::on_wake_stats`
+//!   交回 App）。本文件**没有**读 `iters` 的判据 —— 曾有的那条
+//!   `assert_eq!(iters, IDLE_ITERS)` 是**同义反复**（harness 自己循环 N 次调 `note_iter`，
+//!   再断言等于 N），已按复审删掉。
 
 use std::time::{Duration, Instant};
 
@@ -185,7 +197,8 @@ fn wake_stats_counts_each_thing_separately() {
     assert_eq!((s.fired(), s.requested()), (3, 4), "fired ⇒ 每次都请求：3 次到点 ⇒ 请求 3+1=4 次");
     assert_eq!(s.fired(), 3, "到点次数就是唤醒次数（不受 wake() 影响）");
 
-    // iters 独立。
+    // `iters` 只由 `note_iter` 加，且**不碰**其它账（下面这行把其余五个数一起钉住）。
+    // ⚠️ 这不是「防空转判据」：它只证明计数器接线对（M5c 复审 I1 把那句 overclaim 删了）。
     for _ in 0..7 {
         s.note_iter();
     }
@@ -224,7 +237,12 @@ fn idle_plans_no_wakeup_at_all() {
         let now = base + Duration::from_micros(i);
         assert_eq!(h.refresh(now), WakePlan::Wait, "第 {i} 轮：没有 deadline ⇒ 必须 Wait（睡死）");
     }
-    assert_eq!(h.stats.iters(), IDLE_ITERS, "每一轮都该被记一次迭代");
+    // 🚫 **不要在这里断言 `iters == IDLE_ITERS`**（M5c 复审 I1）：harness 每轮自己调
+    //    `note_iter`，再断言它等于轮数 ⇒ **同义反复**（只有删掉 `note_iter` 才会红，与
+    //    「有没有空转」无关）。`iters` 的真判据在真窗口那边：`examples/wake_probe.rs` 的
+    //    空闲档断言上界；`WakePlan ⇒ ControlFlow` 的翻译由 `src/lib.rs` 的单测钉住。
+    //    这里真正有判别力的是**上面**每条 `refresh` 的返回值断言（`plan_wake` 真值表）
+    //    与下面「零唤醒 / 零请求 / 一帧都不画」。
     assert_eq!(h.stats.fired(), 0, "空闲期**零**唤醒");
     assert_eq!(h.stats.requested(), 0, "空闲期**零**重绘请求");
     assert_eq!(h.stats.looks(), 0);

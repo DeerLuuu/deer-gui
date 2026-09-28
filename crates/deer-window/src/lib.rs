@@ -106,7 +106,7 @@
 //! 纳秒的超时都不设**（[`ControlFlow::Wait`]，睡死）。这两句话看着像自相矛盾，所以专门写进
 //! 文档：**先读「唤醒面」那节，再回来看这里**。
 //!
-//! 置位规则一共五条：
+//! 置位规则一共六条（表里就是 6 行；M5c fix 轮把「五条」改对）：
 //!
 //! | 触发 | 是否请求重绘 |
 //! |---|---|
@@ -163,8 +163,13 @@
 //! 被否掉的是**本层凭空造超时** —— 没人要求、到点也没事干，纯粹空转。现在本层**只在 App
 //! 显式声明了 deadline 时**才用 `WaitUntil`，而**声明这个动作是 App 主动做的**：它不声明，
 //! 本层就 [`ControlFlow::Wait`] 睡死。**开机不会自己醒来，只有 App 说「那个时刻叫我」才醒。**
-//! 「唤醒账本」里的 `iters` 就是这条承诺的可数证据：**空闲时事件循环迭代次数必须是个位数**，
-//! 若退化成超时打转，它会一秒涨上千（`wake_probe` 示例与 `tests/wake_policy.rs` 都数它）。
+//! 「唤醒账本」里的 `iters` 是**观测值，不是判据**（M5c 复审 I1 的结论，别再把它当全局证据）：
+//! 空闲时它应当是个位数（本机实测 5–7，含启动期的系统事件），但**本层不设全局阈值** ——
+//! `RedrawPolicy::Continuous` 档下它与帧数同阶（实测 229365）是**合法**的。真正读它下断言的是
+//! **空闲档自己**：`examples/wake_probe.rs` 的 `DEER_WAKE_TICKS=0` 档断言 `iters` 上界
+//! （账本经 [`App::on_wake_stats`] 交给 App）；另有本文件末尾的 `plan_to_control_flow` 单测
+//! 钉死「`Wait` ⇒ `ControlFlow::Wait`（不是 `Poll`）」。**`tests/wake_policy.rs` 里没有读它的
+//! 断言**（那条同义反复的 `assert_eq!(iters, IDLE_ITERS)` 已按复审删掉）。
 //!
 //! 两条 **⚠️ 使用须知**（都是「App 自己的要求」的直接后果，不是本层的 bug）：
 //!
@@ -176,7 +181,8 @@
 //!    要求连续重绘（那就是 [`RedrawPolicy::Continuous`] 的语义 —— 本层照做，账本上会看见
 //!    `fired` 跟着 `iters` 一起涨）。
 //!
-//! 结束时的**唤醒账本**（可数；`wake_probe` 与 `tests/wake_policy.rs` 数的就是它）：
+//! 结束时打一行的**唤醒账本**（`iters` 的定性见上面「唤醒面」：**观测值**，本层不设全局阈值；
+//! 读它下断言的是空闲档的 `examples/wake_probe.rs`（经 [`App::on_wake_stats`] 拿账本））：
 //!
 //! ```text
 //! [deer-window] 唤醒账本：wake=<wake()投递到达> wake_after=<wake_after()投递到达> fired=<deadline到点> requested=<唤醒面请求的重绘次数> skipped=<wake()答假而没请求> iters=<事件循环迭代次数>
@@ -452,6 +458,24 @@ pub fn plan_wake(now: Instant, armed: Option<Instant>, declared: Option<Instant>
     }
 }
 
+/// 把 [`WakePlan`] 翻成 winit 的 [`ControlFlow`]（**唯一的翻译点**，[`RunHandler::refresh_control_flow`]
+/// 只调它）。
+///
+/// 抽成函数是为了**可单测**：`WakePlan::Wait ⇒ ControlFlow::Wait`（**睡死**）是整个省电承诺的
+/// 落点，而它原来只是 `match` 里的一个字面量。M5c 复审的变异把它改成 `Poll` ⇒ CPU 烧满一核、
+/// `iters` 5 → 11 695 034，**却没有任何断言抓得住**（`plan_wake` 的真值表只管到 `WakePlan`，
+/// 管不到这次翻译；`wake_policy.rs` 的 harness 是复刻，也管不到）。现在本文件末尾的
+/// `wake_policy_control_flow_mapping` 单测直接钉住这三条映射。
+///
+/// `Due ⇒ Wait`：到点那一帧已经 `request_redraw()` 过了，本轮先睡 —— 下一个 deadline 由 App
+/// 在 `redraw` 里重装（推式）或由 `next_deadline` 现问（拉式）。
+fn plan_to_control_flow(plan: WakePlan) -> ControlFlow {
+    match plan {
+        WakePlan::Wait | WakePlan::Due => ControlFlow::Wait,
+        WakePlan::WaitUntil(at) => ControlFlow::WaitUntil(at),
+    }
+}
+
 /// 唤醒面的**账本**（[`run()`] 收尾打的那行「唤醒账本」就是它；`tests/wake_policy.rs` 数的也是它）。
 ///
 /// 与 [`FrameCounter`] 同一纪律：**只能通过这几个方法加计数**（「请求次数」只有一个真相来源），
@@ -502,11 +526,14 @@ impl WakeStats {
         self.requested += 1;
     }
 
-    /// 事件循环**迭代一次**（= `about_to_wait` 被调用一次）：**空转探针**。
+    /// 事件循环**迭代一次**（= `about_to_wait` 被调用一次）：**空转观测值**。
     ///
-    /// 省电空闲下它应当只有**个位数**（建窗那几轮）。若哪天退化成「超时打转」，这个数会一秒
-    /// 涨上千 —— 而 `frames`/`wants_redraw` 那套**抓不住**这种空转（没人请求重绘，一帧都不会多画，
-    /// 只有 CPU 在烧）。这就是本轮的省电护栏为什么必须带一个「迭代次数」。
+    /// 省电空闲下它应当只有**个位数**（实测 5–7）；退化成「超时打转」时它会一秒涨上千，而
+    /// `frames`/`wants_redraw` 那套**抓不住**这种空转（没人请求重绘，一帧都不会多画）。
+    ///
+    /// ⚠️ **它自己不是判据**（M5c 复审 I1：本层没有全局阈值，`Continuous` 档下它本来就高）。
+    /// 下断言的地方在**声明了空闲语义的那一档**：`examples/wake_probe.rs` 的 `DEER_WAKE_TICKS=0`
+    /// 档通过 [`App::on_wake_stats`] 拿账本，断言 `iters` 的**上界**。
     pub fn note_iter(&mut self) {
         self.iters += 1;
     }
@@ -538,7 +565,7 @@ impl WakeStats {
         self.skipped
     }
 
-    /// 事件循环迭代次数（空转探针，见 [`WakeStats::note_iter`]）。
+    /// 事件循环迭代次数（**观测值**，见 [`WakeStats::note_iter`]：断言在 `wake_probe` 空闲档）。
     pub fn iters(&self) -> u64 {
         self.iters
     }
@@ -832,6 +859,27 @@ pub trait App {
     fn next_deadline(&self) -> Option<Instant> {
         None
     }
+
+    /// **收尾时把唤醒账本交给你**（M5c fix 轮加的；**默认实现什么都不做**）。
+    ///
+    /// `run()` 收尾（打「唤醒账本」那行**之前**）**调一次**，参数是最终的 [`WakeStats`]。
+    /// 这是 App（及示例/探针）**唯一**能读到 `iters` 的地方 —— 它不在任何其它回调的参数里。
+    ///
+    /// 存在的理由只有一条：**让空闲档能对 `iters` 下上界断言**。M5c 复审（I1）实测：
+    /// 只把事件循环的 [`ControlFlow::Wait`] 换成 `Poll` ⇒ `iters` 从 5 涨到 **11 695 034**、
+    /// CPU 烧满一核，而**退出码 0、每条判据仍 ✅** —— 因为当时仓库里**没有任何断言读 `iters`**。
+    /// 现在 `examples/wake_probe.rs` 的 `DEER_WAKE_TICKS=0`（空闲）档用它断言上界。
+    ///
+    /// **本层刻意不做全局阈值**：`RedrawPolicy::Continuous` 档下 `iters` 与帧数同阶（实测
+    /// 229365）是**合法**的 ⇒ 把阈值做进 [`run()`] 的收尾路径会假红。上界只能由**声明了空闲语义
+    /// 的那一档**自己下（review 的原话：「只用于空闲档断言上界」）。
+    ///
+    /// ⚠️ 调用时机：事件循环**已经结束**（窗口可能已销毁）⇒ 这里只适合记账 / 断言 / 打印，
+    /// **不要**再碰渲染资源。
+    fn on_wake_stats(&mut self, stats: &WakeStats) {
+        // 默认实现什么都不做。参数名保持易读（不改成 `_stats`），用 `let _` 消化 unused 警告。
+        let _ = stats;
+    }
 }
 
 /// 帧数 + 重绘请求数 + 跳过帧数 + 退出标记 —— [`run()`] 内部账本的**纯逻辑核心**（不碰窗口，可直接单测）。
@@ -987,7 +1035,9 @@ fn window_info(window: &Window) -> Result<WindowInfo, String> {
 ///   `[deer-window] 事件循环结束：frames=<n> extent=<w>x<h> result=ok|error`、
 ///   `[deer-window] 重绘账本：requests=<n> skipped=<n> frames=<n>` 与
 ///   `[deer-window] 唤醒账本：wake=<n> wake_after=<n> fired=<n> requested=<n> skipped=<n> iters=<n>`
-///   （M5c 起；`iters` = 事件循环迭代次数，**空闲时必须是低值**，它是「没在空转」的可数证据）。
+///   （M5c 起；`iters` = 事件循环迭代次数，**是观测值**：本层**不设全局阈值**
+///   （`Continuous` 档下它与帧数同阶是合法的）—— 读它下断言的是**空闲档**的
+///   `examples/wake_probe.rs`（上界），账本经 [`App::on_wake_stats`] 交给 App）。
 pub fn run<A: App + 'static>(config: WindowConfig, app: A) -> Result<(), String> {
     // 重绘策略在这里定，**在建 EventLoop 之前**：策略 = App 自己声明的 + 环境变量的覆盖，
     // 与窗口无关 ⇒ 就算建窗失败，自证那行也已经打出来了。
@@ -1125,19 +1175,17 @@ impl<A: App> RunHandler<A> {
         let now = Instant::now();
         let armed = self.armed;
         let declared = self.app.next_deadline();
-        match plan_wake(now, armed, declared) {
-            WakePlan::Wait => event_loop.set_control_flow(ControlFlow::Wait),
-            WakePlan::WaitUntil(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
-            WakePlan::Due => {
-                // 兑现一次：推来的那个清掉（拉式的由 App 自己负责往前走）。
-                if armed.is_some_and(|t| t <= now) {
-                    self.armed = None;
-                }
-                self.wake_stats.on_fire();
-                self.request_redraw();
-                event_loop.set_control_flow(ControlFlow::Wait);
+        let plan = plan_wake(now, armed, declared);
+        if matches!(plan, WakePlan::Due) {
+            // 兑现一次：推来的那个清掉（拉式的由 App 自己负责往前走）。
+            if armed.is_some_and(|t| t <= now) {
+                self.armed = None;
             }
+            self.wake_stats.on_fire();
+            self.request_redraw();
         }
+        // 翻译只有这一处：`WakePlan` ⇒ `ControlFlow`（见 `plan_to_control_flow` 的单测）。
+        event_loop.set_control_flow(plan_to_control_flow(plan));
     }
 
     /// 把一条输入事件交给 `App::input`，并按**置位规则**决定要不要请求重绘。
@@ -1186,9 +1234,13 @@ impl<A: App> RunHandler<A> {
         }
     }
 
-    /// 收尾：打摘要、给出最终结果（回调错误优先于事件循环自身的错误）。
-    fn finish(self, loop_error: Option<String>) -> Result<(), String> {
+    /// 收尾：先**把账本交给 App**（[`App::on_wake_stats`]，空闲档的唯一上界落点），
+    /// 再打摘要、给出最终结果（回调错误优先于事件循环自身的错误）。
+    fn finish(mut self, loop_error: Option<String>) -> Result<(), String> {
         let err = self.error.or(loop_error);
+        // M5c fix（复审 I1）：账本交给 App **在打印之前** —— `iters` 的上界断言只能由
+        // 「声明了空闲语义的那一档」自己下，本层不做全局阈值（`Continuous` 档它本来就高）。
+        self.app.on_wake_stats(&self.wake_stats);
         println!(
             "[deer-window] 事件循环结束：frames={} extent={}x{} result={}",
             self.counter.frames(),
@@ -1294,6 +1346,11 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
         // 而 `OnDemand` 下 App 没有别的办法要到第一帧（它拿不到窗口句柄）⇒ 这里主动要一帧，
         // 否则窗口会一直留一块没画过的区域，`Continuous` 的续帧链也根本起不来。
         // 这是一次性的引导，不是空转：之后要么由输入/系统事件置位，要么由 `Continuous` 续帧。
+        //
+        // ⚠️ 诚实注记（M5c 复审 M2）：**这一行在 Windows 上删掉也全绿** —— 那一帧其实是 OS
+        // （窗口显示后的 WM_PAINT）给的，`wake_probe` 恒等式里那个 `+1` 因此**没有对应计数器**，
+        // 它是一个关于 winit/OS 的**假设**（实测：删掉本行 `frames` 仍是 6、`requests` 9→8）。
+        // 保留它是为了**非 Windows / 其它 winit 后端**，以及「没有 OS 帧时 OnDemand 也能起步」。
         self.request_redraw();
     }
 
@@ -1477,5 +1534,38 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
             // 其余事件（触摸/手势/拖放/CursorEntered…）本期不转发：见模块文档的「仍未接线」。
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **省电承诺的落点**：`WakePlan::Wait` 必须翻成 `ControlFlow::Wait`（**睡死**）——
+    /// **不是** `Poll`。
+    ///
+    /// M5c 复审 I1 的变异就是这一格：只把这一处改成 `Poll` ⇒ `iters` 5 → 11 695 034、
+    /// CPU 烧满一核，而当时**全仓库没有任何断言抓得住**（`plan_wake` 的真值表只管到 `WakePlan`；
+    /// `tests/wake_policy.rs` 的 harness 是复刻，也管不到这次翻译）⇒ exit=0、每条判据仍 ✅。
+    /// 这条单测把「翻译」本身钉住（真窗口那一侧的运行期上界断言在 `examples/wake_probe.rs` 的
+    /// 空闲档里；两者一起才覆盖「Wait ⇒ Poll」的两种写法：改翻译、改调用点）。
+    #[test]
+    fn wake_policy_control_flow_mapping() {
+        let at = Instant::now() + Duration::from_millis(5);
+        assert_eq!(
+            plan_to_control_flow(WakePlan::Wait),
+            ControlFlow::Wait,
+            "空闲（没有 deadline）⇒ 必须睡死；Poll 就是 M5c 复审实测的那种空转"
+        );
+        assert_eq!(
+            plan_to_control_flow(WakePlan::WaitUntil(at)),
+            ControlFlow::WaitUntil(at),
+            "睡到那个时刻（不是轮询、也不是立刻醒）"
+        );
+        assert_eq!(
+            plan_to_control_flow(WakePlan::Due),
+            ControlFlow::Wait,
+            "到点那一帧已经 request_redraw() 过了 ⇒ 本轮先睡，别自转"
+        );
     }
 }
