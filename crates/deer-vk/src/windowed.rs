@@ -80,6 +80,20 @@ const VK_ACCESS_HOST_WRITE: u32 = 1 << 14;
 /// `VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT`
 const VK_ACCESS_VERTEX_ATTRIBUTE_READ: u32 = 1 << 2;
 
+// ── 间接绘制（M3+ 第 4 项下半）需要的同步位 ────────────────────────────────────
+//
+// 与上面四个同一处境（`ffi_dev.rs` 不在允许改动清单里 ⇒ 具名常量放在使用者旁边，
+// 值取自本机 SDK `1.4.357.0/include/vulkan/vulkan_core.h`，并由单测钉住确切数字）。
+// **两组数值刻意不同**：索引在 `VERTEX_INPUT` 阶段被读、间接命令在 `DRAW_INDIRECT`
+// 阶段被读 —— 写混不会报错，只会让屏障不覆盖真正读它的那一步。
+
+/// `VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT`（`0x2`）：读**间接命令**的阶段。
+const VK_PIPELINE_STAGE_DRAW_INDIRECT: u32 = 1 << 1;
+/// `VK_ACCESS_INDIRECT_COMMAND_READ_BIT`（`0x1`）。
+const VK_ACCESS_INDIRECT_COMMAND_READ: u32 = 1 << 0;
+/// `VK_ACCESS_INDEX_READ_BIT`（`0x2`；与 `DRAW_INDIRECT` 数值相同但属于另一套枚举）。
+const VK_ACCESS_INDEX_READ: u32 = 1 << 1;
+
 /// 同时在飞的帧数（也是每帧槽命令缓冲/信号量/栅栏的数量）。///
 /// 取 2 的理由：1 会让 CPU 每帧都等 GPU（吞吐掉一半），3 以上对 GUI 没有额外收益
 /// 却要多一份命令缓冲与延迟。
@@ -110,6 +124,7 @@ pub enum FrameOutcome {
 // 绘制段类型与「形状/文本」两条管线的身份都取自**共用的一份**
 // （`gpu_render::{DrawCall, PipelineKind}`）：窗口与离屏的「顺序即 z 序」表达必须逐字相同，
 // 各写一份就是「只改了一边」的温床（M3c 收敛过一次，这里沿用同一条规矩）。
+use crate::device::DrawIndexedIndirectCommand;
 use crate::gpu_render::{DrawCall, PipelineKind, RenderStats};
 
 /// 顶点缓冲（host 可见 + coherent；窗口路径每帧重传）。
@@ -194,6 +209,16 @@ struct UiResources {
     /// 缓冲一旦换新（容量增长、`release_ui_resources()` 之后重建），句柄就不匹配 ⇒
     /// **自动作废**，不依赖任何调用方记得清记录。
     uploaded_vertices: Option<(vk::BufferHandle, Vec<u8>)>,
+    /// **索引缓冲 + 间接命令缓冲**（M3+ 第 4 项下半：间接绘制必需，与离屏同一条设计）。
+    ///
+    /// 惰性创建 + 跨帧复用；**只在顶点数变化时重传**（索引是 `0..N`、命令里只有
+    /// `indexCount` 随 N 变）。声明在 `pipes`/`unified` 之前 ⇒ 先销毁缓冲、再销毁管线。
+    index: Option<UiVertexBuffer>,
+    indirect: Option<UiVertexBuffer>,
+    /// 上一次写进索引缓冲的**顶点数 + 缓冲句柄**（句柄一变即作废，与 `uploaded_vertices` 同款）。
+    uploaded_indices: Option<(vk::BufferHandle, u32)>,
+    /// 上一次写进间接缓冲的**命令 + 缓冲句柄**。
+    uploaded_indirect: Option<(vk::BufferHandle, DrawIndexedIndirectCommand)>,
 }
 
 /// 存活中的 [`UiResources`] 实例数（进程级）。
@@ -267,21 +292,25 @@ fn ui_single_command_in_clip(active_clip: &[RectI], cmd: &DrawCmd) -> DrawList {
     crate::gpu_render::single_command_in_clip(active_clip, cmd)
 }
 
-/// 建（或扩容）一个 host 可见的顶点缓冲。**先建新的、成功后再换**（失败不破坏旧状态）。
+/// 建（或扩容）一个 host 可见的缓冲。**先建新的、成功后再换**（失败不破坏旧状态）。
 ///
 /// `stats.buffer_allocations` 在**真正创建**的那一步自增（与 `vkCreateBuffer` 同处）——
 /// 计数放被调用方，删掉创建就必然删掉计数。
+///
+/// `usage` 由调用方给（顶点 / 索引 / 间接三种）—— M3+ 第 4 项下半起这块结构同时承载三者。
 fn ensure_ui_vertex_capacity(
     device: &VkDevice,
     slot: &mut Option<UiVertexBuffer>,
     bytes: u64,
     stats: &mut RenderStats,
+    usage: u32,
+    what: &'static str,
 ) -> GpuResult<bool> {
     if slot.as_ref().is_some_and(|v| v.capacity >= bytes) {
         return Ok(false);
     }
     let capacity = bytes.next_power_of_two().max(4096);
-    let (buffer, memory) = create_host_vertex_buffer(device, capacity)?;
+    let (buffer, memory) = create_host_vertex_buffer(device, capacity, usage, what)?;
     *slot = Some(UiVertexBuffer {
         buffer,
         memory,
@@ -293,10 +322,54 @@ fn ensure_ui_vertex_capacity(
     Ok(true)
 }
 
-/// 建一个 DEVICE 无关的 host-visible/coherent 顶点缓冲（`VERTEX_BUFFER` 用法）。
+/// 发一条「主机写缓冲 → GPU 读缓冲」的屏障（`src` 恒为 `HOST`/`HOST_WRITE`，
+/// 目标阶段/访问位由调用方给）。
+///
+/// 抽出来的理由与离屏侧的 `emit_host_buffer_barrier` 相同：三种缓冲各需要一条，
+/// 而目标掩码**不同**（顶点/索引在 `VERTEX_INPUT`、间接命令在 `DRAW_INDIRECT`）。
+/// 三份字面量屏障正是「写错不报错、屏障照样被接受」的高发形态 ⇒ 集中到一处并让
+/// 单测钉住确切数字。
+fn emit_ui_buffer_barrier(
+    cmd: vk::CommandBufferHandle,
+    fns: crate::device::DeviceFns,
+    buffer: vk::BufferHandle,
+    dst_stage: u32,
+    dst_access: u32,
+) {
+    let barrier = vk::BufferMemoryBarrier {
+        s_type: vk::VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
+        p_next: ptr::null(),
+        src_access_mask: VK_ACCESS_HOST_WRITE,
+        dst_access_mask: dst_access,
+        src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+        dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+        buffer,
+        offset: 0,
+        size: vk::WHOLE_SIZE,
+    };
+    // SAFETY: 结构体在栈上存活；命令缓冲处于录制状态；`buffer` 是本结构持有的有效句柄。
+    unsafe {
+        (fns.cmd_pipeline_barrier)(
+            cmd,
+            VK_PIPELINE_STAGE_HOST,
+            dst_stage,
+            0,
+            0,
+            ptr::null(),
+            1,
+            &barrier,
+            0,
+            ptr::null(),
+        );
+    }
+}
+
+/// 建一个 host-visible/coherent 缓冲（用法位由调用方给）。
 fn create_host_vertex_buffer(
     device: &VkDevice,
     size: u64,
+    usage: u32,
+    what: &'static str,
 ) -> GpuResult<(OwnedBuffer, OwnedMemory)> {
     let fns = device.fns();
     let info = vk::BufferCreateInfo {
@@ -304,7 +377,7 @@ fn create_host_vertex_buffer(
         p_next: ptr::null(),
         flags: 0,
         size,
-        usage: vk::VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+        usage,
         sharing_mode: vk::VK_SHARING_MODE_EXCLUSIVE,
         queue_family_index_count: 0,
         p_queue_family_indices: ptr::null(),
@@ -315,7 +388,7 @@ fn create_host_vertex_buffer(
     if rc != ffi::VK_SUCCESS {
         return Err(GpuError::Driver {
             code: rc,
-            message: format!("vkCreateBuffer（顶点缓冲 {size} 字节）失败：{}", vk_result_name(rc)),
+            message: format!("vkCreateBuffer（{what} {size} 字节）失败：{}", vk_result_name(rc)),
         });
     }
     let buffer = OwnedBuffer {
@@ -707,6 +780,10 @@ pub struct WindowedRenderer {
     /// B5-2 之前是 `(形状, 文本)` 两个 bool（两块缓冲各一条屏障）；统一之后
     /// **只有一块缓冲** ⇒ 一个 bool、一条屏障。
     ui_barrier: bool,
+    /// 索引 / 间接缓冲这一帧是否**真的重传了**（与 `ui_barrier` 同一套语义：
+    /// 没重传 = 没有新的主机写入 ⇒ 上一次那条屏障已经给同一块缓冲建立过依赖）。
+    ui_index_barrier: bool,
+    ui_indirect_barrier: bool,
     /// 累计发出的 host→vertex 屏障条数。
     ///
     /// 为什么必须有（review I-2）：窗口路径的屏障一度**没有计数、没有测试** ——
@@ -830,6 +907,8 @@ impl WindowedRenderer {
             ui_builds: 0,
             stats: RenderStats::default(),
             ui_barrier: false,
+            ui_index_barrier: false,
+            ui_indirect_barrier: false,
             ui_host_to_vertex_barriers: 0,
             unify_calls: 0,
             unify_output_vertices: 0,
@@ -1177,6 +1256,10 @@ impl WindowedRenderer {
         // SAFETY: 队列是设备自己的；三个数组与 `submit` 都在本栈帧存活；
         // 命令缓冲已结束录制；栅栏已 reset 且本帧独占。
         let rc = unsafe { (fns.queue_submit)(self.device.queue(), 1, &submit, fence) };
+        // 计数与真实调用同处（M3+ 第 4 项下半）：`submits` 就是**这一行**的次数 ——
+        // 放在 `if rc != VK_SUCCESS` **之前**（提交已经发出去了，成功与否都是「一次提交尝试」），
+        // 且删掉这行提交就必然删掉这行计数。
+        self.stats.submits += 1;
         if rc != ffi::VK_SUCCESS {
             return Err(GpuError::Driver {
                 code: rc,
@@ -1442,7 +1525,14 @@ impl WindowedRenderer {
             let dev = &self.device;
             let stats = &mut self.stats;
             let ui = self.ui.as_mut().expect("ensure_ui 之后必有资源");
-            ensure_ui_vertex_capacity(dev, &mut ui.vb, bytes as u64, stats)?;
+            ensure_ui_vertex_capacity(
+                dev,
+                &mut ui.vb,
+                bytes as u64,
+                stats,
+                vk::VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                "窗口统一顶点缓冲",
+            )?;
             // SAFETY: `UnifiedVertex` 是 `#[repr(C)]` 纯 `f32`（无指针、无 Drop）⇒ 字节视图合法。
             let src = unsafe { std::slice::from_raw_parts(unified.as_ptr() as *const u8, bytes) };
             let handle = ui.vb.as_ref().expect("刚 ensure 过").buffer.handle();
@@ -1458,6 +1548,67 @@ impl WindowedRenderer {
         }
         // 屏障只在**这一帧真的上传了**时发（B3 收紧后的语义，与离屏一致）
         self.ui_barrier = uploaded_now;
+
+        // ④b **索引 + 间接命令**（M3+ 第 4 项下半）：与离屏同一条设计 ——
+        //     内容只在顶点数变化时才变 ⇒ 稳态零上传、零分配；三种缓冲各有自己的计数器。
+        self.ui_index_barrier = false;
+        self.ui_indirect_barrier = false;
+        if !unified.is_empty() {
+            let vertex_count = unified.len() as u32;
+            let dev = &self.device;
+            let stats = &mut self.stats;
+            let ui = self.ui.as_mut().expect("ensure_ui 之后必有资源");
+
+            let mut index_slot = ui.index.take();
+            ensure_ui_vertex_capacity(
+                dev,
+                &mut index_slot,
+                vertex_count as u64 * 4,
+                stats,
+                crate::device::VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                "窗口索引缓冲",
+            )?;
+            ui.index = index_slot;
+            let index_handle = ui.index.as_ref().expect("刚 ensure 过").buffer.handle();
+            let index_changed = !matches!(
+                &ui.uploaded_indices,
+                Some((h, n)) if *h == index_handle && *n == vertex_count
+            );
+            if index_changed {
+                let buf = ui.index.as_ref().expect("刚 ensure 过");
+                let indices = DrawIndexedIndirectCommand::sequential_indices(vertex_count);
+                upload_ui_vertices(dev, buf, &indices, "vkMapMemory(窗口索引)", stats)?;
+                // 计数与真实调用同处
+                stats.index_uploads += 1;
+                ui.uploaded_indices = Some((index_handle, vertex_count));
+                self.ui_index_barrier = true;
+            }
+
+            let mut indirect_slot = ui.indirect.take();
+            ensure_ui_vertex_capacity(
+                dev,
+                &mut indirect_slot,
+                std::mem::size_of::<DrawIndexedIndirectCommand>() as u64,
+                stats,
+                crate::device::VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                "窗口间接命令缓冲",
+            )?;
+            ui.indirect = indirect_slot;
+            let indirect_handle = ui.indirect.as_ref().expect("刚 ensure 过").buffer.handle();
+            let query = DrawIndexedIndirectCommand::for_vertex_count(vertex_count);
+            let command_changed = !matches!(
+                &ui.uploaded_indirect,
+                Some((h, c)) if *h == indirect_handle && *c == query
+            );
+            if command_changed {
+                let buf = ui.indirect.as_ref().expect("刚 ensure 过");
+                upload_ui_vertices(dev, buf, &query.to_bytes(), "vkMapMemory(窗口间接命令)", stats)?;
+                // 计数与真实调用同处
+                stats.indirect_uploads += 1;
+                ui.uploaded_indirect = Some((indirect_handle, query));
+                self.ui_indirect_barrier = true;
+            }
+        }
 
         // ⑤ 图集纹理：指纹变化才重传（与离屏同一条契约）
         if let Some(engine) = engine.as_deref() {
@@ -1546,6 +1697,10 @@ impl WindowedRenderer {
                 descriptor_points_at,
                 uploaded: None,
                 uploaded_vertices: None,
+            index: None,
+            indirect: None,
+            uploaded_indices: None,
+            uploaded_indirect: None,
             });
         }
         // `want_text = false` 时也**照样**建全部资源（含哑纹理）：
@@ -1663,6 +1818,30 @@ impl WindowedRenderer {
                 self.ui_host_to_vertex_barriers += 1;
             }
         }
+        // 索引 / 间接缓冲各自只在**这一帧真的重传了**时发一条（与顶点缓冲同一套语义）。
+        // 目标阶段/访问位不同：索引在 `VERTEX_INPUT` 被读、间接命令在 `DRAW_INDIRECT` 被读。
+        if self.ui_index_barrier {
+            if let Some(buf) = ui.index.as_ref() {
+                emit_ui_buffer_barrier(
+                    cmd,
+                    fns,
+                    buf.buffer.handle(),
+                    VK_PIPELINE_STAGE_VERTEX_INPUT,
+                    VK_ACCESS_INDEX_READ,
+                );
+            }
+        }
+        if self.ui_indirect_barrier {
+            if let Some(buf) = ui.indirect.as_ref() {
+                emit_ui_buffer_barrier(
+                    cmd,
+                    fns,
+                    buf.buffer.handle(),
+                    VK_PIPELINE_STAGE_DRAW_INDIRECT,
+                    VK_ACCESS_INDIRECT_COMMAND_READ,
+                );
+            }
+        }
 
         let clear_value = vk::ClearValue {
             color: vk::ClearColorValue {
@@ -1716,9 +1895,10 @@ impl WindowedRenderer {
                 (fns.cmd_set_scissor)(cmd, 0, 1, &scissor);
             }
             // ★ **B5-2：整帧一次 bind + 一次 draw**（从前按段在两条管线间来回切）。
-            //   形状与文本已合成一条顶点流 + 一条管线 ⇒ 绑定一次、一次 `vkCmdDraw`。
-            //   于是 `pipeline_switches` / `draw_calls` 对任何非空帧都恒为 **1**，
-            //   且计数都写在**发调用的同一处**（删掉发射必然删掉计数）。
+            //   形状与文本已合成一条顶点流 + 一条管线 ⇒ 绑定一次、一次绘制。
+            //   M3+ 第 4 项下半起这次绘制走**间接**（`vkCmdDrawIndexedIndirect`，命令在缓冲里）
+            //   —— 与离屏路径同一条设计；`pipeline_switches` / `draw_calls` 对任何非空帧
+            //   仍恒为 **1**，且计数都写在**发调用的同一处**（删掉发射必然删掉计数）。
             if !unified.is_empty() {
                 (fns.cmd_bind_pipeline)(
                     cmd,
@@ -1730,6 +1910,14 @@ impl WindowedRenderer {
                 let vb = ui.vb.as_ref().expect("有统一顶点 ⇒ 缓冲已上传");
                 let offset: vk::DeviceSize = 0;
                 (fns.cmd_bind_vertex_buffers)(cmd, 0, 1, &vb.buffer.handle(), &offset);
+                // 索引缓冲：`u32` 索引、偏移 0（`VK_INDEX_TYPE_UINT32` = 1）
+                let ib = ui.index.as_ref().expect("有统一顶点 ⇒ 索引缓冲已就绪");
+                (fns.cmd_bind_index_buffer)(
+                    cmd,
+                    ib.buffer.handle(),
+                    0,
+                    crate::device::VK_INDEX_TYPE_UINT32,
+                );
                 // `set 0 / binding 0`：**恒有**（字形图集或 1×1 哑纹理）。
                 // 统一片元着色器无条件采样 ⇒ 少了这条绑定就是未定义行为。
                 (fns.cmd_bind_descriptor_sets)(
@@ -1742,9 +1930,25 @@ impl WindowedRenderer {
                     0,
                     ptr::null(),
                 );
-                (fns.cmd_draw)(cmd, unified.len() as u32, 1, 0, 0);
+                // ★ **间接绘制**：命令来自间接缓冲（`drawCount = 1`、`stride = 20`）。
+                //   两个计数都写在**这一行调用旁边** ⇒ 换回 `vkCmdDraw`（或删掉）时
+                //   `indirect_draws` 必然掉到 0（`draw_calls` 是派发次数，两种发法都算）。
+                let indirect_handle = ui
+                    .indirect
+                    .as_ref()
+                    .expect("有统一顶点 ⇒ 间接命令缓冲已就绪")
+                    .buffer
+                    .handle();
+                (fns.cmd_draw_indexed_indirect)(
+                    cmd,
+                    indirect_handle,
+                    0,
+                    1,
+                    std::mem::size_of::<DrawIndexedIndirectCommand>() as u32,
+                );
                 // 计数与真实调用同处（B1）
                 self.stats.draw_calls += 1;
+                self.stats.indirect_draws += 1;
             }
             (fns.cmd_end_render_pass)(cmd);
         }
@@ -2286,6 +2490,27 @@ mod tests {
             VK_ACCESS_VERTEX_ATTRIBUTE_READ,
             1 << 2,
             "dstAccessMask = VERTEX_ATTRIBUTE_READ = 0x4（**不是** 1<<5 的 SHADER_READ）"
+        );
+
+        // ── 间接绘制（M3+ 第 4 项下半）的两个目标掩码 ──
+        // 变异验证（**已实测**）：把 `VK_PIPELINE_STAGE_DRAW_INDIRECT` 改成
+        // `VK_PIPELINE_STAGE_VERTEX_INPUT`（「和顶点一样就行」这个很自然的笔误）⇒ 本测试变红；
+        // 把 `VK_ACCESS_INDEX_READ` 写成 `VK_ACCESS_INDIRECT_COMMAND_READ` ⇒ 也变红。
+        // 两种写法都**不会**被驱动或校验层拒绝 —— 只会让屏障不覆盖真正读那块缓冲的阶段。
+        assert_eq!(
+            VK_PIPELINE_STAGE_DRAW_INDIRECT,
+            1 << 1,
+            "间接命令在 DRAW_INDIRECT = 0x2 阶段被读（**不是** VERTEX_INPUT 的 0x4）"
+        );
+        assert_eq!(
+            VK_ACCESS_INDIRECT_COMMAND_READ,
+            1 << 0,
+            "dstAccessMask = INDIRECT_COMMAND_READ = 0x1（**不是** INDEX_READ 的 0x2）"
+        );
+        assert_eq!(
+            VK_ACCESS_INDEX_READ,
+            1 << 1,
+            "dstAccessMask = INDEX_READ = 0x2（与 DRAW_INDIRECT 同值但不同枚举 —— 不是笔误）"
         );
     }
 
