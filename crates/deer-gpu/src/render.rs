@@ -130,10 +130,10 @@ impl NullRenderer {
         let mut list = DrawList::new();
         fn walk(n: &Node, geo: &Geometry, list: &mut DrawList) {
             if let Some(f) = geo.get(&n.id) {
-                list.push(DrawCmd::NodeHint {
-                    rect: RectI::new(f.x as i32, f.y as i32, f.w as i32, f.h as i32),
-                    node_id_len: n.id.len() as u32,
-                });
+                list.push(DrawCmd::node_hint(
+                    RectI::new(f.x as i32, f.y as i32, f.w as i32, f.h as i32),
+                    &n.id,
+                ));
             }
             for c in &n.children {
                 walk(c, geo, list);

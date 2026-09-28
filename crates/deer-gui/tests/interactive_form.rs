@@ -24,7 +24,8 @@
 use std::collections::BTreeMap;
 
 use deer_gpu::interact::{
-    FOCUS_RING_INSET, FOCUS_STROKE_WIDTH, FieldText, InteractState, InteractiveRenderer,
+    FILL_ROUND_RADIUS, FOCUS_RING_INSET, FOCUS_STROKE_WIDTH, FieldText, InteractState,
+    InteractiveRenderer,
 };
 use deer_gui::gpu::null::CpuRenderer;
 use deer_gui::gpu::{Color, DrawList, Extent, TextEngine, Theme};
@@ -722,6 +723,254 @@ fn four_states_differ_only_inside_the_expected_rectangles() {
         "判据必须拒绝「技术上有差异、肉眼看不出」的环，否则对比度下限是摆设"
     );
 
+    // ---- 焦点环判据（`typed` 档的**输入框**）+ 反向自检 ----
+    //
+    // `typed` 档的差异有**两个来源**：输入框文字（占位标签 → `hi`）与输入框**焦点环**。
+    // 要单独咬住环，就把文字这个变量固定住：拿一个「同样显示 `hi`、但**没有焦点**」的帧，
+    // 与 `typed` 相减 ⇒ 两帧的填充/边框/文字逐字节相同，差异**只剩环带**。
+    //
+    // 为什么输入框也要这一条：它的环改前**贴在框边画**（直角描边压在圆角填充上，补出 32 px
+    // 方角补块，与按钮当初同一根因）⇒ 而旧的 `typed` 判据只看「框内差异 ≥ 500」，
+    // 684 px 的坏几何照样过关。现在判据是「**框内差异一个都不许落在环带之外**」+「环像素
+    // 一个都不许落在圆角剪影之外」+ 像素数下限 + 对比度下限，并当场把坏几何喂回去。
+    let typed_state = UiState {
+        hover: Some("button_1".into()),
+        focus: Some("field_1".into()),
+        pressed: None,
+        texts: BTreeMap::from([("field_1".to_string(), "hi".to_string())]),
+    };
+    let no_focus_state = UiState {
+        focus: None,
+        ..typed_state.clone()
+    };
+    let typed_frame = cases.iter().find(|(n, _, _)| *n == "typed").expect("typed 在列表里");
+    let no_focus_frame = frame_with(&tree, &theme, &geo, &no_focus_state);
+    println!(
+        "  输入框焦点环：#1 前置｜两帧状态除 `focus` 外必须相同（typed={}）",
+        fmt_state(&typed_state)
+    );
+    assert_eq!(
+        UiState {
+            focus: Some("field_1".into()),
+            ..no_focus_state.clone()
+        },
+        typed_state,
+        "前置：对照帧只差一个 `focus` 字段"
+    );
+
+    let field = rect_i(&geo, "field_1");
+    let fband = RectI::new(
+        field.x + FOCUS_RING_INSET,
+        field.y + FOCUS_RING_INSET,
+        field.w - 2 * FOCUS_RING_INSET,
+        field.h - 2 * FOCUS_RING_INSET,
+    );
+    // 前置：输入框上恰好一条 1px 边框 + 一条环，且环的矩形就是内缩那一圈。
+    let (mut f_owner, mut f_border, mut f_ring, mut f_ring_index) = (None, None, None, None);
+    for (i, cmd) in typed_frame.1.list.cmds.iter().enumerate() {
+        match cmd {
+            DrawCmd::NodeHint { rect, .. } => f_owner = Some(*rect),
+            DrawCmd::StrokeRect { rect, color, width } if f_owner == Some(field) => {
+                if *width == FOCUS_STROKE_WIDTH {
+                    assert!(
+                        f_ring_index.is_none(),
+                        "前置：输入框上出现了第二条焦点环描边（判据只喂得了第一条）"
+                    );
+                    f_ring_index = Some(i);
+                    f_ring = Some((*rect, *color));
+                } else {
+                    f_border = Some((*rect, *width, *color));
+                }
+            }
+            _ => {}
+        }
+    }
+    let f_ring_index = f_ring_index.expect("前置：`typed` 那一帧的输入框必须有焦点环描边");
+    let (f_ring_rect, f_ring_color) = f_ring.expect("刚设过");
+    let (f_border_rect, f_border_w, f_border_color) = f_border.expect("前置：输入框必须保留 1px 边框");
+    assert_eq!(
+        (f_border_rect, f_border_w),
+        (field, 1),
+        "前置：边框仍是 1px、且铺满框（差异才恰好等于环带）"
+    );
+    assert_eq!(f_border_color, theme.text_dim, "前置：边框色是 text_dim");
+    assert_eq!(f_ring_rect, fband, "前置：环矩形 = 框内缩 FOCUS_RING_INSET 的那一圈");
+    let f_fill = typed_frame
+        .1
+        .list
+        .cmds
+        .iter()
+        .find_map(|c| match c {
+            DrawCmd::FillRoundRect { rect, color, .. } if *rect == field => Some(*color),
+            _ => None,
+        })
+        .expect("前置：输入框必须有填充命令");
+    assert_eq!(f_fill, theme.border, "前置：输入框填充是 border（环色必须与它分得开）");
+    assert_ne!(f_ring_color, f_fill, "前置：环与填充同色 ⇒ 对比度判据测的是空气");
+    let f_band_px = (fband.w * fband.h
+        - inset_rect(fband, FOCUS_STROKE_WIDTH).w * inset_rect(fband, FOCUS_STROKE_WIDTH).h)
+        as usize;
+    println!(
+        "  输入框 {field:?}｜环 #{f_ring_index} {f_ring_rect:?} 色 {f_ring_color:?}｜填充 {f_fill:?}\
+         ｜边框 1px {f_border_color:?}｜环带 {f_band_px} px｜下限 {FIELD_RING_MIN_PX} px + 平均通道差 {FOCUS_MIN_CONTRAST:.1}"
+    );
+
+    // 只换**输入框描边命令**的三个语料（其余命令逐字节相同 ⇒ 差异只能来自环）。
+    let with_field_strokes = |ring: RectI, color: Color, keep_border: bool| {
+        let mut l = typed_frame.1.list.clone();
+        let mut out: Vec<DrawCmd> = Vec::with_capacity(l.cmds.len());
+        let (mut owner, mut done) = (None, false);
+        for cmd in l.cmds.drain(..) {
+            match &cmd {
+                DrawCmd::NodeHint { rect, .. } => {
+                    owner = Some(*rect);
+                    out.push(cmd);
+                }
+                DrawCmd::StrokeRect { .. } if owner == Some(field) => {
+                    if !done {
+                        done = true;
+                        if keep_border {
+                            out.push(DrawCmd::StrokeRect {
+                                rect: field,
+                                color: theme.text_dim,
+                                width: 1,
+                            });
+                        }
+                        out.push(DrawCmd::StrokeRect {
+                            rect: ring,
+                            color,
+                            width: FOCUS_STROKE_WIDTH,
+                        });
+                    }
+                }
+                _ => out.push(cmd),
+            }
+        }
+        assert!(done, "前置：输入框上必须有描边命令可替换");
+        DrawList::from_cmds(out)
+    };
+    let f_idle_px = render(&no_focus_frame);
+    let f_real_px = render(&typed_frame.1);
+    // 前置：这一对帧只在输入框的描边上不同（把环命令之外的差异排除掉）。
+    assert_eq!(
+        no_focus_frame.list.counts().node_hint,
+        typed_frame.1.list.counts().node_hint,
+        "前置：两帧的提示条数必须相同"
+    );
+    let s_field = ring_band(
+        &f_idle_px,
+        &f_real_px,
+        ext,
+        field,
+        fband,
+        f_ring_rect,
+        FILL_ROUND_RADIUS,
+    );
+    println!(
+        "  输入框环实测：环带内 {}（下限 {FIELD_RING_MIN_PX}）｜环带外 {}（要求 0）｜框外 {}（要求 0）\
+         ｜方角补块 {}（要求 0）｜平均通道差 {:.1}（下限 {FOCUS_MIN_CONTRAST:.1}）",
+        s_field.in_band,
+        s_field.out_band_in_rect,
+        s_field.out_rect,
+        s_field.patch,
+        s_field.mean
+    );
+    field_ring_verdict("实测", &s_field).unwrap_or_else(|e| panic!("{e}"));
+
+    // 反向自检 a：环色 = 填充色（`border`）⇒ 环带内差异塌成 0。
+    let s_same = ring_band(
+        &f_idle_px,
+        &render_list(&with_field_strokes(fband, f_fill, true)),
+        ext,
+        field,
+        fband,
+        fband,
+        FILL_ROUND_RADIUS,
+    );
+    println!(
+        "  反向自检 a（环 = 填充色）：环带内 {}｜平均通道差 {:.1} ⇒ {:?}",
+        s_same.in_band,
+        s_same.mean,
+        field_ring_verdict("a", &s_same).err()
+    );
+    assert!(
+        field_ring_verdict("反自检 a：环与填充同色", &s_same).is_err(),
+        "判据必须拒绝「环与填充同色」"
+    );
+
+    // 反向自检 b：环色 = 填充色提亮 5%（技术上不同色、肉眼看不出）⇒ 靠**对比度**下限咬住。
+    let s_faint = ring_band(
+        &f_idle_px,
+        &render_list(&with_field_strokes(fband, f_fill.lighten(0.05), true)),
+        ext,
+        field,
+        fband,
+        fband,
+        FILL_ROUND_RADIUS,
+    );
+    println!(
+        "  反向自检 b（环 = 填充提亮 5%）：环带内 {}｜平均通道差 {:.1} ⇒ {:?}",
+        s_faint.in_band,
+        s_faint.mean,
+        field_ring_verdict("b", &s_faint).err()
+    );
+    assert!(
+        s_faint.in_band >= FIELD_RING_MIN_PX,
+        "反向自检 b 的前置：近似色**照样**改掉整条环带（{} px ≥ 下限 {FIELD_RING_MIN_PX}）",
+        s_faint.in_band
+    );
+    assert!(
+        field_ring_verdict("反自检 b：环色几乎与填充相同", &s_faint).is_err(),
+        "判据必须拒绝「技术上有差异、肉眼看不出」的环"
+    );
+
+    // 反向自检 c：**几何**退回贴边画（= 改前的代码路径）⇒ 方角补块与「环带外差异」都必须被抓出来。
+    let s_flush = ring_band(
+        &f_idle_px,
+        &render_list(&with_field_strokes(field, f_ring_color, false)),
+        ext,
+        field,
+        fband,
+        field,
+        FILL_ROUND_RADIUS,
+    );
+    println!(
+        "  反向自检 c（环贴边画 = 改前几何）：环带内 {}｜环带外 {}｜方角补块 {}｜平均通道差 {:.1} ⇒ {:?}",
+        s_flush.in_band,
+        s_flush.out_band_in_rect,
+        s_flush.patch,
+        s_flush.mean,
+        field_ring_verdict("c", &s_flush).err()
+    );
+    assert_eq!(
+        s_flush.patch, 32,
+        "前置：贴边画的 3px 直角环在半径 {FILL_ROUND_RADIUS} 的圆角上必留 32 px 方角补块（与按钮同源）"
+    );
+    assert!(
+        field_ring_verdict("反自检 c：环贴边画", &s_flush).is_err(),
+        "判据必须拒绝「环贴边画」—— 这正是本轮修的形状缺陷"
+    );
+    // 而且**旧的 `typed` 判据会原样放行它** —— 这是「旧判据强度不够」的现场证据：
+    // 同一份坏几何（贴边、不留 1px 边框）与 idle 相比，框内差异仍然远超旧下限 500。
+    let flush_vs_idle = diff_pixels(
+        &px.iter().find(|(n, _)| *n == "idle").expect("idle 已渲染").1,
+        &render_list(&with_field_strokes(field, f_ring_color, false)),
+        ext,
+        field,
+    );
+    println!(
+        "  对照：改前几何下 `typed` 档**框内**差异 = {flush_vs_idle} px（旧下限 {} ⇒ 旧判据原样放行）",
+        STATE_MIN_PX
+            .iter()
+            .find(|(n, _)| *n == "typed")
+            .expect("typed 有下限")
+            .1
+    );
+    assert!(
+        flush_vs_idle >= FOCUS_MIN_PX,
+        "前置：这份坏几何在框内留下了 {flush_vs_idle} px 差异（远超旧下限）⇒ 「只数框内像素」抓不住它"
+    );
+
     // 反向自检：五档状态**两两不同**（否则「状态之间可区分」是空话）。
     for (i, (n1, p1)) in px.iter().enumerate() {
         for (n2, p2) in px.iter().skip(i + 1) {
@@ -741,15 +990,21 @@ fn four_states_differ_only_inside_the_expected_rectangles() {
 ///
 /// | 状态 | 期望矩形 | 上限（几何） | 实测 | 下限 |
 /// |---|---|---|---|---|
-/// | `hover` | 按钮 | 1092 px（按钮 42×26） | 628 | 600 |
-/// | `pressed` | 按钮 | 1092 | 628 | 600 |
-/// | `focused` | 按钮 | 焦点环环带 324 px | 228 | [`FOCUS_MIN_PX`] = 180 |
-/// | `typed` | 输入框 | 2860 px（输入框 110×26） | 816 | 500 |
+/// | `hover` | 按钮 | 792 px（按钮 36×22） | 628 | 600 |
+/// | `pressed` | 按钮 | 792 | 628 | 600 |
+/// | `focused` | 按钮 | 焦点环环带 264 px | 228 | [`FOCUS_MIN_PX`] = 180 |
+/// | `typed` | 输入框 | 2156 px（输入框 98×22） | 702 | 500 |
 ///
-/// `typed` 的下限留得多（816 → 500）是有意的：它数的是「占位标签换成缓冲内容」的占位格差异，
+/// `typed` 的下限留得多（702 → 500）是有意的：它数的是「占位标签换成缓冲内容」的占位格差异，
 /// 随度量模型而变；而「什么都没画出来」是 **0 px**，所以 500 仍然有判别力。
 /// `hover`/`pressed` 的下限（628 → 600）离实测更近，因为它们的上界是**几何**给的
 /// （整块填充 = 按钮面积减去被字形盖住的部分），不是模型给的。
+///
+/// ⚠️ `typed` 这一档在 **2b 修输入框焦点环**前后都被实测过，两次数字都在本测试里当场打印：
+/// 改前几何（环贴边、focus 不留 1px 边框）**816 px**（正是旧表格里记的那个数），交付几何 **702 px**。
+/// 下限**保持 500 不动**：绝对值没降，而「下限 / 实测」从 0.61 升到 **0.71** ⇒ 强度不降反升；
+/// 同时输入框的环另有**更强**的一条判据（`FIELD_RING_MIN_PX` + 环带外差异 = 0 + 方角补块 = 0
+/// + 反向自检 a/b/c）—— 那才是对本次缺陷真正有判别力的那一层。
 const STATE_MIN_PX: [(&str, usize); 4] = [
     ("hover", 600),
     ("pressed", 600),
@@ -787,6 +1042,9 @@ const FOCUS_MIN_PX: usize = 180;
 /// **这个数值必须与 `crates/deer-gpu/src/interact.rs` 的 `FOCUS_RING_MIN_CONTRAST` 相同** ——
 /// 两边口径一致（同为「差异像素的三通道平均差」），只是分类范围不同（那边按环带内外，
 /// 这边按按钮矩形）；两个数的依据也一致：`on_accent` 压 `accent` = 97.7、提亮 5% = 17.0。
+///
+/// **输入框的环用同一个下限**（`field_ring_verdict`）：环色 `accent` 压在填充 `border` 上 =
+/// **106.7**（放行），同色 = **0.0**、提亮 5% = **10.3**（都拒绝）—— 两个锚点与按钮那条同量级。
 const FOCUS_MIN_CONTRAST: f64 = 64.0;
 
 /// 在 `rect` 内逐**像素**比较（4 字节一组），返回差异像素数。
@@ -1078,4 +1336,140 @@ fn four_states_match_the_cpu_backend_offline() {
     );
     assert!(worst_overall <= 1, "半透明也不能超过 1 LSB");
     assert_eq!(worst_overall, 0, "本语料实测逐字节相同");
+}
+
+// ---------------------------------------------------------------------------
+// 四、输入框焦点环的诊断与判据（口径与 `crates/deer-gpu/src/interact.rs` 的 `ring_stats` 一致）
+// ---------------------------------------------------------------------------
+
+/// 输入框**焦点环**的差异像素数下限（本语料 `field_1` = 98×22）。
+///
+/// 出处：
+/// - 期望环带 = 框内缩 `FOCUS_RING_INSET`=2、宽 `FOCUS_STROKE_WIDTH`=3 ⇒ `94×18 − 88×12 = 636` px；
+/// - 环画在文字之上，而文字在两帧里**相同** ⇒ 被字形盖住的环像素不产生差异，实测 **594** px；
+/// - 下限取环带的 **3/4 = 636×3/4 = 477**（与按钮那条 `264×3/4 = 198` 同一条推导），
+///   实测 594 留余量 117；而「环与填充同色」实测 **0 px**、坏几何的方角补块是 **32 px** ⇒
+///   两个锚点都远在下限之下（这条下限只负责「环有没有被画出来」，形状由 `patch == 0` 与
+///   「环带外差异 == 0」负责）。
+const FIELD_RING_MIN_PX: usize = 477;
+
+/// 向内缩 `n` 像素（与 `deer-gpu` 的 `inset` 同口径）。
+fn inset_rect(r: RectI, n: i32) -> RectI {
+    RectI::new(r.x + n, r.y + n, (r.w - 2 * n).max(1), (r.h - 2 * n).max(1))
+}
+
+/// 圆角剪影判定（**口径照抄** `deer-gpu/src/null.rs` 的 `inside_rounded`）。
+fn inside_rounded(rect: RectI, x: i32, y: i32, r: i32) -> bool {
+    let corners = [
+        (rect.x + r, rect.y + r, -1, -1),
+        (rect.right() - 1 - r, rect.y + r, 1, -1),
+        (rect.x + r, rect.bottom() - 1 - r, -1, 1),
+        (rect.right() - 1 - r, rect.bottom() - 1 - r, 1, 1),
+    ];
+    for (ccx, ccy, sx, sy) in corners {
+        let in_corner_x = if sx < 0 { x < ccx } else { x > ccx };
+        let in_corner_y = if sy < 0 { y < ccy } else { y > ccy };
+        if in_corner_x && in_corner_y {
+            let dx = (x - ccx) as f32;
+            let dy = (y - ccy) as f32;
+            if dx * dx + dy * dy > (r * r) as f32 {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// 焦点环的像素诊断。
+#[derive(Debug)]
+struct RingBand {
+    /// 期望环带内的差异像素数。
+    in_band: usize,
+    /// 差异像素里落在期望环带**之外、但仍在控件矩形内**的数量（必须为 0）。
+    out_band_in_rect: usize,
+    /// 差异像素里落在**控件矩形之外**的数量（必须为 0）。
+    out_rect: usize,
+    /// 差异像素的三通道平均差。
+    mean: f64,
+    /// **方角补块**：环实际画在圆角剪影之外的像素数（必须为 0）。
+    patch: usize,
+}
+
+fn ring_band(
+    a: &[u8],
+    b: &[u8],
+    ext: Extent,
+    owner: RectI,
+    band: RectI,
+    ring_rect: RectI,
+    radius: i32,
+) -> RingBand {
+    let hole = inset_rect(band, FOCUS_STROKE_WIDTH);
+    let w = ext.width.max(1) as usize;
+    let (mut in_band, mut out_band, mut out_rect, mut sum) = (0usize, 0usize, 0usize, 0u64);
+    for i in (0..a.len().min(b.len())).step_by(4) {
+        if a[i..i + 4] == b[i..i + 4] {
+            continue;
+        }
+        let x = ((i / 4) % w) as i32;
+        let y = ((i / 4) / w) as i32;
+        if !owner.contains(x, y) {
+            out_rect += 1;
+        } else if band.contains(x, y) && !hole.contains(x, y) {
+            in_band += 1;
+        } else {
+            out_band += 1;
+        }
+        for c in 0..3 {
+            sum += a[i + c].abs_diff(b[i + c]) as u64;
+        }
+    }
+    let mut patch = 0usize;
+    for y in ring_rect.y..ring_rect.bottom() {
+        for x in ring_rect.x..ring_rect.right() {
+            if ring_rect.contains(x, y) && !inside_rounded(owner, x, y, radius) {
+                patch += 1;
+            }
+        }
+    }
+    let n = in_band + out_band + out_rect;
+    RingBand {
+        in_band,
+        out_band_in_rect: out_band,
+        out_rect,
+        mean: if n == 0 { 0.0 } else { sum as f64 / (3.0 * n as f64) },
+        patch,
+    }
+}
+
+/// **输入框焦点环判据本体**（函数化 ⇒ 同一次运行里被「实测 + 三个坏环」喂四次）。
+fn field_ring_verdict(name: &str, s: &RingBand) -> Result<(), String> {
+    if s.out_rect != 0 {
+        return Err(format!("[{name}] 有 {} 个差异像素落在控件矩形之外", s.out_rect));
+    }
+    if s.out_band_in_rect != 0 {
+        return Err(format!(
+            "[{name}] 有 {} 个差异像素落在期望环带之外",
+            s.out_band_in_rect
+        ));
+    }
+    if s.patch != 0 {
+        return Err(format!(
+            "[{name}] 环有 {} 个像素画在圆角剪影之外（直角描边把圆角补成了方角）",
+            s.patch
+        ));
+    }
+    if s.in_band < FIELD_RING_MIN_PX {
+        return Err(format!(
+            "[{name}] 环带内只有 {} 个差异像素 < 下限 {FIELD_RING_MIN_PX}",
+            s.in_band
+        ));
+    }
+    if s.mean < FOCUS_MIN_CONTRAST {
+        return Err(format!(
+            "[{name}] 平均通道差 {:.1} < 下限 {FOCUS_MIN_CONTRAST:.1} —— 环画上去了，但看不出",
+            s.mean
+        ));
+    }
+    Ok(())
 }

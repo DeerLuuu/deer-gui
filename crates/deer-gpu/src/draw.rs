@@ -109,8 +109,58 @@ pub enum DrawCmd {
     /// 推送裁剪区（与 `PopClip` 配对）。
     PushClip { rect: RectI },
     PopClip,
-    /// 引用节点（诊断用；后端可忽略）。
-    NodeHint { rect: RectI, node_id_len: u32 },
+    /// 引用节点（**绑定校验用**；后端可忽略）。
+    ///
+    /// 后端的语义是「诊断信息，安静忽略」—— 它**不产生任何像素**。但
+    /// `deer_gui::interaction::ClipSnapshot::from_draw_list` 依赖它把「第 k 条提示」
+    /// 绑到「前序里第 k 个有几何的节点」上，所以这两个字段是**校验和**，不是给人看的：
+    ///
+    /// - `node_id_len`：id 的**字节长度**（便宜的前置检查）；
+    /// - `node_id_fp`：id 的**确定性指纹**（[`node_id_fp`]）。
+    ///
+    /// 为什么必须有指纹：只有长度时，**等长 id 互换**（例如同一层里两个 8 字节的 id
+    /// 换了位置）会让长度校验和逐项相同 ⇒ 绑定静默错位、快照悄悄张冠李戴。
+    /// 两个字段都由 [`DrawCmd::node_hint`] 一处产出，调用方不要手写字面量。
+    NodeHint {
+        rect: RectI,
+        node_id_len: u32,
+        node_id_fp: u64,
+    },
+}
+
+/// 节点 id 的**确定性指纹**（FNV-1a 64 位）。
+///
+/// 用途见 [`DrawCmd::NodeHint`]：让 id **真的参与**「提示 ⇄ 节点」的绑定校验。
+///
+/// 三条刻意的性质：
+/// 1. **确定性**：纯函数、无随机种子（`DefaultHasher` 不能用在这里 —— 它只承诺
+///    「同一次运行内一致」，而这里的护栏要跨进程/跨平台复现同样的结论）；
+/// 2. **无依赖、无分配**：`const fn`，热路径上每个节点每帧算一次也不产生堆分配；
+/// 3. **够用就好**：这里要拦的是「顺序错位」这类**结构性**错误，不是对抗性碰撞，
+///    所以不引密码学哈希（那会让 `DrawCmd` 与构建图都变重）。
+pub const fn node_id_fp(id: &str) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let bytes = id.as_bytes();
+    let mut h = OFFSET;
+    let mut i = 0;
+    while i < bytes.len() {
+        h ^= bytes[i] as u64;
+        h = h.wrapping_mul(PRIME);
+        i += 1;
+    }
+    h
+}
+
+impl DrawCmd {
+    /// 一条节点提示（**唯一**构造点：id 指纹只在这里算，免得各产出点各写一份）。
+    pub fn node_hint(rect: RectI, node_id: &str) -> DrawCmd {
+        DrawCmd::NodeHint {
+            rect,
+            node_id_len: node_id.len() as u32,
+            node_id_fp: node_id_fp(node_id),
+        }
+    }
 }
 
 /// 一帧的绘制列表。

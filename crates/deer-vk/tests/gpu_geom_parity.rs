@@ -426,7 +426,7 @@ fn mixed_command_parity() {
     // 命令顺序敏感：后画的覆盖先画的；`NodeHint` 必须不影响任何像素
     let mut l = DrawList::new();
     l.push(DrawCmd::FillRect { rect: RectI::new(0, 0, 16, 12), color: W });
-    l.push(DrawCmd::NodeHint { rect: RectI::new(0, 0, 16, 12), node_id_len: 3 });
+    l.push(DrawCmd::node_hint(RectI::new(0, 0, 16, 12), "mix"));
     l.push(DrawCmd::FillRect { rect: RectI::new(2, 2, 8, 6), color: Color::rgb(0, 0, 0) });
     l.push(DrawCmd::StrokeRect { rect: RectI::new(1, 1, 12, 8), color: W, width: 2 });
     l.push(DrawCmd::FillRoundRect { rect: RectI::new(4, 3, 5, 5), radius: 2, color: W });

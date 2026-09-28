@@ -228,7 +228,7 @@
 | `pub fn right(&self) -> i32` / `pub fn bottom(&self) -> i32` | `:43` / `:46` | `null.rs`（`fill`/`stroke`/`inside_rounded`/`draw_text`）；`deer-vk/src/gpu_geom.rs` |
 | `pub fn contains(&self, px: i32, py: i32) -> bool` | `:49-51` | `null.rs:371`（裁剪判据） |
 | `pub struct TextureId(pub u32);` | `:56` | `null.rs:154`（`create_texture` 分配）、`deer-vk` |
-| `pub enum DrawCmd { FillRect{rect,color}, StrokeRect{rect,color,width}, FillRoundRect{rect,radius,color}, Text{rect,text,color,size,align}, PushClip{rect}, PopClip, NodeHint{rect,node_id_len} }` | `:64-85` | 生产：`render.rs:46-108`、`:133`；消费：`null.rs:317-353`（CPU）、`deer-vk/src/gpu_geom.rs:142-194`（GPU）；打印：`deer-gui/examples/draw_list.rs:38-54` |
+| `pub enum DrawCmd { FillRect{rect,color}, StrokeRect{rect,color,width}, FillRoundRect{rect,radius,color}, Text{rect,text,color,size,align}, PushClip{rect}, PopClip, NodeHint{rect,node_id_len,node_id_fp} }` | `:92-131` | 生产：`render.rs:46-108`、`:129`（`DrawCmd::node_hint`）；消费：`null.rs:317-353`（CPU）、`deer-vk/src/gpu_geom.rs:142-194`（GPU）；打印：`deer-gui/examples/draw_list.rs:38-54` |
 | `pub struct DrawList { pub cmds: Vec<DrawCmd>, /* private */ clip_balance: i32 }` | `:89-93` | 全链路；`deer-vk/tests/gpu_geom_stream.rs:468-469` 直接写 `cmds`（绕过 `push`） |
 | `pub fn new() -> DrawList` | `:96` | `render.rs:29`/`:130`；测试 |
 | `pub fn from_cmds(cmds: Vec<DrawCmd>) -> DrawList` | `:104` | `null.rs:245`（`CpuFrame::submit_and_present` 重建列表）；测试 `draw_list_and_cpu_backend.rs:40-49` |

@@ -13,7 +13,7 @@
 //! |---|---|
 //! | `hover`（未按下、未聚焦） | 底色**提亮** `LIGHTEN` 比例（`Button` 的 `FillRoundRect` / `Field` 的填充换成提亮色） |
 //! | `pressed` | 底色**加深** `DARKEN` 比例 |
-//! | `focus` | 沿矩形内侧画 `FOCUS_STROKE_WIDTH` 像素的描边（填色回到 idle）；**颜色按控件分**：`Field` 用 `theme.accent`（它的填充是 `border` 色 ⇒ 本就分得出），`Button` 用 `theme.on_accent` 且再内缩 `FOCUS_RING_INSET`（它的填充**就是** `accent`，同色描边等于没画 —— 见下面「焦点环」一节） |
+//! | `focus` | 沿矩形**内侧内缩 `FOCUS_RING_INSET` 之后**画 `FOCUS_STROKE_WIDTH` 像素的描边；**颜色按控件分**：`Button` 用 `theme.on_accent`（它的填充**就是** `accent`，同色描边等于没画），`Field` 用 `theme.accent`（它保留了 1px `text_dim` 边框，填充是 `border` 色 ⇒ 与环的平均通道差 106.7）。两者的**内缩**是必须的：描边命令只有直角矩形，填充是圆角（半径 `FILL_ROUND_RADIUS`）⇒ 贴边画会补出方角（见下面「焦点环」一节） |
 //! | `texts` | `Field` 的文字换成**文本缓冲内容**（`FieldText::Content`；见下） |
 //!
 //! ## 三条刻意的选择（都有代价，写在这里免得被当缺陷）
@@ -27,32 +27,51 @@
 //!    `interaction` 层的判据；这里跟着做，是为了让「禁用节点上**一定**没有状态色」也能被
 //!    像素判据咬住（否则一个错误的 `focus` 会被画出来而没人发现）。
 //!
-//! ## 焦点环：按钮的环**必须**换色（附改前的实测数字）
+//! ## 焦点环：**两个**控件的环都必须「换色 + 内缩」（附改前的实测数字）
+//!
+//! 探针语料：本 crate 模块测试的那棵树（画布 200×120，`button_1` = 36×22、`field_1` = 98×22，
+//! 填充半径 4；黑底与 `#08090c` 底两种 clear 色下**完全一致**）。
+//!
+//! ### 按钮：环与填充**同色**
 //!
 //! 按钮（未 hover、未按下）的填充是 `tint(accent, Idle) == accent`，而焦点描边原来也用
-//! `theme.accent` ⇒ **环与底色同色**。探针实测（`button_1` = 36×22 = 792 px，画布 200×120，
-//! 黑底与 `#08090c` 底两种 clear 色下**完全一致**）：
+//! `theme.accent` ⇒ **环与底色同色**：
 //!
 //! | 帧 | 与 idle 不同的像素 | 构成 |
 //! |---|---|---|
 //! | 改前 `focused` | **56 px**（= 144 字节） | 32 px 是**方角补角**（圆角被直角环补上）、其余 24 px 是**描边压过标签字形** |
 //! | 改后 `focused` | **228 px**（= 456 字节） | 全在环带内（标签与环同色 ⇒ 重叠处**不**产生差异） |
 //!
-//! 也就是说：改前那 56 px **不是**「一条看得见的焦点环」，而是两个副产物 —— 而当时的判据是
-//! `diff > 0`，所以它一直是绿的。两处改动（都只改**按钮自己的矩形内**的像素，
-//! hover/pressed/idle 的像素一个都不动）：
+//! ### `Field`：环**贴边画**（与按钮**同一根因**）
 //!
-//! 1. **颜色**：环改用 `theme.on_accent`（= 该控件的内容色；与 `accent` 填充的通道平均差
+//! `Field` 的环颜色本来就与填充不同（`accent` vs `border`），但**几何**是贴边的：
+//! 3px 的直角描边铺满整个框边 ⇒ 半径 4 的圆角被补成方角。实测：
+//!
+//! | 帧 | 与 idle 不同的像素 | 落在期望环带外 | 圆角补块 | 平均通道差 |
+//! |---|---|---|---|---|
+//! | 改前 `focused`（贴边、focus 时不留 1px 边框） | **684 px** | **464 px**（边框被环盖住 + 四角） | **32 px** | 88.2（环带内 106.7） |
+//! | 改后 `focused`（内缩 + 保留 1px 边框） | **570 px** | **0** | **0** | 106.7 |
+//!
+//! 改后差异**恰好**是环带（636 px 减去被字形盖住的 66 px）—— 于是判据能升级成
+//! 「**框内差异一个都不许落在环带之外**」+「环像素一个都不许落在圆角剪影之外」，
+//! 而不是「差异 ≥ 某个下限」这种会被方角补块喂饱的弱判据（684 px 就喂饱了旧的 500 下限）。
+//!
+//! ### 两处改动（都只改**控件自己矩形内**的像素，hover/pressed/idle 的像素一个都不动）
+//!
+//! 1. **颜色**：按钮的环改用 `theme.on_accent`（= 该控件的内容色；与 `accent` 填充的通道平均差
 //!    **97.7**）。不新增硬编码颜色；也不用半透明 —— 半透明会把 CPU/GPU 的逐字节对照
-//!    拖进「≤1 LSB」那一档（见本文档第 1 条）。
-//! 2. **内缩 `FOCUS_RING_INSET`**：描边命令只有**直角**矩形，而填充是**圆角**（半径 4）⇒
-//!    贴着边画会把四个圆角补成方角（实测 32 px）。内缩 2 之后环的直角顶点落回圆角内
-//!    （`√2·(4−2) ≈ 2.83 < 4`），于是按钮的**外轮廓一个像素都不变**。
+//!    拖进「≤1 LSB」那一档（见本文档第 1 条）。`Field` 的环保留 `theme.accent`（与 `border`
+//!    填充的通道平均差 **106.7**，同样远高于 64 的下限）。
+//! 2. **内缩 `FOCUS_RING_INSET`**：描边命令只有**直角**矩形，而填充是**圆角**（半径 `FILL_ROUND_RADIUS`）⇒
+//!    贴着边画会把四个圆角补成方角（实测 32 px；只缩 1 px 仍留 4 px）。内缩 2 之后环的直角
+//!    顶点落回圆角内（`√2·(4−2) ≈ 2.83 < 4`），于是控件的**外轮廓一个像素都不变**。
+//!    `Field` 还**保留**它那条 1px 边框（改前是「focus 就把边框加粗变色」，那正是贴边的来源）。
 //!
-//! 判据同时从「差异 > 0」加严成三条：环带内差异像素数 ≥ 下限、环带内**平均通道差** ≥ 下限、
-//! 且差异**一个都不许**落在环带之外。这条判据在同一份模块测试里**反向自检**：
-//! 把环色改回填充色（以及改成一个「技术上不同、肉眼看不出」的近似色）⇒ 它必须拒绝
-//! （`button_focus_ring_is_visible_against_the_fill`）。
+//! 判据同时从「差异 > 0」加严成四条：环带内差异像素数 ≥ 下限、**平均通道差** ≥ 下限、
+//! 差异**一个都不许**落在环带之外（框外更不许）、且环**一个像素都不许**落在圆角剪影之外。
+//! 这条判据在同一份模块测试里**反向自检**：把环色改回填充色、改成「技术上不同、肉眼看不出」
+//! 的近似色、把几何**退回贴边**、以及「内缩不足 1 px」⇒ 四次都必须被拒绝
+//! （`button_focus_ring_is_visible_against_the_fill`、`field_focus_ring_is_inset_and_visible_against_the_fill`）。
 //!
 //! ## `FieldText`：文本内容要不要上屏
 //!
@@ -70,9 +89,12 @@
 //! ## `NodeHint`：这份列表是**裁剪感知命中**的前提
 //!
 //! `interaction::ClipSnapshot::from_draw_list` 的绑定协议要求「第 k 个 `NodeHint` = 前序遍历
-//! 里第 k 个**有几何**的节点」。`DefaultRenderer` **不发** `NodeHint` ⇒ 快照恒为空 ⇒
+//! 里第 k 个**有几何**的节点」，并用提示里的 `node_id_len` **和** `node_id_fp`
+//! （id 的确定性指纹）**双重校验**这次绑定（只比长度时，等长 id 互换会静默错位 —— 见
+//! `draw.rs` 的 `DrawCmd::NodeHint`）。`DefaultRenderer` **不发** `NodeHint` ⇒ 快照恒为空 ⇒
 //! 命中不受裁剪约束（而且**看不出来**）。所以本模块的骨架逐字照抄
 //! `NullRenderer::build`：先给每个有几何的节点发提示（不因零面积而跳过），再画视觉。
+//! 提示一律走 `DrawCmd::node_hint`（唯一算校验和的地方），本模块不手写字面量。
 //! 零面积节点只画描边（与 `DefaultRenderer` 的早退不同），并在模块测试里钉住这条差异。
 
 use deer_layout::layout::{Geometry, Measure};
@@ -127,6 +149,11 @@ pub const HOVER_LIGHTEN: f32 = 0.22;
 pub const PRESSED_DARKEN: f32 = 0.30;
 /// 焦点描边宽度（像素，**向内**画 ⇒ 不会跑到矩形之外）。
 pub const FOCUS_STROKE_WIDTH: i32 = 3;
+/// `Button` / `Field` 的**圆角填充半径**（像素）—— 两者共用同一个值。
+///
+/// 焦点环的内缩判别式 `√2·(radius − inset) ≤ radius` 就建立在它之上（见 [`FOCUS_RING_INSET`]）：
+/// 谁把圆角改大而不动内缩，模块测试会红，而不是悄悄又冒出方角补块。
+pub const FILL_ROUND_RADIUS: i32 = 4;
 /// **按钮**焦点环相对按钮矩形再内缩的像素数（原因见模块文档「焦点环」一节）。
 ///
 /// 按钮的填充是**圆角**（半径 4），而描边命令只有直角矩形：贴着边画时环的四个直角顶点会伸到
@@ -233,10 +260,10 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
         let focused = self.is_focused(n, dead);
 
         // ① 提示**先发**：与 `NullRenderer::build` 同序（每个有几何的节点一条，零面积也算）。
-        list.push(DrawCmd::NodeHint {
-            rect: RectI::new(f.x as i32, f.y as i32, f.w as i32, f.h as i32),
-            node_id_len: n.id.len() as u32,
-        });
+        list.push(DrawCmd::node_hint(
+            RectI::new(f.x as i32, f.y as i32, f.w as i32, f.h as i32),
+            &n.id,
+        ));
 
         // ② 视觉。零面积只画描边（`DefaultRenderer` 是直接早退 ⇒ 两者在这条边界上不同，
         //    模块测试钉住了这一点）。
@@ -294,7 +321,7 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
                     };
                     list.push(DrawCmd::FillRoundRect {
                         rect,
-                        radius: 4,
+                        radius: FILL_ROUND_RADIUS,
                         color: tint(base, visual),
                     });
                     let label = n.props.label.clone().unwrap_or_default();
@@ -325,7 +352,7 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
                     }
                 }
                 Kind::Field => {
-                    // 填充：pressed/hover 改色；描边：focus 改成强调色（填充**回到 idle 色**）。
+                    // 填充：pressed/hover 改色；**focus 不改填充**（焦点只由下面那条环表达）。
                     let fill = if focused {
                         self.theme.border
                     } else {
@@ -333,19 +360,28 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
                     };
                     list.push(DrawCmd::FillRoundRect {
                         rect,
-                        radius: 4,
+                        radius: FILL_ROUND_RADIUS,
                         color: fill,
                     });
-                    let border = if focused {
-                        self.theme.accent
-                    } else {
-                        self.theme.text_dim
-                    };
+                    // 边框：**恒为 1px 的 `text_dim`** —— focus **不再**把边框本身加粗变色。
+                    // 那正是「贴边画」的老缺陷：3px 的**直角**描边压在半径 4 的**圆角**填充上，
+                    // 把四个圆角补成方角（本语料实测 32 px 补块，与按钮当初同一根因）。
                     list.push(DrawCmd::StrokeRect {
                         rect,
-                        color: border,
-                        width: if focused { FOCUS_STROKE_WIDTH } else { 1 },
+                        color: self.theme.text_dim,
+                        width: 1,
                     });
+                    // 焦点环：**对比色**（`theme.accent`，与填充 `border` 的平均通道差 **106.7**）
+                    // + **内缩 `FOCUS_RING_INSET`**（环的直角顶点落回圆角内 ⇒ 补块 0）。
+                    // 保留上面那条 1px 边框是刻意的：于是「focused vs idle」的差异**恰好**是环带，
+                    // 判据才能升级成「框内差异一个都不许落在环带之外」（见模块测试）。
+                    if focused {
+                        list.push(DrawCmd::StrokeRect {
+                            rect: focus_ring_rect(rect),
+                            color: self.theme.accent,
+                            width: FOCUS_STROKE_WIDTH,
+                        });
+                    }
                     // 文本**内缩**：文字与描边不重叠 ⇒「文本变化」只发生在框内（判据更强）。
                     list.push(DrawCmd::Text {
                         rect: inset(rect, TEXT_INSET),
@@ -751,23 +787,105 @@ mod tests {
     /// 只数「差异像素数」是不够的 —— 那个近似色**照样**改掉整条环带（264 px，一个不少）。
     const FOCUS_RING_MIN_CONTRAST: f64 = 64.0;
 
+    /// **`Field` 焦点环**的差异像素数下限。
+    ///
+    /// 出处（本语料 `field_1` = 98×22，半径 4，canvas 200×120）：
+    /// - 期望环带 = `focus_ring_rect(field)` 内缩 2、宽 3 ⇒ `94×18 − 88×12 = 1692 − 1056 = `**636** px；
+    /// - 环画在文字**之上**，而文字与环在重叠处... 不：文字在 idle 与 focused 两帧里**相同**，
+    ///   所以被占位字形盖住的环像素**不产生差异** ⇒ 实测 **570** px（= 636 − 66 个字形像素）；
+    /// - 下限取环带的 **3/4 = 636×3/4 = 477**（与按钮那条同一条推导：`264×3/4 = 198`），
+    ///   实测 570 留余量 93；而「环与填充同色」时的实测是 **0 px**、「内缩不足」是几何上的 4 px 补块 ——
+    ///   两者都远在 477 之下，中间隔着一整个数量级。
+    const FIELD_RING_MIN_PIXELS: usize = 477;
+
+    /// 「改前几何」的**按钮**焦点帧：环**贴边**画（不内缩），其余命令与交付的 focused 帧逐字节相同。
+    ///
+    /// 反向自检用：单变量地退回改前那种几何 ⇒ 方角补块必须被当场抓出来。
+    fn px_of_flush_ring(t: &Node, g: &Geometry, theme: &Theme, ext: Extent, owner: RectI) -> Vec<u8> {
+        let mut list = InteractiveRenderer::new(
+            theme.clone(),
+            &ApproxMeasure,
+            &InteractState::focused("button_1"),
+        )
+        .build(t, g);
+        let mut hit = 0;
+        for cmd in list.cmds.iter_mut() {
+            if let DrawCmd::StrokeRect { rect, width, .. } = cmd {
+                if *width == FOCUS_STROKE_WIDTH {
+                    *rect = owner; // ← 唯一变量：环回到贴边
+                    hit += 1;
+                }
+            }
+        }
+        assert_eq!(hit, 1, "前置：恰好一条焦点环命令");
+        CpuRenderer::new()
+            .render(ext, &list, Color::rgb(0, 0, 0))
+            .unwrap()
+            .pixels
+    }
+
     /// 一份逐像素对照的统计（打印用 + 判据用）。
     #[derive(Debug)]
     struct RingStats {
         /// 环带内的差异像素数。
         diff_inside: usize,
-        /// 差异像素里落在环带**之外**的数量（必须为 0）。
+        /// 差异像素里落在环带**之外、但仍在控件矩形内**的数量（必须为 0）。
         diff_outside: usize,
+        /// 差异像素里落在**控件矩形之外**的数量（必须为 0：状态视觉不许溢出自己的矩形）。
+        diff_out_rect: usize,
         /// 差异像素的「三通道平均差」。
         mean_contrast: f64,
+        /// **方角补块**：环画在**圆角剪影之外**的像素数（必须为 0）。
+        ///
+        /// 描边命令只有直角矩形，而填充是圆角（半径 4）⇒ 贴边画时环的四个直角顶点会伸到
+        /// 圆角之外，把圆角「补成方角」。这个数就是那些像素 —— 改前实测 **32**（按钮与
+        /// `Field` 同源、都是 32）。
+        patch: usize,
     }
 
-    /// 数出 `focused` 相对 `idle` 在环带内外各差了多少像素、以及平均通道差。
+    /// 圆角剪影判定 —— **口径照抄** `null.rs::inside_rounded`（CPU 后端的圆角掩码）。
     ///
-    /// `band` = 环带外沿矩形，`hole` = 环带内沿（`band` 内缩 `FOCUS_STROKE_WIDTH`）。
-    fn ring_stats(idle: &[u8], focused: &[u8], ext: Extent, band: RectI, hole: RectI) -> RingStats {
+    /// 复制一份是刻意的：判据要能**独立**指出「环画到了圆角之外」，而不是去问被它检验的
+    /// 那条渲染路径「你觉得圆角在哪」。两边一旦漂，这条测试会红（而不是静默失去判别力）。
+    fn inside_rounded(rect: RectI, x: i32, y: i32, r: i32) -> bool {
+        let corners = [
+            (rect.x + r, rect.y + r, -1, -1),
+            (rect.right() - 1 - r, rect.y + r, 1, -1),
+            (rect.x + r, rect.bottom() - 1 - r, -1, 1),
+            (rect.right() - 1 - r, rect.bottom() - 1 - r, 1, 1),
+        ];
+        for (ccx, ccy, sx, sy) in corners {
+            let in_corner_x = if sx < 0 { x < ccx } else { x > ccx };
+            let in_corner_y = if sy < 0 { y < ccy } else { y > ccy };
+            if in_corner_x && in_corner_y {
+                let dx = (x - ccx) as f32;
+                let dy = (y - ccy) as f32;
+                if dx * dx + dy * dy > (r * r) as f32 {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    /// 数出 `focused` 相对 `idle` 在环带内外各差了多少像素、平均通道差、以及方角补块。
+    ///
+    /// - `owner` = 控件自己的矩形（越界判据的边界）；
+    /// - `band` = **期望的**环带外沿矩形（内缩后的那一圈）；内沿 = `band` 内缩 `FOCUS_STROKE_WIDTH`；
+    /// - `ring_rect` = **实际画出去**的环矩形（用来数方角补块：它落在圆角剪影之外多少像素）；
+    /// - `radius` = 填充的圆角半径（由调用方从**这一帧的真实填充命令**里读出来，不是写死的）。
+    fn ring_stats(
+        idle: &[u8],
+        focused: &[u8],
+        ext: Extent,
+        owner: RectI,
+        band: RectI,
+        ring_rect: RectI,
+        radius: i32,
+    ) -> RingStats {
+        let hole = inset(band, FOCUS_STROKE_WIDTH);
         let w = ext.width as usize;
-        let (mut inside, mut outside, mut sum) = (0usize, 0usize, 0u64);
+        let (mut inside, mut outside, mut out_rect, mut sum) = (0usize, 0usize, 0usize, 0u64);
         for p in 0..(ext.width as usize * ext.height as usize) {
             let i = p * 4;
             if focused[i..i + 4] == idle[i..i + 4] {
@@ -775,8 +893,9 @@ mod tests {
             }
             let x = ((i / 4) % w) as i32;
             let y = ((i / 4) / w) as i32;
-            let in_band = band.contains(x, y) && !hole.contains(x, y);
-            if in_band {
+            if !owner.contains(x, y) {
+                out_rect += 1;
+            } else if band.contains(x, y) && !hole.contains(x, y) {
                 inside += 1;
             } else {
                 outside += 1;
@@ -785,33 +904,58 @@ mod tests {
                 sum += focused[i + c].abs_diff(idle[i + c]) as u64;
             }
         }
-        let n = inside + outside;
+        // 方角补块：**实际环矩形**里落在圆角剪影之外的像素（与像素差异无关，纯几何）。
+        let mut patch = 0usize;
+        for y in ring_rect.y..ring_rect.bottom() {
+            for x in ring_rect.x..ring_rect.right() {
+                if ring_rect.contains(x, y) && !inside_rounded(owner, x, y, radius) {
+                    patch += 1;
+                }
+            }
+        }
+        let n = inside + outside + out_rect;
         RingStats {
             diff_inside: inside,
             diff_outside: outside,
+            diff_out_rect: out_rect,
             mean_contrast: if n == 0 {
                 0.0
             } else {
                 sum as f64 / (3.0 * n as f64)
             },
+            patch,
         }
     }
 
     /// **焦点环判据本体**（函数化是为了让它在同一次运行里被反向自检）。
     ///
-    /// 三条都要成立：① 差异**一个都不许**落在环带之外（否则焦点视觉溢出了自己的矩形）；
-    /// ② 环带内差异像素数 ≥ [`FOCUS_RING_MIN_PIXELS`]；③ 平均通道差 ≥ [`FOCUS_RING_MIN_CONTRAST`]。
-    fn focus_ring_verdict(name: &str, s: &RingStats) -> Result<(), String> {
+    /// 四条都要成立：① 差异**一个都不许**落在控件矩形之外；② 差异**一个都不许**落在
+    /// 期望环带之外（否则「焦点视觉」在框内乱跑：贴边画的方角补块就是这么被抓出来的）；
+    /// ③ 环带内差异像素数 ≥ `min_px`；④ 平均通道差 ≥ [`FOCUS_RING_MIN_CONTRAST`]；
+    /// ⑤ 环本身**不许**画到圆角剪影之外（`patch == 0`）。
+    fn focus_ring_verdict(name: &str, s: &RingStats, min_px: usize) -> Result<(), String> {
+        if s.diff_out_rect != 0 {
+            return Err(format!(
+                "[{name}] 有 {} 个差异像素落在控件矩形之外",
+                s.diff_out_rect
+            ));
+        }
         if s.diff_outside != 0 {
             return Err(format!(
-                "[{name}] 有 {} 个差异像素落在环带之外",
+                "[{name}] 有 {} 个差异像素落在期望环带之外",
                 s.diff_outside
             ));
         }
-        if s.diff_inside < FOCUS_RING_MIN_PIXELS {
+        if s.patch != 0 {
             return Err(format!(
-                "[{name}] 环带内只有 {} 个差异像素 < 下限 {}",
-                s.diff_inside, FOCUS_RING_MIN_PIXELS
+                "[{name}] 环有 {} 个像素画在圆角剪影之外（直角描边把圆角补成了方角）",
+                s.patch
+            ));
+        }
+        if s.diff_inside < min_px {
+            return Err(format!(
+                "[{name}] 环带内只有 {} 个差异像素 < 下限 {min_px}",
+                s.diff_inside
             ));
         }
         if s.mean_contrast < FOCUS_RING_MIN_CONTRAST {
@@ -912,31 +1056,38 @@ mod tests {
         // ---- ② 实测 + 判据 ----
         let idle = px_of(&InteractState::default(), None);
         let focused = px_of(&InteractState::focused("button_1"), None);
-        let s = ring_stats(&idle, &focused, ext, ring_rect, hole);
+        let s = ring_stats(&idle, &focused, ext, btn, ring_rect, ring_rect, radius);
         println!(
-            "focused vs idle：环带内差异像素 {}（下限 {}）｜环带外 {}（要求 0）｜平均通道差 {:.1}（下限 {:.1}）",
-            s.diff_inside, FOCUS_RING_MIN_PIXELS, s.diff_outside, s.mean_contrast, FOCUS_RING_MIN_CONTRAST
+            "focused vs idle：环带内差异像素 {}（下限 {}）｜环带外 {}（要求 0）｜矩形外 {}（要求 0）\
+             ｜方角补块 {}（要求 0）｜平均通道差 {:.1}（下限 {:.1}）",
+            s.diff_inside,
+            FOCUS_RING_MIN_PIXELS,
+            s.diff_outside,
+            s.diff_out_rect,
+            s.patch,
+            s.mean_contrast,
+            FOCUS_RING_MIN_CONTRAST
         );
         println!(
             "对照：差异字节数 = {}（改前是 144；其中 32 px 是方角补角、24 px 是描边压字形）",
             focused.iter().zip(idle.iter()).filter(|(a, b)| a != b).count()
         );
-        focus_ring_verdict("实测", &s).unwrap_or_else(|e| panic!("{e}"));
+        focus_ring_verdict("实测", &s, FOCUS_RING_MIN_PIXELS).unwrap_or_else(|e| panic!("{e}"));
 
         // ---- ③ 反向自检（每次运行都跑）----
         //    (a) 环色改回填充色 —— 本次要修的那一版就是它（那时环还贴着边画，多出 32 px
         //        方角补角 ⇒ 56 px；这里的新几何下只剩「环压过字形」的那些像素 ⇒ 36 px，
         //        两者都远低于下限，判据必须拒绝）。
         let same = px_of(&InteractState::focused("button_1"), Some(fill_color));
-        let s_same = ring_stats(&idle, &same, ext, ring_rect, hole);
+        let s_same = ring_stats(&idle, &same, ext, btn, ring_rect, ring_rect, radius);
         println!(
             "反向自检 a（环 = 填充色）：环带内差异 {}｜平均通道差 {:.1} ⇒ {:?}",
             s_same.diff_inside,
             s_same.mean_contrast,
-            focus_ring_verdict("a", &s_same).err()
+            focus_ring_verdict("a", &s_same, FOCUS_RING_MIN_PIXELS).err()
         );
         assert!(
-            focus_ring_verdict("反向自检 a：环与填充同色", &s_same).is_err(),
+            focus_ring_verdict("反向自检 a：环与填充同色", &s_same, FOCUS_RING_MIN_PIXELS).is_err(),
             "判据必须拒绝「环与填充同色」，否则它抓不住本次要修的缺陷"
         );
         //    (b) 环色 = 填充色提亮 5%（技术上不同色、肉眼看不出）⇒ 差异像素数几乎不少，靠**对比度**下限咬住。
@@ -944,12 +1095,12 @@ mod tests {
             &InteractState::focused("button_1"),
             Some(fill_color.lighten(0.05)),
         );
-        let s_faint = ring_stats(&idle, &faint, ext, ring_rect, hole);
+        let s_faint = ring_stats(&idle, &faint, ext, btn, ring_rect, ring_rect, radius);
         println!(
             "反向自检 b（环 = 填充提亮 5%）：环带内差异 {}｜平均通道差 {:.1} ⇒ {:?}",
             s_faint.diff_inside,
             s_faint.mean_contrast,
-            focus_ring_verdict("b", &s_faint).err()
+            focus_ring_verdict("b", &s_faint, FOCUS_RING_MIN_PIXELS).err()
         );
         assert!(
             s_faint.diff_inside >= FOCUS_RING_MIN_PIXELS,
@@ -957,8 +1108,24 @@ mod tests {
             s_faint.diff_inside
         );
         assert!(
-            focus_ring_verdict("反向自检 b：环色几乎与填充相同", &s_faint).is_err(),
+            focus_ring_verdict("反向自检 b：环色几乎与填充相同", &s_faint, FOCUS_RING_MIN_PIXELS)
+                .is_err(),
             "判据必须拒绝「技术上有差异、肉眼看不出」的环，否则对比度下限是摆设"
+        );
+        //    (c) **几何**反向自检：把环挪回贴边画（本次修的正是它）⇒ 方角补块必须当场抓出来。
+        let flush = px_of_flush_ring(&t, &g, &theme, ext, btn);
+        let s_flush = ring_stats(&idle, &flush, ext, btn, ring_rect, btn, radius);
+        println!(
+            "反向自检 c（环贴边画 = 改前几何）：环带内 {}｜环带外 {}｜方角补块 {} ⇒ {:?}",
+            s_flush.diff_inside,
+            s_flush.diff_outside,
+            s_flush.patch,
+            focus_ring_verdict("c", &s_flush, FOCUS_RING_MIN_PIXELS).err()
+        );
+        assert_eq!(s_flush.patch, 32, "前置：贴边画的 3px 直角环在半径 4 的圆角上必留 32 px 补块");
+        assert!(
+            focus_ring_verdict("反向自检 c：环贴边画", &s_flush, FOCUS_RING_MIN_PIXELS).is_err(),
+            "判据必须拒绝「环贴边画」（方角补块）—— 这正是本次修的形状缺陷"
         );
 
         // ---- ④ 越界：差异不许出现在**别的控件**上（输入框/容器一个字节都不许动）----
@@ -976,6 +1143,262 @@ mod tests {
             .count();
         println!("按钮/输入框之外的差异字节 = {stray}");
         assert_eq!(stray, 0, "按钮焦点视觉溢到了别的控件上");
+    }
+
+    /// **`Field` 的焦点环**：与按钮**同源**的形状缺陷 —— 必须**内缩**（`FOCUS_RING_INSET`），
+    /// 且必须**看得见**（对比度下限）。
+    ///
+    /// 改前实测（本语料 `field_1` = 98×22、半径 4、期望环带 636 px）：
+    /// 环贴在框边画（`rect` 全宽、宽 `FOCUS_STROKE_WIDTH`）⇒ 与 idle 差 **684 px**，其中
+    /// **464 px 落在期望环带之外**（框的 1px 边框被 3px 直角环盖住 + 四角），
+    /// **32 px 是方角补块**（直角环压在半径 4 的圆角上，把圆角补成方角，与按钮当初一模一样）。
+    /// 当时的判据是「输入框矩形内差异 ≥ 500」⇒ 684 ≥ 500，于是它一直绿着。
+    ///
+    /// 修法（与按钮同一套）：环矩形内缩 `FOCUS_RING_INSET`，**并保留** 1px 的 idle 边框 ⇒
+    /// 与 idle 的差异**恰好**是环带（实测 570 = 636 减去被字形盖住的 66），
+    /// 于是判据能升级成「**框内差异一个都不许落在环带之外**」+「环像素一个都不许落在圆角剪影之外」。
+    /// 反向自检三次（环色同色 / 近似色 / **几何退回贴边**）都必须被拒绝。
+    #[test]
+    fn field_focus_ring_is_inset_and_visible_against_the_fill() {
+        let t = tree();
+        let g = geo();
+        let theme = Theme::default();
+        let ext = Extent {
+            width: 200,
+            height: 120,
+        };
+        let fr = *g.get("field_1").expect("测试前置：field_1 必须有几何");
+        let field = RectI::new(fr.x as i32, fr.y as i32, fr.w as i32, fr.h as i32);
+        let band = focus_ring_rect(field);
+        let hole = inset(band, FOCUS_STROKE_WIDTH);
+        let band_pixels = (band.w * band.h - hole.w * hole.h) as usize;
+
+        let render = |list: &DrawList| {
+            CpuRenderer::new()
+                .render(ext, list, Color::rgb(0, 0, 0))
+                .unwrap()
+                .pixels
+        };
+        let focused_list =
+            InteractiveRenderer::new(theme.clone(), &ApproxMeasure, &InteractState::focused("field_1"))
+                .build(&t, &g);
+
+        // ---- 前置：命令层面的几何与颜色（判据的落点由它们决定，错了下面全在测空气）----
+        let (mut owner, mut fills, mut borders, mut rings) = (None, Vec::new(), Vec::new(), Vec::new());
+        for cmd in &focused_list.cmds {
+            match cmd {
+                DrawCmd::NodeHint { rect, .. } => owner = Some(*rect),
+                DrawCmd::FillRoundRect { rect, radius, color } if owner == Some(field) => {
+                    assert_eq!(*rect, field, "输入框填充必须铺满框");
+                    fills.push((*radius, *color));
+                }
+                DrawCmd::StrokeRect { rect, color, width } if owner == Some(field) => {
+                    if *width == FOCUS_STROKE_WIDTH {
+                        rings.push((*rect, *color));
+                    } else {
+                        borders.push((*rect, *width, *color));
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(fills.len(), 1, "输入框只允许一条填充命令");
+        assert_eq!(rings.len(), 1, "focused 必须**恰好**给输入框画一条焦点环");
+        assert_eq!(
+            borders.len(),
+            1,
+            "focused 必须保留那条 1px 边框（差异才恰好等于环带 —— 判据强度靠它）"
+        );
+        let (radius, fill_color) = fills[0];
+        assert_eq!(fill_color, theme.border, "前置：输入框填充是 theme.border（环色必须与它分得开）");
+        assert_eq!(borders[0], (field, 1, theme.text_dim), "前置：边框仍是 1px 的 text_dim");
+        let (ring_rect, ring_color) = rings[0];
+        assert_eq!(
+            ring_rect, band,
+            "前置：环矩形 = 框内缩 FOCUS_RING_INSET（{FOCUS_RING_INSET}）—— 判据的落点就是它"
+        );
+        assert_ne!(ring_color, fill_color, "前置：环与填充同色 ⇒ 判据测的是空气");
+        assert!(
+            (FOCUS_RING_INSET as f32) >= radius as f32 * (1.0 - 1.0 / 2.0f32.sqrt()),
+            "前置：内缩 {FOCUS_RING_INSET} 不够 —— 填充半径 {radius} 的圆角会被直角环补成方角"
+        );
+        println!(
+            "输入框 {field:?}｜填充 {fill_color:?}（半径 {radius}）｜边框 1px {:?}\
+             ｜环 {ring_rect:?} 色 {ring_color:?} 宽 {FOCUS_STROKE_WIDTH}（内缩 {FOCUS_RING_INSET}）",
+            theme.text_dim
+        );
+        assert_eq!(band_pixels, 636, "前置：本语料的环带像素数变了 ⇒ 下面那条下限必须跟着重算");
+
+        // ---- ② 实测 + 判据 ----
+        let idle = render(
+            &InteractiveRenderer::new(theme.clone(), &ApproxMeasure, &InteractState::default())
+                .build(&t, &g),
+        );
+        let focused = render(&focused_list);
+        let s = ring_stats(&idle, &focused, ext, field, band, ring_rect, radius);
+        println!(
+            "field focused vs idle：环带内 {}（下限 {FIELD_RING_MIN_PIXELS}）｜环带外 {}（要求 0）\
+             ｜框外 {}（要求 0）｜方角补块 {}（要求 0）｜平均通道差 {:.1}（下限 {FOCUS_RING_MIN_CONTRAST:.1}）\
+             ｜差异字节 {}（改前 684 px）",
+            s.diff_inside,
+            s.diff_outside,
+            s.diff_out_rect,
+            s.patch,
+            s.mean_contrast,
+            focused.iter().zip(idle.iter()).filter(|(a, b)| a != b).count()
+        );
+        focus_ring_verdict("field 实测", &s, FIELD_RING_MIN_PIXELS).unwrap_or_else(|e| panic!("{e}"));
+
+        // ---- ③ 反向自检：三个坏环都必须被拒 ----
+        //
+        // 变体只改**输入框自己的描边命令**（填充、文字、别的节点一字不动）⇒ 唯一变量就是那些描边。
+        let variant = |ring: RectI, color: Color, keep_border: bool| -> Vec<u8> {
+            let mut out: Vec<DrawCmd> = Vec::new();
+            let (mut owner, mut done) = (None, false);
+            for cmd in &focused_list.cmds {
+                match cmd {
+                    DrawCmd::NodeHint { rect, .. } => {
+                        owner = Some(*rect);
+                        out.push(cmd.clone());
+                    }
+                    DrawCmd::StrokeRect { .. } if owner == Some(field) => {
+                        if !done {
+                            done = true;
+                            if keep_border {
+                                out.push(DrawCmd::StrokeRect {
+                                    rect: field,
+                                    color: theme.text_dim,
+                                    width: 1,
+                                });
+                            }
+                            out.push(DrawCmd::StrokeRect {
+                                rect: ring,
+                                color,
+                                width: FOCUS_STROKE_WIDTH,
+                            });
+                        }
+                    }
+                    _ => out.push(cmd.clone()),
+                }
+            }
+            assert!(done, "前置：输入框上必须有描边命令可替换");
+            render(&DrawList::from_cmds(out))
+        };
+
+        // (a) 环色 = 填充色（`border`）⇒ 环带内差异塌成 0。
+        let s_same = ring_stats(&idle, &variant(band, fill_color, true), ext, field, band, band, radius);
+        println!(
+            "反向自检 a（环 = 填充色）：环带内 {}｜平均通道差 {:.1} ⇒ {:?}",
+            s_same.diff_inside,
+            s_same.mean_contrast,
+            focus_ring_verdict("a", &s_same, FIELD_RING_MIN_PIXELS).err()
+        );
+        assert!(
+            focus_ring_verdict("反自检 a：环与填充同色", &s_same, FIELD_RING_MIN_PIXELS).is_err(),
+            "判据必须拒绝「环与填充同色」"
+        );
+
+        // (b) 环色 = 填充色提亮 5%（技术上不同色、肉眼看不出）⇒ 像素数一个不少，靠对比度下限咬住。
+        let s_faint = ring_stats(
+            &idle,
+            &variant(band, fill_color.lighten(0.05), true),
+            ext,
+            field,
+            band,
+            band,
+            radius,
+        );
+        println!(
+            "反向自检 b（环 = 填充提亮 5%）：环带内 {}｜平均通道差 {:.1} ⇒ {:?}",
+            s_faint.diff_inside,
+            s_faint.mean_contrast,
+            focus_ring_verdict("b", &s_faint, FIELD_RING_MIN_PIXELS).err()
+        );
+        assert!(
+            s_faint.diff_inside >= FIELD_RING_MIN_PIXELS,
+            "反向自检 b 的前置：近似色**照样**改掉整条环带（{} px）⇒ 只数像素数抓不住它",
+            s_faint.diff_inside
+        );
+        assert!(
+            focus_ring_verdict("反自检 b：环色几乎与填充相同", &s_faint, FIELD_RING_MIN_PIXELS)
+                .is_err(),
+            "判据必须拒绝「技术上有差异、肉眼看不出」的环"
+        );
+
+        // (c) **几何**退回**贴边**画（= 改前的代码路径：不内缩、且不留 1px 边框）
+        //     ⇒ 方角补块与「环带外差异」都必须当场抓出来。
+        let s_flush = ring_stats(
+            &idle,
+            &variant(field, ring_color, false),
+            ext,
+            field,
+            band,
+            field,
+            radius,
+        );
+        println!(
+            "反向自检 c（环贴边画 = 改前几何）：环带内 {}｜环带外 {}｜方角补块 {} ⇒ {:?}",
+            s_flush.diff_inside,
+            s_flush.diff_outside,
+            s_flush.patch,
+            focus_ring_verdict("c", &s_flush, FIELD_RING_MIN_PIXELS).err()
+        );
+        assert_eq!(
+            s_flush.patch, 32,
+            "前置：贴边画的 3px 直角环在半径 {radius} 的圆角上必留 32 px 方角补块（与按钮同源）"
+        );
+        assert!(
+            focus_ring_verdict("反自检 c：环贴边画", &s_flush, FIELD_RING_MIN_PIXELS).is_err(),
+            "判据必须拒绝「环贴边画」—— 这正是本次修的形状缺陷"
+        );
+
+        // (d) 内缩**不够**（只缩 1 px）⇒ 四角各留下 1 px 补块 ⇒ 也必须被拒。
+        //     这条同时把 `FOCUS_RING_INSET` 的取值（√2 判别式的整数下限 2）钉住：谁把它调小，这里会红。
+        let s_shallow = ring_stats(
+            &idle,
+            &variant(inset(field, 1), ring_color, true),
+            ext,
+            field,
+            band,
+            inset(field, 1),
+            radius,
+        );
+        println!(
+            "反向自检 d（内缩只 1 px）：环带内 {}｜环带外 {}｜方角补块 {} ⇒ {:?}",
+            s_shallow.diff_inside,
+            s_shallow.diff_outside,
+            s_shallow.patch,
+            focus_ring_verdict("d", &s_shallow, FIELD_RING_MIN_PIXELS).err()
+        );
+        assert_eq!(
+            s_shallow.patch, 4,
+            "前置：内缩 1 px 时四角各留 1 px 补块（√2·(4−1) > 4）"
+        );
+        assert!(
+            focus_ring_verdict("反自检 d：内缩不足", &s_shallow, FIELD_RING_MIN_PIXELS).is_err(),
+            "判据必须拒绝「内缩不足」的环 —— 否则 FOCUS_RING_INSET 就是个没有判据支撑的常数"
+        );
+
+        // ---- ④ 越界：别的控件与容器一个字节都不许动 ----
+        let br = *g.get("button_1").expect("测试前置：button_1 必须有几何");
+        let btn = RectI::new(br.x as i32, br.y as i32, br.w as i32, br.h as i32);
+        let stray = focused
+            .iter()
+            .zip(idle.iter())
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .filter(|(i, _)| {
+                let (x, y) = (
+                    (i / 4 % ext.width as usize) as i32,
+                    (i / 4 / ext.width as usize) as i32,
+                );
+                !field.contains(x, y)
+            })
+            .count();
+        println!("输入框之外（含按钮）的差异字节 = {stray}");
+        assert_eq!(stray, 0, "输入框的焦点视觉溢到了别的控件上");
+        // 前置：按钮确实在画布上（否则上一条「按钮没被污染」是空话）。
+        assert!(btn.w > 0 && btn.h > 0, "测试前置：button_1 有非零几何");
     }
 
     /// 零面积节点：本模块（照抄 `NullRenderer`）**发提示且发描边**，`DefaultRenderer` 直接早退。

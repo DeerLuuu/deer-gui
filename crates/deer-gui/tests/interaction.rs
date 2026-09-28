@@ -41,10 +41,7 @@ fn center(g: &Geometry, id: &str) -> (f32, f32) {
 
 fn hint_cmd(id: &str, g: &Geometry) -> DrawCmd {
     let r = g.get(id).copied().unwrap_or_else(|| panic!("测试前置：{id} 没有几何"));
-    DrawCmd::NodeHint {
-        rect: RectI::new(r.x as i32, r.y as i32, r.w as i32, r.h as i32),
-        node_id_len: id.len() as u32,
-    }
+    DrawCmd::node_hint(RectI::new(r.x as i32, r.y as i32, r.w as i32, r.h as i32), id)
 }
 
 fn press(k: Key, shift: bool) -> InputEvent {

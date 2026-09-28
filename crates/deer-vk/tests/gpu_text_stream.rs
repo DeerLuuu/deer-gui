@@ -634,10 +634,7 @@ fn shape_commands_do_not_affect_the_text_stream() {
         rect: RectI::new(0, 0, 96, 40),
         color: BG,
     });
-    mixed.push(DrawCmd::NodeHint {
-        rect: RectI::new(0, 0, 96, 40),
-        node_id_len: 3,
-    });
+    mixed.push(DrawCmd::node_hint(RectI::new(0, 0, 96, 40), "mix"));
     mixed.push(DrawCmd::StrokeRect {
         rect: RectI::new(1, 1, 94, 38),
         color: FG,

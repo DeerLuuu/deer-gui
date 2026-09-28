@@ -8,7 +8,7 @@
 //! | 事实 | 出处 |
 //! |---|---|
 //! | `hit_test` **最深命中者胜出**（后序覆盖）、**半开区间** `px ∈ [x, x+w)`、注释写明它是「输入路由的唯一依据」 | `crates/deer-layout/src/layout.rs:350-367` |
-//! | `DrawCmd::NodeHint { rect, node_id_len }` **不含 id**；**全仓库没有 id 侧表** —— 唯一产出点只写长度（`render.rs:135`），全部消费点（`null.rs:352`、`gpu_geom.rs:193`、`gpu_render.rs:1444`、`windowed.rs:1363`）都**忽略**它 | `crates/deer-gpu/src/draw.rs:83-84` |
+//! | `DrawCmd::NodeHint { rect, node_id_len, node_id_fp }` **不含 id 本身**；**全仓库没有 id 侧表** —— 两个校验和由**唯一**构造点 `DrawCmd::node_hint`（`draw.rs`）产出，全部后端消费点（`null.rs:352`、`gpu_geom.rs:193`、`gpu_render.rs:1444`、`windowed.rs:1363`、`hal.rs:170`）都**忽略**它（它不产生像素） | `crates/deer-gpu/src/draw.rs`（`NodeHint` 与 `node_id_fp`） |
 //! | 裁剪语义：`PushClip` 与当前裁剪**求交**、`PopClip` 出栈、**空栈 `PopClip` ⇒ 退回全画布** | `crates/deer-gpu/src/null.rs:313-329`（GPU 侧同语义 `deer-vk/src/gpu_text.rs:126-130`） |
 //! | `NodeProps::disabled` 已存在 | `crates/deer-layout/src/node.rs:119-122` |
 //! | `InputEvent`/`Key`/`Mods`/`PointerButton` 已在 `deer-window` 落地（M5-1），与本层的镜像逐字相同 | `crates/deer-window/src/lib.rs:127-210` |
@@ -17,10 +17,14 @@
 //!
 //! 1. **命中必须复用 `hit_test`**（`hit()` 只做两件它不做的事：查裁剪、查禁用），
 //!    不另写一套遍历 —— 否则「谁是输入路由的唯一依据」就有两份，必然漂。
-//! 2. **`ClipSnapshot` 无法只从 `DrawList` 派生**：`NodeHint` 只有 id **长度**，
-//!    没有 id，也没有侧表。所以构造时要**与树 + 几何共走**，把第 k 个 `NodeHint`
-//!    绑到第 k 个「有几何的节点」上，并用 `node_id_len` 当**校验和**（不一致就断言失败，
-//!    而不是悄悄错位）。计划里「id 在侧表」的前提经核实**不成立**，这里按实际情况实现。
+//! 2. **`ClipSnapshot` 无法只从 `DrawList` 派生**：`NodeHint` 不带 id 本身（只有它的
+//!    长度与指纹），也没有侧表。所以构造时要**与树 + 几何共走**，把第 k 个 `NodeHint`
+//!    绑到第 k 个「有几何的节点」上，并用 `node_id_len` **和** `node_id_fp`（id 的
+//!    确定性指纹）当校验和（不一致就断言失败，而不是悄悄错位）。
+//!    计划里「id 在侧表」的前提经核实**不成立**，这里按实际情况实现。
+//!    ⚠️ 只比长度是**不够**的：等长 id 互换会让长度校验和逐项相同 ⇒ 静默错位
+//!    （改前实测：`aaaa`/`bbbb` 互换后不 panic，且裁剪张冠李戴）—— 指纹就是为了堵这个盲区
+//!    （回归见 `r19_equal_length_id_swap_must_be_caught_by_the_id_fingerprint`）。
 //! 3. **命中落在禁用子树或被裁掉的点上 ⇒ 这个点没有命中**（**不回退**到祖先）。
 //!    回退需要「第二套路由规则」（谁是次优候选），与结论 1 冲突；代价见模块末尾「已知边界」。
 
@@ -227,9 +231,10 @@ impl ClipSnapshot {
 
     /// 从一份绘制列表派生「每个节点的有效裁剪」。
     ///
-    /// **协议**（因为 `NodeHint` 不带 id，只能这样绑定）：
+    /// **协议**（因为 `NodeHint` 不带 id 本身，只能这样绑定）：
     /// 把列表里第 k 个 `NodeHint` 绑到**前序遍历**里第 k 个「有几何的节点」上，
-    /// 并用 `node_id_len` 校验（对不上就 panic，不静默错位）。
+    /// 并用 `node_id_len` **和** `node_id_fp`（id 的确定性指纹）双重校验
+    /// （对不上就 panic，不静默错位；长度单独用是不够的 —— 等长 id 互换躲得过它）。
     /// 列表里**一个 `NodeHint` 都没有**时返回**空快照**（例如 `DefaultRenderer`
     /// 不产出 `NodeHint`）—— 这时没有绑定信息，只能全不裁剪；`is_empty()` 为真，
     /// 调用方可以据此断言前置条件，而不是误以为「裁剪已生效」。
@@ -277,14 +282,28 @@ impl ClipSnapshot {
                     // 空栈：`unwrap_or(full)` ⇒ 退回全画布（既有语义，不是新发明）。
                     clip = stack.pop().flatten();
                 }
-                DrawCmd::NodeHint { node_id_len, .. } => {
+                DrawCmd::NodeHint {
+                    node_id_len,
+                    node_id_fp,
+                    ..
+                } => {
                     let n = next
                         .next()
                         .expect("NodeHint 比「有几何的节点」还多：绘制列表与这棵树不是同一份");
+                    // ① 长度（便宜的前置检查，失败信息最直白）。
                     assert_eq!(
                         *node_id_len,
                         n.id.len() as u32,
                         "NodeHint 的长度校验和与节点 `{}` 对不上（顺序错位）",
+                        n.id
+                    );
+                    // ② **指纹**：只有长度时「等长 id 互换」会逐项相同、静默错位
+                    //    （改前实测：不 panic，且命中节点的裁剪张冠李戴）。
+                    assert_eq!(
+                        *node_id_fp,
+                        deer_gpu::draw::node_id_fp(&n.id),
+                        "NodeHint 的 **id 指纹** 与节点 `{}` 对不上：绘制列表与这棵树不是同一份\
+                         （长度校验和看不见这类错位 —— 等长 id 互换就是典型）。",
                         n.id
                     );
                     out.insert(n.id.clone(), clip);
@@ -749,14 +768,144 @@ mod tests {
     }
 
     /// 一份 `NodeHint`（真实用法：`NullRenderer` 给每个有几何的节点都发一条）。
+    ///
+    /// 这里**照样**走 `DrawCmd::node_hint`（唯一定义了「校验和怎么算」的地方）——
+    /// 手写字面量会让测试与产出路径各有一份算法，护栏就会在测试里绿、在真实列表上红。
     fn hint(n: &Node, g: &Geometry) -> DrawCmd {
         let r = g
             .get(&n.id)
             .copied()
             .unwrap_or_else(|| panic!("测试前置：节点 {} 没有几何", n.id));
-        DrawCmd::NodeHint {
-            rect: RectI::new(r.x as i32, r.y as i32, r.w as i32, r.h as i32),
-            node_id_len: n.id.len() as u32,
+        DrawCmd::node_hint(RectI::new(r.x as i32, r.y as i32, r.w as i32, r.h as i32), &n.id)
+    }
+
+    /// **2a 的变异夹具**：两棵树只在**两个等长**兄弟 id 的**顺序**上不同。
+    ///
+    /// ```text
+    /// app(0,0,60,40)
+    /// ├── aaaa (0, 0,10,10)   ← 两个 id 都是 4 字节
+    /// └── bbbb (20,0,10,10)
+    /// ```
+    ///
+    /// `swapped = false` ⇒ 前序 `[app, aaaa, bbbb]`；`swapped = true` ⇒ `[app, bbbb, aaaa]`。
+    /// 两棵树的 id 集合与几何**逐项相同**，只有兄弟顺序不同 —— 于是「第 k 条提示 =
+    /// 第 k 个有几何的节点」这条绑定在两棵树上把**不同的 id** 绑到同一个 `NodeHint` 上。
+    fn swap_fixture(swapped: bool) -> (Node, Geometry) {
+        let (first, second) = if swapped {
+            ("bbbb", "aaaa")
+        } else {
+            ("aaaa", "bbbb")
+        };
+        let t = Node::new(Kind::Column, "app")
+            .push(Node::new(Kind::Button, first))
+            .push(Node::new(Kind::Button, second));
+        let mut g = Geometry::new();
+        g.insert("app".into(), Rect::new(0.0, 0.0, 60.0, 40.0));
+        // 几何**按 id** 登记 ⇒ 两棵树共用同一份几何，「错位」只可能来自绑定顺序。
+        g.insert("aaaa".into(), Rect::new(0.0, 0.0, 10.0, 10.0));
+        g.insert("bbbb".into(), Rect::new(20.0, 0.0, 10.0, 10.0));
+        (t, g)
+    }
+
+    /// 前序里「有几何的节点」的 id（**顺序**就是绑定协议里的第 k 个）。
+    fn ordered_ids(root: &Node, g: &Geometry) -> Vec<String> {
+        let mut v = Vec::new();
+        collect_with_geometry(root, g, &mut v);
+        v.into_iter().map(|n| n.id.clone()).collect()
+    }
+
+    fn panic_text(e: &(dyn std::any::Any + Send)) -> String {
+        if let Some(s) = e.downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = e.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "<非字符串 panic>".to_string()
+        }
+    }
+
+    /// **2a**：**等长 id 互换**的变异必须被拦下 —— 而且必须由 **id 指纹**拦下
+    /// （长度校验和看不见它：两个 id 都是 4 字节）。
+    ///
+    /// 这条测试同时钉住两件事（改前它在第一件上红）：
+    /// ① 改前**静默**给出错快照（`aaaa` 的裁剪被错位成 `None`）—— 这才是缺陷；
+    /// ② 改后由**指纹**确定性 panic（断言消息里就是「id 指纹」，不是长度）。
+    #[test]
+    fn r19_equal_length_id_swap_must_be_caught_by_the_id_fingerprint() {
+        let (a, ga) = swap_fixture(false);
+        let (b, gb) = swap_fixture(true);
+
+        // 前置①：这次变异**真的**换了前序（否则下面全在测空气）。
+        let (ids_a, ids_b) = (ordered_ids(&a, &ga), ordered_ids(&b, &gb));
+        println!("树 A 前序 = {ids_a:?}｜树 B 前序 = {ids_b:?}");
+        assert_ne!(ids_a, ids_b, "测试前置：变异必须真的换了绑定顺序");
+        // 前置②：**等长**互换 ⇒ 长度序列逐项相同 ⇒ 长度校验和对此完全免疫。
+        let lens = |v: &[String]| v.iter().map(|s| s.len()).collect::<Vec<_>>();
+        assert_eq!(
+            lens(&ids_a),
+            lens(&ids_b),
+            "测试前置：这是「等长 id 互换」—— 长度序列必须逐项相同，\
+             否则长度校验和就能抓住它，这条测试测的就不是那个盲区了"
+        );
+        assert_eq!(lens(&ids_a), vec![3, 4, 4], "测试前置：本夹具的长度序列");
+
+        // 绘制列表来自树 A：**`aaaa` 那一刻正在裁剪里**，`bbbb` 在裁剪之外。
+        // （裁剪的落点由列表本身编码 ⇒ 它就是「本应如此」的地面真相。）
+        let list = build_list(&a, &ga, |id, l| match id {
+            "aaaa" => l.push(DrawCmd::PushClip {
+                rect: RectI::new(0, 0, 5, 5),
+            }),
+            "bbbb" => l.push(DrawCmd::PopClip),
+            _ => {}
+        });
+        let counts = list.counts();
+        println!(
+            "列表：{} 条命令（node_hint {}｜push {}｜pop {}｜balanced {}）",
+            list.len(),
+            counts.node_hint,
+            counts.push_clip,
+            counts.pop_clip,
+            list.clip_balanced()
+        );
+        assert_eq!(
+            (counts.node_hint, counts.push_clip, counts.pop_clip),
+            (3, 1, 1),
+            "测试前置：3 条节点提示 + 一对裁剪命令"
+        );
+        assert!(list.clip_balanced(), "测试前置：裁剪栈配平");
+        // 地面真相：按**列表来源树**，`aaaa` 的裁剪是 Some(0,0,5,5)、`bbbb` 是 None。
+        let truth = ClipSnapshot::from_draw_list(&list, &a, &ga);
+        println!(
+            "地面真相（列表来源树 A）：aaaa={:?}｜bbbb={:?}",
+            truth.clip_of("aaaa"),
+            truth.clip_of("bbbb")
+        );
+        assert_eq!(truth.clip_of("aaaa"), Some(RectI::new(0, 0, 5, 5)));
+        assert_eq!(truth.clip_of("bbbb"), None);
+
+        // 变异：把**同一份列表**绑到兄弟顺序互换的树 B 上。
+        // 改前实测：`node_id_len` 校验和全过 ⇒ **不 panic**，静默给出错快照
+        // （`aaaa` 的裁剪变 `None`，`bbbb` 反而拿到 `Some(0,0,5,5)`）。
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ClipSnapshot::from_draw_list(&list, &b, &gb)
+        }));
+        match outcome {
+            Ok(snap) => panic!(
+                "等长 id 互换**没有被拦下** ⇒ 静默给出错快照：\
+                 aaaa 的裁剪 = {:?}（列表来源树给的是 {:?}）、bbbb 的裁剪 = {:?}（应为 None）。\
+                 长度校验和（3,4,4 逐项相同）看不见这次错位。",
+                snap.clip_of("aaaa"),
+                Some(RectI::new(0, 0, 5, 5)),
+                snap.clip_of("bbbb")
+            ),
+            Err(e) => {
+                let msg = panic_text(&*e);
+                println!("拦下了：{msg}");
+                assert!(
+                    msg.contains("id 指纹"),
+                    "必须由 **id 指纹** 拦下（长度校验和看不见这次变异），实际消息：{msg}"
+                );
+            }
         }
     }
 
@@ -1611,6 +1760,30 @@ mod tests {
         // 把第一条提示的长度改错（模拟「列表与树不是同一份」）。
         if let Some(DrawCmd::NodeHint { node_id_len, .. }) = list.cmds.first_mut() {
             *node_id_len += 1;
+        }
+        let _ = ClipSnapshot::from_draw_list(&list, &t, &g);
+    }
+
+    /// 指纹这一条**自己**也要有判别力：长度**不动**、只把指纹改错 ⇒ 必须由指纹拦下。
+    ///
+    /// （否则「加了指纹」可能只是摆设 —— 长度那条正好也红了，就没人知道指纹有没有生效。）
+    #[test]
+    #[should_panic(expected = "id 指纹")]
+    fn r16b_node_hint_fingerprint_mismatch_panics_even_when_length_matches() {
+        let (t, g) = fixture();
+        let mut list = build_list(&t, &g, |_, _| {});
+        let first_len = match &list.cmds[0] {
+            DrawCmd::NodeHint { node_id_len, .. } => *node_id_len,
+            other => panic!("测试前置：第一条命令必须是 NodeHint，实际 {other:?}"),
+        };
+        if let Some(DrawCmd::NodeHint {
+            node_id_len,
+            node_id_fp,
+            ..
+        }) = list.cmds.first_mut()
+        {
+            *node_id_fp ^= 0xdead_beef; // 只动指纹
+            assert_eq!(*node_id_len, first_len, "测试前置：长度必须**没**变");
         }
         let _ = ClipSnapshot::from_draw_list(&list, &t, &g);
     }

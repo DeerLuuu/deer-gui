@@ -253,3 +253,76 @@ fn cpu_framebuffer_helpers_work() {
     let fb2 = Framebuffer::new(4, 4, RED);
     assert!(fb.bytes_eq(&fb2));
 }
+
+// ── 节点提示的 id 指纹（`ClipSnapshot` 绑定校验的另一半） ──────────────────
+
+/// `node_id_fp` 是**确定性**指纹 —— 护栏跨进程/跨平台必须给出同一个结论。
+///
+/// 这条测试同时也是「不许把它换成退化实现」的锁：若有人把它改成
+/// `id.len()`（就是本次要修的那个盲区）或换成带随机种子的 `DefaultHasher`，
+/// 下面「等长不同 id 必须不同指纹」与**钉住的具体值**至少有一条会红。
+#[test]
+fn node_id_fingerprint_is_deterministic_and_discriminates_equal_length_ids() {
+    use deer_gpu::draw::node_id_fp;
+
+    // ① 确定性：同一输入每次都一样（没有随机种子）。
+    for id in ["app", "button_1", "button_2", "名字", ""] {
+        assert_eq!(node_id_fp(id), node_id_fp(id), "`{id}` 的指纹必须确定");
+    }
+    // ② **等长 id 必须给出不同指纹** —— 这正是本次修的盲区（长度看不见它）。
+    for (a, b) in [
+        ("button_1", "button_2"),
+        ("aaaa", "bbbb"),
+        ("field_1", "field_2"),
+        ("field_1", "other_1"), // 等长但不同前缀（FNV 会走不同路径）
+    ] {
+        assert_eq!(a.len(), b.len(), "测试前置：`{a}` 与 `{b}` 必须等长（否则测的不是盲区）");
+        assert_ne!(node_id_fp(a), node_id_fp(b), "等长 id `{a}`/`{b}` 必须有不同指纹");
+    }
+    // ③ 字节级（不是字符级）：中文 id 按 UTF-8 字节参与。
+    assert_ne!(node_id_fp("名"), node_id_fp("字"));
+    println!(
+        "指纹：app={:#x}｜button_1={:#x}｜button_2={:#x}",
+        node_id_fp("app"),
+        node_id_fp("button_1"),
+        node_id_fp("button_2")
+    );
+    // ④ 钉住具体值 —— 换成退化实现（只返回长度、换哈希、加随机种子）都会在这里红。
+    //    前两行是 **FNV-1a 64 的公开测试向量**（`""` = 偏移基、`"foobar"` 是标准算例），
+    //    所以这个算法本身可以被独立复核，而不是「我们自己说了算」。
+    assert_eq!(node_id_fp(""), 0xcbf2_9ce4_8422_2325, "FNV-1a 64 偏移基");
+    assert_eq!(node_id_fp("foobar"), 0x8594_4171_f739_67e8, "FNV-1a 64 标准算例");
+    assert_eq!(node_id_fp("button_1"), 0x8574_78d6_5872_a2e1);
+    assert_eq!(node_id_fp("button_2"), 0x8574_75d6_5872_9dc8);
+    println!(
+        "指纹：app={:#018x}｜button_1={:#018x}｜button_2={:#018x}",
+        node_id_fp("app"),
+        node_id_fp("button_1"),
+        node_id_fp("button_2")
+    );
+}
+
+/// `DrawCmd::node_hint` 是**唯一**构造点：长度与指纹都必须与 id 一致。
+#[test]
+fn node_hint_constructor_fills_both_checksums() {
+    use deer_gpu::draw::node_id_fp;
+
+    let c = DrawCmd::node_hint(RectI::new(1, 2, 3, 4), "button_1");
+    assert_eq!(
+        c,
+        DrawCmd::NodeHint {
+            rect: RectI::new(1, 2, 3, 4),
+            node_id_len: 8,
+            node_id_fp: node_id_fp("button_1"),
+        },
+        "构造点必须把长度与指纹一起写对（手写字面量会漂）"
+    );
+    // 中文 id：长度是**字节**长度（与 `str::len` 一致），不是字符数。
+    let c2 = DrawCmd::node_hint(RectI::new(0, 0, 1, 1), "名字");
+    match c2 {
+        DrawCmd::NodeHint { node_id_len, .. } => {
+            assert_eq!(node_id_len, 6, "「名字」是 6 字节（2 个 3 字节字符）")
+        }
+        other => panic!("必须是 NodeHint，实际 {other:?}"),
+    }
+}
