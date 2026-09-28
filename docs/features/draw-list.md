@@ -97,7 +97,7 @@ assert!(n.fill_round_rect + n.text < 100, "命令太多：{n:?}");
 
 - 渲染：[`rendering.md`](rendering.md)
 - GPU HAL（后端契约）：[`gpu-hal.md`](gpu-hal.md)
-- **做不到**：自定义着色（渲染器现在是固定的）；**批处理的其它高级形态**（间接绘制 / 多批次提交 / 通用纹理 —— **统一管线与跨帧复用缓冲已落地**，见 [`gpu-geometry.md`](gpu-geometry.md) 第 7 节；原「合段」函数已随统一管线删除）
+- **做不到**：自定义着色（渲染器现在是固定的）；**多批次提交**（理由：一帧已是 1 bind / 1 draw / 1 submit ⇒ 没有可合并的批次）—— **统一管线、跨帧复用缓冲、间接绘制与通用纹理（`RGBA8_UNORM`）都已落地**，见 [`gpu-geometry.md`](gpu-geometry.md) 第 7 节；原「合段」函数已随统一管线删除
 
 ## 7. 检查清单
 
