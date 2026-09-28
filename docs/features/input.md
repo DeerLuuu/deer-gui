@@ -200,7 +200,9 @@ bad:3
    有动作的脚本应当在动作那几步让 `frames` 增长。`move @id` 之类可让脚本不写死坐标、跟着布局走。
    > ⚠️ **`skipped` 与重绘策略正交**：它衡量的是「**输入有没有改变状态**」（输入门禁），
    > 所以在 `DEER_WINDOW_REDRAW=continuous` 档**它照样增长** —— **不要**写成「连续模式下恒 0」。
-   > 另外，脚本重放需要帧推进，因此 `interactive_form` 声明 `RedrawPolicy::Continuous`（见第 6.2 节：`OnDemand` 下接口上做不到）。
+   > 另外，`interactive_form` **默认**声明 `RedrawPolicy::Continuous`（脚本重放自己推进）；但**M5c 起 `OnDemand` 下也能重放**：
+   > 加 `DEER_FORM_ONDEMAND=1` 那一档就是用**唤醒面**自驱的（`next_deadline` / `wake_after`）——
+   > 「`OnDemand` 下接口上做不到」这条**已过时**，见 [`window.md`](window.md) 第 6 节的唤醒面。
 3. **像素判据**：状态变了 ⇒ 画出来的那一帧必须与「该状态下的 CPU 基准」逐像素一致（不透明 0 / 半透明 ≤1 LSB）；
    **按状态分别对照**，不要只对照最终一帧。
 
@@ -254,10 +256,10 @@ assert!(parse_script("# 注释行\nbad:3").unwrap_err().contains("第 2 条"));
 
 ### 6.2 仍未做（**不要以为能跑**）
 
-- **按时间的动画在 `OnDemand` 下无法自驱**：`OnDemand` 下事件循环纯阻塞（`ControlFlow::Wait`，**无超时兜底**），
-  而 `deer-window` **没有**给 `App` 任何「主动唤醒事件循环」的手段（无定时器 / 无用户事件面）⇒
-  需要按时间推进的动画**必须**声明 `RedrawPolicy::Continuous`（或设 `DEER_WINDOW_REDRAW=continuous`）。
-  这也是 `interactive_form` 的脚本重放声明 `Continuous` 的原因 —— **接口上做不到**，不是没做；
+- **按时间的动画**：**M5c 起可以在 `OnDemand` 下自驱** —— 用唤醒面（`App::wake_handle` + `Waker::wake_after` /
+  `App::next_deadline`，见 [`window.md`](window.md) 第 6 节），**不再必须**声明 `Continuous`（声明了仍然可以）。
+  注意 `next_deadline()` 必须返回**固定时刻并自己往前走**（返回 `now()+50ms` 会永远不到点 ⇒ 空转），
+  且**本层不做防护**（那等于凭空造超时）；
 - **停靠面板 / 多窗口**；**滚动**与**方向键导航**；**右键 / 中键**的语义；**IME 预编辑**；
 - **按键重复未建模**（长按会产生重复 `KeyDown`，状态机不区分「重复」与「新按」）；
 - **`texts` 没有光标位置**：`Backspace` **只删末尾**，不能用方向键移动插入点；

@@ -375,7 +375,7 @@ set "DEER_WINDOW_REDRAW=continuous" && cargo run -q -p deer-window --example <�
 
 | 示例 | 策略 | 理由 |
 |---|---|---|
-| `window_preview` / `hal_window_path` / `interactive_form` | **`Continuous`** | 演示类要连续推进；**脚本重放在 `OnDemand` 下接口上做不到** —— 窗口层没有定时器 / 用户事件面（这是**诚实的边界**，不是遗漏） |
+| `window_preview` / `hal_window_path` / `interactive_form` | **`Continuous`** | 演示类要连续推进。**注意（M5c 后口径变了）**：脚本重放**已经能在 `OnDemand` 下做** —— `interactive_form` 的 `DEER_FORM_ONDEMAND=1` 档就是用唤醒面自驱的重放；默认仍声明 `Continuous` 是**演示类的选择**，不再是「接口上做不到」 |
 | `window_parity` | **`OnDemand`** | 它只需要 1 帧；判据与退出码**零改动** |
 
 **`skipped_frames` 与重绘策略正交**（别写混）：它的含义是「**派发了输入但没有请求重绘**」的次数，
@@ -384,12 +384,47 @@ set "DEER_WINDOW_REDRAW=continuous" && cargo run -q -p deer-window --example <�
 **已知边界**：
 
 - `Occluded(false)` 已接线，但 **winit 0.30 文档写明 Windows 不支持该事件** ⇒ **Windows 上未实测**；
-- `OnDemand` 下 `App` **没有**唤醒事件循环的手段（无定时器 / 无用户事件）⇒ **按时间的动画必须声明 `Continuous`**；
 - **`DEER_IDLE_REQUIRE` 已删除**：它的旧语义是「**只有**设了它才把 0 输入判失败，**默认不算失败**」——
   一个**默认没牙**的旋钮正是上面那个前置漏洞的根源。删掉只会**更严**（0 输入一律 `exit=1`），
   不会让任何东西**静默变绿**；如果你在脚本里还设着它，那是**无效**的，删掉即可。
 - **真窗口的 `DEER_IDLE_DIRTY=1`（变化档）目前只报数、不下结论** ⇒ 「**从不请求重绘**」这类错误
   在**真窗口路径**上**只能靠单测**兜住（该档的「0 输入」也已被上面的前置拦掉，所以它至少不会假绿）。
+
+**唤醒面（M5c）：`OnDemand` 下 App **也能**自己唤醒事件循环** —— 上面那条「`OnDemand` 下没有唤醒手段」的旧边界已由 M5c 取代：
+
+| 手段 | 语义 | 到点画不画 |
+|---|---|---|
+| `App::wake_handle(Waker)` | 建窗后**调一次**，把可克隆的 `Waker` 交给 App（**默认实现什么都不做** ⇒ M5c 之前的 `App` 实现一行都不用改） | — |
+| `Waker::wake()` | 「**看一眼**」（提示性：也许别处改了状态） | 与输入同一把尺：问 `App::wants_redraw`，**答真才画** |
+| `Waker::wake_after(Duration)` | 「**d 之后叫醒我**」（预约：定时动画 / 脚本重放） | 到点**一律画一帧** |
+| `App::next_deadline() -> Option<Instant>` | 同上，但**拉**式（App 声明「我希望被唤醒的最近时刻」） | 到点**一律画一帧** |
+
+**这「不是」先前被否掉的 `WaitUntil` 兜底**（最容易读成自相矛盾的一条）：被否掉的是**本层凭空造超时** ——
+没人要求、到点也没事干，纯空转。现在本层**只在 App 显式声明了 deadline 时**才用 `WaitUntil`，
+而**声明这个动作是 App 主动做的**：**它不声明，本层就在 `Wait` 上睡死 —— 开机不会自己醒来，
+只有 App 说「那个时刻叫我」才醒。**
+
+**防空转最干净的判据是 `iters`（事件循环迭代次数），不是 CPU 时间**：空闲时它必须是**个位数**
+（本机实测：`DEER_WAKE_TICKS=0` 档 **`iters=7`**，其中含启动期 3 次 `resized`；另一次实测 **5** ——
+**具体数随启动期的系统事件浮动，「个位数 vs 一秒上千」这个量级才是判据**）。
+账本行：`[deer-window] 唤醒账本：wake=… wake_after=… fired=… requested=… skipped=… iters=…`。
+
+⚠️ **两条使用须知**（「App 自己的要求」的直接后果，不是本层的 bug）：
+
+- **`next_deadline()` 必须返回固定时刻并自己往前走**：别每次都返回 `Instant::now() + 50ms` ——
+  那样它**永远不到点**，事件循环每 50ms 醒一次却**一帧都不画**（空转）。要「每 50ms 来一次」就用
+  `Waker::wake_after`：在 `App::redraw` 里排下一次（推式）。**本层不做防护** —— 那等于凭空造超时。
+- **已过期**的 deadline 视为「立刻到点」⇒ 画一帧；App 不把它清掉 / 往前推，就等于自己要求连续重绘
+  （账本上 `fired` 会跟着 `iters` 一起涨）。
+
+⚠️ **`Send` 是契约，`Sync` 是巧合（别在别处依赖 `Sync`）**：`EventLoopProxy` 的 **`Send` 是 winit 的显式承诺**
+（编译期断言 + `waker_is_send` 单测钉着它）；但 **`Sync` 在 Windows 后端没有 impl** —— 它今天成立纯属两个字段的
+**自动 trait 巧合**（`HWND` = `isize`、`mpsc::Sender` 恰好 `Sync`）。⇒ 若 winit / windows-sys 哪天改回裸指针，
+**`Send` 会编译期炸（好事）**，而 **`Sync` 会静默消失（坏事）**。
+
+详见 `crates/deer-window/src/lib.rs` 的「唤醒面」一节与 `crates/deer-window/examples/wake_probe.rs`
+（配套单测 `crates/deer-window/tests/wake_policy.rs`）。**仍未做**：自定义用户事件类型（对外**只有 `Waker`** 这一个面）、
+跨进程唤醒、多窗口唤醒。
   这是**已知限制**，不是判据。
 
 ## 7. 常见坑
@@ -445,4 +480,4 @@ set "DEER_WINDOW_REDRAW=continuous" && cargo run -q -p deer-window --example <�
 - [x] `FEATURES.md` 已登记（状态 / 指南链接 / 示例命令都对）
 - [x] 如果属于新手主线，`docs/TUTORIAL.md` 已更新（第 12 章）
 - [x] 明确写了「做不到什么」
-- [x] 重绘策略已写明（默认省电 / 如何关掉 / 两个自证标记要 grep），并登记 `Occluded` 的 Windows 边界与「`OnDemand` 下无唤醒手段」
+- [x] 重绘策略已写明（默认省电 / 如何关掉 / 两个自证标记要 grep），并登记 `Occluded` 的 Windows 边界、`DEER_IDLE_REQUIRE` 的删除、M5c 唤醒面（含 `iters` 判据、`next_deadline` 陷阱、`Send` vs `Sync`）
