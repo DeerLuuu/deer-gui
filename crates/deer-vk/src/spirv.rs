@@ -2493,8 +2493,15 @@ pub fn vertex_shader_unified() -> Vec<u8> {
 /// 1. 绑定的图集纹理**必须存在**（形状帧也要绑一个，没有 GlyphAtlas 时用 1×1 哑纹理）；
 /// 2. 采样器必须是 `ClampToEdge`（越界 uv 不能是未定义行为）。
 ///
-/// 这两条不满足时的表现是**静默的**（复用上次绑定 / 采到未定义值），
-/// 所以 B5-2 要用**变异**（哑纹理换成 cov=0）证明它承重。
+/// ⚠️ **判据要打对目标（B5-3 更正）**：承重的是「**绑**一个已写入的有效描述符」，
+/// **不是**那张 1×1 哑纹理的**取值** —— 把它换成 `cov=0`（`[0]`）甚至 `[128]`，
+/// 形状帧在像素上**逐字节不变**（这一支的结果被 `OpSelect` 丢弃）。
+/// 所以**不能**用「哑纹理换成 cov=0 ⇒ 形状帧变红」当承重性判据（早先这里就是这么写的，
+/// 与实测相反，已改）。真正的判据是
+/// `tests/gpu_vs_cpu.rs::a_shape_only_frame_binds_the_one_by_one_dummy_texture`：
+/// 删掉 `cmd_bind_descriptor_sets` ⇒ 默认档 18 failed（形状帧读回**整幅 0**）、
+/// 校验层 `VUID-vkCmdDraw-None-08600`；跳过 `update_descriptor_texture` ⇒
+/// `VUID-vkCmdDraw-None-08114`。详见 `gpu_render::DUMMY_COVERAGE` 的说明。
 ///
 /// ## ⚠️ 逐分量 `OpSelect`（一次实测教训）
 ///

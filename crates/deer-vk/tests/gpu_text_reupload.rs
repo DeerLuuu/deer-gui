@@ -22,6 +22,18 @@
 //! - 第二次接管后那一帧必须触发一次**图集纹理上传**（`deer_vk::device::texture_r8_upload_count()`）。
 //!
 //! 这样「删掉那句作废」或「忘了改指描述符集」都会红。
+//!
+//! ## ⚠️ B5-3：第二条断言原先**不咬**（复审 Important F-7），现在改了读数来源
+//!
+//! 先前的 `bound_texture_size()` 读的是 `TextResources.texture` 这个**代理字段** ——
+//! 变异「**跳过** `update_descriptor_texture`（创建了新图集纹理，但没把描述符集改指过去）」
+//! 下它**照样**返回图集尺寸 ⇒ 本用例**仍然绿**（当时只有 `gpu_vs_cpu` 的 10 条像素判据接住，
+//! 也就是断言名不副实）。
+//!
+//! 现在它读的是**描述符集真实指向**（`GpuGeometryRenderer::descriptor_points_at`，
+//! 由 `gpu_render::point_descriptor_at` 在发 `vkUpdateDescriptorSets` 的**同一处**、
+//! 以**返回值**赋值）⇒ 「跳过改指」必然让这里的读数停在 `(1,1)` 并变红。
+//! 这是本项目「**读数与真实调用同处**」规矩的一次直接应用。
 
 use deer_gpu::draw::{Color, DrawCmd, DrawList};
 use deer_gpu::text::TextEngine;

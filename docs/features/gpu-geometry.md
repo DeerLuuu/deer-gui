@@ -20,8 +20,8 @@
 **什么时候不该用它**：
 - 你要把结果**显示在窗口**里 —— 窗口呈现是 **M3c**（见 [`vulkan-swapchain.md`](vulkan-swapchain.md)）；
 - 你要画**任意图片**（RGBA 纹理）—— 目前只有字形图集这一条**专用** `R8_UNORM` 纹理；
-- 你要**极致性能** —— 已有**合段 + 跨帧复用缓冲**（见第 7 节的边界说明），但**管线切换次数仍未降**
-  （由 z 序决定，不许重排），统一管线 / 单缓冲两段式也未做。
+- 你要**极致性能** —— 已有**统一管线（形状 + 文本合成一条管线、每帧一次 draw/切换）+ 跨帧复用缓冲**
+  （见第 7 节的边界说明）；**仍未做**的是其它高级形态（间接绘制、多批次提交、通用纹理等）。
 
 ## 2. 最小示例
 
@@ -285,13 +285,35 @@ assert_eq!(gpu.extent(), extent);
   - **通用图像 / RGBA 纹理**：目前只有**字形图集**这一条专用 `R8_UNORM` 覆盖率纹理；
     通用纹理创建/上传（`create_texture`/`upload_texture` 的 HAL 路径）仍未实现；
   - **窗口呈现**：本模块只出离屏像素；把界面呈到窗口是 **M3c**；
-  - **批处理优化**：**已落地**的部分 = **合段**（相邻同管线的段合成一次 `vkCmdDraw`）+ **跨帧复用缓冲**
-    （语料不变时不再每帧重建/重传）；**仍未做** = **管线切换次数未降**（由 z 序决定，不许重排）、
-    **统一管线**与**单缓冲两段式**（reviewer 已指出**存在可行路径**：统一两条管线可做到 1 draw + 1 切换且不动像素）。
-    复现：`DEER_VK_WINDOW_TESTS=1 cargo run -q -p deer-gui --features window --example window_parity`（**以运行输出为准**）；
+  - **批处理优化**：**已落地** = **统一管线**（形状 + 文本合成**一条顶点流 + 一条管线** ⇒ 每帧**一次** `vkCmdDraw` / **一次** `vkCmdBindPipeline`；
+    改造前是每段一次 ⇒ 交错界面树的 draw/切换次数由「段数」降为 **1**）+ **跨帧复用缓冲**（语料不变时不再每帧重建/重传）。
+    **仍未做** = **其它高级形态**（间接绘制 / 多批次提交 / 通用纹理），以及 `unify` 每帧新建一个 `Vec` 的堆分配。
+    复现：`DEER_VK_WINDOW_TESTS=1 cargo run -q -p deer-gui --features window --example window_parity`
+    （打印 draw call / 管线切换 / 缓冲上传 / 缓冲分配，以及 CPU 侧 `unify` 调用次数与顶点数；**以运行输出为准**）；
   - **没有 sRGB / 色彩管理**：刻意用线性 UNORM（为了与 CPU 对齐）；
   - **没有 MSAA**：形状的抗锯齿由 CPU 侧的整数像素判据决定；文本的覆盖率来自字形位图（不是 MSAA）。
   - **文本的 `size <= 0` 与 CPU 不一致**（有意，见第 6 节）。
+
+### 7.1 公开 API 变更记录（**删除/改名**，`deer-vk` 0.x 允许不兼容变更，但必须有记录）
+
+统一管线落地（M3+ B5）时删掉了两块顶点缓冲对应的分项 API，以及一批「只有一条管线之后不再成立」的东西。
+删它们**不是**为了好看：每一条都对应「概念已消失」——留着只会让人以为它们还分辨着什么。
+
+| 变更 | 原 API | 现在 | 理由 |
+|---|---|---|---|
+| B5-2 删除 | `GpuGeometryRenderer::{shape,text}_host_to_vertex_barrier_count` | `GpuGeometryRenderer::host_to_vertex_barrier_count` | 只剩**一块**统一顶点缓冲 ⇒ 每帧最多一条屏障，两个分项恒等的数没有意义 |
+| B5-2 删除 | `WindowedRenderer::{shape,text}_host_to_vertex_barrier_count` | `WindowedRenderer::ui_host_to_vertex_barrier_count` | 同上（窗口路径） |
+| B5-3 删除 | `pipelines::PipelineSet`（含 `shape` / `text` / `shape_layout` 三个字段与 `color_format()`） | `pipelines::PipelineResources`（只有管线布局 / `set 0` 布局 / 采样器） | 旧的两条管线**没有任何绑定点**（B5-2 起绘制路径只用统一管线）；继续建它们只是白付创建成本 |
+| B5-3 改名 | `pipelines::build_pipelines(...)`（带 `render_pass` / `color_format` / `viewport` / 两组顶点布局参数） | `pipelines::build_pipeline_resources(&device)` | 名字里的「建管线」已不成立：管线改由 `gpu_render::build_unified_pipeline` 建（那里才有 `UnifiedVertex` 的布局） |
+| B5-3 删除 | `gpu_render::merge_adjacent_draw_calls`（`pub(crate)`，M3+ B2 的合段） | ——（连同它的单测） | 整帧只发一次 `vkCmdDraw` ⇒ 段划分不影响录制，合段失去了唯一的存在理由 |
+| B5-3 公开 | —— | `gpu_render::build_unified_pipeline`（`pub(crate)` → `pub`） | 两条绘制路径本来就都用它；`pipeline_smoke.rs` 需要它来断言「两种颜色格式 / 两种 viewport 策略都能建出统一管线」（M3c-T1 那条判据在 B5-3 之后的落点） |
+
+**保留但消费者只剩测试的**（**刻意保留**，不是漏删）：`pipelines::text_state`、
+`gpu_render::{vertex_attrs,text_attrs}`、`spirv` 里那 4 支旧着色器函数
+（`vertex_shader_rect_attrs` / `fragment_shader_rect_shape` / `vertex_shader_text` / `fragment_shader_text`）。
+它们是**冻结产物的对照物**：例如 `fragment_shader_rect_shape` 的字节是 M3a 的 fixture
+（`spirv_val.rs` 的结构签名断言拿它当基准），`text_state` 钉住「形状与文本的冻结状态逐字相同」
+（统一管线的状态取自 `shape_state`，这条不变式是它成立的前提）。
 
 ## 8. 检查清单（发布前过一遍）
 

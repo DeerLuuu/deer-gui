@@ -21,14 +21,29 @@
 //!
 //! | 语料 | 判据 |
 //! |---|---|
-//! | 不透明界面树（形状 + 真实字形） | **逐字节相同**（`max_diff == 0`） |
-//! | 半透明（矩形/文字/圆角各一份 α=0.5） | **≤1 LSB**（CPU `round()` vs GPU UNORM 定点混合），打印实测值 |
+//! | `shapes-only`（**只有**形状，且**先跑**） | **逐字节相同**；`set 0` 指着 **1×1 哑纹理** |
+//! | `opaque-ui-tree`（形状 + 真实字形） | **逐字节相同**（`max_diff == 0`）；`set 0` 指着**字形图集**；每帧 **1 draw + 1 switch** |
+//! | `semi-transparent`（矩形/文字/圆角各一份 α=0.5） | **≤1 LSB**（CPU `round()` vs GPU UNORM 定点混合），打印实测值 |
+//!
+//! ## B5-3 补齐的两组读数（复审 F-9：窗口侧原本一个调用点都没有）
+//!
+//! 1. **`set 0` 的真实指向**（`WindowedRenderer::bound_texture_size()`）——
+//!    「统一片元着色器**无条件采样** ⇒ 形状帧也必须绑一张有效纹理」这条**静默依赖**，
+//!    在真正的验收语料（960×600 界面树）上原先**没有判据**。现在两条都断言：
+//!    `shapes-only` 跑完必须是 `(1,1)`、`opaque-ui-tree` 跑完必须是图集（> 1×1）；
+//! 2. **CPU 侧成本口径**（`unify_call_count` / `unify_output_vertex_count`）——
+//!    每帧恰好 1 次 `unify`、顶点数 > 0，且带文本的语料**多于**只有形状的语料
+//!    （多出来的就是字形四边形 ⇒ 证明文本段真的进了统一顶点流）。
+//!    这两条读数在报告里是**可打印的数字**，而不是一句「很便宜」。
 //!
 //! ## 顺带验一条：`resize` 失效重建不泄漏
 //!
 //! 反复 `resize` + 每轮画一帧，断言 `live_ui_resource_count() == 1`（存活资源恒一份）
 //! 且重建次数与策略一致（动态不必重建、静态必须重建）。这两个计数记在**资源类型自己**
 //! 身上（构造 +1 / `Drop` −1），不靠调用方上报 ⇒ 删掉 `Drop` 或漏置 `None` 都会红。
+//!
+//! ⚠️ **不许与 `cargo test` 并发跑在同一个 `target/` 上**：复审实测过并发时退出码不可信
+//! （抢 build 锁 + 抢同一块 Intel GPU）。串行跑并各留完整日志。
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -82,6 +97,34 @@ fn fixed_tree() -> deer_gui::layout::Node {
     app.build()
 }
 
+/// **只有形状、没有文本**的语料：哑纹理那条契约的窗口侧判据（见 `compare` 的 `with_text`）。
+///
+/// 为什么单独一条：B5-2 的统一片元着色器**无条件采样** ⇒ 形状帧也必须绑一张有效纹理；
+/// 而「绑的是 1×1 哑纹理」只有在**这个渲染器从没上传过图集**时才成立 ——
+/// 所以这条语料必须**排在**带文本的语料**之前**跑（见 `redraw` 的调用顺序）。
+fn shapes_only_list(extent: Extent) -> DrawList {
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(0, 0, extent.width as i32, extent.height as i32),
+        color: Color::rgb(0x20, 0x30, 0x40),
+    });
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(8, 8, 60, 24),
+        color: Color::rgb(0xC0, 0x40, 0x20),
+    });
+    l.push(DrawCmd::FillRoundRect {
+        rect: RectI::new(8, 40, 80, 30),
+        radius: 6,
+        color: Color::rgb(0x30, 0x90, 0x40),
+    });
+    l.push(DrawCmd::StrokeRect {
+        rect: RectI::new(100, 40, 60, 30),
+        width: 2,
+        color: Color::rgb(0xE0, 0xE0, 0xE0),
+    });
+    l
+}
+
 /// 半透明语料 —— **这是那 44 字节的终局检验**：不透明底 + α=0.5 的矩形 + α=0.5 的文字
 /// + α=0.5 的圆角矩形，四者都会经过「字节空间 vs 线性空间」这条分岔。
 fn semi_transparent_list(extent: Extent) -> DrawList {
@@ -120,6 +163,14 @@ struct ParityResult {
     cpu: [u8; 4],
     /// **每帧**的渲染统计（两次读取的差值 ÷ 帧数；M3+ B1 的验收量）。
     stats_per_frame: RenderStats,
+    /// **每帧**的 `unify` 调用次数（B5-3：窗口路径的 CPU 成本读数，复审 F-9 的缺口）。
+    /// 这里用的是 `WindowedRenderer::unify_call_count` 的差值 ÷ 帧数。
+    unify_calls_per_frame: u64,
+    /// **每帧** `unify` 输出的统一顶点数（= 这一帧 CPU 搬运的顶点数）。
+    unify_vertices_per_frame: u64,
+    /// 画完这些帧之后，`set 0` **指着**哪张纹理（宽, 高）——
+    /// `WindowedRenderer::bound_texture_size()`，即真实描述符指向。
+    bound_texture: (u32, u32),
 }
 
 /// 两个统计快照的差（都是累计值 ⇒ **差值**才是「这一段」的代价）。
@@ -143,10 +194,18 @@ struct Parity {
 
 impl Parity {
     /// 渲染若干帧后回读**最后一帧**，与 CPU 逐像素比。
+    ///
+    /// ## `with_text`：这条语料要不要把文本引擎交给窗口渲染器
+    ///
+    /// - `false` ⇒ 传 `None`（语料里**不能有** `Text` 命令，否则渲染器会按 M3a 行为报
+    ///   `Unsupported` —— 那是契约，不是缺陷）。此时渲染器**从没上传过图集** ⇒
+    ///   `set 0` 必须指着 1×1 哑纹理（断言在 `redraw` 里）；
+    /// - `true` ⇒ 传 `Some(engine)`，图集会被上传、`set 0` 改指到它。
     fn compare(
         &mut self,
         name: &'static str,
         list: &DrawList,
+        with_text: bool,
     ) -> Result<ParityResult, String> {
         let font_path = self
             .font_path
@@ -160,11 +219,19 @@ impl Parity {
                 .map_err(|e| format!("解析字体失败：{e}"))?,
         );
         let r = self.renderer.as_mut().ok_or("还没有渲染器")?;
-        let engine = self.engine.as_mut().ok_or("还没有字体引擎")?;
-        // M3+ B1：统计是**累计值** ⇒ 取画这些帧前后的差值、再除以帧数 = 每帧代价
+        let mut engine = self.engine.as_mut();
+        // M3+ B1：统计是**累计值** ⇒ 取画这些帧前后的差值、再除以帧数 = 每帧代价。
+        // B5-3 新增的两组读数（`unify` 调用/顶点数、描述符指向）同样用**差值**。
         let stats_before = r.render_stats();
+        let unify_calls_before = r.unify_call_count();
+        let unify_verts_before = r.unify_output_vertex_count();
         for _ in 0..frames {
-            match r.draw_and_present(list, Some(engine)) {
+            let text_arg = if with_text {
+                Some(engine.as_deref_mut().ok_or("还没有字体引擎")?)
+            } else {
+                None
+            };
+            match r.draw_and_present(list, text_arg) {
                 Ok(FrameOutcome::Presented) => {}
                 Ok(FrameOutcome::OutOfDate) => {
                     r.resize(extent)
@@ -173,6 +240,9 @@ impl Parity {
                 Err(e) => return Err(format!("{name}: 呈现失败：{e}")),
             }
         }
+        let bound_texture = r.bound_texture_size();
+        let unify_calls = r.unify_call_count() - unify_calls_before;
+        let unify_verts = r.unify_output_vertex_count() - unify_verts_before;
         let gpu = r
             .read_back_last_frame()
             .map_err(|e| format!("{name}: 回读失败：{e}"))?;
@@ -219,6 +289,9 @@ impl Parity {
                 buffer_uploads: delta.buffer_uploads / n,
                 buffer_allocations: delta.buffer_allocations / n,
             },
+            unify_calls_per_frame: unify_calls / n,
+            unify_vertices_per_frame: unify_verts / n,
+            bound_texture,
             gpu: [gpu[worst], gpu[worst + 1], gpu[worst + 2], gpu[worst + 3]],
             cpu: [
                 cpu_px[worst],
@@ -440,11 +513,40 @@ impl App for Parity {
             gpu::build_draw_list(&tree, &geo, theme.clone(), &engine.measure())
         };
         let semi_list = semi_transparent_list(extent);
+        let shapes_only = shapes_only_list(extent);
 
-        // ② 对照
+        // ★ 前置条件（**显式查**）：`shapes_only` 语料里**不能**有 `Text` 命令 ——
+        //   它要求窗口渲染器从没上传过图集（下面断言 `set 0` 指着 1×1 哑纹理）。
+        //   若将来有人往这条语料里加了文字，本判据会**静默失效**（图集一上传，
+        //   哑纹理断言就没意义了）⇒ 所以先查再跑。
+        let shapes_only_has_text = shapes_only
+            .cmds
+            .iter()
+            .any(|c| matches!(c, DrawCmd::Text { .. }));
+        if shapes_only_has_text {
+            return Err(
+                "前置条件不成立：`shapes-only` 语料必须**不含**文本命令 —— 否则图集会被上传，\
+                 「形状帧绑 1×1 哑纹理」那条断言就不再指向哑纹理（判据静默失效）"
+                    .to_string(),
+            );
+        }
+        let shapes_only_has_shape = shapes_only.cmds.iter().any(|c| {
+            matches!(
+                c,
+                DrawCmd::FillRect { .. }
+                    | DrawCmd::FillRoundRect { .. }
+                    | DrawCmd::StrokeRect { .. }
+            )
+        });
+        if !shapes_only_has_shape {
+            return Err("前置条件不成立：`shapes-only` 语料里必须有形状命令".to_string());
+        }
+
+        // ② 对照（**顺序有意义**：`shapes-only` 必须第一个跑 —— 那时还没上传过图集）
         let mut results = vec![
-            self.compare("opaque-ui-tree", &opaque_list)?,
-            self.compare("semi-transparent", &semi_list)?,
+            self.compare("shapes-only", &shapes_only, false)?,
+            self.compare("opaque-ui-tree", &opaque_list, true)?,
+            self.compare("semi-transparent", &semi_list, true)?,
         ];
 
         // ③ resize 失效重建不泄漏
@@ -465,13 +567,91 @@ impl App for Parity {
                 r.stats_per_frame.buffer_uploads,
                 r.stats_per_frame.buffer_allocations
             );
+            // ★ B5-3：窗口路径的 CPU 侧读数（`unify` 调用/顶点数）+ 描述符**真实指向**
+            println!(
+                "      每帧 CPU 侧（B5-2 口径）：unify 调用 {} 次 / 输出顶点 {} 个；\
+                 画完后 `set 0` 指着 {}×{}（1×1 = 哑纹理，>1 = 字形图集）",
+                r.unify_calls_per_frame,
+                r.unify_vertices_per_frame,
+                r.bound_texture.0,
+                r.bound_texture.1
+            );
         }
         println!("  {leak}");
+        let shapes_only = results.remove(0);
         let opaque = results.remove(0);
         let semi = results.remove(0);
         println!(
-            "结论：不透明最大通道差 **{}**（要求 0）；半透明最大通道差 **{}**（要求 ≤1）",
-            opaque.max_diff, semi.max_diff
+            "结论：形状-only 最大通道差 **{}**（要求 0）；\
+             不透明最大通道差 **{}**（要求 0）；半透明最大通道差 **{}**（要求 ≤1）",
+            shapes_only.max_diff, opaque.max_diff, semi.max_diff
+        );
+        if shapes_only.max_diff != 0 {
+            return Err(format!(
+                "只有形状的语料也必须**逐字节相同**：实测最大通道差 {} @({}, {}) GPU={:?} CPU={:?}",
+                shapes_only.max_diff,
+                shapes_only.at.0,
+                shapes_only.at.1,
+                shapes_only.gpu,
+                shapes_only.cpu
+            ));
+        }
+        // ★ **哑纹理契约（窗口侧）**：从没上传过图集的渲染器，`set 0` 必须指着 1×1 哑纹理。
+        //   这是复审 F-9 指出的缺口 —— 「形状帧也必须绑一张有效纹理」这条**静默依赖**
+        //   原本只在离屏的合成语料上有读数，而真正的验收语料（960×600 界面树）上没有。
+        if shapes_only.bound_texture != (1, 1) {
+            return Err(format!(
+                "`shapes-only` 画完后 `set 0` 必须指着 **1×1 哑纹理**（统一 FS 无条件采样 ⇒ \
+                 形状帧也必须有一张有效纹理），实测 {}×{} —— 说明描述符集被改指到了别的纹理，\
+                 或者读数不是从描述符真实指向来的（见 `bound_texture_size` 的文档）",
+                shapes_only.bound_texture.0, shapes_only.bound_texture.1
+            ));
+        }
+        // ★ **图集契约（窗口侧）**：接管了 `TextEngine` 的渲染器画完带文本的语料后，
+        //   `set 0` 必须**已经改指到字形图集**（不是哑纹理）。真实图集的宽 = 字号 ≥ 2
+        //   ⇒ 宽高都 > 1 是可靠判据（与 `(1,1)` 不可能混淆）。
+        if opaque.bound_texture.0 <= 1 || opaque.bound_texture.1 <= 1 {
+            return Err(format!(
+                "`opaque-ui-tree`（含真实字形）画完后 `set 0` 必须指着**字形图集**，\
+                 实测 {}×{} —— 仍是 1×1 说明描述符集**没有**被改指到图集\
+                 （`refresh_ui_atlas_texture` 的改指被跳过了？）",
+                opaque.bound_texture.0, opaque.bound_texture.1
+            ));
+        }
+        // ★ **CPU 侧读数必须言之有物**：每帧恰好一次 `unify`、且搬运的顶点数 > 0。
+        for r in [&shapes_only, &opaque] {
+            if r.unify_calls_per_frame != 1 {
+                return Err(format!(
+                    "`{}`: 每帧必须恰好调用一次 `unify`（一帧一次合流），实测 {}",
+                    r.name, r.unify_calls_per_frame
+                ));
+            }
+            if r.unify_vertices_per_frame == 0 {
+                return Err(format!(
+                    "`{}`: 每帧 `unify` 输出的统一顶点数必须 > 0（空帧才允许为 0）\
+                     —— 否则这条读数什么都没测",
+                    r.name
+                ));
+            }
+        }
+        // ★ 形状与文本**都要真的进到统一顶点流里**（否则「CPU 侧口径」只覆盖了一半）：
+        //   带文本的语料每帧搬运的顶点数必须**多于**只有形状的语料（多出的就是字形四边形）。
+        if opaque.unify_vertices_per_frame <= shapes_only.unify_vertices_per_frame {
+            return Err(format!(
+                "`opaque-ui-tree` 每帧的统一顶点数（{}）必须**多于** `shapes-only`（{}）\
+                 —— 否则说明文本段没进统一顶点流（或 shapes-only 语料意外含了文本）",
+                opaque.unify_vertices_per_frame, shapes_only.unify_vertices_per_frame
+            ));
+        }
+        println!(
+            "统一管线 CPU 侧 ✅：`shapes-only` {} 顶点/帧、`opaque-ui-tree` {} 顶点/帧\
+             （各 1 次 unify）；`set 0` 分别指向 {}×{}（哑纹理）与 {}×{}（字形图集）",
+            shapes_only.unify_vertices_per_frame,
+            opaque.unify_vertices_per_frame,
+            shapes_only.bound_texture.0,
+            shapes_only.bound_texture.1,
+            opaque.bound_texture.0,
+            opaque.bound_texture.1
         );
         if opaque.max_diff != 0 {
             return Err(format!(
@@ -545,8 +725,9 @@ impl App for Parity {
             opaque.stats_per_frame.draw_calls, opaque.stats_per_frame.pipeline_switches
         );
         println!(
-            "窗口 parity 通过 ✅（不透明逐字节相同；半透明 ≤1 LSB；统一管线 1 draw + 1 switch；\
-             resize 重建无泄漏；校验零消息由外层命令核对）"
+            "窗口 parity 通过 ✅（不透明与 shapes-only 逐字节相同；半透明 ≤1 LSB；\
+             统一管线 1 draw + 1 switch；`set 0` 指向被断言（哑纹理 / 字形图集）；\
+             CPU 侧 unify 读数 > 0；resize 重建无泄漏；校验零消息由外层命令核对）"
         );
         Ok(Flow::Exit)
     }

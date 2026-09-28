@@ -43,8 +43,14 @@
 //! 形状段的 `uv = (-1,-1)` 是**越界**采样，靠采样器的 `ClampToEdge` 兜住
 //! （`device.rs::create_sampler` 已是 `NEAREST + ClampToEdge`）；采到的值**不被采用**
 //! （`is_shape` 为真时选的是形状那一支），但**采样本身必须合法**。
-//! 这条依赖是**静默的**（不绑 = 未定义行为，驱动与校验层都不一定报）⇒
-//! B5-2 的变异 **B**（把哑纹理换成 `cov=0`）就是它的判据：形状帧必须变红。
+//! 这条依赖是**静默的**（不绑 = 未定义行为，驱动与校验层都不一定报）。
+//!
+//! ⚠️ **判据要找对目标（B5-3 更正）**：承重的是「**绑**一个已写入的有效描述符」，
+//! **不是** [`DUMMY_COVERAGE`] 的**取值** —— 后者改成 `[0]` / `[128]` 形状帧
+//! **逐字节不变**（采样结果被 `OpSelect` 丢弃）。所以判据是
+//! `tests/gpu_vs_cpu.rs::a_shape_only_frame_binds_the_one_by_one_dummy_texture`
+//! （删掉 `cmd_bind_descriptor_sets` / 跳过 `update_descriptor_texture` 时它会红，
+//! 表现是**读回整幅 0**，不是「颜色不对」）。详见 [`DUMMY_COVERAGE`] 的说明。
 //!
 //! ## 为什么不复用 `offscreen.rs`
 //!
@@ -159,8 +165,18 @@ const MIN_VERTEX_BYTES: u64 = 4096;
 ///
 /// `tests/gpu_vs_cpu.rs::vertex_layout_matches_the_hand_written_attribute_offsets`
 /// 另外钉住**字面数字**（stride 44 / 0 / 8 / 24 / 28）—— 布局若被改动，两个地方都会红。
-/// `pub(crate)`：窗口路径（`windowed.rs`）用**同一份** —— M3c 要求把「两处同源复制」
-/// 收敛成一处，所以这里是全仓库唯一的一份，`windowed.rs` 直接 `use` 它而不是再抄一遍。
+///
+/// ## B5-3 之后谁在读它（**消费者只剩测试**，如实登记）
+///
+/// 旧的两条管线已删 ⇒ 绘制路径不再建「认 `GpuVertex` 的管线」，本表**没有生产消费者**。
+/// 保留它的理由与保留 `spirv.rs` 那 4 支旧着色器**是同一条**：它们是冻结产物的
+/// **数据侧对照物** —— `windowed.rs::shared_shape_attrs_match_the_frozen_vertex_layout`
+/// 拿它钉住「`GpuVertex` 字段偏移 ⇒ 冻结着色器的 location」这条对应，
+/// 而 `spirv_val.rs` 在**着色器侧**钉住同一条契约。删掉本表 = 那条对应只剩一半。
+///
+/// `#[cfg_attr(not(test), allow(dead_code))]` 是**精确**表达（不是全局 `allow`）：
+/// 唯一读者在 `#[cfg(test)]` 里 ⇒ 非测试构建下它确实未被使用。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn vertex_attrs() -> [VertexAttr; 4] {
     [
         VertexAttr {
@@ -190,7 +206,10 @@ pub(crate) fn vertex_attrs() -> [VertexAttr; 4] {
 ///
 /// 与 `spirv::vertex_shader_text` 的 `location 0/1/2` 逐字段对应；偏移同样用 `offset_of!`
 /// 取（结构上不可能与 `gpu_text` 的 `#[repr(C)]` 布局漂移）。
-/// `pub(crate)`：与 [`vertex_attrs`] 同一理由（窗口路径共用这一份）。
+///
+/// 消费者与 [`vertex_attrs`] 同一条（B5-3 起只剩单测：
+/// `windowed.rs::shared_text_attrs_match_the_frozen_vertex_layout`）。
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn text_attrs() -> [VertexAttr; 3] {
     [
         VertexAttr {
@@ -220,7 +239,8 @@ pub(crate) fn text_attrs() -> [VertexAttr; 3] {
 /// 另外钉住字面数字 52 / 0 / 8 / 24 / 28 / 44）。
 ///
 /// `pub(crate)`：窗口路径（`windowed.rs`）用**同一份** —— 两条渲染路径的顶点布局
-/// 必须逐字相同，各写一份就是「只改了一边」的温床（与 [`vertex_attrs`] 同一规矩）。
+/// 必须逐字相同，各写一份就是「只改了一边」的温床（与 [`vertex_attrs`] 同一规矩：
+/// 全仓库只有一份，两条路径都 `use` 它）。
 pub(crate) fn unified_attrs() -> [VertexAttr; 5] {
     [
         VertexAttr {
@@ -258,9 +278,27 @@ pub(crate) fn unified_attrs() -> [VertexAttr; 5] {
 /// `ClampToEdge` 兜到唯一的那个纹素上，采到 255 ⇒ 即使**误用**文本那一支，
 /// `color.a * 1.0` 也还是原色（不会把像素变没）。
 ///
-/// ⚠️ **它是承重的**，不是「反正不读」的摆设：变异 **B**（把这里改成 `[0]`）必须让
-/// **形状帧**变红 —— 若不变红，说明有人把形状段的判别符或采样路径改坏了，
-/// 而像素判据没发现（B5-2 的红/绿记录见 `docs/superpowers/plans/2026-09-28-b5-unified-pipeline.md`）。
+/// ## ⚠️ 分清两件事：**取值不承重；绑定承重**（实测结论，别再把两者混起来）
+///
+/// - **取值不承重**：把这里改成 `[0]` 甚至 `[128]`，形状帧**逐字节完全相同**
+///   （实测：`gpu_vs_cpu` 27 passed / 0 failed，形状帧最大通道差仍是 0）。
+///   原因是可断言的：统一片元着色器里 `out = select(is_shape, shape_out, text_out)`，
+///   而形状段的 `is_shape` 恒真 ⇒ 采样结果被丢弃，它的**值**影响不了任何像素。
+///   所以**不存在**「把这里改成 `[0]` ⇒ 形状帧必红」这种判据 —— 早先代码注释里
+///   那句「变异 B 必须让形状帧变红」与实测**相反**，已删。
+/// - **绑定承重**：**必须绑一个已写入的有效描述符**，否则整条 `vkCmdDraw` 是**未定义**的
+///   —— 实测的表现不是「形状帧颜色不对」，而是**读回整幅全 0**（连清屏色都没了，
+///   `GPU=[0,0,0,0]`、形状帧差 255）。变异记录（复审独立复现）：
+///   删掉录制里的 `cmd_bind_descriptor_sets` ⇒ **默认档 18 failed / 9 passed**、
+///   校验层报 `VUID-vkCmdDraw-None-08600`（"statically uses set n 但没绑"）；
+///   描述符集**从不写入**（跳过 `update_descriptor_texture`）⇒ 校验层报
+///   `VUID-vkCmdDraw-None-08114`、默认档 9 failed。
+///
+/// 这条依赖**在默认档就有常驻判据**：
+/// `tests/gpu_vs_cpu.rs::a_shape_only_frame_binds_the_one_by_one_dummy_texture`
+/// （要求形状帧逐字节 0）在上面两种变异下都会红 ⇒ **不需要**再补一条。
+/// 本常量的存在理由因此是**接口契约**（无分支着色器要求恒有一张有效纹理），
+/// 而不是「它的值会让像素变」。
 pub(crate) const DUMMY_COVERAGE: [u8; 1] = [255];
 
 // 为什么**不需要**一个「当前绑的是哑纹理」的哨兵指纹（推理留在注释里，别造无用常量）：
@@ -286,17 +324,21 @@ pub(crate) fn texture_fingerprint(engine: &TextEngine) -> (u32, u32, usize) {
 /// （[`crate::pipelines::shape_state`] —— 它产出的就是「除颜色格式/viewport/顶点布局外
 /// 与文本管线逐字相同」的那份状态，`pipelines.rs` 的测试钉着这条不变式）。
 ///
-/// ## 为什么不用 `pipelines::build_pipelines` 里那两条旧管线
+/// ## 为什么它在这里、而不在 `pipelines.rs`
 ///
-/// 旧的两条（形状 / 文本）各自只认**一种**顶点布局；统一管线认的是合流后的 `UnifiedVertex`。
-/// 把 `unified` 作为 `PipelineSet` 的**第三个**成员会牵动 `pipelines.rs`（B5-2 的
-/// 允许改动清单里没有它）以及与它绑定的既有断言；而这里需要的三样东西
-/// （`text_layout` = `set 0` 布局、`text_set_layout`、`sampler`）都已经由
-/// `build_pipelines` 建好了 ⇒ 统一管线在调用侧拼出来，**状态来源仍然是共用层那一份**。
+/// 顶点布局是 [`UnifiedVertex`]（`stride 52` / 5 个 location）—— 那个类型属于本模块。
+/// 共用层（[`crate::pipelines::build_pipeline_resources`]）只提供它需要的三样资源
+/// （管线布局 / `set 0` 布局 / 采样器），**不建管线**（B5-3 起不再建旧的两条管线）。
+///
+/// `pub`：两条绘制路径（离屏 [`GpuGeometryRenderer::new`] 与窗口
+/// `windowed::ensure_ui`）都用它，`tests/pipeline_smoke.rs` 也用它断言
+/// 「两种颜色格式 / 两种 viewport 策略都能建出统一管线」—— 这是 M3c-T1
+/// 「共用层能服务两条路径」那条判据在 B5-3 之后的落点（原来落在已删除的
+/// `build_pipelines` 上）。
 ///
 /// **生命周期契约**：返回的管线引用了 `layout`（→ `text_set_layout`）与两个着色器模块
 /// ⇒ 调用方必须把它们声明在管线**之前**（Rust 按声明顺序析构 ⇒ 管线先销毁）。
-pub(crate) fn build_unified_pipeline(
+pub fn build_unified_pipeline(
     device: &VkDevice,
     render_pass: &RenderPass,
     color_format: i32,
@@ -325,6 +367,25 @@ pub(crate) fn build_unified_pipeline(
 }
 
 
+/// 把 `set` 改指到 `texture`，并**在同一处**返回「它现在指着谁」。
+///
+/// ## 为什么是「返回值」而不是「自己记一个字段」
+///
+/// 本项目既有原则是「**读数与真实调用同处**」（见 [`RenderStats`] 的说明）。
+/// 这条更进一步：调用点是 `vkUpdateDescriptorSets` **本身**，而记录**只能是它的返回值**
+/// ⇒ 「跳过这次写入」在调用侧**无法**留下一条假记录（连编译都过不去，没有值可赋）。
+/// 于是 [`GpuGeometryRenderer::bound_texture_size`] 名副其实 ——
+/// 它报的就是描述符集里那张纹理，而不是别的字段的副产物。
+pub(crate) fn point_descriptor_at(
+    device: &VkDevice,
+    set: &DescriptorSet,
+    sampler: &crate::device::Sampler,
+    texture: &Texture,
+) -> GpuResult<(u32, u32)> {
+    device.update_descriptor_texture(set, texture, sampler)?;
+    Ok((texture.width(), texture.height()))
+}
+
 /// 一条绘制段属于哪条**来源**管线（顺序即 z 序）。
 ///
 /// ## B5-2 之后的语义变化（**只当段表的标记，不再决定绑定**）
@@ -344,6 +405,12 @@ pub(crate) enum PipelineKind {
 /// `first`/`count` 是**各自（翻译层）顶点数组内**的区间（形状 44 字节 / 文本 32 字节
 /// 两种顶点）—— [`vertex_unify::unify`] 按这张表把两路搬进统一顶点流，
 /// 于是「z 序」只在这一处被解释，**不存在第二份顺序真值**。
+///
+/// ⚠️ **B5-3：段表只用于 [`vertex_unify::unify`] 的「选源 + z 序」** ——
+/// 录制侧整帧只发**一次** `vkCmdDraw(0, 全部顶点数)`，段划分对它没有任何影响。
+/// 于是 M3+ B2 的合段函数（`merge_adjacent_draw_calls`）**失去了它存在的唯一理由**
+/// （它守的是「把相邻同管线且区间连续的段并成一次 draw」），已连同单测一起删掉；
+/// 段的划分现在是**搬运阶段的输入**，不是绘制次数的决定因素。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DrawCall {
     pub(crate) kind: PipelineKind,
@@ -375,45 +442,6 @@ pub struct RenderStats {
     pub pipeline_switches: u64,
     pub buffer_uploads: u64,
     pub buffer_allocations: u64,
-}
-
-/// 把**相邻同管线且区间连续**的绘制段合并成一段（M3+ B2「合段」）。
-///
-/// ## ⚠️ B5-2 起**绘制路径不再调用它**（如实登记，别当成死代码删掉就完事）
-///
-/// B5-2 把两条管线合成一条、并且**整帧只发一次** `vkCmdDraw(0, 全部顶点数)` ——
-/// 段的划分对录制已经没有任何影响，所以合段失去了调用点。
-/// 保留这个纯函数 + 它的单测的理由：① 删掉等于**同时删掉 B2 的判据**（那是不相关的损失）；
-/// ② 它是「合段是像素等价的」这条不变式的**唯一可执行表达**，将来若有第二条绘制路径
-/// （例如间接绘制 / 多次 draw）仍要用它。**由 B5-3 决定它的去留**（那一步才是清理）。
-///
-/// ## 为什么合并是像素等价的
-///
-/// 每个 `DrawCall` 是「同一块顶点缓冲里从 `first` 开始的 `count` 个顶点」；相邻同管线的
-/// 两段若**区间首尾相接**（`prev.first + prev.count == next.first`），一次
-/// `vkCmdDraw(first, count_a + count_b, …)` 与两次连续 `vkCmdDraw` 光栅化的**图元序列完全相同**
-/// —— 顶点顺序不变 ⇒ 三角形顺序不变 ⇒ z 序与混合结果不变。
-///
-/// **不合并**的两种情况（都由这条不变式兜住）：管线不同（形状↔文本）⇒ 必须切管线；
-/// 区间不连续（中间被别的管线插过）⇒ 一次 draw 画不出来。
-///
-/// 这是纯函数：**无 GPU 就能单测**（见本模块单测）。
-///
-/// ⚠️ `allow(dead_code)`：**B5-2 起没有调用点**（见上面的说明，去留由 B5-3 定）。
-/// 压掉警告是刻意的 —— 但**不是**为了掩盖「没人用」这件事：那段说明就在上面，
-/// 而它的单测仍在跑（删掉函数就必须连测试一起删，那是一次**有意识**的决定）。
-#[allow(dead_code)]
-pub(crate) fn merge_adjacent_draw_calls(calls: &[DrawCall]) -> Vec<DrawCall> {
-    let mut out: Vec<DrawCall> = Vec::with_capacity(calls.len());
-    for c in calls {
-        match out.last_mut() {
-            Some(prev) if prev.kind == c.kind && prev.first + prev.count == c.first => {
-                prev.count += c.count;
-            }
-            _ => out.push(*c),
-        }
-    }
-    out
 }
 
 /// 文本管线**特有的**资源（渲染器以 `Option` 持有：不调
@@ -846,16 +874,17 @@ pub struct GpuGeometryRenderer {
     ///
     /// 从前这里是 `pipeline: Pipeline` + `TextResources` 里的 `pipeline`/`layout`/
     /// `vs`/`fs`/`set_layout` —— 即**管线状态被手写了两份**（形状一份、文本一份）。
-    /// 现在状态集中在 [`crate::pipelines::build_pipelines`]，离屏与（M3c 的）窗口
+    /// 现在状态集中在 [`crate::pipelines::shape_state`]（B5-3：旧的两条管线已删，
+    /// 统一管线的状态取自那里），离屏与（M3c 的）窗口
     /// 两条路径共用同一份来源：复制 N 份字面量 = N 份「将来只改一份」的风险。
     ///
     /// 离屏用**静态** viewport（M2a 实测：动态在本机 Intel 上零像素），
     /// 窗口用**动态**（M2b 实证能上屏）—— 这个差异是 [`ViewportStrategy`] 参数，
     /// 不是两份手写状态。
-    pipelines: crate::pipelines::PipelineSet,
+    pipelines: crate::pipelines::PipelineResources,
     /// **统一管线**（B5-2）：整帧只用这一条（形状 + 文本合流后的 `UnifiedVertex`，stride 52）。
     ///
-    /// 它的布局用 [`crate::pipelines::PipelineSet::text_layout`]（= 带 `set 0` 的那个）
+    /// 它的布局用 [`crate::pipelines::PipelineResources::text_layout`]（= 带 `set 0` 的那个）
     /// ⇒ 描述符集（图集或哑纹理）在这里也是**必绑**的。
     /// **字段顺序契约**：本管线引用 `unified_vs` / `unified_fs` 与 `pipelines` 里的布局
     /// ⇒ 必须声明在它们**之前**（Rust 按声明顺序析构 ⇒ 管线先销毁）。
@@ -943,6 +972,21 @@ pub struct GpuGeometryRenderer {
     /// reviewer 变异「让记录活过重建」后**所有断言仍全绿**（实际 75% 画面陈旧），
     /// 即那段清理是**承重但没有测试**的。现在把它变成**结构上不可能出错**。
     uploaded_vertices: Option<(vk::BufferHandle, Vec<u8>)>,
+    /// **描述符集此刻指着哪张纹理**（宽, 高）—— B5-3 起这是
+    /// [`GpuGeometryRenderer::bound_texture_size`] 的**唯一**来源。
+    ///
+    /// ## 为什么要单独一个字段（而不是从 `text.texture` 推）
+    ///
+    /// 从前 `bound_texture_size()` 读的是 `TextResources.texture` 这个**代理字段**，
+    /// 于是变异「**跳过** `update_descriptor_texture`（忘了把 `set` 改指到图集）」
+    /// 下它**照样返回图集尺寸** ⇒ 断言名不副实（复审 M12 实测：`gpu_text_reupload`
+    /// 仍然绿，只有像素判据接住）。
+    ///
+    /// 现在读数与**真实副作用同处**：它由 [`point_descriptor_at`] 返回、且**只能**由
+    /// 那个函数的返回值赋值（`?` 传播）—— 那个函数体内就是 `vkUpdateDescriptorSets`
+    /// 的调用点。所以「跳过改指」既会漏掉写入、也必然漏掉这个记录
+    /// （删掉调用连编译都过不去，返回值没有来源）。
+    descriptor_points_at: (u32, u32),
     /// **必须最后**（最后析构）。
     device: VkDevice,
 }
@@ -963,8 +1007,9 @@ impl GpuGeometryRenderer {
         let device_handle = device.handle();
         let mem_props = *device.memory_properties();
 
-        // ① 着色器不再在这里建：两条管线的着色器由 `pipelines::build_pipelines` 统一建出
-        //    （M3c-T1；从前这里建形状的、`with_text` 里建文本的 —— 两处各一份）。
+        // ① 着色器不在这里建：本路径**唯一**的管线（统一管线）由
+        //    [`build_unified_pipeline`] 建它的两个模块（B5-3 起旧的两条管线已删；
+        //    从前是「这里建形状的、`with_text` 里建文本的」两处各一份）。
 
         // ② 渲染通道：清屏 + 离开通道即 `TRANSFER_SRC_OPTIMAL`（好直接回读）
         let pass = device.create_render_pass(
@@ -973,29 +1018,16 @@ impl GpuGeometryRenderer {
             vk::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         )?;
 
-        // ③ 两条旧管线：**由共用层建出**（M3c-T1）。颜色格式 = 本路径的附件格式；
-        //    viewport 用**静态**（M2a 实测：动态在本机 Intel 驱动上零像素）。
-        //
-        //    ⚠️ B5-2 起绘制路径**只用下面的 `unified`**；这两条仍被建出来是因为
-        //    `pipelines.rs` 不在本任务的允许改动清单里（旧路清理属 B5-3），
-        //    而它们顺带提供了统一管线需要的 `text_layout` / `text_set_layout` / `sampler`。
-        let pipelines = crate::pipelines::build_pipelines(
-            &device,
-            &pass,
-            COLOR_FORMAT,
-            crate::pipelines::ViewportStrategy::Static {
-                width: extent.width,
-                height: extent.height,
-            },
-            std::mem::size_of::<GpuVertex>() as u32,
-            &vertex_attrs(),
-            std::mem::size_of::<TextVertex>() as u32,
-            &text_attrs(),
-        )?;
+        // ③ 共用资源（B5-3）：**不建管线**，只建统一管线需要的三样东西
+        //    （管线布局 / `set 0` 布局 / 采样器）。旧的两条管线已删 ——
+        //    B5-2 之后它们没有任何绑定点，建了不用就是纯创建成本（复审 Minor F-4）。
+        let pipelines = crate::pipelines::build_pipeline_resources(&device)?;
 
-        // ③' **统一管线**（B5-2）：形状与文本合流后的一条管线。
+        // ③' **统一管线**（B5-2）：形状与文本合流后的一条管线（本路径**唯一**建的管线）。
         //     **声明顺序契约**：`unified` 先于 `unified_vs`/`unified_fs`（先销毁管线）；
         //     它引用的 `text_layout` 在 `pipelines` 里（同一条规矩）。
+        //     颜色格式 = 本路径的附件格式；viewport 用**静态**
+        //     （M2a 实测：动态在本机 Intel 驱动上零像素）。
         let (unified, unified_vs, unified_fs) = build_unified_pipeline(
             &device,
             &pass,
@@ -1017,7 +1049,10 @@ impl GpuGeometryRenderer {
         let descriptor_set =
             device.allocate_descriptor_set(&descriptor_pool, &pipelines.text_set_layout)?;
         let dummy_texture = device.create_texture_r8(1, 1, &DUMMY_COVERAGE)?;
-        device.update_descriptor_texture(&descriptor_set, &dummy_texture, &pipelines.sampler)?;
+        // 读数与副作用同处：`descriptor_points_at` **只能**来自这个返回值
+        // ⇒ 「跳过改指」不可能留下一条旧读数为真的记录（见字段与函数的说明）。
+        let descriptor_points_at =
+            point_descriptor_at(&device, &descriptor_set, &pipelines.sampler, &dummy_texture)?;
 
         // ④ 离屏图像（DEVICE_LOCAL：颜色附件 | 传输源）
         let img_info = vk::ImageCreateInfo {
@@ -1194,6 +1229,8 @@ impl GpuGeometryRenderer {
             unify_calls: 0,
             unify_output_vertices: 0,
             uploaded_vertices: None,
+            // `new()` 刚把哑纹理写进描述符集 ⇒ 这就是它此刻指着的东西
+            descriptor_points_at,
             device,
         })
     }
@@ -1325,22 +1362,25 @@ impl GpuGeometryRenderer {
         self.unify_output_vertices
     }
 
-    /// **本帧绑定并采样的纹理尺寸**（宽, 高）—— B5-2 的哑纹理护栏的读数口。
+    /// **本帧绑定并采样的纹理尺寸**（宽, 高）—— 哑纹理 / 图集护栏的读数口。
     ///
     /// 为什么需要它：统一片元着色器**无条件采样**，所以「形状帧也必须绑一张纹理」
     /// 是一条**静默依赖**（不绑 = 未定义行为，驱动不报错）。有了这个读数，
     /// 测试就能断言「**只有形状、没有 `TextEngine`** 的渲染器，绑的是 **1×1** 哑纹理」
-    /// —— 而变异 **B**（把哑纹理换成 `cov=0`）会让形状帧在**像素**上变红，
-    /// 两者合起来把这条依赖钉住。
+    /// 以及「接管了引擎的渲染器，绑的是**字形图集**」。
+    ///
+    /// ## 它读的是**描述符集真实指向**（B5-3 修正）
+    ///
+    /// 返回值来自 [`GpuGeometryRenderer::descriptor_points_at`] ——
+    /// 那个字段**只能**由 [`point_descriptor_at`]（= 发 `vkUpdateDescriptorSets` 的
+    /// 那个函数）的返回值赋值。从前它读的是 `TextResources.texture` 这个**代理字段**，
+    /// 于是「忘了把 `set` 改指到图集」这类变异下它**照样**报图集尺寸
+    /// ⇒ 断言名不副实（复审 M12 实测：`gpu_text_reupload` 当时仍然绿）。
     ///
     /// 语义边界**如实体现在返回值里**：它返回的是**当前描述符集里那张纹理**的尺寸
     /// （哑纹理 `(1, 1)` 或字形图集 `(w, h)`），不表示「这一帧采到了什么」。
     pub fn bound_texture_size(&self) -> (u32, u32) {
-        match self.text.as_ref().and_then(|t| t.texture.as_ref()) {
-            Some(t) => (t.width(), t.height()),
-            // 没传过图集 ⇒ 描述符集里是 `new()` 建的 1×1 哑纹理
-            None => (1, 1),
-        }
+        self.descriptor_points_at
     }
 
     /// **把渲染器置为「上次提交未确认完成」** —— 之后所有 `render` 都会报错。
@@ -1482,7 +1522,8 @@ impl GpuGeometryRenderer {
 
         // ③ **合流**（B5-2 的核心）：两路顶点 + 段表 ⇒ **一条**统一顶点流。
         //    段表**顺序即 z 序**，`unify` 只按它搬运（不排序、不合并）⇒ 像素语义不变。
-        //    这里不再需要 `merge_adjacent_draw_calls`：整帧只发一次 draw，段划分不影响录制。
+        //    这里不需要任何合段：整帧只发一次 draw，段划分不影响录制
+        //    （B5-3 已把那个失去调用点的合段函数连同单测一起删掉，见 `DrawCall` 的说明）。
         self.unify_calls += 1;
         let unified: Vec<UnifiedVertex> = vertex_unify::unify(&shape_verts, &text_verts, &calls);
         self.unify_output_vertices += unified.len() as u64;
@@ -1574,9 +1615,15 @@ impl GpuGeometryRenderer {
         };
         let (w, h, glyphs) = key;
         let texture = self.device.create_texture_r8(w, h, &data)?;
-        // 改指描述符集：**同一个集**（渲染器级的那个），不是文本自己的
-        self.device
-            .update_descriptor_texture(&self.descriptor_set, &texture, &self.pipelines.sampler)?;
+        // 改指描述符集：**同一个集**（渲染器级的那个），不是文本自己的。
+        // 读数与副作用同处：记录**只能**来自这个返回值（见 `point_descriptor_at`）——
+        // 跳过这次改指，`bound_texture_size()` 就不可能报出图集尺寸。
+        self.descriptor_points_at = point_descriptor_at(
+            &self.device,
+            &self.descriptor_set,
+            &self.pipelines.sampler,
+            &texture,
+        )?;
         {
             let res = self.text.as_mut().expect("同上");
             res.texture = Some(texture);
@@ -1948,53 +1995,6 @@ mod tests {
         );
     }
 
-    /// **I1 的回归判据（fix round 2 / R1-1）**：屏障的四个掩码必须**确切**是
-    /// `HOST` / `VERTEX_INPUT(0x4)` / `HOST_WRITE` / `VERTEX_ATTRIBUTE_READ(0x4)`。
-    ///
-    /// **合段（M3+ B2）的纯函数判据**：相邻同管线且区间连续的段合并，其余一律不动。
-    ///
-    /// 这是 B2 唯一改动语义的地方，而它是纯函数 ⇒ **无 GPU 就能回归**
-    /// （`tests/gpu_vs_cpu.rs` 另有一条真机用例断言「合段后像素不变 + 计数下降」）。
-    #[test]
-    fn merge_adjacent_draw_calls_only_merges_contiguous_same_pipeline() {
-        let c = |kind, first, count| DrawCall { kind, first, count };
-
-        // ① 相邻同管线 + 区间连续 ⇒ 合成一段
-        let merged = merge_adjacent_draw_calls(&[
-            c(PipelineKind::Shape, 0, 6),
-            c(PipelineKind::Shape, 6, 6),
-            c(PipelineKind::Shape, 12, 6),
-        ]);
-        assert_eq!(merged, vec![c(PipelineKind::Shape, 0, 18)], "三段应当合成一段");
-
-        // ② 相邻但**区间不连续** ⇒ 不合并（一次 draw 画不出来）
-        let split = merge_adjacent_draw_calls(&[
-            c(PipelineKind::Shape, 0, 6),
-            c(PipelineKind::Shape, 12, 6),
-        ]);
-        assert_eq!(split.len(), 2, "区间有洞时不许合并：{split:?}");
-
-        // ③ 相邻但**管线不同** ⇒ 不合并（必须切管线）
-        let mixed = merge_adjacent_draw_calls(&[
-            c(PipelineKind::Shape, 0, 6),
-            c(PipelineKind::Text, 0, 6),
-            c(PipelineKind::Shape, 6, 6),
-        ]);
-        assert_eq!(mixed.len(), 3, "跨管线不许合并：{mixed:?}");
-
-        // ④ 文本那一路同样合并（两条管线共用这一份实现）
-        let text = merge_adjacent_draw_calls(&[
-            c(PipelineKind::Text, 0, 6),
-            c(PipelineKind::Text, 6, 6),
-        ]);
-        assert_eq!(text, vec![c(PipelineKind::Text, 0, 12)]);
-
-        // ⑤ 空输入 ⇒ 空输出；单段 ⇒ 原样
-        assert!(merge_adjacent_draw_calls(&[]).is_empty());
-        let one = merge_adjacent_draw_calls(&[c(PipelineKind::Text, 30, 6)]);
-        assert_eq!(one, vec![c(PipelineKind::Text, 30, 6)], "单段必须原样保留（含 first 偏移）");
-    }
-
     /// **B1 的统计字段语义**：默认全 0（新渲染器 = 没画过任何东西）。
     #[test]
     fn render_stats_starts_at_zero() {
@@ -2005,6 +2005,9 @@ mod tests {
         assert_eq!(s.buffer_allocations, 0);
     }
 
+    /// **I1 的回归判据（fix round 2 / R1-1）**：屏障的四个掩码必须**确切**是
+    /// `HOST` / `VERTEX_INPUT(0x4)` / `HOST_WRITE` / `VERTEX_ATTRIBUTE_READ(0x4)`。
+    ///
     /// 变异验证：把 `VK_PIPELINE_STAGE_VERTEX_INPUT_BIT` 改成 `1 << 5`（细分求值）⇒ 本测试**变红**。
     /// 之前没有这条断言时，那个变异在 16 个测试靶上全绿（只有校验层刷 VUID-04091）。
     #[test]

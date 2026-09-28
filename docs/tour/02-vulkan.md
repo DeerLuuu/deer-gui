@@ -917,7 +917,8 @@ cargo test -p deer-vk --test spirv_val
   `build_pipeline` 的 `None` 分支 `:729-738`），理由写在 `:600-606`
   「两个都要有：既能定位问题，也给调用方一个可用选择」。
 - **窗口路径用动态**：`WindowedRenderer` 每帧按当前 extent 设置 viewport/scissor，resize 不必重建管线
-  （M3c 之后管线由共用层 `pipelines::build_pipelines` 一次建两条；策略由 `DEER_VK_WINDOW_VIEWPORT`
+  （M3c 之后管线由**共用资源 + 统一管线**建出：`pipelines::build_pipeline_resources` +
+  `gpu_render::build_unified_pipeline`（B5-3 起旧的两条管线已删）；策略由 `DEER_VK_WINDOW_VIEWPORT`
   选择，**默认 `dynamic` 才是产品行为**）。**两条路径的策略不同，这是刻意的。**
 - 文档侧同述：[`docs/features/window.md`](../features/window.md) 第 5.2 节（含对照实验表）、
   [`docs/features/gpu-geometry.md`](../features/gpu-geometry.md) 第 3 节前提 1。

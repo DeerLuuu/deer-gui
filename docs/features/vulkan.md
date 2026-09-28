@@ -120,8 +120,9 @@ cargo test -p deer-vk --test pipeline_smoke format_mismatch_is_accepted_by_this_
   格式（以及由此决定的编码/混合空间）**传错也能建成功**，但**像素语义**会按错误格式走；
   窗口路径若把 `color_format` 传成离屏那个 UNORM 常量、或交换链退回 sRGB，都会「跑得通、画得不对」，
   只有**上屏像素对照**（[`window.md`](window.md) 第 5 节的 `window_parity`）能发现。
-- 实现侧的说明与这条契约写在 `crates/deer-vk/src/pipelines.rs` 的 `build_pipelines` 文档里
-  （`RenderPass` 没有公开的 format getter ⇒ 这条约束**无法由 `build_pipelines` 强制**，是**调用方契约**）。
+- 实现侧的说明与这条契约写在 `crates/deer-vk/src/pipelines.rs` 的 `build_pipeline_resources` 文档里
+  （B5-3 起建管线的是 `gpu_render::build_unified_pipeline`；两者都**无法**强制这条约束 ——
+  `RenderPass` 没有公开的 format getter ⇒ 它是**调用方契约**）。
 
 **第二条（声明动态却不设置）的证据与硬要求**：
 

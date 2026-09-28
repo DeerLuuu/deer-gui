@@ -379,7 +379,7 @@ fn validation_counter_actually_counts_when_a_message_is_emitted() {
 /// 且测试执行顺序不受控 ⇒ 进程级计数迟早非 0。
 ///
 /// 所以把绝对断言放进**干净的进程**：子进程里只跑一个最小工作负载
-/// （开设备 → 建渲染通道/两条管线 → 建纹理/采样器/描述符 → 销毁），
+/// （开设备 → 建渲染通道/统一管线 → 建纹理/采样器/描述符 → 销毁），
 /// 然后断言那个进程的**全局**计数为 0。
 ///
 /// ## 它是怎么做到「确定性」的
@@ -467,7 +467,7 @@ fn child_probe_zero_messages() {
     };
     assert!(dev.validation_enabled(), "子进程里校验层必须真的启用");
 
-    // 最小工作负载：渲染通道 + 两条管线 + 纹理/采样器/描述符
+    // 最小工作负载：渲染通道 + **统一管线** + 纹理/采样器/描述符
     let Ok(pass) = dev.create_render_pass(
         vk::VK_FORMAT_R8G8B8A8_UNORM,
         vk::VK_ATTACHMENT_LOAD_OP_CLEAR,
@@ -481,23 +481,40 @@ fn child_probe_zero_messages() {
         format: vk::VK_FORMAT_R32G32_SFLOAT,
         offset: 0,
     }];
-    let _set = deer_vk::pipelines::build_pipelines(
-        &dev,
-        &pass,
+    // B5-3：旧的两条旧管线已删 ⇒ 探针改为建**统一管线**（界面路径唯一建的那一条），
+    // 工作负载里仍然有真正的 `vkCreateGraphicsPipelines`（否则「零消息」会变成空转）。
+    let pipes = deer_vk::pipelines::build_pipeline_resources(&dev).expect("子进程：建共用资源失败");
+    let state = deer_vk::pipelines::shape_state(
         vk::VK_FORMAT_R8G8B8A8_UNORM,
         deer_vk::pipelines::ViewportStrategy::Dynamic,
         8,
-        &shape,
-        8,
-        &shape,
-    )
-    .expect("子进程：建管线失败");
+        shape.to_vec(),
+    );
+    let vs = dev
+        .create_shader_module(&deer_vk::spirv::vertex_shader_unified())
+        .expect("子进程：建 VS 模块失败");
+    let fs = dev
+        .create_shader_module(&deer_vk::spirv::fragment_shader_unified())
+        .expect("子进程：建 FS 模块失败");
+    let _pipeline = dev
+        .create_pipeline_from_state(
+            &state,
+            &[
+                (&vs, vk::VK_SHADER_STAGE_VERTEX_BIT),
+                (&fs, vk::VK_SHADER_STAGE_FRAGMENT_BIT),
+            ],
+            &pipes.text_layout,
+            &pass,
+        )
+        .expect("子进程：建统一管线失败");
     let tex = dev.create_texture_r8(4, 4, &[0u8; 16]).expect("纹理");
     let sampler = dev.create_sampler().expect("采样器");
-    let dsl = dev.create_descriptor_set_layout_combined_sampler().expect("布局");
     let pool = dev.create_descriptor_pool(1).expect("池");
-    let set = dev.allocate_descriptor_set(&pool, &dsl).expect("集");
-    dev.update_descriptor_texture(&set, &tex, &sampler).expect("写描述符");
+    let set = dev
+        .allocate_descriptor_set(&pool, &pipes.text_set_layout)
+        .expect("集");
+    dev.update_descriptor_texture(&set, &tex, &sampler)
+        .expect("写描述符");
     dev.wait_idle().expect("空闲");
     drop(set);
     drop(pool);
@@ -513,14 +530,21 @@ fn child_probe_zero_messages() {
 
 // ── M3c-T1：共用管线层 ────────────────────────────────────────────────────────
 
-/// **M3c-T1 验收**：共用层能同时建出「形状 + 文本」两条管线，且**同一批状态**
-/// 换一个颜色格式 + viewport 策略就能服务另一条路径（离屏 ↔ 窗口）。
+/// **M3c-T1 验收**：共用层 + 统一管线**能在两种颜色格式 / 两种 viewport 策略下建出来**
+/// （离屏 ↔ 窗口），即「同一批状态换两个参数就能服务另一条路径」。
 ///
 /// ## 为什么这条测试的重点是「两种格式都能建出来」
 ///
 /// M3c 要让窗口用同一套画法，而窗口的颜色格式是 **`B8G8R8A8_SRGB`（本机实测 `0x32`）**、
-/// 离屏是 `R8G8B8A8_UNORM` —— 两者走的是**同一份** `build_pipelines`，只是
-/// `color_format` 参数不同。所以「共用层对两种格式都能建出管线」是这层能用的前提。
+/// 离屏是 `R8G8B8A8_UNORM` —— 两者走的是**同一份**共用资源
+/// （`pipelines::build_pipeline_resources`）+ **同一个**建管线函数
+/// （[`deer_vk::gpu_render::build_unified_pipeline`]），只是 `color_format` 参数不同。
+/// 所以「共用层对两种格式都能建出管线」是这层能用的前提。
+///
+/// ⚠️ **B5-3 的落点变化（如实登记）**：B5-2 之前这条断言的是
+/// `build_pipelines` 建出的**形状 + 文本两条**管线（`set.shape` / `set.text` 句柄非空）。
+/// 那两条管线已删（它们没有任何绑定点）⇒ 本条改为断言**统一管线**在两种组合下都能建出来，
+/// 判据的**意思不变**（「同一批状态参数化后能服务两条路径」），只是对象换成了真正在用的那条。
 ///
 /// 注意这里**只**验证管线建得出来（驱动接受状态组合）；**像素语义**在
 /// `pipelines.rs` 的纯函数测试里定（sRGB 混合空间差 44 字节 ⇒ 结论是窗口要用
@@ -546,6 +570,9 @@ fn shared_pipeline_layer_builds_both_paths() {
         ),
     ];
 
+    // 共用资源只建一份（它不含格式/viewport —— 那两样是统一管线的参数）
+    let pipes = deer_vk::pipelines::build_pipeline_resources(&dev).expect("共用资源建成");
+
     for (name, format, viewport) in cases {
         let pass = dev
             .create_render_pass(
@@ -555,77 +582,23 @@ fn shared_pipeline_layer_builds_both_paths() {
             )
             .unwrap_or_else(|e| panic!("{name}: 建渲染通道失败：{e}"));
 
-        // 形状顶点布局（GpuVertex stride 44）与文本顶点布局（TextVertex stride 32）
-        let shape_attrs = [
-            vk::VertexInputAttributeDescription {
-                location: 0,
-                binding: 0,
-                format: vk::VK_FORMAT_R32G32_SFLOAT,
-                offset: 0,
-            },
-            vk::VertexInputAttributeDescription {
-                location: 1,
-                binding: 0,
-                format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
-                offset: 8,
-            },
-            vk::VertexInputAttributeDescription {
-                location: 2,
-                binding: 0,
-                format: 100, // R32_SFLOAT
-                offset: 24,
-            },
-            vk::VertexInputAttributeDescription {
-                location: 3,
-                binding: 0,
-                format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
-                offset: 28,
-            },
-        ];
-        let text_attrs = [
-            vk::VertexInputAttributeDescription {
-                location: 0,
-                binding: 0,
-                format: vk::VK_FORMAT_R32G32_SFLOAT,
-                offset: 0,
-            },
-            vk::VertexInputAttributeDescription {
-                location: 1,
-                binding: 0,
-                format: vk::VK_FORMAT_R32G32_SFLOAT,
-                offset: 8,
-            },
-            vk::VertexInputAttributeDescription {
-                location: 2,
-                binding: 0,
-                format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
-                offset: 16,
-            },
-        ];
-        let to_attr = |d: &vk::VertexInputAttributeDescription| deer_vk::VertexAttr {
-            location: d.location,
-            format: d.format,
-            offset: d.offset,
-        };
-        let shape: Vec<deer_vk::VertexAttr> = shape_attrs.iter().map(to_attr).collect();
-        let text: Vec<deer_vk::VertexAttr> = text_attrs.iter().map(to_attr).collect();
-
-        let set = deer_vk::pipelines::build_pipelines(
+        let (pipeline, vs, fs) = deer_vk::gpu_render::build_unified_pipeline(
             &dev,
             &pass,
             format,
             viewport,
-            44,
-            &shape,
-            32,
-            &text,
+            &pipes.text_layout,
         )
-        .unwrap_or_else(|e| panic!("{name}: 共用层建两条管线失败：{e}"));
+        .unwrap_or_else(|e| panic!("{name}: 统一管线建不出来：{e}"));
 
-        assert!(!set.shape.handle().is_null(), "{name}: 形状管线句柄不能为空");
-        assert!(!set.text.handle().is_null(), "{name}: 文本管线句柄不能为空");
-        assert_eq!(set.color_format(), format, "{name}: 记录的格式必须与传入一致");
-        println!("  {name}: 形状 + 文本两条管线建成 ✅");
+        // ★ 前置条件：句柄真的非空（否则下面那句断言是空转）
+        assert!(
+            !pipeline.handle().is_null(),
+            "{name}: 统一管线句柄不能为空"
+        );
+        // 着色器模块必须比管线活得久（这里只是把它们留在作用域里到循环末）
+        assert!(!vs.handle().is_null() && !fs.handle().is_null());
+        println!("  {name}: 统一管线建成 ✅");
     }
 }
 
@@ -640,7 +613,7 @@ fn shared_pipeline_layer_builds_both_paths() {
 ///
 /// 所以这条测试改成**记录事实**，于是它有两个作用：
 /// 1. 钉住「不能指望驱动替我们发现格式传错」⇒ 调用方必须自己传对
-///    （`build_pipelines` 的文档里写明这条前提）；
+///    （`build_pipeline_resources` 的文档里写明这条前提）；
 /// 2. 若某天驱动升级后开始拒绝，这条会红，我们会知道「驱动变严了」——
 ///    那也是必须知道的变化（它意味着别处可能有依赖「被宽容接受」的代码）。
 ///
@@ -663,54 +636,18 @@ fn format_mismatch_is_accepted_by_this_driver_and_must_be_guarded_by_the_caller(
     // but VERTEX has ... at that Location"）——本条测试**只想**验证格式不一致的行为，
     // 不该顺带引入别的 VUID（那会让「零校验消息」的断言被无关消息污染：
     // 这正是我第一版只声明 1 个属性时踩到的，实测 5 条 VUID）。
-    let shape_attrs = [
-        deer_vk::VertexAttr {
-            location: 0,
-            format: vk::VK_FORMAT_R32G32_SFLOAT,
-            offset: 0,
-        },
-        deer_vk::VertexAttr {
-            location: 1,
-            format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
-            offset: 8,
-        },
-        deer_vk::VertexAttr {
-            location: 2,
-            format: 100, // R32_SFLOAT
-            offset: 24,
-        },
-        deer_vk::VertexAttr {
-            location: 3,
-            format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
-            offset: 28,
-        },
-    ];
-    let text_attrs = [
-        deer_vk::VertexAttr {
-            location: 0,
-            format: vk::VK_FORMAT_R32G32_SFLOAT,
-            offset: 0,
-        },
-        deer_vk::VertexAttr {
-            location: 1,
-            format: vk::VK_FORMAT_R32G32_SFLOAT,
-            offset: 8,
-        },
-        deer_vk::VertexAttr {
-            location: 2,
-            format: vk::VK_FORMAT_R32G32B32A32_SFLOAT,
-            offset: 16,
-        },
-    ];
-    let r = deer_vk::pipelines::build_pipelines(
+    //
+    // B5-3 起这里不需要手写属性表了：建的是**统一管线**，而它的属性表由实现侧的
+    // `gpu_render::unified_attrs()`（`offset_of!` 生成、5 个 location）提供 ——
+    // 「表覆盖着色器的 location」由 `spirv_val.rs` 的接口断言与
+    // `gpu_vs_cpu::unified_vertex_layout_matches_the_unified_attribute_offsets` 钉住。
+    let pipes = deer_vk::pipelines::build_pipeline_resources(&dev).expect("共用资源建成");
+    let r = deer_vk::gpu_render::build_unified_pipeline(
         &dev,
         &pass,
         vk::VK_FORMAT_R8G8B8A8_UNORM, // ← 与通道的 SRGB **不一致**
         deer_vk::pipelines::ViewportStrategy::Dynamic,
-        44,
-        &shape_attrs,
-        32,
-        &text_attrs,
+        &pipes.text_layout,
     );
     match r {
         Ok(_) => println!(
@@ -1018,4 +955,132 @@ fn descriptor_pool_rejects_zero_capacity() {
     let e = dev.create_descriptor_pool(0).expect_err("max_sets=0 必须被拒");
     assert!(format!("{e}").contains("max_sets"), "{e}");
     println!("描述符池 max_sets=0 被拒 ✅");
+}
+
+// ── B5-3：**析构顺序**的具名判据（复审 Important F-3）────────────────────────
+
+/// 子进程探针成功跑完时打印的哨兵（父进程用它区分「真的跑了」与「0 tests run」）。
+const DTOR_SENTINEL: &str = "【DTOR 探针】";
+
+/// **子进程探针**：构造 + 用 + **析构**一个离屏 [`deer_vk::GpuGeometryRenderer`]。
+///
+/// ## 为什么这件事需要一个**具名**判据（复审 F-3 的实测）
+///
+/// `GpuGeometryRenderer` 的字段顺序是**硬契约**：`descriptor_set` 必须声明在
+/// `descriptor_pool` **之前**（`DescriptorSet::drop` 会调
+/// `vkFreeDescriptorSets(device, pool, ..)`）。把顺序写反 ⇒ **每条测试的逻辑都通过**
+/// （像素逐字节相同、计数 1/1、`render` 无错），但**进程在退出时
+/// `STATUS_ACCESS_VIOLATION`（`0xC0000005`）**，而且**没有任何失败用例名**、
+/// 关掉校验层时**没有任何消息**。
+///
+/// 也就是说：这不是**静默**缺陷（`cargo` 会报 `exit code: 0xc0000005`），
+/// 但**定位极差**（连「是哪条用例」都不知道）。本探针把它变成可局部化的判据：
+/// **构造 → 渲染一帧（含文本 ⇒ 图集 + 描述符改指）→ 析构 → 进程正常退出**。
+/// 顺序写反时子进程的退出码就不是 0 ⇒ 父进程那条**具名用例**失败。
+///
+/// 由 [`renderer_construct_and_destruct_in_a_fresh_child_exits_cleanly`] 以
+/// `DEER_VK_DTOR_PROBE` 打开；默认（直接跑整个测试套件时）**立即返回**，不产生噪声。
+#[test]
+fn child_probe_offscreen_renderer_release() {
+    if std::env::var("DEER_VK_DTOR_PROBE").is_err() {
+        return;
+    }
+    use deer_gpu::draw::{Color, DrawCmd, DrawList};
+    use deer_gpu::{Extent, RectI};
+
+    let extent = Extent {
+        width: 48,
+        height: 32,
+    };
+    let Ok(mut r) = deer_vk::GpuGeometryRenderer::new(0, extent, Color::rgb(16, 16, 16)) else {
+        eprintln!("子进程：本机没有可用的 Vulkan GPU");
+        std::process::exit(2);
+    };
+    // ① 形状帧（覆盖：统一管线 + 顶点缓冲 + 屏障 + 哑纹理描述符）
+    let mut l = DrawList::new();
+    l.push(DrawCmd::FillRect {
+        rect: RectI::new(2, 2, 20, 16),
+        color: Color::WHITE,
+    });
+    r.render(&l).expect("子进程：形状帧渲染失败");
+    // ② 有系统字体时连文本路径一起走（图集纹理 + **描述符改指**也是析构契约的一部分）
+    let text_ran = match deer_gpu::text::TextEngine::from_system_font(16.0) {
+        Ok(engine) => {
+            let mut r = r.with_text(engine).expect("子进程：with_text 失败");
+            let mut lt = DrawList::new();
+            lt.push(DrawCmd::Text {
+                rect: RectI::new(2, 2, 40, 20),
+                text: "Wg".into(),
+                color: Color::WHITE,
+                size: 16.0,
+                align: 0,
+            });
+            r.render(&lt).expect("子进程：文本帧渲染失败");
+            drop(r);
+            true
+        }
+        Err(e) => {
+            eprintln!("子进程：拿不到系统字体（{e}）⇒ 只覆盖形状帧路径");
+            drop(r);
+            false
+        }
+    };
+    println!(
+        "{DTOR_SENTINEL}离屏渲染器（统一管线 + 描述符集/池{text_state}）已构造并**析构**，进程准备正常退出",
+        text_state = if text_ran { " + 图集" } else { "" }
+    );
+}
+
+/// **具名判据**：在**干净子进程**里构造 + 析构一个离屏渲染器，子进程必须**正常退出**。
+///
+/// 与 [`child_probe_offscreen_renderer_release`] 配对；它抓的是「字段顺序写反 ⇒
+/// `vkFreeDescriptorSets` 访问已销毁的池 ⇒ 进程 abort」这条**原本没有名字**的失效模式。
+///
+/// ## 为什么用 `std::env::current_exe()` 而不是扫 target 目录
+///
+/// 本文件就是一个测试二进制 ⇒ 子进程用**同一个可执行文件** + `--exact <探针名>`
+/// 只跑那一个用例（不依赖「在哪找 deer_vk-<hash>.exe」这种脆弱约定）。
+/// 父进程**必须**校验两件事，否则判据会空转：
+/// 1. 退出码 == 0（顺序写反时是 `0xC0000005`）；
+/// 2. stdout 里有哨兵 `【DTOR 探针】`（`--exact` 没匹配到时 libtest 会报 `0 passed`
+///    并且同样 exit 0 ⇒ 只看退出码会把「什么都没跑」当成通过）。
+#[test]
+fn renderer_construct_and_destruct_in_a_fresh_child_exits_cleanly() {
+    // 自己是子进程时不要递归
+    if std::env::var("DEER_VK_DTOR_PROBE").is_ok() {
+        return;
+    }
+    let exe = std::env::current_exe().expect("拿不到当前测试二进制路径");
+    let out = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "child_probe_offscreen_renderer_release",
+            "--nocapture",
+        ])
+        .env("DEER_VK_DTOR_PROBE", "1")
+        .output()
+        .expect("启动子进程");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // ★ 先看**退出码**：它才是这条判据的主体 —— 顺序写反时子进程会以 `0xC0000005` 退出。
+    //   （顺序不能反：崩掉的子进程**不会**打印哨兵，先查哨兵会把「崩了」误报成「空转」。）
+    assert!(
+        out.status.success(),
+        "子进程（构造 + 析构一个离屏渲染器）**没有正常退出**：exit={:?}\n\
+         若是 `0xC0000005`（STATUS_ACCESS_VIOLATION）：几乎一定是 `GpuGeometryRenderer`\
+         的**字段顺序被写反**了（`descriptor_pool` 提到 `descriptor_set` 之前 ⇒\
+         `vkFreeDescriptorSets` 访问已销毁的池）。\n--- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status.code(),
+        stdout.lines().rev().take(8).collect::<Vec<_>>().join("\n"),
+        stderr.lines().rev().take(8).collect::<Vec<_>>().join("\n")
+    );
+    // ★ 再看**哨兵**：退出码 0 但没有哨兵 ⇒ 探针根本没跑（`--exact` 没匹配到）
+    //   ⇒ 这条判据会**空转**，必须单独报出来（别把「什么都没跑」当成通过）。
+    assert!(
+        stdout.contains(DTOR_SENTINEL),
+        "子进程退出码正常，但没有跑探针（stdout 里没有哨兵 `{DTOR_SENTINEL}`）⇒ 本判据会空转\
+         （`--exact` 没匹配到用例名？）\n--- stdout ---\n{}",
+        stdout
+    );
+    println!("干净子进程里「构造 + 析构」正常退出 ✅（析构顺序契约有名字了）");
 }

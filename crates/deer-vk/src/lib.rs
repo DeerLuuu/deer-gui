@@ -48,7 +48,7 @@ pub use gpu_render::{GpuGeometryRenderer, RenderStats};
 pub use gpu_text::{build_text_stream, TextStream, TextVertex};
 pub use hal::{VulkanDevice, VulkanFrame, VulkanSwapchain};
 pub use offscreen::{Buffer, CommandPool, Fence, Framebuffer, Image, ImageView, Memory, OffscreenRenderer};
-pub use pipelines::{build_pipelines, PipelineState, PipelineSet, ViewportStrategy};
+pub use pipelines::{build_pipeline_resources, PipelineResources, PipelineState, ViewportStrategy};
 pub use surface::Surface;
 pub use vertex_unify::{UnifiedVertex, SHAPE_UV_SENTINEL};
 pub use swapchain::{Acquire, Present, Semaphore, Swapchain, SwapchainConfig};

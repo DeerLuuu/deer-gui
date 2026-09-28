@@ -138,7 +138,12 @@ struct UiVertexBuffer {
 /// 校验层能说清（`descriptorPool Invalid VkDescriptorPool Object`），
 /// **但关掉校验层时这条消息不存在** ⇒ 症状像「测试框架自己崩了」。
 struct UiResources {
-    pipes: pipelines::PipelineSet,
+    /// 统一管线需要的**共用资源**（管线布局 / `set 0` 布局 / 采样器）。
+    ///
+    /// ⚠️ **声明在 `unified` 之前**：统一管线建在这份布局上 ⇒ 管线必须先销毁
+    /// （B5-3 之前这里装的是「形状 + 文本两条旧管线」，它们已删 —— 见
+    /// `pipelines::PipelineResources` 的说明）。
+    pipes: pipelines::PipelineResources,
     /// **统一**顶点缓冲（形状 + 文本共用一条流）。
     vb: Option<UiVertexBuffer>,
     /// 统一界面管线（`vertex_shader_unified` / `fragment_shader_unified`，stride 52）。
@@ -168,6 +173,17 @@ struct UiResources {
     dummy_texture: Texture,
     /// 当前已上传的**字形图集**（`None` = 还没传过 ⇒ `set` 指向 `dummy_texture`）。
     texture: Option<Texture>,
+    /// **描述符集此刻指着哪张纹理**（宽, 高）—— [`WindowedRenderer::bound_texture_size`]
+    /// 的**唯一**来源。
+    ///
+    /// ## 为什么要单独一个字段（与 `gpu_render.rs` 同一条纪律）
+    ///
+    /// 从 `texture` / `uploaded` **推**出来的读数会名不副实：变异「跳过
+    /// `update_descriptor_texture`（忘了把 `set` 改指到图集）」下 `texture` 照样被更新
+    /// ⇒ 读数照旧报图集，断言咬不住（复审在离屏侧实测过这一条）。
+    /// 现在它**只能**由 `crate::gpu_render::point_descriptor_at` 的返回值赋值 ——
+    /// 那个函数体内就是 `vkUpdateDescriptorSets` 的调用点 ⇒ 读数与副作用同处。
+    descriptor_points_at: (u32, u32),
     /// 已上传图集的指纹 `(宽, 高, 已光栅化字形数)`；`None` = 还没传过。
     ///
     /// `Some` 的指纹**不可能**是 `(1,1,0)`：图集宽 = 字号 ≥ 2 ⇒ 不会与哑纹理混淆。
@@ -1224,15 +1240,16 @@ impl WindowedRenderer {
         self.unify_output_vertices
     }
 
-    /// **本帧绑定并采样的纹理尺寸**（宽, 高）—— B5-2 哑纹理护栏的读数口
+    /// **本帧绑定并采样的纹理尺寸**（宽, 高）—— 哑纹理 / 图集护栏的读数口
     /// （与 `GpuGeometryRenderer::bound_texture_size` 同一语义）。
+    ///
+    /// 读的是 **`set` 真实指向**（`descriptor_points_at`，由
+    /// `gpu_render::point_descriptor_at` 在发 `vkUpdateDescriptorSets` 的同一处赋值）
+    /// —— 不是从 `texture` 字段推出来的代理读数。见那个字段的说明。
     pub fn bound_texture_size(&self) -> (u32, u32) {
         match self.ui.as_ref() {
-            // 传过图集 ⇒ 那才是 `set` 指着的纹理
-            Some(u) => match u.texture.as_ref() {
-                Some(t) => (t.width(), t.height()),
-                None => (1, 1),
-            },
+            // 界面资源已建 ⇒ 它记着描述符集此刻指着谁（哑纹理或字形图集）
+            Some(u) => u.descriptor_points_at,
             // 界面资源还没建 ⇒ 下一帧建的时候会绑 1×1 哑纹理
             None => (1, 1),
         }
@@ -1275,19 +1292,22 @@ impl WindowedRenderer {
 
     /// **画一帧界面树并呈现**（M3c-T3）。
     ///
-    /// ## 它做什么
+    /// ## 它做什么（**B5-2 起是单管线、单缓冲、一次 draw**）
     ///
-    /// 1. 惰性建界面资源（形状管线；调用方给了 `TextEngine` 时再建文本管线）；
+    /// 1. 惰性建界面资源（**一条**统一管线 + `set 0` + 哑纹理）；
     /// 2. **单次遍历** `list`：形状命令走 `gpu_geom::build_stream`、文本命令走
-    ///    `gpu_text::build_text_stream`（**不重写顶点流语义**），按原顺序记录
-    ///    [`UiDrawCall`] ⇒ z 序与 CPU 一致；
-    /// 3. 每帧上传两块**独立**顶点缓冲（形状 stride 44 / 文本 stride 32）；
+    ///    `gpu_text::build_text_stream`（**不重写顶点流语义**），按原顺序记录段表
+    ///    ⇒ z 序与 CPU 一致 → 两路顶点由 `vertex_unify::unify` 合成**一条**统一流；
+    /// 3. 每帧把统一顶点流上传进**一块**缓冲（内容逐字节相同则跳过，B3）；
     /// 4. 图集纹理**只在指纹变化时**重传（与离屏同一条契约）；
-    /// 5. 录制：清屏 → 按段切管线/缓冲/描述符集 → 绘制 →（可选）回读复制 → 呈现。
+    /// 5. 录制：清屏 → **一次** bind（管线/顶点缓冲/描述符集）+ **一次** `vkCmdDraw`
+    ///    →（可选）回读复制 → 呈现。
     ///
-    /// ## viewport：默认**动态**（共用层参数化，`DEER_VK_WINDOW_VIEWPORT` 可强制静态）
+    /// ## viewport：默认**动态**（`DEER_VK_WINDOW_VIEWPORT` 可强制静态）
     ///
-    /// 两条管线由 `pipelines::build_pipelines` 按 [`viewport_strategy_from_env`] 建：
+    /// 统一管线由 [`crate::gpu_render::build_unified_pipeline`] 按
+    /// [`viewport_strategy_from_env`] 建（共用层提供布局/采样器：
+    /// `pipelines::build_pipeline_resources`）：
     ///
     /// - **动态（默认）**：M2b 起窗口路径就是这么用的；尺寸变化**不必**重建管线；
     /// - **静态**（诊断/实测用）：viewport 写死在管线里 ⇒ `resize()` 必须让界面资源失效
@@ -1434,8 +1454,8 @@ impl WindowedRenderer {
 
         // ⑥ 帧舞蹈（取图 → 录制 → 提交 → 呈现）：与 `render_and_present` 共用同一段逻辑
         //
-        // ⚠️ B5-2 起**不再需要** `merge_adjacent_draw_calls`：整帧只发一次 draw，
-        // 段划分对录制没有任何影响（与离屏同一条）。
+        // ⚠️ 这里**不需要**任何合段：整帧只发一次 draw，段划分对录制没有影响
+        // （与离屏同一条；B5-3 已把那个失去调用点的合段函数删掉）。
         self.present_frame(|s, slot, image_index| s.record_ui(slot, image_index, &unified))
     }
 
@@ -1446,9 +1466,9 @@ impl WindowedRenderer {
     /// M3c 的 Step 1 曾在这里踩过一次：形状管线的 VS 写成 `vertex_shader_from_vertex_buffer`
     /// （M2a 探针用的那个），而形状 FS 声明了 location 0/1/2 的输入 —— **驱动照样建管线成功、
     /// 照样画出像素**，只有校验层报「FS 有 Input 但上一阶段没有对应 Output」。
-    /// 现在着色器只有两个来源：`pipelines::build_pipelines`（两条旧管线）与
-    /// [`crate::gpu_render::build_unified_pipeline`]（界面路径真正用的那条），
-    /// 两者的接口一致性都有测试（`spirv_val.rs` 的 location 断言）。窗口路径不再自己拼管线。
+    /// 现在界面路径的着色器只有**一个**来源：[`crate::gpu_render::build_unified_pipeline`]
+    /// （B5-3 起旧的两条管线已删；那 4 支旧着色器函数仍留在 `spirv.rs` 里，
+    /// `spirv_val.rs` / 本模块的单测继续钉它们的接口一致性）。窗口路径不自己拼管线。
     ///
     /// ## 颜色格式与 viewport 策略
     ///
@@ -1472,20 +1492,10 @@ impl WindowedRenderer {
                 other => other,
             };
             self.ui_viewport_is_dynamic = viewport == pipelines::ViewportStrategy::Dynamic;
-            // 两条旧管线（形状/文本）：B5-2 起界面路径**不用**它们，但它们提供统一管线
-            // 需要的 `text_layout`（带 `set 0` 的布局）、`text_set_layout` 与 `sampler`。
-            // 是否删除属 B5-3（旧路清理）—— 那一步要连 `pipelines.rs` 的测试一起改。
-            let pipes = pipelines::build_pipelines(
-                &self.device,
-                &self.render_pass,
-                self.swapchain.format(),
-                viewport,
-                std::mem::size_of::<GpuVertex>() as u32,
-                &crate::gpu_render::vertex_attrs(),
-                std::mem::size_of::<TextVertex>() as u32,
-                &crate::gpu_render::text_attrs(),
-            )?;
-            // ★ 统一管线：界面路径真正使用的那一条（stride 52，5 个 location）
+            // 共用资源（B5-3）：管线布局 / `set 0` 布局 / 采样器 —— **不建管线**。
+            // 旧的两条（形状/文本）已删：统一之后它们没有任何绑定点，建了不用就是纯成本。
+            let pipes = pipelines::build_pipeline_resources(&self.device)?;
+            // ★ 统一管线：界面路径**唯一**建、也唯一使用的那一条（stride 52，5 个 location）
             let (unified, unified_vs, unified_fs) = crate::gpu_render::build_unified_pipeline(
                 &self.device,
                 &self.render_pass,
@@ -1500,8 +1510,14 @@ impl WindowedRenderer {
             let dummy_texture =
                 self.device
                     .create_texture_r8(1, 1, &crate::gpu_render::DUMMY_COVERAGE)?;
-            self.device
-                .update_descriptor_texture(&set, &dummy_texture, &pipes.sampler)?;
+            // 读数与副作用同处：这块记录**只能**来自那个函数的返回值
+            // （删掉调用就没值可赋 ⇒ 跳过改指不可能留下假读数）。
+            let descriptor_points_at = crate::gpu_render::point_descriptor_at(
+                &self.device,
+                &set,
+                &pipes.sampler,
+                &dummy_texture,
+            )?;
             LIVE_UI_RESOURCES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.ui_builds += 1;
             self.ui = Some(UiResources {
@@ -1515,6 +1531,7 @@ impl WindowedRenderer {
                 pool,
                 dummy_texture,
                 texture: None,
+                descriptor_points_at,
                 uploaded: None,
                 uploaded_vertices: None,
             });
@@ -1545,8 +1562,13 @@ impl WindowedRenderer {
         let data = engine.atlas().coverage().to_vec();
         let texture = self.device.create_texture_r8(w, h, &data)?;
         if let Some(u) = self.ui.as_mut() {
-            self.device
-                .update_descriptor_texture(&u.set, &texture, &u.pipes.sampler)?;
+            // 改指 + **同处记录**（读数只能来自这个返回值 ⇒ 跳过改指必然跳过记录）
+            u.descriptor_points_at = crate::gpu_render::point_descriptor_at(
+                &self.device,
+                &u.set,
+                &u.pipes.sampler,
+                &texture,
+            )?;
             u.texture = Some(texture);
             u.uploaded = Some(key);
         }

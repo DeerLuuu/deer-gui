@@ -66,21 +66,29 @@
 //!
 //! 因此 [`crate::swapchain::pick_config`] 的格式优先级在 M3c 调整为
 //! **`*_UNORM` 优先、sRGB 退路**（见那里的文档），窗口路径的实际格式由
-//! `Swapchain::format()` 决定并作为 `color_format` 传进 [`build_pipelines`] ——
+//! `Swapchain::format()` 决定并作为 `color_format` 传给建管线的那个函数
+//! （[`crate::gpu_render::build_unified_pipeline`]）——
 //! 于是「窗口到底用哪个格式」是**运行期事实**，不是编译期假设。
 //!
-//! ## 本模块提供的东西
+//! ## 本模块提供的东西（**B5-3 起不再建任何管线**）
 //!
 //! - [`ViewportStrategy`]：静态（写进管线）/ 动态（录制时给）——见 `device.rs::build_pipeline` 的教训；
-//! - [`ShapeState`] / [`TextState`]：两条管线**除格式与 viewport 外**的全部状态（纯数据）；
-//! - [`build_pipelines`]：一次性建出两条管线（含各自的管线布局与着色器）；
+//! - [`shape_state`] / [`text_state`]：管线的**状态**（纯数据）。统一管线取
+//!   [`shape_state`] 那一份（两者的差别见 [`text_state`] 的文档）；
+//! - [`build_pipeline_resources`]：建出统一管线**需要的共用资源**
+//!   （`set 0` 的布局 + 采样器 + 带 `set 0` 的管线布局）。**它不建管线**：
+//!   管线由 [`crate::gpu_render::build_unified_pipeline`] 建（顶点布局 `UnifiedVertex` 在那边）；
 //! - [`srgb_encode`] / [`srgb_decode`]：sRGB 传输函数（纯函数，用来**证明**上面那段结论）。
+//!
+//! ⚠️ **B5-3 删掉了旧的两条管线**（形状 / 文本）：B5-2 把绘制路径统一成一条管线之后，
+//! 它们**没有任何绑定点**（唯一读者是 `tests/pipeline_smoke.rs` 的句柄非空断言），
+//! 而「建了不用」是实打实的创建成本。`spirv` 里那 4 支旧着色器函数**保留**
+//! （`fragment_shader_rect_shape` 是 M3a 冻结产物的 fixture，见 `spirv_val.rs`）。
 
 use deer_gpu::GpuResult;
 
-use crate::device::{Pipeline, PipelineLayout, RenderPass, ShaderModule, VkDevice};
+use crate::device::{PipelineLayout, VkDevice};
 use crate::ffi_dev as vk;
-use crate::spirv;
 
 // ── sRGB 传输函数（纯函数；M3c-T2 的判据） ───────────────────────────────────
 
@@ -221,7 +229,8 @@ fn multisample() -> vk::PipelineMultisampleStateCreateInfo {
 ///
 /// 顶点布局（`stride` + `attrs`）用值而不是指针存：指针版会让比较变成
 /// 「比地址」这种无意义的东西，也要求调用方保证生命周期。这里只在
-/// **真正建管线的那一刻**才把它展开成 Vulkan 的结构体（见 `build_pipelines`）。
+/// **真正建管线的那一刻**才把它展开成 Vulkan 的结构体（见
+/// [`crate::device::VkDevice::create_pipeline_from_state`]）。
 ///
 /// **不派生 `PartialEq`/`Debug`**：里面的成员是 `ffi_dev` 的手写 `repr(C)` 结构体，
 /// 含裸指针 ⇒ 派生出来的比较是「比地址」、派生的 `Debug` 打印一堆地址，两者都
@@ -293,7 +302,17 @@ pub fn shape_state(
 /// `shape_and_text_states_differ_only_in_the_three_allowed_dimensions` 把它钉死
 /// （含变异：改任一冻结字段即红）。
 ///
-/// 文本管线**额外**需要的资源（描述符集布局 + 采样器）不在这里，见 [`build_pipelines`]。
+/// 文本管线**额外**需要的资源（描述符集布局 + 采样器）不在这里，见
+/// [`build_pipeline_resources`]。
+///
+/// ## B5-3 之后谁在用这两份状态
+///
+/// 绘制路径**只用一份**：统一管线（[`crate::gpu_render::build_unified_pipeline`]）
+/// 取 [`shape_state`]，因为它「除 `color_format` / `viewport` / 顶点布局外
+/// 与文本管线逐字相同」。本函数**在测试里**仍被用来钉住这条不变式
+/// （`shape_and_text_states_differ_only_in_the_three_allowed_dimensions`）；
+/// 生产代码没有第二个调用点 —— 这是**刻意的**：删掉它等于删掉那条不变式的表达，
+/// 而「形状与文本的冻结状态逐字相同」正是统一管线能成立的前提。
 pub fn text_state(
     color_format: i32,
     viewport: ViewportStrategy,
@@ -312,153 +331,74 @@ pub fn text_state(
     }
 }
 
-// ── 两条管线的集合 ───────────────────────────────────────────────────────────
+// ── 统一管线所需的**共用资源** ───────────────────────────────────────────────
 
-/// 一次建好的两条管线（+ 各自的着色器与管线布局）。
+/// 统一管线（[`crate::gpu_render::build_unified_pipeline`]）**需要的**共用资源。
 ///
-/// ## 为什么着色器模块也放在这里
+/// ## B5-3：这里**不再有管线**（原来是 `PipelineSet`，装着形状 + 文本两条）
 ///
-/// `Pipeline` 与 `ShaderModule` 的生命周期必须满足「管线 ≤ 着色器」：Vulkan 允许
-/// 在管线建好后销毁着色器模块，但**不允许反过来**。把两者放进同一个结构体、
-/// 并让**字段顺序 = 析构顺序**（`shape`/`text` 管线声明在 `*_vs`/`*_fs` **之前**）⇒
-/// 析构时先销毁管线、再销毁着色器，顺序由类型系统保证。
+/// B5-2 把绘制路径统一成**一条**管线之后，旧的形状/文本管线**没有任何绑定点**
+/// （唯一读者是 `tests/pipeline_smoke.rs` 的句柄非空断言）⇒ 它们只贡献创建成本。
+/// B5-3 删掉它们，并把**仍然被真正使用**的三样东西收进本结构体：
+/// `set 0` 的布局、采样器、以及带 `set 0` 的**管线布局**（统一管线建在它上面）。
 ///
-/// 文本管线还需要它的描述符集布局与采样器才能在绘制时 `bind`/`update` ——
-/// 这里一并持有（同一个理由：布局必须比用到它的管线活得久）。
+/// 管线本身不在这里，因为它的顶点布局是 `gpu_render.rs` 的 `UnifiedVertex`
+/// （`stride 52` / 5 个 location）⇒ 由那边的 `build_unified_pipeline` 建，
+/// **状态来源仍然是本模块的 [`shape_state`]**（只有一处真值）。
 ///
-/// `shape_vs` / `shape_fs` / `text_vs` / `text_fs` **从不被读取** —— 它们存在只为
-/// **所有权**：着色器模块必须在管线存活期间有效（Vulkan 允许建好管线后销毁模块，
-/// 但**不允许反过来**）。`device.rs` 里那三个公开字段（`shape_layout` /
-/// `text_layout` / `text_set_layout` / `sampler`）确实会被渲染循环读用来
-/// `bind` 与 `update`，所以不加全局 `allow`，只对这四个模块加。
-#[allow(dead_code)]
-pub struct PipelineSet {
-    /// 形状管线（顶点属性透传 + 按 `rect`/`radius_kind` 逐像素判定）。
-    pub shape: Pipeline,
-    /// 文本管线（采样字形图集覆盖率）。**总是**存在 —— 不用文本时只是不 bind 它。
-    pub text: Pipeline,
-    /// 两条管线各自的布局（形状无描述符；文本有 set 0）。
-    pub shape_layout: PipelineLayout,
+/// ## 字段顺序（**是契约，不是风格**）
+///
+/// `text_layout`（管线布局）必须声明在 `text_set_layout` **之前**：
+/// 管线布局引用了那个描述符集布局，Vulkan 不允许「集布局先销、布局后销」。
+/// Rust 按声明顺序析构（先声明的先销毁）⇒ 布局先销、集布局后销。✅
+///
+/// 而**统一管线**由调用方持有、声明在本结构体**之前**（见
+/// `GpuGeometryRenderer` / `UiResources` 的字段顺序）⇒ 管线先于它的布局销毁。
+pub struct PipelineResources {
+    /// 统一管线的布局（带 `set 0` = 图集 `COMBINED_IMAGE_SAMPLER`）。
     pub text_layout: PipelineLayout,
-    /// 文本的 set 0 布局（`binding 0 = COMBINED_IMAGE_SAMPLER`）。
+    /// `set 0` 的布局（`binding 0 = COMBINED_IMAGE_SAMPLER`）。
     pub text_set_layout: crate::device::DescriptorSetLayout,
     /// 字形图集采样器（`NEAREST` + `ClampToEdge` + 无 mipmap）。
     pub sampler: crate::device::Sampler,
-    /// 这次建管线用的颜色格式（便于调用方断言「与交换链格式一致」）。
-    color_format: i32,
-    // —— 以下字段只在析构时起作用：必须**后**于上面的管线/布局声明 ——
-    shape_vs: ShaderModule,
-    shape_fs: ShaderModule,
-    text_vs: ShaderModule,
-    text_fs: ShaderModule,
 }
 
-impl PipelineSet {
-    /// 颜色格式（两条管线相同 —— 一次 [`build_pipelines`] 只服务一个渲染通道）。
-    pub fn color_format(&self) -> i32 {
-        self.color_format
-    }
-}
-
-/// 建出两条管线（形状 + 文本），状态由本模块统一提供。
+/// 建出统一管线所需的**共用资源**（见 [`PipelineResources`]）。
 ///
-/// ## 顶点布局为什么是参数
+/// ⚠️ **它不建管线**（B5-3）：管线由 [`crate::gpu_render::build_unified_pipeline`] 建，
+/// 那里才有 `UnifiedVertex` 的顶点布局。本函数在**两条路径**（离屏 / 窗口）里被调用，
+/// 于是「布局 + 采样器 + `set 0` 布局」只有一份来源。
 ///
-/// 「形状」与「文本」的顶点格式本来就不同（stride 44 的 `GpuVertex` vs stride 32 的
-/// `TextVertex`）—— 那是**唯一**允许两路径不同的第三处（前两处是颜色格式与
-/// viewport 策略）。调用方把自己的 `stride` + `attrs` 传进来即可。
+/// ## ⚠️ 格式一致性是**调用方契约**（本函数已经管不到它了）
 ///
-/// ## ⚠️ `color_format` 必须与 `render_pass` 的附件格式一致 ——
-/// **但本机驱动不会替你发现不一致**
+/// `color_format` 必须与 `render_pass` 的附件格式一致 —— 否则规范上是错的
+/// （校验层报 `VUID-VkGraphicsPipelineCreateInfo-renderPass-06043` 一类），
+/// 但**本机 Intel 驱动在关掉校验层时不报错**，实测见
+/// `tests/pipeline_smoke.rs::format_mismatch_is_accepted_by_this_driver_and_must_be_guarded_by_the_caller`
+/// （`B8G8R8A8_SRGB` 的通道 + `R8G8B8A8_UNORM` 的格式 ⇒ `vkCreateGraphicsPipelines` 返回**成功**）。
 ///
-/// 规范上这不一致是错的（校验层报 `VUID-VkGraphicsPipelineCreateInfo-renderPass-06043`
-/// 一类）。**实践上**：本机 Intel 驱动在**校验层之外不报错** ——
-/// 实测（`tests/pipeline_smoke.rs::format_mismatch_is_accepted_by_this_driver_and_must_be_guarded_by_the_caller`）：
-/// 拿 `B8G8R8A8_SRGB` 的渲染通道 + `R8G8B8A8_UNORM` 的 `color_format` 建管线，
-/// `vkCreateGraphicsPipelines` **返回成功**。
+/// 这是本项目反复遇到的那一类「**静默不一致**」（驱动接受非法组合，症状是
+/// 「不报错也不画」或画出错色）。对 M3c 的具体风险：窗口路径若把 `color_format`
+/// 传成离屏那个 UNORM 常量，管线会**建成功**、但像素语义按错误的格式走 ⇒
+/// 除非做像素对照，否则发现不了。
 ///
-/// 这是本项目反复遇到的那一类「**静默不一致**」（驱动接受非法/不一致的组合，
-/// 症状是「不报错也不画」或画出错色，而不是一个清晰的错误码）。
-/// 对 M3c 的具体风险：窗口路径若把 `color_format` 传成离屏那个 UNORM 常量，
-/// 管线会**建成功**、但像素语义按错误的格式走 ⇒ 除非做像素对照，否则发现不了。
-///
-/// 因此：**不要依赖驱动帮你拦住格式传错**。调用方必须传
-/// `render_pass` 的同一格式（离屏是 `COLOR_FORMAT` 常量、窗口是 `swapchain.format()`），
-/// 且 M3c-T3 的窗口读回对照是这条的最终判据。
-/// 这里**不**去 `render_pass` 里查（`RenderPass` 没有公开 format getter），
-/// 所以这条约束是**调用方契约**，不是本函数能强制的。
-///
-/// ## `viewport` 由调用方按**路径**选
-///
-/// 离屏传 [`ViewportStrategy::Static`]，窗口传 [`ViewportStrategy::Dynamic`]。
-/// **不得互相照搬**：离屏那条是「M2a 静态可用」的既成事实，而「动态不可用」的**原因存疑**
-/// （M3c 的窗口路径实测与 M2a 症状不同 —— 见 [`ViewportStrategy`] 的文档）。
-/// 无论哪种策略：**声明了动态状态就必须在录制时真的设置它**，否则是未定义行为
-/// （本机 Intel 实测直接崩）。
-#[allow(clippy::too_many_arguments)]
-pub fn build_pipelines(
-    device: &VkDevice,
-    render_pass: &RenderPass,
-    color_format: i32,
-    viewport: ViewportStrategy,
-    shape_stride: u32,
-    shape_attrs: &[crate::device::VertexAttr],
-    text_stride: u32,
-    text_attrs: &[crate::device::VertexAttr],
-) -> GpuResult<PipelineSet> {
-    // ① 着色器（自研 SPIR-V 汇编器产出；M3a/M3b 已过官方 spirv-val）——
-    //    两条路径**用同一批着色器**，这是「同一套画法」的前提。
-    let shape_vs = device.create_shader_module(&spirv::vertex_shader_rect_attrs())?;
-    let shape_fs = device.create_shader_module(&spirv::fragment_shader_rect_shape())?;
-    let text_vs = device.create_shader_module(&spirv::vertex_shader_text())?;
-    let text_fs = device.create_shader_module(&spirv::fragment_shader_text())?;
-
-    // ② 文本的 set 0 + 采样器（`NEAREST` + `ClampToEdge` + 无 mipmap，M3b 冻结）
+/// 所以：**不要依赖驱动替你拦住格式传错**。调用方必须传 `render_pass` 的同一格式
+/// （离屏是 `COLOR_FORMAT` 常量、窗口是 `swapchain.format()`），而 M3c-T3 的窗口
+/// 读回对照是这条的最终判据（`RenderPass` 没有公开 format getter ⇒ 传参这件事
+/// **无法**由本模块强制，只能由调用方保证 + 像素判据兜住）。
+pub fn build_pipeline_resources(device: &VkDevice) -> GpuResult<PipelineResources> {
+    // ① `set 0` + 采样器（`NEAREST` + `ClampToEdge` + 无 mipmap，M3b 冻结）
     let text_set_layout = device.create_descriptor_set_layout_combined_sampler()?;
     let sampler = device.create_sampler()?;
 
-    // ③ 两个管线布局：形状不带描述符、文本带 set 0
-    let shape_layout = device.create_pipeline_layout(None)?;
+    // ② 统一管线的布局：带 `set 0`（统一片元着色器**无条件采样** ⇒ 必须恒有绑定）
     let text_layout = device.create_pipeline_layout_ex(None, Some(&text_set_layout))?;
 
-    // ④ 状态：两条管线由**同一批构造函数**产出 ⇒「除三个允许维度外相同」是
-    //    结构上保证的，不靠人眼比对（见本文件的状态断言测试）。
-    let shape_state = shape_state(color_format, viewport, shape_stride, shape_attrs.to_vec());
-    let text_state = text_state(color_format, viewport, text_stride, text_attrs.to_vec());
-
-    // ⑤ 真正建管线（顶点输入结构体在 device 侧的一个作用域里拼，避免悬垂指针）
-    let shape = device.create_pipeline_from_state(
-        &shape_state,
-        &[
-            (&shape_vs, vk::VK_SHADER_STAGE_VERTEX_BIT),
-            (&shape_fs, vk::VK_SHADER_STAGE_FRAGMENT_BIT),
-        ],
-        &shape_layout,
-        render_pass,
-    )?;
-    let text = device.create_pipeline_from_state(
-        &text_state,
-        &[
-            (&text_vs, vk::VK_SHADER_STAGE_VERTEX_BIT),
-            (&text_fs, vk::VK_SHADER_STAGE_FRAGMENT_BIT),
-        ],
-        &text_layout,
-        render_pass,
-    )?;
-
-    Ok(PipelineSet {
-        // ⚠️ 字段顺序 = 析构顺序：管线与布局在前、着色器在后
-        shape,
-        text,
-        shape_layout,
+    Ok(PipelineResources {
+        // ⚠️ 字段顺序 = 析构顺序：布局在前（引用 `text_set_layout`）
         text_layout,
         text_set_layout,
         sampler,
-        color_format,
-        shape_vs,
-        shape_fs,
-        text_vs,
-        text_fs,
     })
 }
 
@@ -566,14 +506,18 @@ mod tests {
     /// **本模块的核心断言**：两条管线状态只在三个**允许**维度上不同。
     ///
     /// 允许不同的维度恰好是三个：
-    /// 1. `color_format` —— 但同一路径下两条管线**用同一个**格式（一次
-    ///    `build_pipelines` 只服务一个渲染通道），所以这里断言它们**相等**；
+    /// 1. `color_format` —— 但同一路径下只建**一条**管线（统一管线，B5-3）
+    ///    且它服务一个渲染通道，所以这里断言两份状态**相等**；
     /// 2. `viewport` —— 同上，同一路径下相等；
     /// 3. `stride` / `attrs` —— 顶点格式本来就不同（形状 44 字节 4 属性 / 文本 32 字节 3 属性）。
     ///
     /// 其余**必须逐字相同**。这条测试的价值：任何人在 `shape_state` 或 `text_state`
     /// 里只改一边（例如只把形状的 `cull_mode` 打开），这里立刻红 —— 而那种错在
     /// **像素对照**里极难定位（只有形状或只有文本的一处会不对，很容易被当成「那个用例本身有问题」）。
+    ///
+    /// ⚠️ **B5-3 之后 `text_state` 只被本测试（和本文件的其它纯函数测试）用到**：
+    /// 绘制路径只用统一管线，而它的状态取自 [`shape_state`]。保留 `text_state` 的理由
+    /// 是它把「两者的冻结字段逐字相同」这条**前提**变成可执行的断言（见上面的价值说明）。
     #[test]
     fn shape_and_text_states_differ_only_in_the_allowed_dimensions() {
         let fmt = vk::VK_FORMAT_R8G8B8A8_UNORM;

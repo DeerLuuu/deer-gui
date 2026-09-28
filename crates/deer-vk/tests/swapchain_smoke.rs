@@ -1115,3 +1115,167 @@ fn pump_messages() {
         }
     }
 }
+
+// ── B5-3：**窗口侧析构顺序**的具名判据（复审 Important F-3）──────────────────
+
+/// 子进程探针成功跑完时打印的哨兵（父进程用它区分「真的跑了」与「0 tests run」）。
+const DTOR_WINDOW_SENTINEL: &str = "【DTOR 窗口探针】";
+
+/// `DEER_VK_WINDOW_TESTS=1` 是否打开（与 `windowed_chain_end_to_end` 同一判据）。
+fn window_tests_enabled() -> bool {
+    std::env::var("DEER_VK_WINDOW_TESTS")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+/// **子进程探针**：建真窗口 → 建 [`WindowedRenderer`] → 画一帧（建出 `UiResources`）
+/// → **主动释放** → 析构 → 进程正常退出。
+///
+/// ## 为什么需要它（复审 F-3 实测的失效模式）
+///
+/// `UiResources` 的字段顺序是**硬契约**（`set` 必须在 `pool` 之前）：
+/// 写反 ⇒ 每条测试的逻辑都通过，但进程退出时
+/// `STATUS_ACCESS_VIOLATION`（`vkFreeDescriptorSets` 访问已销毁的池），
+/// **没有失败用例名**、关校验层时**没有消息**。本探针把这条契约变成
+/// 「子进程退出码必须为 0」——父进程那条具名用例因此能报出它。
+///
+/// 由 `windowed_renderer_construct_and_destruct_in_a_fresh_child_exits_cleanly`
+/// 以 `DEER_VK_DTOR_PROBE_WINDOW` 打开；默认**立即返回**。
+#[test]
+#[cfg(windows)]
+fn child_probe_windowed_renderer_release() {
+    if std::env::var("DEER_VK_DTOR_PROBE_WINDOW").is_err() {
+        return;
+    }
+    if !window_tests_enabled() {
+        eprintln!("子进程：需要 DEER_VK_WINDOW_TESTS=1（真实窗口）");
+        std::process::exit(2);
+    }
+    if !ffi::Instance::extension_available(surface::SURFACE_EXTENSION)
+        || !ffi::Instance::extension_available(surface::WIN32_SURFACE_EXTENSION)
+    {
+        eprintln!("子进程：本机 Vulkan 不提供 VK_KHR_surface / VK_KHR_win32_surface");
+        std::process::exit(3);
+    }
+    let win = Win32TestWindow::create("deer-vk-dtor-probe", 320, 240)
+        .expect("子进程：建 Win32 测试窗口失败");
+    let raw = RawWindowHandle {
+        platform: Platform::Windows,
+        handle: win.hwnd as usize,
+        display: win.hinstance as usize,
+    };
+    const CLEAR: Color = Color::rgb(CLEAR_R, CLEAR_G, CLEAR_B);
+    let want = Extent {
+        width: 320,
+        height: 240,
+    };
+    let mut r = match WindowedRenderer::new(0, raw, want, CLEAR) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("子进程：建窗口渲染器失败（{e}）");
+            std::process::exit(4);
+        }
+    };
+    // 画一帧界面树（**必须**：`UiResources` 是惰性建的，不画就没有描述符集/池可析构）
+    let mut shapes = deer_gpu::DrawList::new();
+    shapes.push(deer_gpu::DrawCmd::FillRect {
+        rect: deer_gpu::RectI::new(4, 4, 100, 60),
+        color: Color::WHITE,
+    });
+    r.draw_and_present(&shapes, None)
+        .expect("子进程：形状界面帧失败");
+    // 有系统字体时连文本路径一起走（图集纹理 + **描述符改指**也是析构契约的一部分）
+    let text_ran = match deer_gpu::text::TextEngine::from_system_font(16.0) {
+        Ok(mut engine) => {
+            let mut with_text = shapes.clone();
+            with_text.push(deer_gpu::DrawCmd::Text {
+                rect: deer_gpu::RectI::new(4, 4, 120, 30),
+                text: "Wg".into(),
+                color: Color::WHITE,
+                size: 16.0,
+                align: 0,
+            });
+            r.draw_and_present(&with_text, Some(&mut engine))
+                .expect("子进程：带文本的界面帧失败");
+            true
+        }
+        Err(e) => {
+            eprintln!("子进程：拿不到系统字体（{e}）⇒ 只覆盖形状界面帧路径");
+            false
+        }
+    };
+    // ★ 前置条件（**显式断言**）：界面资源必须真的被建出来了 ——
+    //   否则「析构顺序」这件事根本没发生，本探针是空转的。
+    assert!(
+        r.ui_build_count() >= 1,
+        "子进程前置条件不成立：界面资源从未被建（ui_build_count = {}）⇒ \
+         没有描述符集/池可析构，本探针空转",
+        r.ui_build_count()
+    );
+    // 主动释放一次 + 再画一帧（覆盖 `release_ui_resources` 那条析构路径）
+    // ⚠️ 这一帧用**只有形状**的列表：`None` 引擎 + 列表里有 `Text` 命令会（正确地）报
+    //    `Unsupported` —— 那是契约，不是缺陷（别把探针写成依赖那个错误）。
+    r.release_ui_resources().expect("子进程：释放界面资源失败");
+    r.draw_and_present(&shapes, None)
+        .expect("子进程：重建后再画一帧失败");
+    r.wait_idle().expect("子进程：wait_idle 失败");
+    println!(
+        "{DTOR_WINDOW_SENTINEL}窗口渲染器（UiResources：统一管线 + 描述符集/池{text_state}）\
+         已构造、使用并析构，进程准备正常退出（界面资源建过 {} 次）",
+        r.ui_build_count(),
+        text_state = if text_ran { " + 图集" } else { "" },
+    );
+    drop(r);
+    drop(win);
+}
+
+/// **具名判据**：在干净**子进程**里构造 + 使用 + 析构一个窗口渲染器，子进程必须正常退出。
+///
+/// 与 [`child_probe_windowed_renderer_release`] 配对 —— 抓「`UiResources` 字段顺序写反
+/// ⇒ 进程 abort」这条**原本没有名字**的失效模式（复审 Important F-3）。
+///
+/// 默认（未设 `DEER_VK_WINDOW_TESTS=1`）**明确跳过**，与 `windowed_chain_end_to_end` 同一门槛。
+#[test]
+#[cfg(windows)]
+fn windowed_renderer_construct_and_destruct_in_a_fresh_child_exits_cleanly() {
+    if std::env::var("DEER_VK_DTOR_PROBE_WINDOW").is_ok() {
+        return; // 自己是子进程时不要递归
+    }
+    if !window_tests_enabled() {
+        eprintln!("跳过：需要真实窗口（设 DEER_VK_WINDOW_TESTS=1 启用）");
+        return;
+    }
+    let exe = std::env::current_exe().expect("拿不到当前测试二进制路径");
+    let out = std::process::Command::new(&exe)
+        .args([
+            "--exact",
+            "child_probe_windowed_renderer_release",
+            "--nocapture",
+        ])
+        .env("DEER_VK_DTOR_PROBE_WINDOW", "1")
+        .env("DEER_VK_WINDOW_TESTS", "1")
+        .output()
+        .expect("启动子进程");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // ★ 先看**退出码**：它才是这条判据的主体 —— 顺序写反时子进程会以 `0xC0000005` 退出。
+    //   （顺序不能反：崩掉的子进程**不会**打印哨兵，先查哨兵会把「崩了」误报成「空转」。）
+    assert!(
+        out.status.success(),
+        "子进程（构造 + 使用 + 析构一个窗口渲染器）**没有正常退出**：exit={:?}\n\
+         若是 `0xC0000005`（STATUS_ACCESS_VIOLATION）：几乎一定是 `UiResources` 的\
+         **字段顺序被写反**了（`pool` 提到 `set` 之前 ⇒ `vkFreeDescriptorSets` 访问已销毁的池）。\n\
+         --- stdout ---\n{}\n--- stderr ---\n{}",
+        out.status.code(),
+        stdout.lines().rev().take(8).collect::<Vec<_>>().join("\n"),
+        stderr.lines().rev().take(8).collect::<Vec<_>>().join("\n")
+    );
+    // ★ 再看**哨兵**：退出码 0 但没有哨兵 ⇒ 探针根本没跑（`--exact` 没匹配到）⇒ 判据空转。
+    assert!(
+        stdout.contains(DTOR_WINDOW_SENTINEL),
+        "子进程退出码正常，但没有跑探针（stdout 里没有哨兵 `{DTOR_WINDOW_SENTINEL}`）⇒ \
+         本判据会空转（`--exact` 没匹配到用例名？）\n--- stdout ---\n{}",
+        stdout
+    );
+    println!("干净子进程里「构造 + 使用 + 析构窗口渲染器」正常退出 ✅（析构顺序契约有名字了）");
+}
