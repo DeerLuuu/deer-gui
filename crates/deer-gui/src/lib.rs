@@ -14,7 +14,7 @@
 //! | **渲染到窗口 / 屏幕上**（M2b：窗口 + `VkSurfaceKHR` + 交换链 + 呈现） | ✅ 需开 `window` feature |
 //! | GPU 侧**界面**（Vulkan 消费 `DrawList`，窗口里显示真实界面） | ❌ 里程碑 M3 |
 //! | GPU 侧文本（把字形图集上传给 Vulkan） | ❌ 里程碑 M3 |
-//! | 输入事件与焦点 | ❌ 里程碑 M5 |
+//! | 输入与焦点（**纯逻辑**：命中测试 + 裁剪 + 状态机） | 🚧 M5-2/3：见 [`interaction`]；窗口接线（M5-4）与指南（M5-5）未做 |
 //!
 //! ## 最小用法
 //!
@@ -42,6 +42,12 @@
 pub use deer_gpu::{self as gpu, DrawCmd, DrawList, GpuError, GpuResult, Theme};
 pub use deer_layout::{self as layout, Node};
 pub use deer_vk::{self as vk, VkBackend};
+
+/// 交互层（M5-2/M5-3，**纯逻辑**）：命中测试、裁剪快照、悬停/按下/点击/焦点/文本输入。
+///
+/// 不碰窗口、不碰 GPU —— 输入是值、输出是值，所以整条交互链能在无 winit / 无 Vulkan
+/// 的环境里被单测覆盖（`cargo test -p deer-gui --lib interaction`）。
+pub mod interaction;
 
 /// 窗口层（**需要 `window` feature**）。
 ///
