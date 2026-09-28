@@ -1,0 +1,303 @@
+//! `idle_probe` —— **真开窗口**量「省电模式到底省没省」（M5b 的验收探针；不是 `#[test]`：
+//! CI 无桌面会假红）。
+//!
+//! 跑法（在仓库根目录）：
+//!
+//! ```text
+//! cmd /c "cargo run -q -p deer-window --example idle_probe"
+//! ```
+//!
+//! 默认行为：开一个 400×200 的窗口，声明 **`OnDemand`**（省电），**不画东西**，跑
+//! `DEER_IDLE_SECONDS`（默认 4 秒）后汇总退出。汇总里是**数得出来**的四个数：
+//! 收到多少条输入、其中几条改了状态、`wants_redraw` 被问了几次/答真几次、真画了几帧。
+//!
+//! ## 三个用法（对照着跑才看得出差别）
+//!
+//! | 命令 | 期望 |
+//! |---|---|
+//! | `cargo run -q -p deer-window --example idle_probe` | **省电**：动鼠标/滚轮不产生重绘 ⇒ 画帧数停在引导帧那 1 帧，`wants_redraw` 答真 0 次 |
+//! | `set DEER_IDLE_DIRTY=1 && cargo run … --example idle_probe` | **变化探针**：把每条输入都当「改了状态」⇒ 每条输入请求一次重绘，画帧数与输入条数相当 |
+//! | `set DEER_WINDOW_REDRAW=continuous && cargo run … --example idle_probe` | **关掉省电**：与 App 声明无关地强制连续重绘 ⇒ 画帧数暴涨（空闲也烧 CPU） |
+//!
+//! 三种模式的**输入条数**要靠人肉动鼠标（脚本人肉驱动见报告里的实测记录）。
+//!
+//! ## 诚实的边界（这条本身就是 M5b 的结论）
+//!
+//! `OnDemand` 下事件循环在 `ControlFlow::Wait` 上**睡死**，而本层**没有**给 App 任何
+//! 「主动唤醒事件循环」的手段（没有定时器、没有用户事件）⇒ 探针**没法自己按时间退**：
+//!
+//! - 若窗口在跑（`Continuous`）：`redraw` 里检查墙钟，到点返回 `Flow::Exit`；
+//! - 若睡死了（`OnDemand` 且没人操作）：由**看门狗线程**打汇总并 `process::exit(0)`
+//!   —— 看门狗晚于预算 1.5 秒醒来，所以「看到看门狗打的那行汇总」就等于
+//!   「事件循环一直没有醒过」这件事的现场证据。
+//!
+//! 环境变量：
+//!
+//! - `DEER_IDLE_SECONDS=<s>`：墙钟预算（默认 4.0 秒，浮点数；先 `trim()` 再 `parse()`）。
+//! - `DEER_IDLE_DIRTY=1`：每条输入都算「改了状态」（模拟 M5b 之前「每次输入都重绘」的行为）。
+//! - `DEER_IDLE_REQUIRE=1`：**一条输入都没收到就 exit=1**（默认不算失败：没人动窗口时收不到输入是正常的）。
+//! - `DEER_WINDOW_REDRAW=continuous`：强制连续重绘（关掉省电模式），由 `deer-window` 解析并自证。
+
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+use deer_window::{
+    App, Flow, InputEvent, RedrawPolicy, WindowConfig, WindowInfo, run,
+};
+
+/// 默认墙钟预算（秒）。
+const DEFAULT_SECONDS: f64 = 4.0;
+
+/// 看门狗比预算晚多久醒来：晚这一截 ⇒ 「看门狗先到」说明事件循环一直没醒（OnDemand 的现场证据）。
+const WATCHDOG_LAG_SECONDS: f64 = 1.5;
+
+/// 每多少帧打一行心跳（连续模式下帧数极大，逐帧打会把终端淹了）。
+const PRINT_EVERY_FRAMES: u64 = 5000;
+
+/// 探针的账本：全部用 `AtomicU64` 共享 —— `run()` 拿走了 `App`，`main`/看门狗事后还要读。
+#[derive(Default)]
+struct Ledger {
+    /// 收到的输入事件条数。
+    inputs: AtomicU64,
+    /// 其中「改了状态」的条数（省电模式下应当为 0，除非 `DEER_IDLE_DIRTY=1`）。
+    state_changes: AtomicU64,
+    /// **系统事件**条数（`resized` + `FocusChanged`）：它们**不看** `wants_redraw`，一律请求重绘 ——
+    /// 数出来才能把「输入没请求重绘」和「系统事件请求了重绘」分开，而不是笼统看帧数。
+    system_events: AtomicU64,
+    /// `App::wants_redraw` 被 `run()` 问了几次（每次派发输入后问一次）。
+    wants_asked: AtomicU64,
+    /// 其中答「要重绘」几次。
+    wants_true: AtomicU64,
+    /// `App::redraw` 真被调用几次（= 真画了几帧）。
+    redraws: AtomicU64,
+}
+
+struct Idle {
+    ledger: Arc<Ledger>,
+    /// 脏标记：`input` 置、`redraw` 清、`wants_redraw` 读（M5b 里 App 侧的全部状态）。
+    dirty: bool,
+    /// 从 `init` 起算的墙钟基准。
+    started: Option<Instant>,
+    /// 墙钟预算（`Continuous` 下由 `redraw` 检查）。
+    budget: Duration,
+    /// 每条输入都算「改了状态」（`DEER_IDLE_DIRTY=1`）。
+    every_input_dirty: bool,
+}
+
+/// 真实 App 的粗略模型：**点击/按键/文本**会改界面，**hover/滚轮/抬键**不会。
+///
+/// M5b 的省电核心就在这条判断上：`PointerMoved` 是数量最多的事件（鼠标动一下就一条），
+/// 它不该产生重绘 —— 旧版「每个输入都请求重绘」正是空闲烧 CPU 的原因之一。
+fn is_state_changing(ev: &InputEvent) -> bool {
+    matches!(
+        ev,
+        InputEvent::PointerDown { .. } | InputEvent::KeyDown { .. } | InputEvent::TextInput { .. }
+    )
+}
+
+impl App for Idle {
+    fn init(&mut self, info: &WindowInfo) -> Result<(), String> {
+        println!(
+            "[idle_probe] init：extent={}x{} handle(HWND)=0x{:X}",
+            info.extent.width, info.extent.height, info.raw.handle
+        );
+        if info.raw.handle == 0 {
+            return Err("HWND 为 0：原生句柄没填对".to_string());
+        }
+        self.started = Some(Instant::now());
+        Ok(())
+    }
+
+    fn resized(&mut self, width: u32, height: u32) -> Result<(), String> {
+        self.ledger.system_events.fetch_add(1, Ordering::SeqCst);
+        println!("[idle_probe] resized：{width}x{height}（系统事件 ⇒ 一定重绘）");
+        Ok(())
+    }
+
+    fn input(&mut self, _info: &WindowInfo, ev: &InputEvent) -> Result<Flow, String> {
+        self.ledger.inputs.fetch_add(1, Ordering::SeqCst);
+        // 焦点变化是**系统事件**（`run()` 对它走「一律置位」那一档），单独数，别混进「输入改状态」里。
+        if matches!(ev, InputEvent::FocusChanged { .. }) {
+            self.ledger.system_events.fetch_add(1, Ordering::SeqCst);
+        }
+        if self.every_input_dirty || is_state_changing(ev) {
+            self.ledger.state_changes.fetch_add(1, Ordering::SeqCst);
+            self.dirty = true;
+        }
+        Ok(Flow::Continue)
+    }
+
+    /// **M5b 的核心问题**：这一条输入改了状态吗？
+    ///
+    /// 注意它只是**回答**（`&self`，改不了状态）：清账在 `redraw`（画完才不脏）。
+    /// 这里顺带数「`run()` 到底问了几次、答真几次」—— 那就是「空闲不请求重绘」的可观测证据。
+    fn wants_redraw(&self) -> bool {
+        self.ledger.wants_asked.fetch_add(1, Ordering::SeqCst);
+        if self.dirty {
+            self.ledger.wants_true.fetch_add(1, Ordering::SeqCst);
+        }
+        self.dirty
+    }
+
+    /// **默认省电**：本探针声明 `OnDemand`（也就是用 `App` 的默认实现）。
+    ///
+    /// 想关掉省电模式不必改这里：`DEER_WINDOW_REDRAW=continuous` 会在**运行时**覆盖它
+    /// （`deer-window` 启动时会打一行自证日志）。
+    fn redraw_policy(&self) -> RedrawPolicy {
+        RedrawPolicy::OnDemand
+    }
+
+    fn redraw(&mut self) -> Result<Flow, String> {
+        let n = self.ledger.redraws.fetch_add(1, Ordering::SeqCst) + 1;
+        // 画完这一帧 = 界面跟状态一致了 ⇒ 清脏标记（不清的话「改了状态」会永久为真）。
+        self.dirty = false;
+        if n == 1 {
+            println!("[idle_probe] frame 1（建窗引导帧：一次性，不是空转）");
+        } else if n % PRINT_EVERY_FRAMES == 0 {
+            println!("[idle_probe] frame {n}");
+        }
+        // 只有 `Continuous`（或一直有输入）才会走到这里；到点就退，让 `run()` 打它自己的账本行。
+        let over = self
+            .started
+            .is_some_and(|started| started.elapsed() >= self.budget);
+        if over {
+            println!("[idle_probe] 到达墙钟预算（frames={n}）⇒ Flow::Exit");
+            return Ok(Flow::Exit);
+        }
+        Ok(Flow::Continue)
+    }
+
+    fn close_requested(&mut self) -> Flow {
+        println!("[idle_probe] close_requested：允许关闭");
+        Flow::Exit
+    }
+}
+
+/// 打汇总（**数得出来**的五个数）+ 给出结论。看门狗与正常退出共用这一个函数。
+fn print_summary(ledger: &Ledger, continuous: bool, dirty_mode: bool, via_watchdog: bool) -> bool {
+    let inputs = ledger.inputs.load(Ordering::SeqCst);
+    let changes = ledger.state_changes.load(Ordering::SeqCst);
+    let system = ledger.system_events.load(Ordering::SeqCst);
+    let asked = ledger.wants_asked.load(Ordering::SeqCst);
+    let wants_true = ledger.wants_true.load(Ordering::SeqCst);
+    let redraws = ledger.redraws.load(Ordering::SeqCst);
+
+    println!(
+        "[idle_probe] 汇总：输入={inputs} 条（其中改状态={changes}） 系统事件={system} \
+         wants_redraw 被问={asked} 答真={wants_true} 画帧={redraws}"
+    );
+    println!(
+        "[idle_probe] 收尾方式：{} —— {}",
+        if via_watchdog { "看门狗线程" } else { "事件循环里 Flow::Exit" },
+        if via_watchdog {
+            "OnDemand 下事件循环在 Wait 上睡死且没人唤醒（这正说明空闲没有空转）"
+        } else {
+            "有帧流动（Continuous 或持续输入）⇒ App 自己按墙钟退"
+        }
+    );
+
+    if dirty_mode || continuous {
+        // 这两种模式本来就会一直重绘 ⇒ 只报数，不下「省电」的结论。
+        println!(
+            "[idle_probe] 说明：{} ⇒ 期望画帧数很大（这一档**不是**省电模式）",
+            if continuous {
+                "DEER_WINDOW_REDRAW=continuous 强制连续重绘"
+            } else {
+                "DEER_IDLE_DIRTY=1：每条输入都算改状态"
+            }
+        );
+        return true;
+    }
+
+    // **省电模式的判据**（两个数，都是可观测计数）：
+    // ① 输入从未请求重绘（`wants_true == 0`）；
+    // ② 画帧数不超过「引导帧 1 + 系统事件数」（系统事件一律置位，那是设计的一部分）。
+    if wants_true == 0 && redraws <= 1 + system {
+        println!(
+            "[idle_probe] 自检通过（省电）：{inputs} 条输入一条都没请求重绘；画帧={redraws} \
+             ≤ 1（引导帧）+ {system}（系统事件）"
+        );
+        true
+    } else if inputs == 0 {
+        println!(
+            "[idle_probe] 没有收到任何输入 ⇒ 这一趟**没验到**置位规则（窗口没人动过）。\
+             人肉验证：跑起来后把鼠标在窗口里动一动 / 滚个轮子。"
+        );
+        true
+    } else {
+        eprintln!(
+            "[idle_probe] 自检失败：期望「输入不改状态 ⇒ 不请求重绘」，实际答真 {wants_true} 次、\
+             画帧 {redraws} 帧（输入 {inputs} 条、系统事件 {system} 个）"
+        );
+        false
+    }
+}
+
+fn main() -> ExitCode {
+    // 门槛判定先 `trim()`：`cmd` 的 `set X=1 && …` 会把 `&&` 前的空格算进变量值
+    // （`cmd /c "set X=1 && set X"` 实测打印 `X=1 `）⇒ 严格 `== "1"` 会把「设了」判成「没设」。
+    // 同一条实测与理由见 `crates/deer-gui/src/env_gate.rs`。
+    let dirty_mode = std::env::var("DEER_IDLE_DIRTY").is_ok_and(|v| v.trim() == "1");
+    let require_input = std::env::var("DEER_IDLE_REQUIRE").is_ok_and(|v| v.trim() == "1");
+    // 数值门槛同样先 `trim()`：`set DEER_IDLE_SECONDS=5 && …` 的值是 `"5 "`。
+    // 非法值（负数/NaN/过大）不 panic，退回默认 —— 本 crate 的纪律是「不 panic」。
+    let seconds: f64 = std::env::var("DEER_IDLE_SECONDS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .filter(|s: &f64| s.is_finite() && *s >= 0.1 && *s <= 600.0)
+        .unwrap_or(DEFAULT_SECONDS);
+
+    // 本示例声明的策略是 OnDemand；连续模式只可能来自环境变量覆盖 ——
+    // 用 `deer-window` 导出的**同一个纯函数**判定，不在这里另写一套（免得与 run() 判得不一样）。
+    let forced_continuous = std::env::var(deer_window::REDRAW_ENV)
+        .ok()
+        .as_deref()
+        .and_then(deer_window::parse_redraw_policy)
+        == Some(RedrawPolicy::Continuous);
+
+    println!(
+        "[idle_probe] 启动：seconds={seconds} dirty_mode={dirty_mode} require_input={require_input} \
+         强制连续={forced_continuous}（App 声明=OnDemand）"
+    );
+
+    let ledger = Arc::new(Ledger::default());
+
+    // 看门狗：只在「事件循环睡死了」的档才会先到（OnDemand + 没人操作）。
+    // 它**不是**重绘的来源 —— 只是收尾手段（App 侧没有任何唤醒事件循环的接口，见模块文档）。
+    {
+        let ledger = Arc::clone(&ledger);
+        let budget = Duration::from_secs_f64(seconds);
+        std::thread::spawn(move || {
+            std::thread::sleep(budget + Duration::from_secs_f64(WATCHDOG_LAG_SECONDS));
+            println!(
+                "[idle_probe] 看门狗：墙钟预算 + {WATCHDOG_LAG_SECONDS}s 到了，事件循环还没自己退出"
+            );
+            let ok = print_summary(&ledger, forced_continuous, dirty_mode, true);
+            std::process::exit(if ok { 0 } else { 1 });
+        });
+    }
+
+    let app = Idle {
+        ledger: Arc::clone(&ledger),
+        dirty: false,
+        started: None,
+        budget: Duration::from_secs_f64(seconds),
+        every_input_dirty: dirty_mode,
+    };
+
+    let result = run(WindowConfig::new("idle_probe", 400, 200), app);
+    if let Err(err) = result {
+        eprintln!("[idle_probe] 失败：run() 返回 Err：{err}");
+        return ExitCode::from(1);
+    }
+
+    // 走到这里 = 事件循环自己退了（连续模式到点 / 手动关窗）⇒ 正常汇总。
+    let ok = print_summary(&ledger, forced_continuous, dirty_mode, false);
+    if ok && require_input && ledger.inputs.load(Ordering::SeqCst) == 0 {
+        eprintln!("[idle_probe] 自检失败：DEER_IDLE_REQUIRE=1 要求至少一条输入，实际 0 条");
+        return ExitCode::from(1);
+    }
+    if ok { ExitCode::SUCCESS } else { ExitCode::from(1) }
+}

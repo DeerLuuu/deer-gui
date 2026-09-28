@@ -9,18 +9,23 @@
 //! 默认行为：开一个 320×200 的窗口，**连续重绘 30 帧**后返回 `Flow::Exit`；
 //! 然后自检 `redraw` 至少被成功调用 30 次（不是「跑完就算过」），全对才 exit=0。
 //!
+//! **M5b**：默认重绘策略已经是 `OnDemand`（省电，空闲零重绘），而本示例要的正是「连续画 30 帧」
+//! ⇒ 它显式声明 [`RedrawPolicy::Continuous`]。要看「省电模式」的真容请用
+//! `--example idle_probe`（它声明 `OnDemand`）。
+//!
 //! 环境变量：
 //!
 //! - `DEER_WINDOW_HOLD=1`：不自动退，一直画到手动关窗/Alt+F4 —— 给人肉眼看窗口用。
 //! - `DEER_WINDOW_FAIL=1`：`App::init` 故意返回 `Err`，验证「回调出错 ⇒ `run()` 返回 Err」
 //!   这条路径真的成立（此时本示例断言 `run()` 必须返回 `Err`，也 exit=0）。
 //! - `DEER_WINDOW_FRAMES=<n>`：改自动退的帧数（默认 30）。
+//! - `DEER_WINDOW_REDRAW=continuous`：与声明无关地强制连续重绘（本示例已经是连续，看不出差别）。
 
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use deer_window::{App, Flow, WindowConfig, WindowInfo, run};
+use deer_window::{App, Flow, RedrawPolicy, WindowConfig, WindowInfo, run};
 
 /// 默认自动退的帧数（任务要求：连续重绘 30 帧）。
 const DEFAULT_AUTO_EXIT_FRAMES: u64 = 30;
@@ -28,7 +33,7 @@ const DEFAULT_AUTO_EXIT_FRAMES: u64 = 30;
 /// 每多少帧打一行（避免 30 行刷屏）。
 const PRINT_EVERY: u64 = 10;
 
-/// hold 模式下每多少帧打一行：Poll 下没有 vsync 节流，帧率极高，打太密没意义。
+/// hold 模式下每多少帧打一行：连续重绘没有 vsync 节流，帧率极高，打太密没意义。
 const PRINT_EVERY_HOLD: u64 = 100;
 
 struct Smoke {
@@ -80,6 +85,14 @@ impl App for Smoke {
     fn close_requested(&mut self) -> Flow {
         println!("[smoke] close_requested：允许关闭");
         Flow::Exit
+    }
+
+    /// M5b：本示例的用途是「**连续**画满 N 帧」，所以显式声明 [`RedrawPolicy::Continuous`]。
+    ///
+    /// 代价说清楚：`Continuous` 在空闲时也烧 CPU（这正是 M5b 要修的那条）。
+    /// 只想看「省电模式」的行为 ⇒ 用 `--example idle_probe`（声明 `OnDemand`）。
+    fn redraw_policy(&self) -> RedrawPolicy {
+        RedrawPolicy::Continuous
     }
 }
 

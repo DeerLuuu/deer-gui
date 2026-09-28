@@ -7,10 +7,13 @@
 //! cmd /c "cargo run -q -p deer-window --example input_probe"
 //! ```
 //!
-//! 默认行为：开一个 480×240 的窗口，跑 **2 秒**（Poll 连续重绘、不画东西）后返回
+//! 默认行为：开一个 480×240 的窗口，跑 **2 秒**（连续重绘、不画东西）后返回
 //! `Flow::Exit`，把期间收到的每个输入事件**逐条打印**，最后打一行汇总。窗口拿到焦点时
 //! 至少会有一条 `focus true` —— 那一条就是「事件循环 → `InputEvent` → `App::input`」
 //! 通电的现场证据。
+//!
+//! **M5b**：本示例按**墙钟**退，靠的是「一直有帧」才轮得到检查时间 ⇒ 显式声明
+//! [`RedrawPolicy::Continuous`]（默认的 `OnDemand` 下这里会一帧都不画、也就永远等不到退出时机）。
 //!
 //! **人肉验证**（真正看事件长什么样）：
 //!
@@ -40,9 +43,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use deer_window::{App, Flow, InputEvent, Key, Mods, PointerButton, WindowConfig, WindowInfo, run};
+use deer_window::{
+    App, Flow, InputEvent, Key, Mods, PointerButton, RedrawPolicy, WindowConfig, WindowInfo, run,
+};
 
-/// 默认自动退的墙钟上限（秒）。Poll 下没有 vsync 节流，帧数跑得飞快 ——
+/// 默认自动退的墙钟上限（秒）。连续重绘下没有 vsync 节流，帧数跑得飞快 ——
 /// 按**帧数**退会在 Windows 投递 `Focused`/`CursorMoved` 之前就退出（实测 300 帧 ≈ 0 事件），
 /// 所以这里按时间退，才看得到真事件。
 const DEFAULT_AUTO_EXIT_SECONDS: f64 = 2.0;
@@ -141,6 +146,12 @@ impl App for Probe {
     fn close_requested(&mut self) -> Flow {
         println!("[input_probe] close_requested：允许关闭");
         Flow::Exit
+    }
+
+    /// M5b：本示例按墙钟退（要一直有帧才轮得到检查时间）⇒ 显式声明 `Continuous`。
+    /// 代价：空闲也烧 CPU（想省电就用默认的 `OnDemand`，见 `--example idle_probe`）。
+    fn redraw_policy(&self) -> RedrawPolicy {
+        RedrawPolicy::Continuous
     }
 }
 
