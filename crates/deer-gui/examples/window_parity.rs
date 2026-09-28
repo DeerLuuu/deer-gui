@@ -95,14 +95,31 @@ fn window_tests_enabled() -> bool {
     deer_gui::env_gate::flag("DEER_VK_WINDOW_TESTS")
 }
 
-fn frames_from_env() -> u64 {
-    // 数值门槛同样先 `trim()`：`set DEER_VK_FRAMES=3 && …` 的值是 `"3 "`，不 trim 的话
-    // `parse()` 失败 ⇒ **静默退回默认帧数**（跑了几帧与你要求的不一致，却什么也不说）。
-    std::env::var("DEER_VK_FRAMES")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(3)
-        .max(1)
+/// **非法值 ⇒ 报错**（不静默退回默认帧数）。
+///
+/// ## 口径统一（复审 MEDIUM-1）
+///
+/// 同一个 `DEER_VK_FRAMES` 原先在两处口径**相反**：testkit
+/// （`testing::window::frames_from_env`）对非法值**报错**，而这里 `.unwrap_or(3)` **静默退回 3**；
+/// `docs/features/testing.md:144` 又断言「解析不出来就报错、**不静默**」⇒ 该断言对这个消费者不成立。
+/// 现在**两处同向：非法即报错**。理由：帧数是**度量的一部分**（跑了几帧决定对比多少次），
+/// 「你要求 30 帧、我悄悄跑了 3 帧还报绿」正是本项目反复吃过的那类不可复现结论。
+fn frames_from_env() -> Result<u64, String> {
+    // 数值门槛同样先 `trim()`：`set DEER_VK_FRAMES=3 && …` 的值是 `"3 "`，不 trim 会误判非法。
+    let raw = match std::env::var("DEER_VK_FRAMES") {
+        Ok(v) => v,
+        Err(_) => return Ok(3), // 没设 ⇒ 默认 3 帧（这是**默认值**，不是「静默吞掉非法值」）
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(n) if n >= 1 => Ok(n),
+        Ok(n) => Err(format!(
+            "DEER_VK_FRAMES = {n} 非法：至少要 1 帧（原值 {raw:?}）"
+        )),
+        Err(_) => Err(format!(
+            "DEER_VK_FRAMES = {raw:?} 不是合法帧数（要正整数）。\
+             ⚠️ 本示例**不静默退回默认值**（与 testkit 同口径，复审 MEDIUM-1）"
+        )),
+    }
 }
 
 /// **固定**的界面树（形状 + 文本）：语料必须确定，否则「差多少」没有意义。
@@ -793,7 +810,13 @@ fn main() -> ExitCode {
         );
         return ExitCode::SUCCESS;
     }
-    let frames = frames_from_env();
+    let frames = match frames_from_env() {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("❌ {e}");
+            return ExitCode::from(2);
+        }
+    };
     let cfg = WindowConfig::new("M3c 窗口 parity（上屏像素 vs CPU）", 960, 600);
     let app = Parity {
         renderer: None,

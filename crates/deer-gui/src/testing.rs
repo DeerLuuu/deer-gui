@@ -1078,7 +1078,26 @@ impl Shot {
     }
 
     /// 期望矩形 = `primary` 自己 + **所有视觉状态真的变了**的节点（自动算，不手抄）。
+    ///
+    /// ## 面积棘轮（复审 HIGH-1 的处置，**为什么是这条而不是「求交」**）
+    ///
+    /// 自动补齐**只看状态差**（`hover`/`focus`/`pressed` 的成员变化）。复审给出的可行修法有两条：
+    ///
+    /// ① **求交 + 漏报 `Err`**：把自动补齐改成「状态差 **∩** 逐节点绘制切片变化」，并对
+    ///    「有切片变化却没被覆盖」直接 `Err`。**这是更彻底的修法**，但它需要 `Shot` 里
+    ///    多出一份「逐节点绘制命令的指纹」—— 那是 **harness 采集侧的新通路**（不是一两行），
+    ///    本修复轮不动它，作为**后续**（已登记进报告）。
+    /// ② **面积棘轮**（本处采用）：自动补进来的矩形**总面积 / 画布面积**超过阈值就直接 `Err`。
+    ///
+    /// 采用 ② 的理由（代价 vs 收益）：反例的杀伤力**完全来自「补齐把整块画布放行」**，
+    /// 而 ② 正好在这一步拦住它，**代码量与风险都是一行常数的量级**；代价是它**不检测**
+    /// 中等面积容器（< 阈值）造成的放宽 —— 那条残余风险在报告里写明，不假装已闭。
+    ///
+    /// 阈值 `0.25` 的**依据**（实测，不是拍脑袋）：仓库内合法的自动补齐是按钮/输入框这类小控件
+    /// （360×200 画布上实测占比 ≤ ~3%），而根容器 = **100%** ⇒ 25% 留了一个量级的余量。
     fn expected_rects(&self, before: &Shot, primary: &str) -> Result<(Vec<RectI>, Vec<String>), String> {
+        /// 自动补齐的总面积 / 画布面积 的**棘轮**（超过就拒绝这次自动比较）。
+        const AUTO_PATCH_AREA_RATCHET: f64 = 0.25;
         let p = self.rects.get(primary).ok_or_else(|| {
             self.carry(format!(
                 "期望的 `{primary}` 没有几何（这一帧有几何的节点：{:?}）",
@@ -1095,6 +1114,23 @@ impl Shot {
             if let Some(r) = self.rects.get(&id) {
                 rects.push(*r);
                 also.push(id);
+            }
+        }
+        // ★ 面积棘轮：自动补齐不得把判据放松到「几乎整屏」
+        if !also.is_empty() {
+            let canvas = f64::from(self.width) * f64::from(self.height);
+            let patched: f64 = rects[1..]
+                .iter()
+                .map(|r| f64::from(r.w) * f64::from(r.h))
+                .sum();
+            if canvas > 0.0 && patched / canvas > AUTO_PATCH_AREA_RATCHET {
+                return Err(self.carry(format!(
+                    "自动补齐的节点 {also:?} 覆盖画布 {:.0}%（棘轮 {:.0}%）⇒ 这次比较的\
+                     「框外为 0」几乎没有判别力（复审 HIGH-1：hover 落在根容器上就是这么绕过的）。\
+                     请把同时变了的东西**指名**为 `primary`、或用 `assert_no_diff_outside` 显式列出矩形",
+                    patched / canvas * 100.0,
+                    AUTO_PATCH_AREA_RATCHET * 100.0
+                )));
             }
         }
         Ok((rects, also))
@@ -2497,6 +2533,67 @@ mod tests {
         let d2 = b.diff_split(&a, &[r]).unwrap();
         assert_eq!(d2.inside, vec![2]);
         assert_eq!(d2.outside, 0);
+    }
+
+    /// **D6 绕过（复审 HIGH-1）**：状态差落在**根容器**上时，自动补齐不得把期望矩形放大到整块画布。
+    ///
+    /// ## 为什么必须有这条（复审给的反例）
+    ///
+    /// `expected_rects` 的自动补齐**只看状态差**（`hover`/`focus`/`pressed` 的成员变化）。
+    /// 于是只要这次比较里有一个**画布级节点**的交互态变了（最典型：`hover` 落在根容器上），
+    /// 自动补齐就把整块画布放行 ⇒ 任何**与状态无关**的远端差异（例如另一处数据变化）
+    /// 都变成「框内」⇒ **判据等于没有**。复审的原始探针：同一批 584 个差异像素，
+    /// 对照1（hover 在小控件上）**抓到**、对照2（hover 在根容器上）**逃过**。
+    ///
+    /// 本用例把对照2 固化：`btn` 之外的一个像素变了 ⇒ 必须被抓住（**Err**）。
+    #[test]
+    fn root_level_hover_cannot_widen_the_auto_expected_rects() {
+        // 根容器**给显式尺寸** ⇒ 它的几何就是整块画布（复现反例的前提）
+        let tree = Node::new(Kind::Column, "app")
+            .with_layout(L::new().w(160.0).h(120.0).pad(4.0).to_props())
+            .push(Node::new(Kind::Button, "btn").with_label("x"));
+        let mut h = Harness::new(tree, 160, 120, opaque_theme());
+        h.set_clear(CLEAR);
+
+        let a = h.shoot_named("A：hover 在小控件上").unwrap();
+        let f = h.frame().unwrap();
+        // ★ 前置断言（前置不成立不会报错 ⇒ 护栏会悄悄失效）
+        let app = f.rect_of("app").expect("根容器必须有几何");
+        let btn = f.rect_of("btn").expect("按钮必须有几何");
+        assert!(
+            app.w >= 160 && app.h >= 120,
+            "前置条件：根容器几何必须 = 整块画布（否则本用例证明不了绕过）；实测 {app:?}"
+        );
+        assert!(
+            btn.w < app.w / 2 && btn.h < app.h / 2,
+            "前置条件：按钮必须**明显小于**画布（否则「放大到整块画布」无从谈起）；实测 {btn:?}"
+        );
+
+        // B：状态差落在**根容器**上（这是反例的关键），差异像素落在 `btn` **之外**
+        let mut b = a.clone();
+        b.state.hover = Some("app".into());
+        b.label = "B：hover 在根容器上".into();
+        // 模拟「与状态无关的远端差异」：改左上角（在 btn 之外）的一个像素
+        b.rgba[0] = b.rgba[0].wrapping_add(9);
+        assert!(
+            !(0 >= btn.x && 0 < btn.x + btn.w && 0 >= btn.y && 0 < btn.y + btn.h),
+            "前置条件：被改的像素必须落在 `btn` 之外（否则这条断言没有意义）"
+        );
+
+        expect_err_carried(
+            "Shot::assert_diff_only_inside（hover 落在根容器上 ⇒ 自动补齐必须被面积棘轮拦住）",
+            "棘轮",
+            b.assert_diff_only_inside(&a, "btn"),
+        );
+        // 对照1 的判别力不能退化：**只**把 hover 放在小控件上、差异仍在外 ⇒ 必须红
+        let mut c = a.clone();
+        c.state.hover = Some("btn".into());
+        c.rgba[0] = c.rgba[0].wrapping_add(9);
+        expect_err_carried(
+            "对照1：hover 在小控件上、差异在框外仍必须红",
+            "之外",
+            c.assert_diff_only_inside(&a, "btn"),
+        );
     }
 
     /// **框外必须为 0**：让差异落在框外 ⇒ 红。
