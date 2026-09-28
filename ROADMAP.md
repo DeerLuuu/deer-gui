@@ -122,7 +122,7 @@ M4 当时还没有窗口层的 `winit` 例外 —— 该例外是 M2b 引入的�
 | **M4-3** | **字形图集**（`atlas.rs` 的 `GlyphAtlas`） | ✅ 完成 | 货架打包 + 1px padding + **增高不搬动已有槽位** + 幂等 + 超限返回 `None` |
 | **M4-4** | **真实度量与换行**（`measure.rs` 的 `FontMeasure`） | ✅ 完成 | 用 `hmtx` 真实 advance + `hhea` 升降部替换「每字符 0.6em」；`ApproxMeasure` 保留作确定性测试用 |
 | **M4-5** | **CPU 后端真实字形**（`text.rs` + `null.rs` + 门面 + 示例） | ✅ 完成 | `TextEngine` 串起度量/光栅化/图集；`CpuRenderer::with_text` 贴真实字形，`CpuRenderer::new()` 旧占位行为不变 |
-| **M4-6** | **hinting 与亚像素定位** | ⬜ | 现在用**超采样抗锯齿** + **整数像素落位**代替；不做 `glyph` instructions、不做 LCD 子像素 |
+| **M4-6** | **hinting 与亚像素定位** | 🔄 **上半已落地** | **亚像素水平定位**：**已落地为 opt-in 路径**（`Rasterizer::rasterize_at` / `rasterize_char_at` + `split_subpixel_x`，1/4 相位档；实测落位误差 RMSE **0.2890→0.0733 px、3.94×**）—— 代价是「**间距精度换边缘锐度**」（部分覆盖质量占比上升，`l` **+64.3%**），且**尚未接进** `TextEngine`（默认路径**逐字节不变**）。**hinting 仍不做，但这次有实测依据**：最省的 hinting-lite 已实现并量过（最大形变 **12.5%**、质量区间 **[-10.3%, +12.8%]**、均值 **+0.4%**）⇒ **没有净收益**；不做 `glyph` instructions、不做 LCD 子像素（RGB 三通道） |
 
 > **GPU 侧文本不在这张表里**：它属于 **M3b，且已完成**（第二条管线 + 图集纹理，与 CPU 逐像素对齐；
 > 见上面「M3 的子步与状态」）。本里程碑交付的**字形图集**正是它的前置依赖。

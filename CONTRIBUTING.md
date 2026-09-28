@@ -260,7 +260,7 @@ Two more were found during the Rust port:
 
 - Layout, draw lists, and rasterization must use **the same font size and the same metrics**. `ApproxMeasure` is retained only as a deterministic test implementation.
 - Only `glyf` outlines are supported. CFF / OpenType-CFF (`OTTO`) fonts are rejected at parse time — deliberately, rather than silently returning empty outlines.
-- Hinting, subpixel positioning, kerning and ligatures (`kern` / `GSUB` / `GPOS`), vertical text, and RTL are **not implemented**.
+- Hinting, kerning and ligatures (`kern` / `GSUB` / `GPOS`), vertical text, and RTL are **not implemented** (hinting now has a measured basis: the cheapest hinting-lite showed no net benefit). **Subpixel horizontal positioning is implemented as an opt-in rasterizer path** (`Rasterizer::rasterize_at` + `split_subpixel_x`, 1/4-pixel steps); the default placement stays integer and it is **not yet wired into the text engine**.
 
 ### Vulkan
 

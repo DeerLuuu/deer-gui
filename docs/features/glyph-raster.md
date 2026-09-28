@@ -180,9 +180,22 @@ assert_eq!(a, b, "光栅化必须是确定性的");
 - 把「度量 + 光栅化 + 图集」串起来画字：[`text-rendering.md`](text-rendering.md)
 - 字体解析（这些 `Glyph` 从哪来）：`crates/deer-gpu/src/font.rs`
 - **做不到**（本模块的边界）：
-  - **不做 hinting**：不读 `glyf` 的 instructions，小字号下笔画不会对齐像素栅格；
-    用超采样抗锯齿代替（字形可能比系统渲染略「软」）。
-  - **不做亚像素水平定位**：字形按**整数像素**落位，没有 LCD 子像素渲染。
+  - **不做 TrueType hinting（这次有实测依据）**：不读 `glyf` 的 instructions，也不做像素网格拟合；
+    小字号清晰度靠超采样抗锯齿 + 亚像素定位。**最省的 hinting-lite（垂直两极对齐整数像素行）已被实现并量过**：
+    8 字号 × 6 字形，需整体垂直缩放、**最大形变 12.5%**、部分覆盖质量区间 **[-10.3%, +12.8%]**、
+    均值仅 **+0.4%** ⇒ **没有净收益**；真 hinting 需要**指令虚拟机 + stem 识别 + CVT**。
+    （可复现：`crates/deer-gpu/tests/text_raster.rs` 的 `simplified_vertical_extent_gridfit_is_not_shipped_measured`。）
+  - **亚像素水平定位已落地为 opt-in 路径**：`Rasterizer::rasterize_at` / `rasterize_char_at` + `split_subpixel_x`（**1/4 像素档**）。
+    **默认的 `Rasterizer::rasterize` 仍是整数落位、逐字节不变**（黄金指纹测试钉住）。
+    实测收益：落位误差 RMSE **0.2890 → 0.0733 px（3.94×）**、最坏 **0.5 → 0.125 px**、
+    相邻间距 RMSE **0.4924 → 0.1214 px**。
+  - **⚠️ 这是「间距精度换边缘锐度」，不是「清晰度提升」**（代价必须一并写）：
+    「固定相位 → 4 相位均值」的**部分覆盖质量占比上升** —— `l` **0.255→0.420（+64.3%）**、
+    `H` **+45.0%**、`o` **+5.7%**、`e` **+9.9%**；另外位图可能**宽 1px**。**没有** LCD 子像素（RGB 三通道）渲染。
+  - **「尚未生效」的边界**：这条 opt-in 路径**未接进** `TextEngine` / `CpuRenderer`（超出本次 scope）⇒
+    **默认文本像素一点没变**，「整段文本更整齐」**还没有**。接法（下一格）：`GlyphKey` 加**相位档**、
+    `GlyphPlacement` 暴露相位、`draw_text_real` 用 `whole + left`；影响面：**图集记录 ×4**、
+    相位相关判据要改写。详见 `crates/deer-gpu/src/text.rs` 的「诚实边界」与 `crates/deer-gpu/src/raster.rs`。
   - **不支持 CFF / OpenType-CFF**（`OTTO`）：解析层直接报错，不静默给空轮廓。
   - **不做字距与连字**：不读 `GSUB`/`GPOS`/`kern`，`advance` 就是 `hmtx` 的原始值。
   - **不做竖排、变体、着色字体**。

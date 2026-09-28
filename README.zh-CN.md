@@ -36,7 +36,7 @@ deer-gui 是一个以**节点树**为核心的 GUI 运行时：你描述一棵�
 | `deer-gpu` —— GPU HAL + CPU 参考后端（软件光栅化） | ✅ 类型与契约就位；CPU 后端能把绘制列表渲成像素，并能离屏贴真实字形 |
 | `deer-vk` —— Vulkan 后端（自己声明符号 + 运行时动态加载） | ✅ 真机枚举到 2 个 GPU（Intel RaptorLake / NVIDIA RTX 5070 Ti，Vulkan 1.4.341）；设备、管线、离屏回读，以及 surface / 交换链 / 呈现 |
 | `deer-window` —— 窗口层（winit） | ✅ **Windows** 上可建真窗口 + 事件循环；本 workspace 唯一第三方依赖 |
-| 真实字形 —— 字体解析、光栅化、图集、真实度量、换行 | ✅ 离屏 CPU 能出真字，GPU 侧也走通了（`R8_UNORM` 覆盖率纹理 + 最近邻采样，与 CPU 后端逐像素对照）。hinting、亚像素定位仍未做 |
+| 真实字形 —— 字体解析、光栅化、图集、真实度量、换行 | ✅ 离屏 CPU 能出真字，GPU 侧也走通了（`R8_UNORM` 覆盖率纹理 + 最近邻采样，与 CPU 后端逐像素对照）。hinting 仍不做（**这次有实测依据**：最省的 hinting-lite 量下来**没有净收益**）；**亚像素水平定位已落地为光栅化层的 opt-in 路径**（默认仍整数落位，尚未接进文本引擎） |
 | 窗口里显示界面 | ✅ 形状与文本经共用管线层呈到线性交换链，上屏像素与 CPU 后端逐像素对照 |
 | 输入与焦点 | ✅ 事件通路（`InputEvent` + winit 映射 + `App::input`）、命中与状态机（含裁剪与禁用）、点击 / `Tab` / `Shift+Tab` / `Escape` 焦点、文本输入（追加 + `Backspace` 按 Unicode 字符删末尾）、脚本化事件重放、**事件驱动重绘（默认省电：`ControlFlow::Wait` + `App::wants_redraw()` + `RedrawPolicy::OnDemand`，可用 `DEER_WINDOW_REDRAW=continuous` 关掉）**；**仍未做**：停靠 / 多窗口、滚动与方向键、右键 / 中键、IME 预编辑（见 [`docs/features/input.md`](docs/features/input.md) 第 6 节） |
 | 批处理（统一管线 + 跨帧复用顶点缓冲） | 🔄 **统一管线已落地**：形状与文本合成**一条**顶点流、**一条**管线 ⇒ 每帧**一次** `vkCmdDraw`、**一次**管线切换（原「合段」函数已随之删除）；另有**跨帧复用缓冲**。仍未做：间接绘制 / 多批次提交 / 通用纹理、`unify` 的每帧 `Vec` 分配、窗口侧屏障断言缺口 |

@@ -619,7 +619,7 @@ cargo test -p deer-gpu --test text_raster -- --nocapture   # 看「跳过系统�
 | 字形右/下各 1px padding（`PADDING = 1`），padding 必须为 0，否则 GPU 双线性采样会渗色。 | `atlas.rs:18-20`、`:50` |
 | `MAX_DIMENSION = 8192`（移动 GPU 常见 `maxTextureDimension2D` 下界）；超限**明确失败**，不静默截断。 | `atlas.rs:52-55`、`:173-176` |
 | `GlyphAtlas::new(0)` 合法：任何非空字形都因「宽超限」失败，只有空位图能登记。 | `atlas.rs:86-89` |
-| 光栅化**不做 hinting**、**不做亚像素水平定位**（`left` 是整数）、**不支持 CFF**、**不做精确曲线极值**（bbox 用控制点包围盒 ⇒ 位图可能比真实墨迹宽不到 1px）。 | `crates/deer-gpu/src/raster.rs:25-37`、落位公式 `:133-141` |
+| 光栅化**不做 hinting**（有实测依据：hinting-lite 无净收益）、**亚像素水平定位是 opt-in 路径**（默认 `rasterize` 仍整数落位、逐字节不变；opt-in 走 `rasterize_at`/`rasterize_char_at` + `split_subpixel_x` 的 1/4 相位档）、**不支持 CFF**、**不做精确曲线极值**（bbox 用控制点包围盒 ⇒ 位图可能比真实墨迹宽不到 1px）。 | `crates/deer-gpu/src/raster.rs`（模块文档的「诚实边界」与 opt-in API）、落位公式见 `raster.rs` 的整数落位路径 |
 | 采样点正好落在轮廓边上时按环绕数算法的朝向约定判定（结果确定，但不保证与解析面积逐位一致）。 | `raster.rs:34-35`、`:309-314` |
 | 退化输入一律给 `blank`（不 panic）：`ppem<=0`/NaN、`units_per_em==0`、非有限 scale、`!advance.is_finite()`、零宽高、单边 > `MAX_BITMAP_DIM=4096`。 | `raster.rs:106-144`、`:70` |
 | `supersample` 是公开字段，误设 `u32::MAX` 会爆；内部夹到 `MAX_SUPERSAMPLE = 64`。展平深度上限 `MAX_FLATTEN_DEPTH = 16`、平坦度 `FLATNESS_TOLERANCE = 0.25`。 | `raster.rs:48-64`、`:193` |
@@ -629,7 +629,7 @@ cargo test -p deer-gpu --test text_raster -- --nocapture   # 看「跳过系统�
 | `wrap`：按空格/制表切词（其它空白不切）、行首不留空白、单词超宽按字符硬切（单字符超宽时该行允许超宽，否则死循环）、`max_width<=0` 不换行、空串算 1 行、`wrap(text).concat()` 不丢字。 | `measure.rs:25-36`、`:124-179` |
 | `Measure::height` 用 `style.line_height`（行距属于**样式**）而不是字体自带行高；`width` 忽略 `style.font_size`（字号由构造时给定）。 | `measure.rs:182-196` |
 | `find_system_font` 只找 `consola.ttf` → `arial.ttf` → `segoeui.ttf`（`%WINDIR%\Fonts`，`WINDIR` 缺失退回 `C:\Windows\Fonts`）；**返回 `None` = 明确跳过**，不伪装成功。 | `measure.rs:198-216` |
-| 文字引擎「诚实边界」：不做亚像素水平定位（±1px 抖动）、不做 hinting、不做字距/连字/替换（GSUB/GPOS 未实现）、**不做多字体回退**（缺字画 `.notdef` 豆腐块并计入 `missing_glyphs()`）、图集不淘汰。 | `crates/deer-gpu/src/text.rs:22-31` |
+| 文字引擎「诚实边界」：**本引擎**不做亚像素水平定位（±1px 抖动；光栅化层已有 opt-in 亚像素路径，**尚未接线**）、不做 hinting、不做字距/连字/替换（GSUB/GPOS 未实现）、**不做多字体回退**（缺字画 `.notdef` 豆腐块并计入 `missing_glyphs()`）、图集不淘汰。 | `crates/deer-gpu/src/text.rs` 的「诚实边界」 |
 | `TextEngine::from_system_font` **找不到就报错**，绝不静默降级成占位字形。 | `text.rs:97-110` |
 | `missing_glyphs()` 是**按调用次数累计**（不是缺字种类数），三种情况各 +1：cmap 未命中（仍回退 `.notdef`）、字形读不出、图集放不下。 | `text.rs:201-205`、`:144-149`、`:156-162`、`:165-171` |
 | `TextEngine::text_width` 与 `FontMeasure::text_width` **只差末尾取整**（后者 `ceil()`，差 < 1px）：前者是「笔走过多远」，后者是「盒子要留多宽」。 | `text.rs:182-194` |
