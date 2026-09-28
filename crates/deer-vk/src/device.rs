@@ -115,6 +115,109 @@ pub fn texture_r8_upload_count() -> usize {
     TEXTURE_R8_UPLOAD_COUNT.with(|c| c.get())
 }
 
+// ——— 通用纹理（`RGBA8_UNORM`）的上传计数 ———
+//
+// 与 `TEXTURE_R8_UPLOAD_COUNT` **完全同一套**理由与约束（`thread_local` + 在被调用方
+// 自增 + 只算「跨过参数校验」的调用，见上面那段长说明）。
+//
+// 为什么**分成两个**计数器而不是合并成一个「纹理上传数」：
+// `texture_r8_upload_count()` 的既有判据断言的是**字形图集的重传语义**
+// （同一图集连续多帧只传一次）。如果把通用纹理的上传也计进去，那条差值就会与
+// 「这一帧有没有贴新纹理」纠缠在一起 —— 两个语义不同的量共用一个计数器，
+// 是「护栏互相污染」的经典来源。
+thread_local! {
+    static TEXTURE_RGBA8_UPLOAD_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// **本线程**累计的 `create_texture_rgba8` 上传路径次数。
+///
+/// 语义边界与并行安全约束同 [`texture_r8_upload_count`]：自增点紧跟在参数校验之后、
+/// 第一次驱动调用之前；读方必须与渲染**同线程**（本项目渲染是同步内联的）。
+pub fn texture_rgba8_upload_count() -> usize {
+    TEXTURE_RGBA8_UPLOAD_COUNT.with(|c| c.get())
+}
+
+// ── 间接绘制（M3+ 第 4 项下半）的 ABI 与常量 ──────────────────────────────────
+//
+// 为什么这些**声明在使用者旁边**（而不是 `ffi_dev.rs`）：`ffi_dev.rs` 不在本任务的
+// 允许改动清单里。既有先例是 M3a-T3 的 `HOST`/`VERTEX_INPUT` 同步位、以及 M2b 的
+// 交换链结构体 —— 都写在使用者模块里，并注明「值取自 SDK 头文件 + 有测试钉住」。
+//
+// 值取自本机 Vulkan SDK `1.4.357.0/include/vulkan/vulkan_core.h`。
+
+/// `VK_BUFFER_USAGE_INDEX_BUFFER_BIT`（= `0x0000_0040`）。
+pub const VK_BUFFER_USAGE_INDEX_BUFFER_BIT: u32 = 0x0000_0040;
+/// `VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT`（= `0x0000_0100`）。
+pub const VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT: u32 = 0x0000_0100;
+/// `VkIndexType::VK_INDEX_TYPE_UINT32`（= **1**；`UINT16` 才是 0）。
+///
+/// ⚠️ 写错成 0 不会编译报错：驱动会按 `UINT16` 解释索引缓冲的**一半字节**，
+/// 症状是「画出来的顶点错位/乱线」，而不是任何错误码。
+pub const VK_INDEX_TYPE_UINT32: i32 = 1;
+
+/// `VkDrawIndexedIndirectCommand`（**手写 ABI**，5 个 `u32` = 20 字节、无 padding）。
+///
+/// ```c
+///   uint32_t indexCount; uint32_t instanceCount; uint32_t firstIndex;
+///   int32_t vertexOffset; uint32_t firstInstance;
+/// ```
+///
+/// 它被**逐字节**灌进间接命令缓冲（`VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT`），
+/// 驱动按这个布局读 ⇒ 字段顺序/大小错了就是「读成垃圾值」（可能什么都不画，也可能越界）。
+/// `size_of`/`offset_of` 断言见 `tests/texture_indirect.rs`。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrawIndexedIndirectCommand {
+    pub index_count: u32,
+    pub instance_count: u32,
+    pub first_index: u32,
+    pub vertex_offset: i32,
+    pub first_instance: u32,
+}
+
+impl DrawIndexedIndirectCommand {
+    /// 「把 `vertex_count` 个顶点按顺序索引、画一遍」这条命令。
+    ///
+    /// 本项目形状是**顺序索引**（`0..N`），所以只有 `index_count` 随帧变化 ——
+    /// 这也是「命令内容不变就不重传」那条复用判据的依据。
+    pub fn for_vertex_count(vertex_count: u32) -> Self {
+        DrawIndexedIndirectCommand {
+            index_count: vertex_count,
+            instance_count: 1,
+            first_index: 0,
+            vertex_offset: 0,
+            first_instance: 0,
+        }
+    }
+
+    /// 小端字节序列（= 驱动从缓冲里读到的内容）。
+    pub fn to_bytes(self) -> [u8; 20] {
+        let mut out = [0u8; 20];
+        out[0..4].copy_from_slice(&self.index_count.to_le_bytes());
+        out[4..8].copy_from_slice(&self.instance_count.to_le_bytes());
+        out[8..12].copy_from_slice(&self.first_index.to_le_bytes());
+        out[12..16].copy_from_slice(&self.vertex_offset.to_le_bytes());
+        out[16..20].copy_from_slice(&self.first_instance.to_le_bytes());
+        out
+    }
+
+    /// 顺序索引 `0..n` 的 `u32` 字节序列（索引缓冲的内容）。
+    pub fn sequential_indices(vertex_count: u32) -> Vec<u8> {
+        let mut out = Vec::with_capacity(vertex_count as usize * 4);
+        for i in 0..vertex_count {
+            out.extend_from_slice(&i.to_le_bytes());
+        }
+        out
+    }
+}
+
+/// `vkCmdBindIndexBuffer(cmd, buffer, offset, indexType)`。
+pub type PfnCmdBindIndexBuffer =
+    unsafe extern "system" fn(vk::CommandBufferHandle, vk::BufferHandle, u64, i32);
+/// `vkCmdDrawIndexedIndirect(cmd, buffer, offset, drawCount, stride)`。
+pub type PfnCmdDrawIndexedIndirect =
+    unsafe extern "system" fn(vk::CommandBufferHandle, vk::BufferHandle, u64, u32, u32);
+
 /// 设备级函数表（在后台线程里解析；全是函数指针，故 `Send`）。
 #[derive(Clone, Copy)]
 pub struct DeviceFns {
@@ -168,6 +271,10 @@ pub struct DeviceFns {
     pub cmd_set_viewport: vk::PfnCmdSetViewport,
     pub cmd_set_scissor: vk::PfnCmdSetScissor,
     pub cmd_draw: vk::PfnCmdDraw,
+    /// `vkCmdBindIndexBuffer`（索引绘制路径用；M3+ 第 4 项下半）
+    pub cmd_bind_index_buffer: PfnCmdBindIndexBuffer,
+    /// `vkCmdDrawIndexedIndirect`（**间接绘制**；M3+ 第 4 项下半）
+    pub cmd_draw_indexed_indirect: PfnCmdDrawIndexedIndirect,
     pub cmd_push_constants: vk::PfnCmdPushConstants,
     pub cmd_pipeline_barrier: vk::PfnCmdPipelineBarrier,
     pub cmd_copy_image_to_buffer: vk::PfnCmdCopyImageToBuffer,
@@ -720,23 +827,63 @@ impl VkDevice {
     /// 标准路径的代价只是一次性的一次拷贝 —— 字形图集只在**内容变化时**重传
     /// （M3b T4 的契约），不是每帧，所以可忽略。
     pub fn create_texture_r8(&self, w: u32, h: u32, data: &[u8]) -> GpuResult<Texture> {
-        validate_texture_r8_args(w, h, data)?;
+        self.create_texture(w, h, TextureFormat::R8Unorm, data)
+    }
+
+    /// 创建一个 **`R8G8B8A8_UNORM` 通用彩色纹理**（M3+ 第 4 项下半）。
+    ///
+    /// 与 [`VkDevice::create_texture_r8`] 走**同一条**上传路径，只是格式与每像素字节数
+    /// 不同（`data` 必须恰好 `w*h*4` 字节，顺序 R,G,B,A）。
+    ///
+    /// ## 采样侧的诚实边界
+    ///
+    /// 当前统一片元着色器只读纹理的 **R 通道**（覆盖率语义）⇒ 这张纹理的 RGB 不会
+    /// 直接显示出来（颜色由顶点颜色给、由 R 调制）。要真正按 RGB 调制需要新的片元
+    /// 着色器（`spirv.rs`，不在本任务 scope）。**但上传本身四通道全保真** ——
+    /// 由 [`VkDevice::read_texture_bytes`] 逐字节证明。
+    pub fn create_texture_rgba8(&self, w: u32, h: u32, data: &[u8]) -> GpuResult<Texture> {
+        self.create_texture(w, h, TextureFormat::Rgba8Unorm, data)
+    }
+
+    /// 通用纹理创建入口（`format` 决定 `VkFormat` 与主机数据的每像素字节数）。
+    ///
+    /// 上传路径：`主机 → HOST_VISIBLE staging → vkCmdCopyBufferToImage → SHADER_READ_ONLY`，
+    /// 一次性提交并等队列空闲 ⇒ 返回时纹理**已经可以采样**。
+    ///
+    /// 计数在**被调用方**（本函数）按格式分别自增：跨过参数校验之后、第一次驱动调用之前
+    /// —— 于是「参数被拒」不计（没碰驱动），而「改了调用方却仍走上传路径」照样会动。
+    pub fn create_texture(
+        &self,
+        w: u32,
+        h: u32,
+        format: TextureFormat,
+        data: &[u8],
+    ) -> GpuResult<Texture> {
+        validate_texture_args(w, h, format, data)?;
         // 计数点紧跟在**校验之后**、第一次驱动调用**之前**：
         // - 参数被拒的调用**不计**（它没碰驱动，否则负例测试会让计数虚增）；
-        // - 「参数合法但驱动随后失败」**计**（那确实是一次上传尝试）——见
-        //   `texture_r8_upload_count()` 的语义边界说明。
+        // - 「参数合法但驱动随后失败」**计**（那确实是一次上传尝试）。
         // 用 `thread_local` ⇒ 别的测试线程的并行上传污染不到本线程的差值断言。
-        TEXTURE_R8_UPLOAD_COUNT.with(|c| c.set(c.get() + 1));
+        match format {
+            TextureFormat::R8Unorm => TEXTURE_R8_UPLOAD_COUNT.with(|c| c.set(c.get() + 1)),
+            TextureFormat::Rgba8Unorm => {
+                TEXTURE_RGBA8_UPLOAD_COUNT.with(|c| c.set(c.get() + 1))
+            }
+        }
+        let fmt = format.vulkan_format();
         let fns = self.fns;
         let device = self.handle;
 
-        // ① 图像：DEVICE_LOCAL + OPTIMAL，用法 = 采样 + 传输目标
+        // ① 图像：DEVICE_LOCAL + OPTIMAL，用法 = 采样 + 传输目标 + **传输源**
+        //
+        // `TRANSFER_SRC` 是 [`VkDevice::read_texture_bytes`] 需要的（上传保真判据要读回来）。
+        // 多一个 usage 位对驱动没有额外代价，也不影响采样语义。
         let img_info = vk::ImageCreateInfo {
             s_type: vk::VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
             p_next: std::ptr::null(),
             flags: 0,
             image_type: vk::VK_IMAGE_TYPE_2D,
-            format: vk::VK_FORMAT_R8_UNORM,
+            format: fmt,
             extent: vk::Extent3D {
                 width: w,
                 height: h,
@@ -746,7 +893,9 @@ impl VkDevice {
             array_layers: 1,
             samples: vk::VK_SAMPLE_COUNT_1_BIT,
             tiling: vk::VK_IMAGE_TILING_OPTIMAL,
-            usage: vk::VK_IMAGE_USAGE_SAMPLED_BIT | vk::VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+            usage: vk::VK_IMAGE_USAGE_SAMPLED_BIT
+                | vk::VK_IMAGE_USAGE_TRANSFER_DST_BIT
+                | vk::VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
             sharing_mode: vk::VK_SHARING_MODE_EXCLUSIVE,
             queue_family_index_count: 0,
             p_queue_family_indices: std::ptr::null(),
@@ -772,14 +921,14 @@ impl VkDevice {
             unsafe { (fns.bind_image_memory)(device, image.handle(), image_memory.handle(), 0) },
         )?;
 
-        // ③ 视图（R8_UNORM、2D、单层单 mip）
+        // ③ 视图（与图像同格式、2D、单层单 mip）
         let view_info = vk::ImageViewCreateInfo {
             s_type: vk::VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
             p_next: std::ptr::null(),
             flags: 0,
             image: image.handle(),
             view_type: vk::VK_IMAGE_VIEW_TYPE_2D,
-            format: vk::VK_FORMAT_R8_UNORM,
+            format: fmt,
             components_r: vk::VK_COMPONENT_SWIZZLE_IDENTITY,
             components_g: vk::VK_COMPONENT_SWIZZLE_IDENTITY,
             components_b: vk::VK_COMPONENT_SWIZZLE_IDENTITY,
@@ -801,6 +950,7 @@ impl VkDevice {
             memory: image_memory,
             width: w,
             height: h,
+            format,
         })
     }
 
@@ -992,6 +1142,210 @@ impl VkDevice {
         check_vk("vkQueueWaitIdle", unsafe { (fns.queue_wait_idle)(self.queue) })?;
         Ok(())
         // buffer / buf_mem / pool 在此按声明逆序 `Drop`，队列此刻已空闲。
+    }
+
+    /// 把纹理从设备内存**回读**到主机（`vkCmdCopyImageToBuffer` 的一次性路径）。
+    ///
+    /// ## 为什么需要它（这是「通用纹理」那条验收的关键证据）
+    ///
+    /// 统一片元着色器只消费纹理的 **R 通道**（`texture(tex,uv).r`，覆盖率语义）
+    /// ⇒ 「RGBA8 的 G/B/A 有没有传对」**只看渲染出来的像素是看不出来的**。
+    /// 回读是唯一能直接证明「四通道逐字节保真」的判据（见
+    /// `tests/texture_indirect.rs::rgba8_texture_upload_preserves_all_four_channels`）。
+    ///
+    /// ## 语义
+    ///
+    /// - 返回字节序与上传时**一致**（R8：1 字节/像素；RGBA8：R,G,B,A 4 字节/像素），
+    ///   `bufferRowLength = 0` ⇒ 行距紧排（`宽 × bytes_per_pixel`），与主机数据布局同构；
+    /// - 结束后图像**回到 `SHADER_READ_ONLY_OPTIMAL`**（与上传完成后一致）
+    ///   ⇒ 回读不改变纹理的可采样状态；
+    /// - 一次性提交 + `vkQueueWaitIdle`（与上传同款）：本项目没有并发提交，等待比栅栏简单；
+    /// - 尺寸/格式从 `texture` 读（不靠调用方传参）⇒ 不存在「参数与纹理不符」的错配。
+    pub fn read_texture_bytes(&self, texture: &Texture) -> GpuResult<Vec<u8>> {
+        let fns = self.fns;
+        let device = self.handle;
+        let (w, h) = (texture.width, texture.height);
+        let size = texture.byte_len();
+        if size == 0 {
+            return Err(GpuError::Unsupported(
+                "0 字节纹理无法回读（宽或高为 0）".to_string(),
+            ));
+        }
+        let image = texture.image.handle();
+
+        // ── staging buffer：TRANSFER_DST + HOST_VISIBLE | HOST_COHERENT
+        let buf_info = vk::BufferCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            size,
+            usage: vk::VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+            sharing_mode: vk::VK_SHARING_MODE_EXCLUSIVE,
+            queue_family_index_count: 0,
+            p_queue_family_indices: std::ptr::null(),
+        };
+        let mut buf_handle: vk::BufferHandle = std::ptr::null_mut();
+        // SAFETY: 结构体在栈上；输出句柄可写。
+        let rc = unsafe { (fns.create_buffer)(device, &buf_info, std::ptr::null(), &mut buf_handle) };
+        check_vk("vkCreateBuffer(readback)", rc)?;
+        let buffer = OwnedHandle::destroy(buf_handle, device, fns.destroy_buffer);
+
+        let mut breq = std::mem::MaybeUninit::<vk::MemoryRequirements>::uninit();
+        // SAFETY: 完整写入结构体。
+        unsafe { (fns.get_buffer_memory_requirements)(device, buffer.handle(), breq.as_mut_ptr()) };
+        let breq = unsafe { breq.assume_init() };
+        let host_bits =
+            vk::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        let bidx = pick_memory_type(self.mem_props, breq.memory_type_bits, host_bits)?;
+        let buf_mem = alloc_memory(device, &fns, breq.size, bidx, host_bits)?;
+        check_vk(
+            "vkBindBufferMemory(readback)",
+            // SAFETY: 缓冲与内存都是本设备的新对象，尺寸匹配；offset 0 合法。
+            unsafe { (fns.bind_buffer_memory)(device, buffer.handle(), buf_mem.handle(), 0) },
+        )?;
+
+        // ── 一次性命令：SHADER_READ_ONLY → TRANSFER_SRC → 拷贝 → 转回 SHADER_READ_ONLY
+        let pool = self.create_transient_command_pool()?;
+        let cmd = self.alloc_one_command_buffer(pool.handle())?;
+        let begin = vk::CommandBufferBeginInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            p_next: std::ptr::null(),
+            flags: vk::VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            p_inheritance_info: std::ptr::null(),
+        };
+        check_vk(
+            "vkBeginCommandBuffer",
+            // SAFETY: 命令缓冲由本设备分配且未在录制中。
+            unsafe { (fns.begin_command_buffer)(cmd, &begin) },
+        )?;
+
+        let range = full_subresource_range();
+        let to_src = vk::ImageMemoryBarrier {
+            s_type: vk::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            p_next: std::ptr::null(),
+            src_access_mask: vk::VK_ACCESS_SHADER_READ_BIT,
+            dst_access_mask: vk::VK_ACCESS_TRANSFER_READ_BIT,
+            old_layout: vk::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            new_layout: vk::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            image,
+            subresource_range: range,
+        };
+        // SAFETY: 命令缓冲正在录制；屏障在栈上存活到调用结束。
+        unsafe {
+            (fns.cmd_pipeline_barrier)(
+                cmd,
+                vk::VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                vk::VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0,
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                1,
+                &to_src,
+            )
+        };
+
+        let copy = vk::BufferImageCopy {
+            buffer_offset: 0,
+            // 0 = 紧密打包：每行 `宽 × bytes_per_pixel` 字节 —— 与主机数据布局一致
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::VK_IMAGE_ASPECT_COLOR_BIT,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            image_offset: vk::Offset3D { x: 0, y: 0, z: 0 },
+            image_extent: vk::Extent3D {
+                width: w,
+                height: h,
+                depth: 1,
+            },
+        };
+        // SAFETY: 缓冲与图像都是本设备对象且尺寸匹配（`size` 由格式算出）。
+        unsafe {
+            (fns.cmd_copy_image_to_buffer)(
+                cmd,
+                image,
+                vk::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                buffer.handle(),
+                1,
+                &copy,
+            )
+        };
+
+        let back_to_shader = vk::ImageMemoryBarrier {
+            s_type: vk::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            p_next: std::ptr::null(),
+            src_access_mask: vk::VK_ACCESS_TRANSFER_READ_BIT,
+            dst_access_mask: vk::VK_ACCESS_SHADER_READ_BIT,
+            old_layout: vk::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            new_layout: vk::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            image,
+            subresource_range: range,
+        };
+        // SAFETY: 同上。
+        unsafe {
+            (fns.cmd_pipeline_barrier)(
+                cmd,
+                vk::VK_PIPELINE_STAGE_TRANSFER_BIT,
+                vk::VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0,
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                1,
+                &back_to_shader,
+            )
+        };
+
+        check_vk(
+            "vkEndCommandBuffer",
+            // SAFETY: 命令缓冲正在录制。
+            unsafe { (fns.end_command_buffer)(cmd) },
+        )?;
+
+        let submit = vk::SubmitInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            p_next: std::ptr::null(),
+            wait_semaphore_count: 0,
+            p_wait_semaphores: std::ptr::null(),
+            p_wait_dst_stage_mask: std::ptr::null(),
+            command_buffer_count: 1,
+            p_command_buffers: &cmd,
+            signal_semaphore_count: 0,
+            p_signal_semaphores: std::ptr::null(),
+        };
+        // SAFETY: 队列是本设备的图形队列；提交后立刻等空闲 ⇒ 不存在「缓冲被销毁而 GPU 仍在写」的窗口。
+        check_vk("vkQueueSubmit", unsafe {
+            (fns.queue_submit)(self.queue, 1, &submit, vk::NULL_HANDLE)
+        })?;
+        // SAFETY: 队列属于本设备。
+        check_vk("vkQueueWaitIdle", unsafe { (fns.queue_wait_idle)(self.queue) })?;
+
+        // ── 读回（HOST_COHERENT ⇒ 不需要 vkInvalidateMappedMemoryRanges）
+        let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        // SAFETY: 内存是 HOST_VISIBLE 且尚未映射；offset/size 在范围内。
+        let rc = unsafe { (fns.map_memory)(device, buf_mem.handle(), 0, vk::WHOLE_SIZE, 0, &mut ptr) };
+        check_vk("vkMapMemory(readback)", rc)?;
+        if ptr.is_null() {
+            return Err(GpuError::Driver {
+                code: -1,
+                message: "vkMapMemory 返回成功但指针为空".to_string(),
+            });
+        }
+        // SAFETY: 映射覆盖整个缓冲（`size` 字节）；拷贝出来即与映射解耦。
+        let out = unsafe { std::slice::from_raw_parts(ptr as *const u8, size as usize).to_vec() };
+        // SAFETY: 与上面的 map 配对；缓冲/内存在本函数末尾按声明逆序析构。
+        unsafe { (fns.unmap_memory)(device, buf_mem.handle()) };
+        Ok(out)
     }
 
     /// 创建一个 `TRANSIENT` 命令池（用于一次性上传/拷贝）。
@@ -1842,6 +2196,11 @@ pub struct Texture {
     memory: OwnedHandle,
     width: u32,
     height: u32,
+    /// 纹理格式（决定主机数据的每像素字节数与 `VkFormat`）。
+    ///
+    /// **必须记下来**：回读（[`VkDevice::read_texture_bytes`]）要按它算行距与总字节数；
+    /// 不记就只能假定 R8 ⇒ RGBA8 纹理回读会拿到 1/4 的数据（或越界）。
+    format: TextureFormat,
 }
 
 /// 只打印尺寸（句柄对调用方无意义，而印出裸指针只会让日志变噪）。
@@ -1861,6 +2220,16 @@ impl Texture {
 
     pub fn height(&self) -> u32 {
         self.height
+    }
+
+    /// 纹理格式（R8 覆盖率 / RGBA8 通用彩色）。
+    pub fn format(&self) -> TextureFormat {
+        self.format
+    }
+
+    /// 主机侧数据的总字节数（`w * h * bytes_per_pixel`）。
+    pub fn byte_len(&self) -> u64 {
+        self.width as u64 * self.height as u64 * self.format.bytes_per_pixel() as u64
     }
 
     pub fn image_view(&self) -> vk::ImageViewHandle {
@@ -2013,30 +2382,104 @@ impl Drop for DescriptorSet {
 
 /// 校验 [`VkDevice::create_texture_r8`] 的参数（**纯函数**：不碰 Vulkan、不碰设备）。
 ///
-/// 抽出来的理由与 [`validate_vertex_pipeline_args`] 完全相同：错误路径若埋在
+/// 保留这个只认 `R8` 的窄入口（历史调用点与判据都按它的语义写的）；
+/// 实现委托给通用版 [`validate_texture_args`]。
+///
+/// `#[cfg_attr(not(test), allow(dead_code))]` 是**精确**表达：生产路径统一走
+/// [`validate_texture_args`]，而这里保留的窄入口只剩本文件末尾的 R8 负例单测在调
+/// （保留它 = 保住那批断言对「R8 口径」的覆盖，不是死代码）。
+#[cfg_attr(not(test), allow(dead_code))]
+fn validate_texture_r8_args(w: u32, h: u32, data: &[u8]) -> GpuResult<()> {
+    validate_texture_args(w, h, TextureFormat::R8Unorm, data)
+}
+
+/// 本项目支持的**通用纹理格式**（M3+ 第 4 项下半）。
+///
+/// ## 为什么是这两种
+///
+/// - [`TextureFormat::R8Unorm`]：字形图集（**单通道覆盖率**）—— 已有能力，保持默认；
+/// - [`TextureFormat::Rgba8Unorm`]：**通用彩色纹理**（图标 / 图片 / 任意内容），
+///   这是 `gpu-hal.md` 里登记的「纹理上传未做」缺口。
+///
+/// 两者共用同一条上传路径（staging buffer → `vkCmdCopyBufferToImage` → 转
+/// `SHADER_READ_ONLY_OPTIMAL`），差异只在 `VkFormat` 与**每像素字节数**。
+///
+/// ## 诚实边界（写在这里，别让人以为它比实际更通用）
+///
+/// - **采样**：当前统一片元着色器只消费纹理的 **R 通道**（`texture(tex,uv).r`，
+///   覆盖率语义）⇒ RGBA8 纹理贴出来的颜色由**顶点颜色**决定、由 R 当覆盖率调制。
+///   要按 RGB 调制需要一支新的片元着色器，而着色器在 `spirv.rs` ——
+///   **不在本任务 scope** ⇒ 已作为未做项登记（见任务报告）。
+///   四通道的**上传**保真由 [`VkDevice::read_texture_bytes`] 直接证明（不依赖采样）。
+/// - 不支持 mipmap / 数组 / 立方体 / 压缩格式（本项目用不到）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextureFormat {
+    /// 单通道 8 位（字形覆盖率）。
+    R8Unorm,
+    /// 四通道 8 位（通用彩色纹理；字节序 R,G,B,A）。
+    Rgba8Unorm,
+}
+
+impl TextureFormat {
+    /// 对应的 `VkFormat` 值（与 SDK `vulkan_core.h` 一致：37 / 43 是 RGBA8 系列、`R8_UNORM` 是 9）。
+    pub fn vulkan_format(self) -> i32 {
+        match self {
+            TextureFormat::R8Unorm => vk::VK_FORMAT_R8_UNORM,
+            TextureFormat::Rgba8Unorm => vk::VK_FORMAT_R8G8B8A8_UNORM,
+        }
+    }
+
+    /// 每像素字节数（**主机数据的行距口径**：`data.len()` 必须是 `w * h * bpp`）。
+    pub fn bytes_per_pixel(self) -> u32 {
+        match self {
+            TextureFormat::R8Unorm => 1,
+            TextureFormat::Rgba8Unorm => 4,
+        }
+    }
+
+    /// 可读名字（错误信息 / 诊断用）。
+    pub fn name(self) -> &'static str {
+        match self {
+            TextureFormat::R8Unorm => "R8_UNORM",
+            TextureFormat::Rgba8Unorm => "R8G8B8A8_UNORM",
+        }
+    }
+}
+
+/// 校验通用纹理的参数（**纯函数**：不碰 Vulkan、不碰设备）。
+///
+/// 抽成纯函数的理由与 [`validate_vertex_pipeline_args`] 相同：错误路径若埋在
 /// 「必须先有真机才能跑」的方法里，就等于**没有负例测试**。
 ///
-/// ## 这两条为什么要拦
+/// ## 两条必须拦下的
 ///
 /// - **`w == 0 || h == 0`**：0 边图像在 Vulkan 里非法；某些驱动直接拒绝，另一些会让
 ///   后续采样读到未定义内存（表现为「画面偶尔花」这种极难查的缺陷）。
-/// - **`data.len() != w * h`**：**最危险**的一条。字数不够 ⇒ 上传时越界读；
-///   字数多了 ⇒ 静默忽略多余数据、掩盖调用方算错尺寸。两者都必须在**调用驱动前**
-///   报错，且信息里要点出「实得 vs 期望」，否则调用方还得自己反查尺寸。
-fn validate_texture_r8_args(w: u32, h: u32, data: &[u8]) -> GpuResult<()> {
+/// - **`data.len() != w * h * bpp`**：**最危险**的一条，而且**必须按格式算** ——
+///   把 RGBA8 的 `w*h*4` 字节按 R8 校验（或反过来）会：字数不够 ⇒ 上传时越界读；
+///   字数多了 ⇒ 静默忽略多余数据、掩盖调用方算错尺寸。
+///
+/// `w * h * bpp` 用 `u64` 相乘：`u32` 下 65536×65536 会溢出，溢出后与
+/// `data.len()` 的比较会得出**错误结论**（甚至反而「通过」）。
+pub fn validate_texture_args(
+    w: u32,
+    h: u32,
+    format: TextureFormat,
+    data: &[u8],
+) -> GpuResult<()> {
     if w == 0 || h == 0 {
         return Err(GpuError::Unsupported(format!(
-            "R8 纹理的宽高必须 > 0，实际 {w}×{h}"
+            "{} 纹理的宽高必须 > 0，实际 {w}×{h}",
+            format.name()
         )));
     }
-    // 用 u64 相乘：`w * h` 在 u32 下会溢出（例如 65536×65536），溢出后与
-    // `data.len()` 的比较会得出**错误结论**（可能反而「通过」）。覆盖率纹理不大，
-    // 但这条检查本身不该有可被绕过的边界。
-    let expected = w as u64 * h as u64;
+    let expected = w as u64 * h as u64 * format.bytes_per_pixel() as u64;
     if data.len() as u64 != expected {
         return Err(GpuError::Unsupported(format!(
-            "R8 纹理数据长度必须等于 宽×高 = {w}×{h} = {expected} 字节，实际 {} 字节",
-            data.len()
+            "{} 纹理数据长度必须等于 宽×高×{bpp} = {w}×{h}×{bpp} = {expected} 字节，实际 {} 字节",
+            format.name(),
+            data.len(),
+            bpp = format.bytes_per_pixel()
         )));
     }
     Ok(())
@@ -2644,6 +3087,8 @@ fn resolve_device_fns() -> GpuResult<DeviceFns> {
             cmd_set_viewport: lib.sym("vkCmdSetViewport")?,
             cmd_set_scissor: lib.sym("vkCmdSetScissor")?,
             cmd_draw: lib.sym("vkCmdDraw")?,
+            cmd_bind_index_buffer: lib.sym("vkCmdBindIndexBuffer")?,
+            cmd_draw_indexed_indirect: lib.sym("vkCmdDrawIndexedIndirect")?,
             cmd_push_constants: lib.sym("vkCmdPushConstants")?,
             cmd_pipeline_barrier: lib.sym("vkCmdPipelineBarrier")?,
             cmd_copy_image_to_buffer: lib.sym("vkCmdCopyImageToBuffer")?,

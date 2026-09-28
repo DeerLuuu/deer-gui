@@ -113,8 +113,9 @@ use std::ffi::c_void;
 use deer_gpu::{Color, DrawCmd, DrawList, Extent, GpuError, GpuResult, RectI, TextEngine};
 
 use crate::device::{
-    vk_result_name, DescriptorPool, DescriptorSet, DeviceFns, RenderPass, Texture, VertexAttr,
-    VkDevice,
+    vk_result_name, DescriptorPool, DescriptorSet, DeviceFns, DrawIndexedIndirectCommand, RenderPass,
+    Texture, VertexAttr, VkDevice, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+    VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_INDEX_TYPE_UINT32,
 };
 use crate::ffi;
 use crate::ffi_dev as vk;
@@ -150,6 +151,29 @@ const VK_ACCESS_HOST_WRITE_BIT: u32 = 1 << 14;
 /// 同样**不是** `1 << 5`（那是 `VK_ACCESS_SHADER_READ_BIT`）。注意它与上面那个阶段位
 /// **数值相同但属于不同枚举** —— 这不是笔误。
 const VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT: u32 = 1 << 2;
+
+// ── 间接绘制（M3+ 第 4 项下半）需要的同步位 ────────────────────────────────────
+//
+// 与上面 `HOST`/`VERTEX_INPUT` 同一处境：`ffi_dev.rs` 里没有这几个位，而它**不在本任务
+// 的允许改动清单**里 ⇒ 按既有先例（M3a-T3 也是这么做的）把具名常量放在**使用者旁边**，
+// 让纯函数产出参数、单元测试钉确切数值。
+//
+// 值取自本机 Vulkan SDK `1.4.357.0/include/vulkan/vulkan_core.h`：
+// `VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT = 0x2`、`VK_ACCESS_INDIRECT_COMMAND_READ_BIT = 0x1`、
+// `VK_ACCESS_INDEX_READ_BIT = 0x2`。
+
+/// `VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT`（= `1 << 1` = `0x2`）：**读间接命令**的阶段。
+const VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT: u32 = 1 << 1;
+/// `VK_ACCESS_INDIRECT_COMMAND_READ_BIT`（= `1 << 0` = `0x1`）。
+///
+/// 注意它与 `VK_ACCESS_INDEX_READ_BIT`（`0x2`）**数值不同但相邻** —— 两个都容易写混。
+const VK_ACCESS_INDIRECT_COMMAND_READ_BIT: u32 = 1 << 0;
+/// `VK_ACCESS_INDEX_READ_BIT`（= `1 << 1` = `0x2`）。
+///
+/// ⚠️ 它与 [`VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT`] **数值相同、枚举不同**（前者是
+/// `VkAccessFlagBits`、后者是 `VkPipelineStageFlagBits`）—— 看上去像复制粘贴错误，
+/// 但规范如此；`index_and_indirect_barrier_params_pin_the_exact_masks` 钉住这两组。
+const VK_ACCESS_INDEX_READ_BIT: u32 = 1 << 1;
 
 /// 颜色附件的格式：**线性 UNORM**（见模块文档「三条前提」）。
 const COLOR_FORMAT: i32 = vk::VK_FORMAT_R8G8B8A8_UNORM;
@@ -427,21 +451,36 @@ pub(crate) struct DrawCall {
 ///
 /// | 字段 | 含义（与真实 Vulkan 调用一一对应） |
 /// |---|---|
-/// | `draw_calls` | `vkCmdDraw` 的调用次数 |
+/// | `draw_calls` | **绘制派发**次数（`vkCmdDraw` **或** `vkCmdDrawIndexedIndirect`，二者只会有一种在跑） |
 /// | `pipeline_switches` | `vkCmdBindPipeline` 的调用次数（每次「切管线」一次） |
-/// | `buffer_uploads` | 主机→顶点缓冲的**上传**次数（map + memcpy + unmap） |
-/// | `buffer_allocations` | 顶点缓冲的**创建**次数（`vkCreateBuffer` + 绑定内存） |
+/// | `buffer_uploads` | 主机→**顶点缓冲**的上传次数（map + memcpy + unmap） |
+/// | `buffer_allocations` | **缓冲的创建**次数（顶点 / 索引 / 间接，每个 `vkCreateBuffer` + 绑定内存一次） |
+/// | `submits` | `vkQueueSubmit` 的调用次数（「一帧一提交」的可断言口径） |
+/// | `indirect_draws` | `vkCmdDrawIndexedIndirect` 的调用次数（**证明走的是间接路径**） |
+/// | `index_uploads` | 主机→**索引缓冲**的上传次数 |
+/// | `indirect_uploads` | 主机→**间接命令缓冲**的上传次数 |
 ///
 /// ## 计数位置（**必须与真实调用同处**）
 ///
-/// 四个 `+= 1` 都写在**发那条 Vulkan 调用的同一个地方** —— 于是「删掉发射」必然也删掉计数，
+/// 八个 `+= 1` 都写在**发那条 Vulkan 调用的同一个地方** —— 于是「删掉发射」必然也删掉计数，
 /// 护栏不会退化成「实现者自证」。这是本项目反复验证过的唯一能挡住「把护栏一起删掉」的写法。
+///
+/// ## 为什么 `draw_calls` 之外还要一个 `indirect_draws`
+///
+/// `draw_calls` 是**派发次数**（两种发法都算），`indirect_draws` 只在**间接**那一支自增。
+/// 两个都要：前者守住「一帧一次绘制」这条不变量（不因换实现而漂移），后者让
+/// 「**真的走了 indirect**」变成可断言的事实 —— 把 `vkCmdDrawIndexedIndirect` 换回
+/// `vkCmdDraw`（或整个删掉）时 `draw_calls` 可能仍对，但 `indirect_draws` 会掉到 0。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RenderStats {
     pub draw_calls: u64,
     pub pipeline_switches: u64,
     pub buffer_uploads: u64,
     pub buffer_allocations: u64,
+    pub submits: u64,
+    pub indirect_draws: u64,
+    pub index_uploads: u64,
+    pub indirect_uploads: u64,
 }
 
 /// 文本管线**特有的**资源（渲染器以 `Option` 持有：不调
@@ -514,8 +553,65 @@ fn vertex_range(base: usize, len: usize) -> GpuResult<(u32, u32)> {
     Ok((first, count))
 }
 
-/// 把翻译层报出的「未支持」清单并进帧级错误状态（**两条管线共用**）。
+/// 一张**纹理 quad** 的 6 个统一顶点（`TL,TR,BR` + `TL,BR,BL`）—— `uv ≥ 0` ⇒ 走**采样支**。
 ///
+/// ## `uv` 是「像素边界」语义（与 `gpu_text` 同源）
+///
+/// ```text
+///   u(px) = (px - rect.x) / rect.w        （v 同理）
+/// ```
+///
+/// 片元在**像素中心** `px + 0.5` 求值 ⇒ `u * tex_w = (px - rect.x + 0.5) * tex_w / rect.w`；
+/// **1:1 时**（`rect.w == tex_w`）正好落在 texel 中心 ⇒ `NEAREST` 取到
+/// `px - rect.x` 那个 texel，**无平局、逐像素精确** ⇒ 可与 CPU 参考逐字节对照。
+///
+/// **朝向**：纹理左上角对到 quad 左上角（画布 y 向下 + 着色器 `OriginUpperLeft`）
+/// ⇒ **不做 V 翻转**；翻错会让上下颠倒（`textured_quad_uv_orientation_is_top_down` 抓这条）。
+///
+/// `rect`/`radius_kind` 对采样支**不被读取**（统一 FS 在 `uv.x ≥ 0` 时不看它们），
+/// 这里照填 quad 的真实矩形以便诊断。
+fn textured_quad_vertices(
+    extent: Extent,
+    tex_w: u32,
+    tex_h: u32,
+    rect: RectI,
+    tint: Color,
+) -> Vec<UnifiedVertex> {
+    if rect.w <= 0 || rect.h <= 0 || tex_w == 0 || tex_h == 0 {
+        return Vec::new();
+    }
+    let w = extent.width.max(1) as f32;
+    let h = extent.height.max(1) as f32;
+    let ndc_x = |px: i32| 2.0 * px as f32 / w - 1.0;
+    let ndc_y = |py: i32| 2.0 * py as f32 / h - 1.0;
+    let u = |px: i32| (px - rect.x) as f32 / rect.w as f32;
+    let v = |py: i32| (py - rect.y) as f32 / rect.h as f32;
+    let color = [
+        tint.r as f32 / 255.0,
+        tint.g as f32 / 255.0,
+        tint.b as f32 / 255.0,
+        tint.a.clamp(0.0, 1.0),
+    ];
+    let rect_attr = [rect.x as f32, rect.y as f32, rect.w as f32, rect.h as f32];
+    let corner = |px: i32, py: i32| UnifiedVertex {
+        pos: [ndc_x(px), ndc_y(py)],
+        rect: rect_attr,
+        radius_kind: 0.0,
+        color,
+        uv: [u(px), v(py)],
+    };
+    let (x0, y0, x1, y1) = (rect.x, rect.y, rect.right(), rect.bottom());
+    vec![
+        corner(x0, y0),
+        corner(x1, y0),
+        corner(x1, y1),
+        corner(x0, y0),
+        corner(x1, y1),
+        corner(x0, y1),
+    ]
+}
+
+/// 把翻译层报出的「未支持」清单并进帧级错误状态（**两条管线共用**）。///
 /// ## 为什么抽出这个函数（review M1）
 ///
 /// 形状路径今天**不可达**（`gpu_geom` 什么命令都翻译得了），而「不可达的分支」最容易被
@@ -577,6 +673,35 @@ fn vertex_buffer_barrier_params() -> BarrierParams {
     }
 }
 
+/// 「主机写索引缓冲 → GPU 索引取数」这条依赖的参数：
+/// `HOST` / `HOST_WRITE` → `VERTEX_INPUT` / `INDEX_READ`。
+///
+/// 索引在**顶点装配**阶段被消费（`vkCmdBindIndexBuffer`），所以 `dst_stage` 与顶点缓冲
+/// 相同（`VERTEX_INPUT`，`1 << 2`），只有 access 位换成 `INDEX_READ`（`1 << 1`）。
+fn index_buffer_barrier_params() -> BarrierParams {
+    BarrierParams {
+        src_stage: VK_PIPELINE_STAGE_HOST_BIT,
+        dst_stage: VK_PIPELINE_STAGE_VERTEX_INPUT_BIT,
+        src_access: VK_ACCESS_HOST_WRITE_BIT,
+        dst_access: VK_ACCESS_INDEX_READ_BIT,
+    }
+}
+
+/// 「主机写间接命令缓冲 → GPU 读间接命令」这条依赖的参数：
+/// `HOST` / `HOST_WRITE` → `DRAW_INDIRECT` / `INDIRECT_COMMAND_READ`。
+///
+/// ⚠️ 这里的 `dst_stage` 是 `DRAW_INDIRECT`（`1 << 1`）而**不是** `VERTEX_INPUT`：
+/// 间接命令在**绘制之前**被读（比顶点取数更早）。写错不会报错、屏障也照样被接受，
+/// 只是它不覆盖「读间接命令」这一步 —— 正是本项目反复吃过的那类「加了屏障但没用」。
+fn indirect_buffer_barrier_params() -> BarrierParams {
+    BarrierParams {
+        src_stage: VK_PIPELINE_STAGE_HOST_BIT,
+        dst_stage: VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT,
+        src_access: VK_ACCESS_HOST_WRITE_BIT,
+        dst_access: VK_ACCESS_INDIRECT_COMMAND_READ_BIT,
+    }
+}
+
 /// 一个「有句柄 + 有销毁函数」的 Vulkan 对象：`Drop` 时销毁。
 ///
 /// 不带 `what` 字段：对象名只在**创建失败**时要紧（那时对象还不存在），所以它是
@@ -604,7 +729,11 @@ impl Drop for VkObject {
     }
 }
 
-/// 顶点缓冲 + 它绑定的内存。
+/// 一块「主机可见 + 跨帧复用 + 按需扩容」的缓冲 + 它绑定的内存。
+///
+/// 名字来自历史（原来只有顶点缓冲），M3+ 第 4 项下半起它**同时承载索引缓冲与间接命令
+/// 缓冲** —— 三者是同一种东西（主机写、GPU 读、内容不变就不重传），所以共用一个结构；
+/// 行为未变，只是语义放宽了。
 ///
 /// **字段顺序 = 析构顺序**：`buffer` 在前 ⇒ 先 `vkDestroyBuffer`、再 `vkFreeMemory`
 /// （内存不能先于绑定它的缓冲消失）。
@@ -902,6 +1031,19 @@ pub struct GpuGeometryRenderer {
     cmd: vk::CommandBufferHandle,
     /// **统一顶点缓冲**（B5-2：全帧只有这一块；**惰性创建**：一帧都没画过非空几何时不分配）。
     vertex: Option<VertexBuffer>,
+    /// **索引缓冲**（M3+ 第 4 项下半）：`0..顶点数` 的 `u32` 序列，间接绘制必需。
+    ///
+    /// 惰性创建 + 跨帧复用；**只在顶点数变化时重传**（内容就是 `0..N`，N 不变则逐字节相同）。
+    /// 声明在 `device` 之前 ⇒ 设备存活时销毁。
+    index: Option<VertexBuffer>,
+    /// **间接命令缓冲**（`VkDrawIndexedIndirectCommand`，20 字节），每帧读它来发绘制。
+    ///
+    /// 同样是惰性 + 复用：`index_count` 不变就不重传（那是唯一会变的字段）。
+    indirect: Option<VertexBuffer>,
+    /// 上一次写进索引缓冲的**顶点数 + 缓冲句柄**（句柄一变即作废，与 `uploaded_vertices` 同款）。
+    uploaded_indices: Option<(vk::BufferHandle, u32)>,
+    /// 上一次写进间接缓冲的**命令 + 缓冲句柄**。
+    uploaded_indirect: Option<(vk::BufferHandle, DrawIndexedIndirectCommand)>,
     /// `set 0 / binding 0` 的组合图像采样器：**恒有效** ——
     /// 统一片元着色器无条件采样 ⇒ 形状帧也必须绑它（内容 = 图集或 [`DUMMY_COVERAGE`]）。
     ///
@@ -1229,6 +1371,10 @@ impl GpuGeometryRenderer {
             unify_calls: 0,
             unify_output_vertices: 0,
             uploaded_vertices: None,
+            index: None,
+            indirect: None,
+            uploaded_indices: None,
+            uploaded_indirect: None,
             // `new()` 刚把哑纹理写进描述符集 ⇒ 这就是它此刻指着的东西
             descriptor_points_at,
             device,
@@ -1238,6 +1384,17 @@ impl GpuGeometryRenderer {
     /// **实际**渲染尺寸（请求 0 尺寸时是 1×1，见 [`GpuGeometryRenderer::new`]）。
     pub fn extent(&self) -> Extent {
         self.extent
+    }
+
+    /// 底层设备（诊断 / 在**同一个设备上**创建纹理用）。
+    ///
+    /// ## 为什么必须暴露它（而不是让调用方自己开一个设备）
+    ///
+    /// `VkImage`/`VkImageView` 是**设备级对象**：拿 A 设备的纹理去 B 设备的描述符集里采样
+    /// 是非法用法（校验层会报，驱动可能只是采到垃圾）。而 [`Self::draw_textured_quad`]
+    /// 需要一个与本渲染器**同设备**的纹理 ⇒ 调用方必须能拿到这个设备。
+    pub fn device(&self) -> &VkDevice {
+        &self.device
     }
 
     /// **让本渲染器支持文本**：接管一个 [`TextEngine`]（字体 + 字形图集 + 排版缓存）。
@@ -1533,10 +1690,81 @@ impl GpuGeometryRenderer {
         self.read_back()
     }
 
-    /// 确保**统一顶点缓冲**至少有 `bytes` 字节（不够就按 2 的幂重建），**先建后换**。
+    /// 把一张**通用纹理**铺到一个矩形上并回读整帧（M3+ 第 4 项下半）。
     ///
-    /// 重建 ⇒ 缓冲句柄变化 ⇒ B3 的上传记录**自动作废**（记录里带着句柄，见 `uploaded_vertices`）。
-    fn ensure_vertex_capacity(&mut self, slot: &mut Option<VertexBuffer>, bytes: u64) -> GpuResult<()> {
+    /// ## 语义
+    ///
+    /// - 顶点走**统一顶点流的「采样支」**（`uv ≥ 0`）⇒ 片元着色器做
+    ///   `out = vec4(tint.rgb, tint.a * texture(tex, uv).r)`（**R 通道当覆盖率**）；
+    /// - `uv` 是**像素边界**语义：`u = (px - rect.x)/rect.w`（与 `gpu_text` 的推导同源），
+    ///   于是 1:1 时每个像素中心正好采到对应 texel、NEAREST 无平局 ⇒ 可与 CPU 逐字节对照；
+    /// - `tint.a` 与覆盖率相乘 ⇒ `cov ∈ {0,1}` + 不透明 tint 时是**逐字节**判据，
+    ///   中间覆盖率则是「≤1 LSB」（与项目既有的不透明/半透明判据口径一致）；
+    /// - **纹理必须与渲染器同一个设备**（`VkImage` 是设备级对象）⇒ 用
+    ///   [`Self::device`] 上的 `create_texture_rgba8`/`create_texture_r8` 造它；
+    /// - 画完把描述符集**改回**「默认纹理」（图集或 1×1 哑纹理），否则后续
+    ///   形状/文本帧会绑着一张无关的纹理（虽然形状支不采样，但那是隐性状态，不该留）。
+    ///
+    /// ## 与 `render(&DrawList)` 的关系
+    ///
+    /// 两者共用同一条录制/提交/回读路径（[`Self::record_and_submit`]），所以
+    /// 间接绘制、屏障、计数、稳态复用这些性质对纹理 quad 同样成立。
+    /// 纹理 quad **不是** `DrawCmd`：`DrawList` 属于 `deer-gpu` 的契约（不在本任务 scope），
+    /// 而「一张任意纹理铺到矩形上」目前只有测试/诊断需要。
+    pub fn draw_textured_quad(
+        &mut self,
+        texture: &Texture,
+        rect: RectI,
+        tint: Color,
+    ) -> GpuResult<Vec<u8>> {
+        self.unsupported.clear();
+        // 上一次提交没确认完成 ⇒ 什么都不许碰（与 `render` 同一守卫）
+        self.sync.ensure_reusable()?;
+
+        let unified = textured_quad_vertices(self.extent, texture.width(), texture.height(), rect, tint);
+        // 改指描述符集（读数与副作用同处：返回值只能来自 `point_descriptor_at`）
+        self.descriptor_points_at = point_descriptor_at(
+            &self.device,
+            &self.descriptor_set,
+            &self.pipelines.sampler,
+            texture,
+        )?;
+        let recorded = self.record_and_submit(&unified);
+        // 无论成败都把描述符集改回默认纹理：失败路径也不该留下「指着别人纹理」的状态。
+        let restored = self.rebind_default_texture();
+        recorded?;
+        restored?;
+        self.read_back()
+    }
+
+    /// 把渲染器级描述符集改回**默认纹理**（有文本引擎时是图集，否则是 1×1 哑纹理）。
+    fn rebind_default_texture(&mut self) -> GpuResult<()> {
+        let target: &Texture = match self.text.as_ref().and_then(|t| t.texture.as_ref()) {
+            Some(t) => t,
+            None => &self.dummy_texture,
+        };
+        self.descriptor_points_at = point_descriptor_at(
+            &self.device,
+            &self.descriptor_set,
+            &self.pipelines.sampler,
+            target,
+        )?;
+        Ok(())
+    }
+
+    /// 确保某块**主机可见缓冲**至少有 `bytes` 字节（不够就按 2 的幂重建），**先建后换**。
+    ///
+    /// 重建 ⇒ 缓冲句柄变化 ⇒ 复用记录**自动作废**（记录里带着句柄，见 `uploaded_vertices`）。
+    ///
+    /// `usage` 由调用方给（顶点 / 索引 / 间接各一种）—— 从 M3+ 第 4 项下半起这块结构
+    /// 同时承载三种缓冲，所以用法位不能再写死成 `VERTEX_BUFFER`。
+    fn ensure_vertex_capacity(
+        &mut self,
+        slot: &mut Option<VertexBuffer>,
+        bytes: u64,
+        usage: u32,
+        what: &'static str,
+    ) -> GpuResult<()> {
         // 破坏性操作（会销毁旧缓冲、分配新内存）⇒ 守卫放在这里（见 R1-3）。
         self.sync.ensure_reusable()?;
         if slot.as_ref().is_some_and(|v| v.capacity >= bytes) {
@@ -1546,14 +1774,7 @@ impl GpuGeometryRenderer {
         // **先建新的、成功后再换**（T3 review F11）：失败时旧缓冲仍然可用、容量信息不丢。
         // 析构顺序仍然正确：`VertexBuffer` 的字段顺序保证「先缓冲、后内存」；
         // 赋值时旧值被 drop，此刻上一帧的提交已经等过栅栏 ⇒ 缓冲不在使用中。
-        let (buffer, memory) = create_host_buffer(
-            "vkCreateBuffer(vertex)",
-            self.device_handle,
-            &self.fns,
-            &self.mem_props,
-            capacity,
-            vk::VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-        )?;
+        let (buffer, memory) = create_host_buffer(what, self.device_handle, &self.fns, &self.mem_props, capacity, usage)?;
         *slot = Some(VertexBuffer {
             buffer,
             memory,
@@ -1564,12 +1785,19 @@ impl GpuGeometryRenderer {
         Ok(())
     }
 
-    /// 把一段**已经是 `#[repr(C)]` 纯 `f32`** 的顶点数据写进缓冲（map → memcpy → unmap）。
+    /// 把一段字节写进一块**主机可见缓冲**（map → memcpy → unmap）。
     ///
-    /// `what` 只用于报错里指认是哪块缓冲（B5-2 之后只有统一顶点缓冲一块）。
+    /// ## 为什么**不在这里**自增计数
+    ///
+    /// 从 M3+ 第 4 项下半起这块结构同时承载三种缓冲（顶点 / 索引 / 间接），而它们各有
+    /// **三个不同的计数器**（`buffer_uploads` / `index_uploads` / `indirect_uploads`）。
+    /// 在共用函数里自增就会把三种上传混成一个数（实测踩过：`buffer_uploads` 变成 3）。
+    /// 所以计数器由调用方在**紧邻这一步的同一处**自增 —— 删掉这次写入仍会同时删掉那一行计数。
+    ///
+    /// `what` 只用于报错里指认是哪块缓冲。
     /// 收 `memory` 句柄（而不是 `&VertexBuffer`）：调用点通常正持有 `self.vertex`
     /// 的借用，传引用会和 `&mut self`（要自增 `stats`）撞借用检查 —— 句柄是 `Copy` 的普通值。
-    fn upload_vertices(
+    fn upload_buffer_bytes(
         &mut self,
         memory: vk::DeviceMemoryHandle,
         src: &[u8],
@@ -1581,8 +1809,6 @@ impl GpuGeometryRenderer {
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr(), mapped.as_mut_ptr() as *mut u8, src.len());
         }
-        // 计数与真实调用同处（memcpy 刚发生、unmap 随 `mapped` 析构）
-        self.stats.buffer_uploads += 1;
         Ok(())
     }
 
@@ -1643,8 +1869,18 @@ impl GpuGeometryRenderer {
     /// 从前那两个分项计数器（形状/文本）**没有意义**了，已随字段一起删除
     /// （留两个恒等的数只会让人以为它们还分辨着什么）。
     fn emit_host_to_vertex_barrier(&mut self, buffer: vk::BufferHandle) {
-        let p = vertex_buffer_barrier_params();
-        let host_to_vertex = vk::BufferMemoryBarrier {
+        self.emit_host_buffer_barrier(buffer, vertex_buffer_barrier_params());
+        self.host_to_vertex_barriers += 1;
+    }
+
+    /// 为**任意一块主机写的缓冲**发一条「主机写 → GPU 读」屏障（参数由纯函数给）。
+    ///
+    /// 抽出来的理由：索引缓冲与间接命令缓冲各需要一条，但目标阶段/访问位不同
+    /// （`VERTEX_INPUT`/`INDEX_READ` 与 `DRAW_INDIRECT`/`INDIRECT_COMMAND_READ`）——
+    /// 三份「字面量屏障」正是本项目反复出错的形态（写错不报错、屏障照样被接受）。
+    /// 参数集中到 [`BarrierParams`] 纯函数里，就能用单元测试钉确切掩码。
+    fn emit_host_buffer_barrier(&mut self, buffer: vk::BufferHandle, p: BarrierParams) {
+        let barrier = vk::BufferMemoryBarrier {
             s_type: vk::VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER,
             p_next: std::ptr::null(),
             src_access_mask: p.src_access,
@@ -1665,12 +1901,11 @@ impl GpuGeometryRenderer {
                 0,
                 std::ptr::null(),
                 1,
-                &host_to_vertex,
+                &barrier,
                 0,
                 std::ptr::null(),
             );
         }
-        self.host_to_vertex_barriers += 1;
     }
 
     /// 录制一帧（清屏 + 按 z 序逐段绑定管线/顶点缓冲 + 绘制 + 屏障 + 拷贝），提交并等栅栏。
@@ -1698,7 +1933,12 @@ impl GpuGeometryRenderer {
         } else {
             let bytes = std::mem::size_of_val(unified) as u64;
             let mut slot = self.vertex.take();
-            self.ensure_vertex_capacity(&mut slot, bytes)?;
+            self.ensure_vertex_capacity(
+                &mut slot,
+                bytes,
+                vk::VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                "vkCreateBuffer(vertex)",
+            )?;
             self.vertex = slot;
             let bytes = std::mem::size_of_val(unified);
             // SAFETY: `UnifiedVertex` 是 `#[repr(C)]` 纯 `f32`（无指针、无 Drop）⇒ 字节视图合法。
@@ -1719,7 +1959,9 @@ impl GpuGeometryRenderer {
                     .expect("ensure 之后必有缓冲")
                     .memory
                     .handle();
-                self.upload_vertices(mem, src, "vkMapMemory(unified vertex)")?;
+                self.upload_buffer_bytes(mem, src, "vkMapMemory(unified vertex)")?;
+                // 计数与真实调用同处（memcpy 刚发生、unmap 随 `mapped` 析构）
+                self.stats.buffer_uploads += 1;
                 self.uploaded_vertices = Some((handle, src.to_vec()));
                 true
             } else {
@@ -1730,6 +1972,88 @@ impl GpuGeometryRenderer {
         // 没有文本引擎时不动：描述符集里是 `new()` 绑好的 1×1 哑纹理。
         if self.text.is_some() {
             self.refresh_atlas_texture()?;
+        }
+
+        // ①b **索引缓冲 + 间接命令缓冲**（M3+ 第 4 项下半）：间接绘制必需的输入。
+        //
+        // 内容只在**顶点数变化**时才变（索引是 `0..N`、命令里只有 `indexCount` 随 N 变）
+        // ⇒ 与顶点缓冲同一套「句柄 + 内容相同就跳过」的复用判据；稳态每帧零上传、零分配。
+        // 顺序：先建/扩容（可能重建 ⇒ 句柄变化 ⇒ 记录自动作废），再按需重传，最后发屏障。
+        let mut indirect_draw = None;
+        let mut index_uploaded_now = false;
+        let mut indirect_uploaded_now = false;
+        if !unified.is_empty() {
+            let vertex_count = unified.len() as u32;
+            let index_bytes = vertex_count as u64 * 4; // u32 索引
+            let mut index_slot = self.index.take();
+            self.ensure_vertex_capacity(
+                &mut index_slot,
+                index_bytes,
+                VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                "vkCreateBuffer(index)",
+            )?;
+            self.index = index_slot;
+            let index_handle = self
+                .index
+                .as_ref()
+                .expect("ensure 之后必有缓冲")
+                .buffer
+                .handle();
+            let query = DrawIndexedIndirectCommand::for_vertex_count(vertex_count);
+            let index_changed = !matches!(
+                &self.uploaded_indices,
+                Some((h, n)) if *h == index_handle && *n == vertex_count
+            );
+            if index_changed {
+                let mem = self
+                    .index
+                    .as_ref()
+                    .expect("ensure 之后必有缓冲")
+                    .memory
+                    .handle();
+                self.upload_buffer_bytes(
+                    mem,
+                    &DrawIndexedIndirectCommand::sequential_indices(vertex_count),
+                    "vkMapMemory(index)",
+                )?;
+                // 计数与真实调用同处（索引缓冲的写入刚发生）
+                self.stats.index_uploads += 1;
+                self.uploaded_indices = Some((index_handle, vertex_count));
+                index_uploaded_now = true;
+            }
+
+            let mut indirect_slot = self.indirect.take();
+            self.ensure_vertex_capacity(
+                &mut indirect_slot,
+                std::mem::size_of::<DrawIndexedIndirectCommand>() as u64,
+                VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                "vkCreateBuffer(indirect)",
+            )?;
+            self.indirect = indirect_slot;
+            let indirect_handle = self
+                .indirect
+                .as_ref()
+                .expect("ensure 之后必有缓冲")
+                .buffer
+                .handle();
+            let command_changed = !matches!(
+                &self.uploaded_indirect,
+                Some((h, c)) if *h == indirect_handle && *c == query
+            );
+            if command_changed {
+                let mem = self
+                    .indirect
+                    .as_ref()
+                    .expect("ensure 之后必有缓冲")
+                    .memory
+                    .handle();
+                self.upload_buffer_bytes(mem, &query.to_bytes(), "vkMapMemory(indirect)")?;
+                // 计数与真实调用同处（间接命令的写入刚发生）
+                self.stats.indirect_uploads += 1;
+                self.uploaded_indirect = Some((indirect_handle, query));
+                indirect_uploaded_now = true;
+            }
+            indirect_draw = Some(indirect_handle);
         }
 
         // SAFETY: `self.cmd` 是 `new()` 里从本结构的命令池分配出来的主命令缓冲句柄，仍然有效；
@@ -1768,6 +2092,21 @@ impl GpuGeometryRenderer {
                 .buffer
                 .handle();
             self.emit_host_to_vertex_barrier(h);
+        }
+        //   ★ 同样地，索引/间接缓冲**这一帧真的重传了**才发各自的屏障
+        //   （没重传 = 没有新的主机写入；上一次那条屏障已经给同一块缓冲建立过依赖）。
+        if index_uploaded_now {
+            let h = self.index.as_ref().expect("刚上传过 ⇒ 缓冲在").buffer.handle();
+            self.emit_host_buffer_barrier(h, index_buffer_barrier_params());
+        }
+        if indirect_uploaded_now {
+            let h = self
+                .indirect
+                .as_ref()
+                .expect("刚上传过 ⇒ 缓冲在")
+                .buffer
+                .handle();
+            self.emit_host_buffer_barrier(h, indirect_buffer_barrier_params());
         }
 
         let clear_value = vk::ClearValue {
@@ -1816,6 +2155,14 @@ impl GpuGeometryRenderer {
                 let vb = self.vertex.as_ref().expect("有统一顶点 ⇒ 缓冲已上传");
                 let offset: vk::DeviceSize = 0;
                 (self.fns.cmd_bind_vertex_buffers)(self.cmd, 0, 1, &vb.buffer.handle(), &offset);
+                // 索引缓冲：`u32` 索引、偏移 0（`VK_INDEX_TYPE_UINT32` = 1）。
+                let ib = self.index.as_ref().expect("有统一顶点 ⇒ 索引缓冲已就绪");
+                (self.fns.cmd_bind_index_buffer)(
+                    self.cmd,
+                    ib.buffer.handle(),
+                    0,
+                    VK_INDEX_TYPE_UINT32,
+                );
                 // `set 0 / binding 0`：**恒有**（图集或 1×1 哑纹理，见 `dummy_texture`）。
                 // 统一片元着色器无条件采样 ⇒ 少了这条绑定就是未定义行为（驱动不必报错）。
                 (self.fns.cmd_bind_descriptor_sets)(
@@ -1828,9 +2175,21 @@ impl GpuGeometryRenderer {
                     0,
                     std::ptr::null(),
                 );
-                (self.fns.cmd_draw)(self.cmd, unified.len() as u32, 1, 0, 0);
+                // ★ **间接绘制**（M3+ 第 4 项下半）：命令来自那块间接缓冲，而不是主机给的数字。
+                //   `drawCount = 1`、`stride = size_of::<VkDrawIndexedIndirectCommand>()`。
+                //   两个计数都写在**这一行调用旁边** ⇒ 换回 `vkCmdDraw`（或删掉）时
+                //   `indirect_draws` 必然掉到 0（`draw_calls` 是派发次数，两种发法都算）。
+                let indirect_handle = indirect_draw.expect("有统一顶点 ⇒ 间接缓冲已就绪");
+                (self.fns.cmd_draw_indexed_indirect)(
+                    self.cmd,
+                    indirect_handle,
+                    0,
+                    1,
+                    std::mem::size_of::<DrawIndexedIndirectCommand>() as u32,
+                );
                 // 计数与真实调用同处（B1）
                 self.stats.draw_calls += 1;
+                self.stats.indirect_draws += 1;
             }
             (self.fns.cmd_end_render_pass)(self.cmd);
         }
@@ -1914,6 +2273,8 @@ impl GpuGeometryRenderer {
         // **提交前**把状态标成「在飞」：从这里到 `resolve` 之间任何失败都意味着
         // 「未知 GPU 状态」，不允许再复用资源（见 `SubmitState`）。
         self.sync.begin();
+        // 计数与真实调用同处：删掉这行提交就必然删掉计数（「一帧一提交」的可断言口径）。
+        self.stats.submits += 1;
         // SAFETY: 队列与命令缓冲都有效；`submit` 在栈上存活；栅栏用于同步。
         if let Err(e) = check("vkQueueSubmit", unsafe {
             (self.fns.queue_submit)(self.queue, 1, &submit, self.fence.handle())
@@ -2003,6 +2364,81 @@ mod tests {
         assert_eq!(s.pipeline_switches, 0);
         assert_eq!(s.buffer_uploads, 0);
         assert_eq!(s.buffer_allocations, 0);
+        assert_eq!(s.submits, 0);
+        assert_eq!(s.indirect_draws, 0);
+        assert_eq!(s.index_uploads, 0);
+        assert_eq!(s.indirect_uploads, 0);
+    }
+
+    /// **间接绘制的两条屏障**必须确切是：
+    /// - 索引：`HOST`/`HOST_WRITE` → `VERTEX_INPUT(0x4)`/`INDEX_READ(0x2)`
+    /// - 间接：`HOST`/`HOST_WRITE` → `DRAW_INDIRECT(0x2)`/`INDIRECT_COMMAND_READ(0x1)`
+    ///
+    /// 变异验证（**已实测**，见任务报告）：
+    /// ① 把间接那条的 `dst_stage` 改成 `VERTEX_INPUT`（一个非常自然的「和顶点一样就行」笔误）
+    ///    ⇒ 本测试**变红**；② 把 `INDEX_READ` 写成 `INDIRECT_COMMAND_READ` ⇒ 也变红。
+    /// 这两种写法**不会**被驱动或校验层拒绝（屏障照样被接受），只会让它建的依赖不覆盖
+    /// 真正读那块缓冲的阶段 —— 属于本项目最怕的「加了屏障但没用」。
+    #[test]
+    fn index_and_indirect_barrier_params_pin_the_exact_masks() {
+        let idx = index_buffer_barrier_params();
+        assert_eq!(idx.src_stage, 1 << 14, "srcStageMask 必须是 HOST");
+        assert_eq!(idx.dst_stage, 0x4, "索引在顶点装配阶段被读 ⇒ VERTEX_INPUT(0x4)");
+        assert_eq!(idx.src_access, 1 << 14, "srcAccessMask 必须是 HOST_WRITE");
+        assert_eq!(idx.dst_access, 0x2, "dstAccessMask 必须是 INDEX_READ(0x2)");
+
+        let ind = indirect_buffer_barrier_params();
+        assert_eq!(ind.src_stage, 1 << 14, "srcStageMask 必须是 HOST");
+        assert_eq!(
+            ind.dst_stage, 0x2,
+            "间接命令在 DRAW_INDIRECT(0x2) 阶段被读 —— **不是** VERTEX_INPUT(0x4)"
+        );
+        assert_eq!(ind.src_access, 1 << 14, "srcAccessMask 必须是 HOST_WRITE");
+        assert_eq!(
+            ind.dst_access, 0x1,
+            "dstAccessMask 必须是 INDIRECT_COMMAND_READ(0x1) —— 不是 INDEX_READ(0x2)"
+        );
+
+        // 显式钉住「这两个位数值相同但枚举不同」这一条容易看错的事实
+        assert_eq!(
+            VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_INDEX_READ_BIT,
+            "阶段位 / 访问位是两套枚举：DRAW_INDIRECT(0x2) 与 INDEX_READ(0x2) 数值相同不是笔误"
+        );
+        assert_ne!(ind.dst_stage, idx.dst_stage, "两者的目标阶段必须不同");
+        assert_ne!(ind.dst_access, idx.dst_access, "两者的目标访问必须不同");
+    }
+
+    /// **纹理 quad 的 uv/朝向是纯逻辑**（不需要 GPU）：上下方向与左右方向都要对。
+    ///
+    /// 变异验证（**已实测**）：把 `v` 改成 `1.0 - v`（经典 V 翻转）⇒ 本测试**变红**；
+    /// 把 `u` 改成 `1.0 - u` ⇒ 也变红。
+    #[test]
+    fn textured_quad_uv_is_top_down_and_left_to_right() {
+        let extent = Extent { width: 8, height: 8 };
+        let quad = RectI::new(2, 2, 4, 4);
+        let vs = textured_quad_vertices(extent, 4, 4, quad, Color::rgb(1, 2, 3));
+        assert_eq!(vs.len(), 6, "两个三角形 = 6 个顶点");
+
+        // 4×4 纹理铺到 4×4 quad ⇒ 像素 (2,2)（quad 左上）必须采到 uv≈(0,0)
+        let tl = vs[0];
+        assert_eq!(tl.pos, [2.0 * 2.0 / 8.0 - 1.0, 2.0 * 2.0 / 8.0 - 1.0], "左上角 NDC");
+        assert_eq!(tl.uv, [0.0, 0.0], "quad 左上角 ⇒ 纹理左上角（**不做 V 翻转**）");
+        // 右上角（x1, y0）⇒ uv = (1, 0)
+        assert_eq!(vs[1].uv, [1.0, 0.0]);
+        // 右下角（x1, y1）⇒ uv = (1, 1)
+        assert_eq!(vs[2].uv, [1.0, 1.0]);
+        // 左下角（x0, y1）⇒ uv = (0, 1)
+        assert_eq!(vs[5].uv, [0.0, 1.0]);
+
+        // 采样支的判别符：`uv.x >= 0` 才走采样（形状段用 SHAPE_UV_SENTINEL = (-1,-1)）
+        assert!(
+            vs.iter().all(|v| !v.is_shape()),
+            "纹理 quad 必须全部落在**采样支**（否则片元着色器不采样）"
+        );
+
+        // 退化输入：空矩形 / 0 尺寸纹理 ⇒ 不产出顶点（与 `emit_quad` 的「裁剪后为空」一致）
+        assert!(textured_quad_vertices(extent, 4, 4, RectI::new(0, 0, 0, 4), Color::WHITE).is_empty());
+        assert!(textured_quad_vertices(extent, 0, 4, quad, Color::WHITE).is_empty());
     }
 
     /// **I1 的回归判据（fix round 2 / R1-1）**：屏障的四个掩码必须**确切**是

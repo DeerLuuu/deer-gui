@@ -201,6 +201,12 @@ fn stats_delta(before: RenderStats, after: RenderStats) -> RenderStats {
         pipeline_switches: after.pipeline_switches - before.pipeline_switches,
         buffer_uploads: after.buffer_uploads - before.buffer_uploads,
         buffer_allocations: after.buffer_allocations - before.buffer_allocations,
+        // M3+ 第 4 项下半新增的判据（间接绘制 / 索引 / 提交）：窗口路径也要能看见
+        // —— 少了这几个字段，那个 struct 字面量就编译不过（这本身就是「计数被删就会红」）。
+        submits: after.submits - before.submits,
+        indirect_draws: after.indirect_draws - before.indirect_draws,
+        index_uploads: after.index_uploads - before.index_uploads,
+        indirect_uploads: after.indirect_uploads - before.indirect_uploads,
     }
 }
 
@@ -309,6 +315,10 @@ impl Parity {
                 pipeline_switches: delta.pipeline_switches / n,
                 buffer_uploads: delta.buffer_uploads / n,
                 buffer_allocations: delta.buffer_allocations / n,
+                submits: delta.submits / n,
+                indirect_draws: delta.indirect_draws / n,
+                index_uploads: delta.index_uploads / n,
+                indirect_uploads: delta.indirect_uploads / n,
             },
             unify_calls_per_frame: unify_calls / n,
             unify_vertices_per_frame: unify_verts / n,
@@ -597,6 +607,17 @@ impl App for Parity {
                 r.stats_per_frame.pipeline_switches,
                 r.stats_per_frame.buffer_uploads,
                 r.stats_per_frame.buffer_allocations
+            );
+            // ★ M3+ 第 4 项下半：**间接绘制**的可数证据（窗口路径与离屏同一套计数）。
+            //   `indirect_draws` 必须等于 `draw_calls`（每一次绘制都走 indirect）；
+            //   稳态下 `buffer_allocations`/`index_uploads` 应该都是 0（跨帧复用）。
+            println!(
+                "      每帧间接绘制（M3+ 第 4 项下半）：submits {} / indirect_draws {} / \
+                 index_uploads {} / indirect_uploads {}",
+                r.stats_per_frame.submits,
+                r.stats_per_frame.indirect_draws,
+                r.stats_per_frame.index_uploads,
+                r.stats_per_frame.indirect_uploads
             );
             // ★ B5-3：窗口路径的 CPU 侧读数（`unify` 调用/顶点数）+ 描述符**真实指向**
             println!(
