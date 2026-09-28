@@ -25,29 +25,40 @@
 //!    （`InteractiveRenderer` 给每个有几何的节点发 `NodeHint`；`DefaultRenderer` **不发**
 //!    ⇒ 那份快照会是空的，「全不裁剪」而**看不出来**）。所以 `init` 里先断言快照非空。
 //!
-//! # 关于重绘策略（M5b 后重写：这里不再假设「每帧都会被调」）
+//! # 关于重绘策略（M5c 后重写：`OnDemand` 下也能重放了）
 //!
 //! M5b 起 `deer-window` 的事件循环是 `ControlFlow::Wait`（没有事件就睡死），重绘时机由
 //! [`App::redraw_policy`] 的声明决定：
 //!
 //! | 声明 | 语义 |
 //! |---|---|
-//! | `OnDemand`（库默认，省电） | 只有 [`App::wants_redraw`] 为真（**这条输入改了状态**）或系统事件才请求一帧 |
+//! | `OnDemand`（库默认，省电） | 只有 [`App::wants_redraw`] 为真（**这条输入改了状态**）、系统事件、**或 App 自己排的唤醒**才来一帧 |
 //! | `Continuous` | 每画完一帧续下一帧（= M5b 之前那条无条件 `ControlFlow::Poll` 的语义） |
 //!
-//! 本示例**声明 `Continuous`**，因为脚本重放必须**自己推进**：`deer-window` 没有给 App
-//! 定时器 / 用户事件（`EventLoopProxy`）这类「自己唤醒事件循环」的手段（见它的模块文档
-//! 「诚实的边界」），而脚本重放期间窗口一个真实输入都没有 ⇒ `OnDemand` 下它只会拿到建窗
-//! 引导帧那 1 帧：脚本卡在第 2 步、进程不退出（M5b-A2 实测：目标 5 条语句，35 s 超时被杀）。
-//! **这是接口边界，不是本示例在偷懒**；要在 `OnDemand` 下重放，得先给窗口层加「用户事件」面。
+//! 本示例**默认声明 `Continuous`**（脚本重放必须**自己推进**），另有一条 **M5c 的省电重放档**：
 //!
-//! 但「状态没变就不重绘」这条判据**没有降级**，它现在是两层、且共用同一份判据（同一个 `dirty`）：
+//! ```sh
+//! cmd /c "set DEER_FORM_ONDEMAND=1 && set DEER_VK_WINDOW_TESTS=1 && cargo run -q -p deer-gui --features window --example interactive_form"
+//! ```
+//!
+//! > **历史**（M5b 时写在这里的话）：「`deer-window` 没有给 App 定时器 / 用户事件这类『自己唤醒
+//! > 事件循环』的手段 ⇒ 脚本重放期间窗口一个真实输入都没有，`OnDemand` 下它只会拿到建窗引导帧
+//! > 那 1 帧：脚本卡在第 2 步、进程不退出（M5b-A2 实测：目标 5 条语句，35 s 超时被杀）。
+//! > **这是接口边界，不是本示例在偷懒**；要在 `OnDemand` 下重放，得先给窗口层加「用户事件」面。」
+//! > —— M5c 把那个面加上了（`App::wake_handle` + [`Waker`]），这条边界**不再存在**：现在
+//! > `OnDemand` 档用 `Waker::wake_after`（**deadline**，不睡线程）逐帧推进脚本，跑完还能
+//! > 证明「空闲期一帧都不画」。
+//!
+//! `OnDemand` 档的推进方式（**与真实输入共用同一个入口**）：建窗引导帧喂第 1 条脚本事件，
+//! 之后**每画完一帧排一次 `wake_after(STEP)`** ⇒ 到点被唤醒 ⇒ 一帧 ⇒ 再喂一条。
+//! 「状态没变就不重绘」这条判据**没有降级**，它现在是两层、且共用同一份判据（同一个 `dirty`）：
 //!
 //! 1. **App 侧**：`redraw()` 先查 `dirty`，不脏就**不碰 GPU**、只记一笔 `false` ——
 //!    `redraw_log` / `painted` / `skipped` 就是这层的账本（`finish_script` 里断言）；
 //! 2. **窗口层**：`wants_redraw()` 返回**同一份** `dirty` ⇒ `OnDemand` 下窗口层也不会为
 //!    「没改状态」的输入请求帧（本示例声明连续，所以这一层在这里只影响账本的 `skipped` 计数；
-//!    窗口层「空闲零重绘」的完整演示是 `cargo run -p deer-window --example idle_probe`）。
+//!    窗口层「空闲零重绘」的完整演示是 `cargo run -p deer-window --example idle_probe`，
+//!    唤醒面的演示是 `cargo run -p deer-window --example wake_probe`）。
 //!
 //! **脚本事件与真实窗口事件走同一个输入入口**（[`Form::handle_input`]）：状态机、命中、置脏、
 //! 记账只有一份实现 ⇒「脚本重放」与「人手点」不可能漂；脚本推进是「输入进来了」这件事本身，
@@ -56,6 +67,7 @@
 use std::collections::VecDeque;
 use std::path::Path;
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use deer_gui::gpu::interact::{FieldText, InteractState, InteractiveRenderer};
 use deer_gui::gpu::measure::find_system_font;
@@ -68,7 +80,7 @@ use deer_gui::layout::layout::{self, Geometry, Measure, TextStyle};
 use deer_gui::layout::node::{Kind, Node, Rect};
 use deer_gui::prelude::*;
 use deer_gui::vk::windowed::{FrameOutcome, WindowedRenderer};
-use deer_gui::window::{App, Flow, RedrawPolicy, WindowConfig, WindowInfo, run};
+use deer_gui::window::{App, Flow, RedrawPolicy, Waker, WindowConfig, WindowInfo, run};
 
 /// 清屏色（离屏对照与上屏用同一个值）。
 const CLEAR: Color = Color::rgb(0x08, 0x09, 0x0c);
@@ -76,6 +88,18 @@ const CLEAR: Color = Color::rgb(0x08, 0x09, 0x0c);
 /// 窗口尺寸（脚本里的坐标与它同一套物理像素口径）。
 const WIDTH: u32 = 420;
 const HEIGHT: u32 = 220;
+
+/// M5c 省电重放档的开关（`DEER_FORM_ONDEMAND=1`；**先 `trim()` 再比**，理由见 [`window_tests_enabled`]）。
+const ONDEMAND_ENV: &str = "DEER_FORM_ONDEMAND";
+
+/// 省电重放档每步之间的间隔（`Waker::wake_after` 的 deadline；**不睡线程**）。
+const STEP: Duration = Duration::from_millis(20);
+
+/// 脚本跑完之后的**安静窗口**：这期间不排任何唤醒，用来证明「OnDemand 下空闲零重绘」。
+const QUIET: Duration = Duration::from_millis(400);
+
+/// 安静窗口的**下限比例**：墙钟到点了才算数（winit 的定时器可能早一点点醒）。
+const QUIET_MIN_RATIO: f64 = 0.8;
 
 /// 内置脚本（没设 `DEER_INPUT_SCRIPT` 时用它）—— 它**有期望终态**，所以是断言的一部分。
 ///
@@ -259,6 +283,24 @@ struct Form {
     /// 环境变量给的自定义脚本模板（`None` ⇒ 用内置脚本，那个有期望终态）。
     script_src: Option<String>,
     done: bool,
+    /// **M5c 省电重放档**：声明 `OnDemand` 并用 [`Waker`]（deadline）推进脚本。
+    ondemand: bool,
+    /// 建窗后从 [`App::wake_handle`] 拿到的唤醒句柄（`OnDemand` 档的推进器）。
+    waker: Option<Waker>,
+    /// `wake_after` 排了几次（可数与核对：**每画完一帧排一次**）。
+    wake_after_calls: u64,
+    /// 安静窗口（`OnDemand` 档：脚本跑完之后的「什么都不做」那段）。
+    quiet: Option<Quiet>,
+    /// `wants_redraw` 被窗口层问了几次（`OnDemand` 档应当**一次都没有**：没输入、没 `wake()`）。
+    ///
+    /// 用 `Cell`：问它的地方是 `wants_redraw(&self)` —— 那里改不了自己的字段（接口事实）。
+    wants_asked: std::cell::Cell<u64>,
+}
+
+/// 安静窗口的现场：起点 + 起点时的帧数（用来证明「窗口内**零**重绘」）。
+struct Quiet {
+    started: Instant,
+    frames_at_start: u64,
 }
 
 impl Form {
@@ -324,15 +366,15 @@ impl Form {
             // 注意：这一帧**没有画过**任何输入 ⇒ 不记账（`step_script` 拿到 `Exit` 就直接返回），
             // 所以它不会去和「重绘次数」对账（见 `finish_script` 的口径）。
             println!(
-                "{} ⇒ 收尾并退出",
+                "{} ⇒ 收尾",
                 if source == Source::Script {
                     "脚本里的 Escape"
                 } else {
                     "窗口按 Esc"
                 }
             );
-            self.finish_script()?;
-            return Ok(Flow::Exit);
+            // M5c：收尾走 `exit_or_quiet` —— `Continuous` 档直接退，`OnDemand` 档先进安静窗口。
+            return self.exit_or_quiet();
         }
         Ok(Flow::Continue)
     }
@@ -359,6 +401,117 @@ impl Form {
         self.fed_events += 1;
         self.fed_changed.push(self.state != before);
         Ok(Some(Flow::Continue))
+    }
+
+    /// **一帧画完之后**（M5c 的 `OnDemand` 档）：排下一次唤醒，好让脚本继续推进。
+    ///
+    /// 这就是「`OnDemand` 下自己推进」的全部秘密：**不睡线程**，只装一个 deadline ——
+    /// `deer-window` 平时仍然睡在 `ControlFlow::Wait` 上，到点由系统叫醒（`wake_probe` 量过：
+    /// 预约迟到 < 2ms，两次唤醒之间零 CPU）。
+    ///
+    /// 排的时机是「**每画完一帧**排一次」⇒ 帧的序列与 `Continuous` 档**逐帧同构**
+    /// （所以 `finish_script` 那套帧账判据一个字都不用改）；区别只在两帧之间**真的睡着了**。
+    fn schedule_step(&mut self) {
+        if !self.ondemand {
+            return;
+        }
+        // ⚠️ 收尾之后**不许**再排「下一步」的唤醒：`exit_or_quiet` 已经排了安静窗口那一次，
+        // 再插一个更早的（`STEP` < `QUIET`）会让安静窗口提前结束 —— 那条判据（窗口时长 ≥ 0.8×QUIET）
+        // 就是逮这个的（本地实测：漏了这一行时窗口只有 20ms ⇒ 判据红，措辞是「更可能是事件循环在打转」）。
+        if self.done || self.quiet.is_some() {
+            return;
+        }
+        let Some(waker) = self.waker.clone() else {
+            println!("[interactive_form] ⚠️ 没有唤醒句柄 ⇒ 脚本推不动（不该发生：OnDemand 档必须有）");
+            return;
+        };
+        self.wake_after_calls += 1;
+        waker.wake_after(STEP);
+        println!("[interactive_form] 排下一次唤醒：wake_after({}ms)（deadline，不睡线程）", STEP.as_millis());
+    }
+
+    /// 脚本**喂完**之后的收尾：先断言（[`Form::finish_script`]），再按档决定怎么退。
+    ///
+    /// - `Continuous` 档（默认）：直接 `Flow::Exit`（与 M5b 行为逐字一致）；
+    /// - `OnDemand` 档：进**安静窗口** —— 排**唯一**一次 `wake_after(QUIET)`，期间不排任何别的
+    ///   唤醒、也没有输入。**窗口内一帧都不许画**，窗口到点那一帧进来时在 `redraw` 顶部
+    ///   的 `done` 分支里处理（只断言、不画、不碰 GPU）。
+    fn exit_or_quiet(&mut self) -> Result<Flow, String> {
+        self.finish_script()?;
+        if !self.ondemand {
+            return Ok(Flow::Exit);
+        }
+        let Some(waker) = self.waker.clone() else {
+            return Err(format!(
+                "{ONDEMAND_ENV} 档必须先拿到 Waker（App::wake_handle 没被调用？）"
+            ));
+        };
+        self.quiet = Some(Quiet { started: Instant::now(), frames_at_start: self.rendered });
+        self.wake_after_calls += 1;
+        waker.wake_after(QUIET);
+        println!();
+        println!(
+            "[interactive_form] 安静窗口：{}ms —— 期间**不排任何**唤醒、没有输入、不碰 GPU；\
+             到点那一帧只做断言（wake_after 累计 {} 次）",
+            QUIET.as_millis(),
+            self.wake_after_calls
+        );
+        Ok(Flow::Continue)
+    }
+
+    /// 安静窗口**结束**那一帧（`redraw` 顶部 `done` 分支调用）：只断言，不画。
+    ///
+    /// 两条判据（都是可数的）：
+    ///
+    /// 1. **窗口内重绘 = 0 帧**（`rendered` 在这段时间里一次都没涨）；
+    /// 2. 墙钟**真的等够**了（≥ [`QUIET_MIN_RATIO`] × [`QUIET`]）—— 否则「零重绘」可能只是因为
+    ///    事件循环根本没睡。
+    ///
+    /// 另外报出 `wants_redraw` 被问了几次：`OnDemand` 档没输入、没 `wake()` ⇒ 必须是 **0**
+    /// （窗口层只在「输入」与「`wake()`」两处问它）。
+    fn finish_quiet(&mut self) -> Result<Flow, String> {
+        let quiet = self.quiet.take().expect("调用方已确认 quiet 是 Some");
+        let elapsed = quiet.started.elapsed();
+        let painted = self.rendered - quiet.frames_at_start;
+        let floor = QUIET.mul_f64(QUIET_MIN_RATIO);
+        println!();
+        println!("—— 安静窗口结束（OnDemand：由一次 wake_after 到点叫醒）——");
+        println!(
+            "窗口时长    : {}ms（要求 ≥ {}ms = {}×{}ms）",
+            elapsed.as_millis(),
+            floor.as_millis(),
+            QUIET_MIN_RATIO,
+            QUIET.as_millis()
+        );
+        println!("窗口内重绘  : {painted} 帧（要求 **0**）");
+        println!(
+            "wants_redraw 被问 : {} 次（要求 **0** —— 没输入、没 wake()）",
+            self.wants_asked.get()
+        );
+        println!("wake_after 累计   : {} 次", self.wake_after_calls);
+        if painted != 0 {
+            return Err(format!(
+                "安静窗口内重绘了 {painted} 帧 —— OnDemand 下空闲**必须零重绘**（有人在凭空唤它）"
+            ));
+        }
+        if elapsed < floor {
+            return Err(format!(
+                "安静窗口只等了 {}ms（要求 ≥ {}ms）⇒ 这不是「睡到点」，更可能是事件循环在打转",
+                elapsed.as_millis(),
+                floor.as_millis()
+            ));
+        }
+        if self.wants_asked.get() != 0 {
+            return Err(format!(
+                "安静窗口里 wants_redraw 被问了 {} 次（要求 0）—— 本档没有输入、也没叫 wake()",
+                self.wants_asked.get()
+            ));
+        }
+        println!(
+            "空闲期零重绘断言 ✅：{painted} 帧 / {}ms 空闲，事件循环真的睡着（OnDemand 没被削弱）",
+            elapsed.as_millis()
+        );
+        Ok(Flow::Exit)
     }
 
     /// 脚本结束：**先打印真实数据，再打期望值，最后断言**。
@@ -515,6 +668,13 @@ impl App for Form {
 
         // 首帧必然要画（窗口刚建好）。
         self.dirty = true;
+        if self.ondemand {
+            println!(
+                "[interactive_form] M5c 省电重放档：{ONDEMAND_ENV}=1 ⇒ 声明 OnDemand，\
+                 脚本由 Waker::wake_after({}ms) 的 deadline 推进（不睡线程）",
+                STEP.as_millis()
+            );
+        }
         Ok(())
     }
 
@@ -556,22 +716,47 @@ impl App for Form {
     /// 「状态真的变了才置脏」置上，由 `redraw` 画完清掉）⇒「窗口层要不要请求一帧」与
     /// 「App 要不要碰 GPU」共用一份判据，两处不可能漂。
     ///
-    /// `OnDemand` 下这就是省电的开关（本示例声明连续，所以这里只影响窗口层账本的
+    /// `OnDemand` 下这就是省电的开关（本示例默认声明连续，所以这里只影响窗口层账本的
     /// `skipped` 计数；窗口层的省电演示见 `cargo run -p deer-window --example idle_probe`）。
+    /// M5c：顺手数一下它**被问了几次** —— `OnDemand` 重放档里必须是 **0**（没输入、也没叫
+    /// `wake()` ⇒ 窗口层没有问它的理由），见 [`Form::finish_quiet`]。
     fn wants_redraw(&self) -> bool {
+        // `&self` 改不了自己的字段 ⇒ 计数走 `Cell`（只加一个计数，不改 `dirty` 本身）。
+        self.wants_asked.set(self.wants_asked.get() + 1);
         self.dirty
     }
 
-    /// **M5b：显式声明 `Continuous`** —— 本示例的脚本重放必须**自己推进**（见模块文档）。
+    /// **M5c 的 `OnDemand` 重放档**：建窗后拿到唤醒句柄，存下来。
     ///
-    /// `OnDemand` 下 `deer-window` 只给建窗引导帧 + 系统事件，而脚本重放期间没有任何真实输入
-    /// ⇒ 脚本会卡在第 2 步、进程不退出（M5b-A2 实测：35 s 超时被杀）。
+    /// 注意这里**不**立刻排唤醒 —— 推进链是从**建窗引导帧**起步的（那一帧喂第 1 条脚本事件、
+    /// 然后排第一次 `wake_after`）。这样帧的序列与 `Continuous` 档**逐帧同构**，
+    /// 没有「引导帧与第一次唤醒抢时序」这种竞态。
+    fn wake_handle(&mut self, waker: Waker) {
+        println!(
+            "[interactive_form] wake_handle：拿到唤醒句柄（{}）",
+            if self.ondemand {
+                format!("{ONDEMAND_ENV}=1 ⇒ 省电重放档：OnDemand + Waker（deadline）推进")
+            } else {
+                format!("未设 {ONDEMAND_ENV} ⇒ 常规档声明 Continuous，本档用不到唤醒面（照旧存下来）")
+            }
+        );
+        self.waker = Some(waker);
+    }
+
+    /// **M5b/M5c：重绘策略**。
     ///
-    /// 代价说清楚：`Continuous` 每画完一帧都请求下一帧（空闲也烧 CPU）。**但「不脏就不画」
-    /// 没有丢**：`redraw` 先查 `dirty`，不脏的帧一帧都不碰 GPU（`redraw_log` 里的 `false`
-    /// 就是它），而 [`App::wants_redraw`] 把同一份判据交给窗口层。
+    /// - 默认（`Continuous`）：脚本重放必须自己推进，M5b 只能靠「每画完一帧续一帧」；
+    /// - `DEER_FORM_ONDEMAND=1`（省电重放档）：声明 `OnDemand`，改由 [`Waker::wake_after`]
+    ///   的 **deadline** 推进（见模块文档「关于重绘策略」）。
+    ///
+    /// 代价说清楚：`Continuous` 每画完一帧都请求下一帧（空闲也烧 CPU）。`OnDemand` 档没有这个
+    /// 代价 —— 两帧之间事件循环**真的睡着**（`wake_probe` 量过：预约迟到 < 2ms、迭代次数个位数）。
     fn redraw_policy(&self) -> RedrawPolicy {
-        RedrawPolicy::Continuous
+        if self.ondemand {
+            RedrawPolicy::OnDemand
+        } else {
+            RedrawPolicy::Continuous
+        }
     }
 
     /// 画一帧（**只在 `dirty` 时真的碰 GPU**）。
@@ -588,6 +773,10 @@ impl App for Form {
     /// 以及 `OutOfDate` 时重新置脏）。
     fn redraw(&mut self) -> Result<Flow, String> {
         if self.done {
+            // M5c 的 `OnDemand` 档：脚本已经喂完，这一帧是**安静窗口到点**那一帧 —— 只断言。
+            if self.quiet.is_some() {
+                return self.finish_quiet();
+            }
             return Ok(Flow::Exit);
         }
         if !self.dirty {
@@ -600,11 +789,12 @@ impl App for Form {
                 self.rendered
             );
             return match stepped {
-                Some(flow) => Ok(flow),
-                None => {
-                    self.finish_script()?;
-                    Ok(Flow::Exit)
+                Some(Flow::Continue) => {
+                    self.schedule_step();
+                    Ok(Flow::Continue)
                 }
+                Some(Flow::Exit) => Ok(Flow::Exit),
+                None => self.exit_or_quiet(),
             };
         }
         self.redraw_log.push(true);
@@ -649,11 +839,12 @@ impl App for Form {
         }
         self.last_skipped = Some(skipped);
         match stepped {
-            Some(flow) => Ok(flow),
-            None => {
-                self.finish_script()?;
-                Ok(Flow::Exit)
+            Some(Flow::Continue) => {
+                self.schedule_step();
+                Ok(Flow::Continue)
             }
+            Some(Flow::Exit) => Ok(Flow::Exit),
+            None => self.exit_or_quiet(),
         }
     }
 
@@ -765,12 +956,20 @@ fn pixel_numbers(theme: &Theme, extent: Extent) -> Result<(), String> {
 fn main() -> ExitCode {
     let theme = Theme::default();
     let script_src = std::env::var(ENV_VAR).ok().filter(|s| !s.trim().is_empty());
+    // M5c 省电重放档：**先 `trim()` 再比**（`cmd` 的 `set X=1 && …` 会把空格算进值里）。
+    let ondemand = deer_gui::env_gate::flag(ONDEMAND_ENV);
     match &script_src {
         Some(_) => println!("[{ENV_VAR}] 已给出 ⇒ 脚本化重放（重放期间忽略窗口事件）"),
         None => {
             println!("没有设 {ENV_VAR} ⇒ 交互模式：自己点、按 Tab 移焦点、打字、Esc 退出");
             println!("             内置脚本（会自动重放）：{BUILTIN_SCRIPT}");
         }
+    }
+    if ondemand {
+        println!(
+            "[interactive_form] 省电重放档：{ONDEMAND_ENV} 已设 ⇒ OnDemand + Waker（deadline）推进\
+             （M5b 时这条在接口上做不到：那时窗口层没有「自己唤醒事件循环」的手段）"
+        );
     }
     if !window_tests_enabled() {
         // 与既有窗口类 example 同一约定：**退出码 0 但明确写着「这不是通过」**。
@@ -796,6 +995,11 @@ fn main() -> ExitCode {
         renderer: None,
         script_src,
         done: false,
+        ondemand,
+        waker: None,
+        wake_after_calls: 0,
+        quiet: None,
+        wants_asked: std::cell::Cell::new(0),
     };
     let result = run(
         WindowConfig::new("M5-4 交互闭环（输入 → 命中 → 状态 → 重绘）", WIDTH, HEIGHT),

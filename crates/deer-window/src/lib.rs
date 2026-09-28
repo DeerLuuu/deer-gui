@@ -10,18 +10,43 @@
 //! ## 用法
 //!
 //! ```no_run
+//! use std::time::{Duration, Instant};
+//!
 //! use deer_window::{
-//!     App, Flow, InputEvent, Key, RedrawPolicy, WindowConfig, WindowInfo, run,
+//!     App, Flow, InputEvent, Key, RedrawPolicy, Waker, WindowConfig, WindowInfo, run,
 //! };
 //!
-//! struct MyApp;
+//! struct MyApp {
+//!     /// M5c：建窗后由 [`App::wake_handle`] 交过来的唤醒句柄（不实现那个方法就一直是 `None`）。
+//!     waker: Option<Waker>,
+//!     /// M5c：定时动画「下一帧要画的时间」（拉式的 [`App::next_deadline`] 报的就是它）。
+//!     deadline: Option<Instant>,
+//! }
 //!
 //! impl App for MyApp {
 //!     fn init(&mut self, info: &WindowInfo) -> Result<(), String> {
 //!         println!("窗口 {}x{}，HWND=0x{:X}", info.extent.width, info.extent.height, info.raw.handle);
 //!         Ok(()) // 这里创建 Vulkan 设备 / 交换链（deer-vk 只吃 info.raw）
 //!     }
+//!     /// M5c：建好窗后**调一次**，把唤醒句柄交给你 —— **存下来**就能在 `OnDemand`（省电）
+//!     /// 下被非窗口事件唤醒。默认实现什么都不做（老实现一行都不用改）。
+//!     fn wake_handle(&mut self, waker: Waker) {
+//!         println!("拿到唤醒句柄：省电模式下也能按时间被叫醒");
+//!         self.waker = Some(waker);
+//!     }
+//!     /// M5c：**我希望被唤醒的最近时刻**（拉式；默认 `None` = 不需要，事件循环就睡死）。
+//!     /// ⚠️ 必须给出**固定**的时刻并自己往前推（别返回 `Instant::now() + …`，理由见模块文档）。
+//!     fn next_deadline(&self) -> Option<Instant> {
+//!         self.deadline
+//!     }
 //!     fn redraw(&mut self) -> Result<Flow, String> {
+//!         self.deadline = None; // 这一帧画完了 ⇒ 先把上一个预约撤掉
+//!         // 60fps 的定时动画：这一帧画完，**排下一次唤醒**（不睡线程 —— 只装一个 deadline）。
+//!         // 两种写法等价：这里用推式的 `wake_after`，也可以改成
+//!         // `self.deadline = Some(Instant::now() + Duration::from_millis(16));`（拉式）。
+//!         if let Some(waker) = &self.waker {
+//!             waker.wake_after(Duration::from_millis(16));
+//!         }
 //!         Ok(Flow::Continue)
 //!     }
 //!     fn input(&mut self, _info: &WindowInfo, ev: &InputEvent) -> Result<Flow, String> {
@@ -41,13 +66,17 @@
 //!     }
 //!     /// M5b：重绘策略。默认 `OnDemand`（省电，空闲时零重绘）；
 //!     /// 要连续动画的实现返回 `Continuous`（每画完一帧续下一帧，空闲也烧 CPU）。
+//!     /// **M5c 起**：按时间自己推进的动画**不必**再退化成 `Continuous` —— 用 [`Waker`] 即可。
 //!     fn redraw_policy(&self) -> RedrawPolicy {
 //!         RedrawPolicy::OnDemand
 //!     }
 //! }
 //!
 //! # fn main() -> Result<(), String> {
-//! run(WindowConfig::new("demo", 800, 600), MyApp)
+//! run(
+//!     WindowConfig::new("demo", 800, 600),
+//!     MyApp { waker: None, deadline: None },
+//! )
 //! # }
 //! ```
 //!
@@ -68,8 +97,16 @@
 //!
 //! ## 重绘策略（M5b：从「连续重绘」改成「事件驱动重绘」）
 //!
-//! 事件循环用 [`ControlFlow::Wait`] —— **纯阻塞**：没有事件就睡死。**不**用 `WaitUntil` 兜底，
-//! 超时唤醒就是隐藏的空转，省电模式会名存实亡。置位规则一共四条：
+//! 事件循环默认用 [`ControlFlow::Wait`] —— **纯阻塞**：没有事件就睡死。**不**用 `WaitUntil` 兜底，
+//! 超时唤醒就是隐藏的空转，省电模式会名存实亡。
+//!
+//! ⚠️ **唯一的例外是 App 自己显式声明的 deadline**（M5c，见下面「唤醒面」一节）：那时用
+//! `WaitUntil(那个时刻)`。这**不是**被否掉的那种「兜底」—— 兜底是**本层凭空造**一个超时
+//! （没有谁要求过 ⇒ 纯空转）；deadline 是 **App 自己要求在那个时刻醒来**。**没人声明就一个
+//! 纳秒的超时都不设**（[`ControlFlow::Wait`]，睡死）。这两句话看着像自相矛盾，所以专门写进
+//! 文档：**先读「唤醒面」那节，再回来看这里**。
+//!
+//! 置位规则一共五条：
 //!
 //! | 触发 | 是否请求重绘 |
 //! |---|---|
@@ -77,6 +114,8 @@
 //! | **系统事件**（`Resized` / `Focused` / `Occluded(false)` 窗口重新暴露 / 建窗后的引导帧） | **一律**请求（不经过 `wants_redraw`） |
 //! | `RedrawRequested` 到达 | 才调 [`App::redraw`]（一帧画一次；不请求就一帧都不画） |
 //! | [`RedrawPolicy::Continuous`] | 每画完一帧再请求下一帧 |
+//! | **唤醒**：[`Waker::wake`] | 与输入**同一把尺**：问 [`App::wants_redraw`]，答真才请求 |
+//! | **唤醒**：deadline 到点（[`Waker::wake_after`] / [`App::next_deadline`]） | **一律**请求（不经过 `wants_redraw`，理由见「唤醒面」） |
 //!
 //! 默认是 [`RedrawPolicy::OnDemand`]（省电）：空闲时**零重绘**，CPU 不再空转。
 //! **运行时开关**：环境变量 [`REDRAW_ENV`]（`DEER_WINDOW_REDRAW`）取值 `continuous` ⇒
@@ -97,17 +136,63 @@
 //! [deer-window] 重绘账本：requests=<请求重绘次数> skipped=<输入没改状态被跳过的帧数> frames=<成功画过的帧数>
 //! ```
 //!
-//! **诚实的边界**：`OnDemand` 下 App **没有**任何「主动唤醒事件循环」的手段（本层不提供
-//! 定时器 / 用户事件）—— 需要按时间自己推进的动画只能声明 [`RedrawPolicy::Continuous`]。
-//! 给 App 一个 `EventLoopProxy`（用户事件）是后续里程碑的事，本层不假装有。
+//! ## 唤醒面（M5c：App 可以**自己**唤醒事件循环）
+//!
+//! > M5b 的诚实边界曾是：「`OnDemand` 下 App **没有**任何『主动唤醒事件循环』的手段（本层不
+//! > 提供定时器 / 用户事件）—— 需要按时间自己推进的动画只能声明 [`RedrawPolicy::Continuous`]；
+//! > 给 App 一个 `EventLoopProxy`（用户事件）是后续里程碑的事，本层不假装有。」
+//! > **这一段现在过时了** —— 这一节就是它的替代品（M5c 交付）。
+//!
+//! [`App::wake_handle`] 在建窗后**调一次**，把可克隆的 [`Waker`] 交给 App（**默认实现什么都不
+//! 做** ⇒ M5c 之前写的 `App` 实现一行都不用改）。三个手段：
+//!
+//! | 手段 | 语义 | 到的时候画不画 |
+//! |---|---|---|
+//! | [`Waker::wake`] | 「**看一眼**」（提示性：也许别的地方改了状态） | 与输入同一把尺：问 [`App::wants_redraw`]，**答真才画** |
+//! | [`Waker::wake_after(d)`] | 「**d 之后叫醒我**」（预约：定时动画 / 脚本重放） | 到点**一律**画一帧 |
+//! | [`App::next_deadline`] | 同上，但是**拉**式（App 声明「我希望被唤醒的最近时刻」） | 到点**一律**画一帧 |
+//!
+//! **为什么 deadline 到点一律画一帧、而 `wake()` 要先问 `wants_redraw`**：本层**没有**
+//! 「唤醒回调」—— App 能对唤醒做出反应的**唯一**地方就是 [`App::redraw`]。若 deadline 到点还
+//! 要先问 `wants_redraw` 为真，App 就得在**预约的那一刻**预先把自己标脏（而且 `wants_redraw`
+//! 是 `&self`、根本改不了自己的状态）⇒ 定时动画会被逼成「预约时先置脏」这种绕圈子的写法。
+//! 所以一刀切开：**`wake_after` / `next_deadline` 是 App 自己下的单**（「那个时刻请叫我」）
+//! ⇒ 到了就画；**`wake()` 是提示**（「看看有没有变化」）⇒ 没变化就不画。
+//!
+//! **这「不是」先前被否掉的 `WaitUntil` 兜底**（最容易被读成自相矛盾的一条，单独说一遍）：
+//! 被否掉的是**本层凭空造超时** —— 没人要求、到点也没事干，纯粹空转。现在本层**只在 App
+//! 显式声明了 deadline 时**才用 `WaitUntil`，而**声明这个动作是 App 主动做的**：它不声明，
+//! 本层就 [`ControlFlow::Wait`] 睡死。**开机不会自己醒来，只有 App 说「那个时刻叫我」才醒。**
+//! 「唤醒账本」里的 `iters` 就是这条承诺的可数证据：**空闲时事件循环迭代次数必须是个位数**，
+//! 若退化成超时打转，它会一秒涨上千（`wake_probe` 示例与 `tests/wake_policy.rs` 都数它）。
+//!
+//! 两条 **⚠️ 使用须知**（都是「App 自己的要求」的直接后果，不是本层的 bug）：
+//!
+//! 1. **`next_deadline()` 必须给出固定的时刻、并且自己往前走**：别每次都返回
+//!    `Instant::now() + 50ms` —— 那样它**永远不到点**，事件循环每 50ms 醒一次却一帧都不画
+//!    （空转，正是本节开头反对的那种）。要「每 50ms 来一次」就用 [`Waker::wake_after`]：
+//!    在 [`App::redraw`] 里排下一次（推式）。
+//! 2. **已过期**的 deadline 视为「立刻到点」⇒ 画一帧。App 若不把它清掉/往前推，就等于自己
+//!    要求连续重绘（那就是 [`RedrawPolicy::Continuous`] 的语义 —— 本层照做，账本上会看见
+//!    `fired` 跟着 `iters` 一起涨）。
+//!
+//! 结束时的**唤醒账本**（可数；`wake_probe` 与 `tests/wake_policy.rs` 数的就是它）：
+//!
+//! ```text
+//! [deer-window] 唤醒账本：wake=<wake()投递到达> wake_after=<wake_after()投递到达> fired=<deadline到点> requested=<唤醒面请求的重绘次数> skipped=<wake()答假而没请求> iters=<事件循环迭代次数>
+//! ```
+//!
+//! **仍未做（别当成已实现）**：自定义用户事件类型（对外**只有** [`Waker`] 这一个面 —— `Wake`
+//! 是私有类型，App 拿不到 `EventLoopProxy::send_event`）、跨进程唤醒、多窗口唤醒。
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use deer_gpu::Extent;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key as KeyboardKey, ModifiersState, NamedKey};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle as RwhRawWindowHandle};
 use winit::window::{Window, WindowId};
@@ -242,6 +327,220 @@ pub fn resolve_redraw_policy(app_policy: RedrawPolicy, raw: Option<&str>) -> Red
     match raw.and_then(parse_redraw_policy) {
         Some(RedrawPolicy::Continuous) => RedrawPolicy::Continuous,
         _ => app_policy,
+    }
+}
+
+// ——————————————— M5c：唤醒面（用户事件 + deadline）———————————————
+
+/// winit 的**用户事件**类型：**私有**（本轮不开自定义用户事件面 —— 「Not Doing」）。
+///
+/// App 那一侧只看得到 [`Waker`]；winit 的类型与这个枚举都不进回调签名（与 [`InputEvent`] 同一条纪律）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Wake {
+    /// [`Waker::wake`]：立刻醒来看一眼。
+    Look,
+    /// [`Waker::wake_after`]：装一个 deadline（到点由事件循环自己醒）。
+    ///
+    /// 带上**绝对**时刻而不是 `Duration`：走一趟通道/消息队列也要时间，用相对量会让每次唤醒
+    /// 都往后漂一点（要做 60fps 的定时动画时，那种漂移会累积）。
+    At(Instant),
+}
+
+/// **可克隆的唤醒句柄**（M5c）：App 在建好窗后由 [`App::wake_handle`] 拿到，存下来即可在
+/// [`RedrawPolicy::OnDemand`]（省电）下被**非窗口事件**唤醒（定时动画、脚本重放、别的线程改状态）。
+///
+/// 它是 winit `EventLoopProxy` 的**薄封装**：App 拿不到 `send_event`，也就没法往里塞自定义事件
+/// （本轮刻意不做）。语义见模块文档的「唤醒面」一节；两个方法的**分工**尤其别混：
+/// [`Waker::wake`] 是提示（答真才画），[`Waker::wake_after`] 是预约（到点一定画）。
+///
+/// **`Send`**：可以搬到别的线程里去叫醒主线程（方法都是 `&self`）；编译期有一处断言钉着它
+/// （见本文件末尾的 `const _: fn()`）。**不沿用「也保证 `Sync`」这个说法** —— 在 Windows 上
+/// 它今天**恰好**同时满足 `Sync`（winit 只为 Windows 写了 `unsafe impl Send`，`Sync` 是字段
+/// 自动推导出来的巧合），但不是 winit 的承诺，本层**不依赖**它：要跨线程共享就每个线程
+/// 各 `clone()` 一份。
+#[derive(Clone)]
+pub struct Waker {
+    proxy: EventLoopProxy<Wake>,
+}
+
+impl Waker {
+    /// 立刻唤醒事件循环。
+    ///
+    /// 醒来之后**问一次** [`App::wants_redraw`]：**答真才请求一帧，答假就一帧都不画**。
+    /// 所以「多叫一声」不会毁掉省电（也不会漏帧）—— 这是它与 [`Waker::wake_after`] 的分工。
+    /// 典型用法：后台线程更新了共享状态，叫主线程起来看一眼。
+    ///
+    /// 事件循环**已经结束**时（`send_event` 返回 `Err(EventLoopClosed)`）**静默丢弃**：那时 App
+    /// 正在退出，没有可报告的对象；本层纪律是**不 panic**。除此之外不会失败。
+    pub fn wake(&self) {
+        let _ = self.proxy.send_event(Wake::Look);
+    }
+
+    /// **`d` 之后**唤醒事件循环一次（定时唤醒：定时动画 / 脚本重放的推进器）。
+    ///
+    /// **用 deadline 实现，不睡线程**：只是把「`now + d`」交给事件循环（后台线程调用也一样），
+    /// 事件循环平时仍然睡在 [`ControlFlow::Wait`] 上，到点由系统叫醒 ⇒ **两次唤醒之间零 CPU**。
+    ///
+    /// 与 [`Waker::wake`] 的语义**不同**：这是 App **自己下的单**（「那个时刻请叫我」）⇒ 到点
+    /// **一律**画一帧（不看 [`App::wants_redraw`]，理由见模块文档「唤醒面」）。调用它本身
+    /// **不画**：只装 deadline。
+    ///
+    /// 排了多次也不会打架：取**最近**的那个（早的先到点），到点后由 App 在 [`App::redraw`] 里
+    /// 排下一次。已经过期的时刻视为「立刻到点」。
+    pub fn wake_after(&self, d: Duration) {
+        let _ = self.proxy.send_event(Wake::At(Instant::now() + d));
+    }
+}
+
+/// `Waker` 的 `Debug`：只说「有个句柄」，不把内部代理打出来（与 winit 自己那份一致）。
+impl std::fmt::Debug for Waker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad("Waker { .. }")
+    }
+}
+
+/// **编译期断言**：`Waker` 必须是 `Send`（可以搬到别的线程里去叫醒事件循环）。
+///
+/// 依据：winit 0.30.13 的 Windows 后端有
+/// `unsafe impl<T: Send + 'static> Send for EventLoopProxy<T>`
+/// （本机源码 `winit-0.30.13/src/platform_impl/windows/event_loop.rs:820`）。
+///
+/// **`Sync` 故意不断言**：本层不用它（见 [`Waker`] 的说明）。若哪天 winit 去掉了那个
+/// `unsafe impl Send`，这里会立刻编译失败 —— 那正是我们要的（`Send` 是承诺，不是碰巧）。
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<Waker>();
+};
+
+/// 一轮「该睡多久」的**纯逻辑**答案（[`plan_wake`] 的返回值，可单测）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WakePlan {
+    /// 没有任何 deadline ⇒ **睡死**（[`ControlFlow::Wait`]）。**这是省电模式的默认值**：
+    /// 本层不造任何超时（「App 不声明就不给 timeout」）。
+    Wait,
+    /// 有一个**未来**的 deadline ⇒ 睡到那个时刻（[`ControlFlow::WaitUntil`]）。
+    WaitUntil(Instant),
+    /// deadline 已经**到点**（含已过期——过期的时刻视为「现在」）⇒ 立刻醒来画一帧。
+    Due,
+}
+
+/// 取两个可选时刻里**更早**的那个（`None` 不参与比较；两个都 `None` ⇒ `None`）。
+///
+/// `Waker::wake_after` 可以排多次、[`App::next_deadline`] 又可能另给一个 ⇒ 需要一个
+/// 「谁先到点听谁的」的合并规则，且只有这一处实现（免得推式/拉式两条路各写一遍、迟早分叉）。
+pub fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
+    match (a, b) {
+        (Some(x), Some(y)) => Some(if x <= y { x } else { y }),
+        (Some(x), None) | (None, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+/// **唤醒计划**（纯函数，不碰窗口）：`now` 时刻，面对「推来的 deadline」与「App 声明的 deadline」
+/// 该收敛到哪个 [`ControlFlow`]。
+///
+/// 规则只有三条（顺序即优先级）：
+///
+/// 1. 两个都没有 ⇒ [`WakePlan::Wait`]（**省电**：睡死，不造超时）；
+/// 2. 更早的那个在 `now` **之后** ⇒ [`WakePlan::WaitUntil`]（睡到那个时刻）；
+/// 3. 更早的那个在 `now` **或之前** ⇒ [`WakePlan::Due`]（到点/已过期 ⇒ 立刻画一帧）。
+pub fn plan_wake(now: Instant, armed: Option<Instant>, declared: Option<Instant>) -> WakePlan {
+    match earliest(armed, declared) {
+        None => WakePlan::Wait,
+        Some(at) if at <= now => WakePlan::Due,
+        Some(at) => WakePlan::WaitUntil(at),
+    }
+}
+
+/// 唤醒面的**账本**（[`run()`] 收尾打的那行「唤醒账本」就是它；`tests/wake_policy.rs` 数的也是它）。
+///
+/// 与 [`FrameCounter`] 同一纪律：**只能通过这几个方法加计数**（「请求次数」只有一个真相来源），
+/// 判定逻辑（[`WakeStats::on_look`]）也放在这里，示例与单测数的是**同一份实现**。
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct WakeStats {
+    looks: u64,
+    arms: u64,
+    fired: u64,
+    requested: u64,
+    skipped: u64,
+    iters: u64,
+}
+
+impl WakeStats {
+    pub fn new() -> WakeStats {
+        WakeStats::default()
+    }
+
+    /// [`Waker::wake`] **投递到达**（事件循环真的收到了这一声）。
+    ///
+    /// 决策与输入走同一把尺：`wants_redraw` 为真 ⇒ 记一次请求并返回 `true`；为假 ⇒ 记一次
+    /// 「唤醒被跳过」（`skipped`）并返回 `false`。
+    ///
+    /// 为什么**不**复用 [`FrameCounter::on_input`] 的 `skipped`：那一格的口径是「**派发了一条
+    /// 输入**但没请求重绘」，`wake()` 不是输入 ⇒ 混进去会让那条口径失去意义（文档与验收都在按
+    /// 它数）。两条账各数各的，名字也不一样。
+    pub fn on_look(&mut self, wants_redraw: bool) -> bool {
+        self.looks += 1;
+        if wants_redraw {
+            self.requested += 1;
+            true
+        } else {
+            self.skipped += 1;
+            false
+        }
+    }
+
+    /// [`Waker::wake_after`] **投递到达**：只装 deadline，**不**请求（到点才请求）。
+    pub fn on_arm(&mut self) {
+        self.arms += 1;
+    }
+
+    /// deadline **到点**：**一律**请求一帧 ⇒ `fired` 与 `requested` **同步 +1**（这条不变量
+    /// 有单测钉着：到点就一定有一次请求，两者不许漂）。
+    pub fn on_fire(&mut self) {
+        self.fired += 1;
+        self.requested += 1;
+    }
+
+    /// 事件循环**迭代一次**（= `about_to_wait` 被调用一次）：**空转探针**。
+    ///
+    /// 省电空闲下它应当只有**个位数**（建窗那几轮）。若哪天退化成「超时打转」，这个数会一秒
+    /// 涨上千 —— 而 `frames`/`wants_redraw` 那套**抓不住**这种空转（没人请求重绘，一帧都不会多画，
+    /// 只有 CPU 在烧）。这就是本轮的省电护栏为什么必须带一个「迭代次数」。
+    pub fn note_iter(&mut self) {
+        self.iters += 1;
+    }
+
+    /// `Waker::wake` 的投递到达次数。
+    pub fn looks(&self) -> u64 {
+        self.looks
+    }
+
+    /// `Waker::wake_after` 的投递到达次数（= 装了几次 deadline）。
+    pub fn arms(&self) -> u64 {
+        self.arms
+    }
+
+    /// deadline 到点的次数。
+    pub fn fired(&self) -> u64 {
+        self.fired
+    }
+
+    /// 唤醒面**请求重绘**的次数（`wake()` 答真 + deadline 到点）。与 `frames` 不一定相等：
+    /// 请求要等 `RedrawRequested` 到达才变成一帧（winit 会把重复请求合并）—— 口径与
+    /// [`FrameCounter::redraw_requests`] 一致。
+    pub fn requested(&self) -> u64 {
+        self.requested
+    }
+
+    /// `wake()` 问了 [`App::wants_redraw`] 但**答假**、因此没请求重绘的次数。
+    pub fn skipped(&self) -> u64 {
+        self.skipped
+    }
+
+    /// 事件循环迭代次数（空转探针，见 [`WakeStats::note_iter`]）。
+    pub fn iters(&self) -> u64 {
+        self.iters
     }
 }
 
@@ -494,6 +793,45 @@ pub trait App {
     fn redraw_policy(&self) -> RedrawPolicy {
         RedrawPolicy::OnDemand
     }
+
+    /// **唤醒句柄**（M5c）：窗口建好后**调一次**，把 [`Waker`] 交给你 —— **存下来**。
+    ///
+    /// 默认实现**什么都不做** ⇒ M5c 之前写的 `App` 实现一行都不用改（它们拿不到句柄，
+    /// 想做按时间的动画就仍然只能声明 [`RedrawPolicy::Continuous`]）。
+    ///
+    /// 调用时机（可依赖的三条）：
+    ///
+    /// 1. 在 [`App::init`] **成功之后**（渲染器已经建好了，可以立刻排一个唤醒）；
+    /// 2. 在**建窗引导帧**之前；
+    /// 3. **只调一次** —— 与 `init` 共用「建窗只做一次」的保证（`resumed` 在部分平台会重复到达）。
+    ///
+    /// 拿到之后就有三个手段（语义见模块文档「唤醒面」）：[`Waker::wake`]（提示）、
+    /// [`Waker::wake_after`]（预约）、[`App::next_deadline`]（拉式预约）。
+    fn wake_handle(&mut self, waker: Waker) {
+        // 默认实现什么都不做。参数名保持易读（不改成 `_waker`），用 `let _` 消化掉 unused 警告。
+        let _ = waker;
+    }
+
+    /// **我希望被唤醒的最近时刻**（M5c，**拉**式）：`Some(t)` ⇒ 事件循环用
+    /// `ControlFlow::WaitUntil(t)` 睡到 `t`，**到点画一帧**（不看 [`App::wants_redraw`]，
+    /// 理由见模块文档「唤醒面」）；`None`（**默认**）⇒ 不装 deadline，事件循环在
+    /// [`ControlFlow::Wait`] 上睡死（**省电**）。
+    ///
+    /// 它每轮事件循环收敛时都可能被问一次（`resumed` / 收到用户事件 / `about_to_wait`），
+    /// 所以实现要**便宜、无副作用**（`&self`：它不该在这里改状态；要改状态就等
+    /// [`App::redraw`]）。
+    ///
+    /// ⚠️ **必须给出固定的时刻、并且自己往前走**（两条都是踩过的坑，写进接口文档）：
+    ///
+    /// - **别**每次都返回 `Instant::now() + 50ms`：那样它**永远不到点** —— 事件循环每 50ms 醒
+    ///   一次、却一帧都不画（空转，正是本层反对的东西）。「每 50ms 画一帧」请用
+    ///   [`Waker::wake_after`]：在 [`App::redraw`] 里排下一次（推式）。
+    /// - 已经**过期**的时刻视为「立刻到点」⇒ 立刻画一帧；App 不清掉它，就等于自己要求
+    ///   连续重绘（那是 [`RedrawPolicy::Continuous`] 的语义）。账本上会看见 `fired` 跟着
+    ///   `iters` 一起涨 —— 那不是本层空转，是 App 自己下的单。
+    fn next_deadline(&self) -> Option<Instant> {
+        None
+    }
 }
 
 /// 帧数 + 重绘请求数 + 跳过帧数 + 退出标记 —— [`run()`] 内部账本的**纯逻辑核心**（不碰窗口，可直接单测）。
@@ -646,8 +984,10 @@ fn window_info(window: &Window) -> Result<WindowInfo, String> {
 /// - 启动时（自证重绘策略真的解析对了）：
 ///   `[deer-window] 重绘策略：请求=<环境变量原值|未设> 实际=<OnDemand|Continuous>（App 声明=<…>）`；
 /// - 结束时（数得出来的账本）：
-///   `[deer-window] 事件循环结束：frames=<n> extent=<w>x<h> result=ok|error` 与
-///   `[deer-window] 重绘账本：requests=<n> skipped=<n> frames=<n>`。
+///   `[deer-window] 事件循环结束：frames=<n> extent=<w>x<h> result=ok|error`、
+///   `[deer-window] 重绘账本：requests=<n> skipped=<n> frames=<n>` 与
+///   `[deer-window] 唤醒账本：wake=<n> wake_after=<n> fired=<n> requested=<n> skipped=<n> iters=<n>`
+///   （M5c 起；`iters` = 事件循环迭代次数，**空闲时必须是低值**，它是「没在空转」的可数证据）。
 pub fn run<A: App + 'static>(config: WindowConfig, app: A) -> Result<(), String> {
     // 重绘策略在这里定，**在建 EventLoop 之前**：策略 = App 自己声明的 + 环境变量的覆盖，
     // 与窗口无关 ⇒ 就算建窗失败，自证那行也已经打出来了。
@@ -656,8 +996,17 @@ pub fn run<A: App + 'static>(config: WindowConfig, app: A) -> Result<(), String>
     let policy = resolve_redraw_policy(app_policy, requested.as_deref());
     print_redraw_policy(requested.as_deref(), app_policy, policy);
 
-    let event_loop =
-        EventLoop::new().map_err(|e| format!("创建 winit EventLoop 失败（run() 必须在主线程调用）：{e}"))?;
+    // M5c：**带用户事件**建事件循环（这才是「App 能自己唤醒本层」的底座）。
+    // 事件类型是本层**私有**的 `Wake`（`EventLoopProxy` 不对 App 开放）⇒ 用
+    // `with_user_event()` 而不是 `EventLoop::new()`；`EventLoop<()>` 那条路没有 proxy。
+    // `build()` 收 `&mut self` ⇒ 先落到一个局部变量上（临时的也能编译，但这样读起来不靠运气）。
+    let mut builder = EventLoop::<Wake>::with_user_event();
+    let event_loop = builder
+        .build()
+        .map_err(|e| format!("创建 winit EventLoop 失败（run() 必须在主线程调用）：{e}"))?;
+    // 句柄在建窗**之前**就取好：`resumed` 里才有东西交给 App（`App::wake_handle`）。
+    let waker = Waker { proxy: event_loop.create_proxy() };
+
     let mut handler = RunHandler {
         config,
         app,
@@ -671,6 +1020,9 @@ pub fn run<A: App + 'static>(config: WindowConfig, app: A) -> Result<(), String>
         ime_composing: false,
         error: None,
         exiting: false,
+        waker,
+        armed: None,
+        wake_stats: WakeStats::new(),
     };
 
     // run_app 的返回值也要接住：只有把它和回调错误合并起来，错误才不会被吞。
@@ -735,6 +1087,16 @@ struct RunHandler<A: App> {
     /// 已经请求 `event_loop.exit()`：同一批事件里后面的回调不再处理，
     /// 这样「帧数」就是 App 真正要求画的帧数，不会被 `exit()` 之后的残留事件多加。
     exiting: bool,
+    /// 交给 App 的唤醒句柄（`resumed` 里 clone 一份给 [`App::wake_handle`]）。
+    waker: Waker,
+    /// [`Waker::wake_after`] **推**来的最近 deadline（`None` = 没推过，或被兑现后清掉了）。
+    ///
+    /// 与「App 声明的那个」（[`App::next_deadline`]，每轮现问）分开存：推来的这个**本层**负责
+    /// 清（兑现一次就清，否则同一个时刻会被反复算成「到点」⇒ 空转）；拉式的那个是 App 的状态，
+    /// 本层**不动**它（App 自己往前走，见 `next_deadline` 的 ⚠️）。
+    armed: Option<Instant>,
+    /// 唤醒面的账本（收尾那行「唤醒账本」）。
+    wake_stats: WakeStats,
 }
 
 impl<A: App> RunHandler<A> {
@@ -745,6 +1107,37 @@ impl<A: App> RunHandler<A> {
             self.error = Some(msg);
         }
         event_loop.exit();
+    }
+
+    /// **唯一**决定「睡多久」的地方（`resumed` / `user_event` / `about_to_wait` 都调它，实现只有这一份）。
+    ///
+    /// 收敛规则就在纯函数 [`plan_wake`] 里（有真值表单测），这里只做「按计划行动」：
+    ///
+    /// - [`WakePlan::Wait`] ⇒ [`ControlFlow::Wait`]（**睡死**：本层不造任何超时 —— 省电模式）；
+    /// - [`WakePlan::WaitUntil(t)`] ⇒ `WaitUntil(t)`（睡到那一刻，期间零 CPU）；
+    /// - [`WakePlan::Due`] ⇒ 记一次 `fired`（连带 `requested`）→ **无条件**请求一帧 →
+    ///   把**推来的**那个 deadline 清掉（App 自己下的单：到点就该画；清掉是为了不空转）
+    ///   → 本轮先 `Wait`（下一轮由 App 在 `redraw` 里重装下一个 deadline）。
+    ///
+    /// 为什么每个事件批次之后都要重新收敛（而不是只在 `resumed` 里设一次）：deadline 会变
+    /// （App 声明改了、`wake_after` 刚推来一个），`ControlFlow` 是**当前**那一轮的状态。
+    fn refresh_control_flow(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        let armed = self.armed;
+        let declared = self.app.next_deadline();
+        match plan_wake(now, armed, declared) {
+            WakePlan::Wait => event_loop.set_control_flow(ControlFlow::Wait),
+            WakePlan::WaitUntil(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+            WakePlan::Due => {
+                // 兑现一次：推来的那个清掉（拉式的由 App 自己负责往前走）。
+                if armed.is_some_and(|t| t <= now) {
+                    self.armed = None;
+                }
+                self.wake_stats.on_fire();
+                self.request_redraw();
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+        }
     }
 
     /// 把一条输入事件交给 `App::input`，并按**置位规则**决定要不要请求重绘。
@@ -783,8 +1176,9 @@ impl<A: App> RunHandler<A> {
 
     /// 请求重绘 + **记账**（`request_redraw()` 的**唯一**落点 ⇒ 「请求次数」只有一个真相来源）。
     ///
-    /// 只有三种触发：输入置位、系统事件（含 `Resized`/`Focused`/窗口暴露/建窗引导帧）、
-    /// `Continuous` 的续帧。窗口还没建时只记账（没有窗口可请求，也没别的地方会读这个数）。
+    /// 触发一共四种：输入置位、系统事件（含 `Resized`/`Focused`/窗口暴露/建窗引导帧）、
+    /// `Continuous` 的续帧、以及**唤醒面**（`wake()` 答真 / deadline 到点，M5c）。
+    /// 窗口还没建时只记账（没有窗口可请求，也没别的地方会读这个数）。
     fn request_redraw(&mut self) {
         self.counter.note_request();
         if let Some(window) = &self.window {
@@ -810,6 +1204,18 @@ impl<A: App> RunHandler<A> {
             self.counter.skipped_frames(),
             self.counter.frames(),
         );
+        // M5c 的唤醒账本（再单列一行，同样不打乱上面两行）：`iters` 是**空转探针** ——
+        // 省电空闲下它必须是小数字；退化成「超时打转」时 `frames` 抓不住（没人请求重绘），
+        // 只有这个数会一秒涨上千。
+        println!(
+            "[deer-window] 唤醒账本：wake={} wake_after={} fired={} requested={} skipped={} iters={}",
+            self.wake_stats.looks(),
+            self.wake_stats.arms(),
+            self.wake_stats.fired(),
+            self.wake_stats.requested(),
+            self.wake_stats.skipped(),
+            self.wake_stats.iters(),
+        );
         match err {
             Some(e) => Err(e),
             None => Ok(()),
@@ -826,7 +1232,7 @@ enum Gate {
     Always,
 }
 
-impl<A: App + 'static> ApplicationHandler for RunHandler<A> {
+impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.error.is_some() || self.window.is_some() {
             // 已经出过错就不再建窗；`resumed` 在部分平台会被多次调用，窗口只建一次。
@@ -865,15 +1271,23 @@ impl<A: App + 'static> ApplicationHandler for RunHandler<A> {
             return self.fail(event_loop, format!("App::init 失败：{e}"));
         }
 
+        // M5c：把唤醒句柄交给 App（**建窗后调一次**，在 `init` 之后、引导帧之前）。
+        // 默认实现什么都不做 ⇒ M5c 之前写的 App 一行都不用改。
+        self.app.wake_handle(self.waker.clone());
+
         // IME：winit 要求**显式允许**才会发 `Ime` 事件（`Ime::Commit` 是中文/日文输入的
         // 文本来源）。不开的话 CJK 输入在本层完全收不到 —— 那就与「输入通路已接通」相反。
         window.set_ime_allowed(true);
 
-        // **纯阻塞**：没有事件就睡死（旧版是 `Poll`：一直空转问「有没有事」）。
-        // 刻意**不**用 `WaitUntil` 兜底 —— 超时唤醒就是隐藏的空转，省电模式会名存实亡。
-        event_loop.set_control_flow(ControlFlow::Wait);
         self.info = Some(info);
         self.window = Some(window);
+
+        // **纯阻塞**：没有事件就睡死（旧版是 `Poll`：一直空转问「有没有事」）。
+        // 刻意**不**用 `WaitUntil` 兜底 —— 超时唤醒就是隐藏的空转，省电模式会名存实亡。
+        // 唯一的例外是 App **自己声明**的 deadline（M5c）：那时用 `WaitUntil(那个时刻)`，
+        // 由 `refresh_control_flow` 按 `App::next_deadline` / `Waker::wake_after` 收敛。
+        // App 什么都没声明 ⇒ 走 `Wait` 这一支（与 M5b 逐字同行为）。
+        self.refresh_control_flow(event_loop);
 
         // **引导帧**：winit 对「建窗后一定发一条 `RedrawRequested`」**没有保证**
         // （见 winit 0.30 `Window::request_redraw` 的「no strong guarantees」），
@@ -881,6 +1295,53 @@ impl<A: App + 'static> ApplicationHandler for RunHandler<A> {
         // 否则窗口会一直留一块没画过的区域，`Continuous` 的续帧链也根本起不来。
         // 这是一次性的引导，不是空转：之后要么由输入/系统事件置位，要么由 `Continuous` 续帧。
         self.request_redraw();
+    }
+
+    /// **用户事件到达**（唯一来源是本层的 [`Waker`]；`Wake` 是私有类型，App 塞不进来别的）。
+    ///
+    /// 两条路（语义差异见模块文档「唤醒面」，别把两者写成一样）：
+    ///
+    /// - `Wake::Look`（[`Waker::wake`]）：**与输入同一把尺** —— 先问 [`App::wants_redraw`]，
+    ///   答真才请求一帧（答假记一次 `skipped`，**不**混进输入的「跳过帧」口径）；
+    /// - `Wake::At(t)`（[`Waker::wake_after`]）：只**装** deadline（记一次 `arms`），
+    ///   **不画** —— 到点由 [`RunHandler::refresh_control_flow`] 兑现（那时才请求）。
+    ///
+    /// 收尾处**显式重算** `ControlFlow`：`wake_after` 的 deadline 就是在这一刻装上的。
+    /// 不靠「`about_to_wait` 反正马上会来一次」——那种依赖 winit 事件顺序的推理，
+    /// 读代码的人不该被迫做。
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Wake) {
+        if self.error.is_some() || self.exiting {
+            return;
+        }
+        match event {
+            Wake::Look => {
+                let wants = self.app.wants_redraw();
+                if self.wake_stats.on_look(wants) {
+                    self.request_redraw();
+                }
+            }
+            Wake::At(at) => {
+                self.wake_stats.on_arm();
+                // 排了多次取最近的那个：早的先到点。
+                self.armed = earliest(self.armed, Some(at));
+            }
+        }
+        self.refresh_control_flow(event_loop);
+    }
+
+    /// 每轮事件循环的收口：**记一次迭代** + 收敛 `ControlFlow`（含 deadline 到点的兑现）。
+    ///
+    /// 为什么放在这里而不是 `new_events`：`AboutToWait` 是 winit 在**每次**要睡下去之前
+    /// 必发的事件（`NewEvents` 只在从 OS 收到新事件时发）—— 「该睡多久」正该在这时候定。
+    /// 迭代计数（`iters`）也在这儿数：它就是「空闲时事件循环醒了几次」这个**可数**的空转探针。
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.wake_stats.note_iter();
+        if self.error.is_some() || self.exiting {
+            // 已经在收尾（`exit()` 请求过了）：不要再请求帧，也不要再装 deadline。
+            event_loop.set_control_flow(ControlFlow::Wait);
+            return;
+        }
+        self.refresh_control_flow(event_loop);
     }
 
     fn window_event(
