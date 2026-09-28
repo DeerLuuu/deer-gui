@@ -64,11 +64,21 @@ const HEIGHT: u32 = 220;
 /// `move @button_1` 读作「指针移到 button_1 的中心」（坐标由布局算，不写死）。
 const BUILTIN_SCRIPT: &str = "move @button_1;down:left;up:left;key:Tab;text:hi";
 
+/// 门槛判定（`DEER_VK_WINDOW_TESTS` 有没有设）。
+///
+/// **为什么必须容忍两边空白**（实测数据，不是猜的）：`cmd` 的
+/// `set DEER_VK_WINDOW_TESTS=1 && cargo run …` 会把 `&&` 前的空格也算进变量值 ——
+/// `cmd /c "set DEER_VK_WINDOW_TESTS=1 && set DEER_VK_WINDOW_TESTS"` 实测打印
+/// `DEER_VK_WINDOW_TESTS=1 `（**带一个尾空格**）；写成 `set …=1&& …`（不留空格）才是不带空格的 `1`。
+/// 严格 `== "1"` 会把「**已经设了**门槛」判成「没设」⇒ 明明建了窗口、跑完了脚本、exit=0，
+/// 却打印「这不是通过，是被跳过」，**与事实相反**。所以这里 `trim()` 后再比。
 fn window_tests_enabled() -> bool {
-    matches!(
-        std::env::var("DEER_VK_WINDOW_TESTS").ok().as_deref(),
-        Some("1") | Some("true")
-    )
+    std::env::var("DEER_VK_WINDOW_TESTS")
+        .map(|v| {
+            let v = v.trim();
+            v == "1" || v.eq_ignore_ascii_case("true")
+        })
+        .unwrap_or(false)
 }
 
 /// 界面树（**确定**：id 由 `IdGen` 按树序生成 ⇒ 脚本里可以写 `button_1`/`field_1`）。
