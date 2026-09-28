@@ -15,7 +15,7 @@
 //! | `scripted_replay_is_deterministic_and_matches_expected_state` | 脚本 → 事件 → 状态：终态逐字段相等 + 重放两次逐条相同 + dirty 序列 |
 //! | `a_pointer_press_that_changes_nothing_does_not_set_dirty` | 点空白处：**没有事件**、状态却从 `None`→`None` 无变化 ⇒ `dirty=false`（「收到事件就重绘」是错的判据） |
 //! | `hits_respect_the_clip_snapshot_from_the_real_draw_list` | 快照**非空**（前置）；同一脚本在「输入框被裁掉」的快照下拿不到事件、在未裁快照下拿得到（反向自检） |
-//! | `four_states_differ_only_inside_the_expected_rectangles` | 四档状态两两像素差异**全部**落在期望矩形内，越界字节 = 0；每档矩形内差异 > 0 |
+//! | `four_states_differ_only_inside_the_expected_rectangles` | 四档状态两两像素差异**全部**落在期望矩形内，越界字节 = 0；每档矩形内差异 ≥ 登记下限；**焦点环再加一条「平均通道差 ≥ [`FOCUS_MIN_CONTRAST`]」**（细带的可见性靠对比度，不靠面积） |
 //! | `four_states_match_the_cpu_backend_offline` | 离屏 GPU vs CPU：**逐字节相同**（不透明语料） |
 //!
 //! 前置条件（每一条都**显式断言**，因为前置不成立时护栏会**静默失效**）：
@@ -567,10 +567,18 @@ fn four_states_differ_only_inside_the_expected_rectangles() {
         );
     }
 
-    // ---- 反向自检：`focused` 那条下限必须能拒绝「环与填充同色」（改前那一版）----
+    // ---- 焦点环判据（两条下限）+ 反向自检 ----
     //
-    // 同一份语料里当场把按钮焦点环的**颜色**换成按钮填充色（几何、宽度、其他命令一字不动），
-    // 再看下限会不会拒绝它。不拒绝 ⇒ 这条下限抓不住本次要修的缺陷，等于没加。
+    // 焦点环的判据是**两条**，缺一不可：
+    //   ① 按钮内差异像素数 ≥ [`FOCUS_MIN_PX`]（「环有没有**被画出来**」）；
+    //   ② 这些差异像素的**平均通道差** ≥ [`FOCUS_MIN_CONTRAST`]（「画出来了**看不看得出**」）。
+    //
+    // 为什么要第二条（本次补的漏洞，M5b 终审 Minor 1）：环是一条**细带**，它「看得见」靠的是
+    // **对比度**而不是面积。只数像素数时，「填充色提亮 5%」这种**技术上不同色、肉眼看不出**的环
+    // **照样**改掉整条环带（像素数一个不少）⇒ `deer-gpu` 单测当场红、而这条 parity 用例仍然绿。
+    //
+    // 反向自检是**同一次运行里真把环色换掉**（几何、宽度、其他命令一字不动）：两种坏环各撞一条下限，
+    // 判据必须两次都拒绝 —— 不拒绝就说明这条下限抓不住本次要修的缺陷，等于没加。
     let focused_frame = cases
         .iter()
         .find(|(n, _, _)| *n == "focused")
@@ -582,51 +590,136 @@ fn four_states_differ_only_inside_the_expected_rectangles() {
         btn.w - 2 * FOCUS_RING_INSET,
         btn.h - 2 * FOCUS_RING_INSET,
     );
+    // 前置①：焦点环**恰好一条**、矩形就是内缩那一圈、宽度就是 `FOCUS_STROKE_WIDTH`
+    //（判据的落点由它决定，错了下面全在测空气）。
     let mut owner: Option<RectI> = None;
     let mut fill = None;
-    let mut hits = 0;
-    let mut same_color = focused_frame.1.list.clone();
-    for cmd in same_color.cmds.iter_mut() {
+    let mut ring_index = None;
+    for (i, cmd) in focused_frame.1.list.cmds.iter().enumerate() {
         match cmd {
             DrawCmd::NodeHint { rect, .. } => owner = Some(*rect),
             DrawCmd::FillRoundRect { color, .. } if owner == Some(btn) => fill = Some(*color),
-            DrawCmd::StrokeRect {
-                rect,
-                color,
-                width,
-            } if owner == Some(btn) => {
+            DrawCmd::StrokeRect { rect, width, .. } if owner == Some(btn) => {
                 assert_eq!(*width, FOCUS_STROKE_WIDTH, "按钮上只允许焦点环这一条描边");
                 assert_eq!(*rect, band, "前置：焦点环的矩形就是按钮内缩 FOCUS_RING_INSET 的那一圈");
-                *color = theme.accent; // = 按钮填充色（下面显式断言）
-                hits += 1;
+                assert!(
+                    ring_index.is_none(),
+                    "前置：按钮上出现了第二条焦点环描边（判据只喂得了第一条）"
+                );
+                ring_index = Some(i);
             }
             _ => {}
         }
     }
-    assert_eq!(hits, 1, "前置：`focused` 那一帧里按钮的焦点环必须恰好一条（否则这条自检测的是空气）");
+    let ring_index = ring_index
+        .unwrap_or_else(|| panic!("前置：`focused` 那一帧里按钮必须有焦点环描边（否则这条自检测的是空气）"));
+    let fill_color = fill.expect("按钮必须有填充命令");
     assert_eq!(
-        fill.expect("按钮必须有填充命令"),
-        theme.accent,
-        "前置：按钮填充就是 accent ⇒ 「环 = accent」等于「环与填充同色」"
+        fill_color, theme.accent,
+        "前置：按钮填充就是 accent ⇒「环 = accent」等于「环与填充同色」"
     );
-    let same_px = CpuRenderer::new()
-        .render(ext, &same_color, CLEAR)
-        .expect("CPU 渲染失败")
-        .pixels;
+    let ring_color = if let DrawCmd::StrokeRect { color, .. } = &focused_frame.1.list.cmds[ring_index] {
+        *color
+    } else {
+        panic!("前置：第 {ring_index} 条命令必须是焦点环描边");
+    };
+    assert_ne!(
+        ring_color, fill_color,
+        "前置：环与填充同色 ⇒ 对比度判据测的是空气（同色时差异只剩「描边压过字形」那几像素）"
+    );
+    println!(
+        "  焦点环：命令 #{ring_index}｜环色 {ring_color:?}｜填充 {fill_color:?}｜环带 {band:?}\
+         ｜下限 {FOCUS_MIN_PX} px + 平均通道差 {FOCUS_MIN_CONTRAST:.1}"
+    );
+
+    // 焦点环的两条下限（函数化 ⇒ 同一次运行里被「实测 + 两个坏环」喂三次）。
+    let focus_verdict = |n: usize, c: f64| -> Result<(), String> {
+        if n < FOCUS_MIN_PX {
+            return Err(format!("按钮内差异 {n} px < 下限 {FOCUS_MIN_PX}"));
+        }
+        if c < FOCUS_MIN_CONTRAST {
+            return Err(format!(
+                "平均通道差 {c:.1} < 下限 {FOCUS_MIN_CONTRAST:.1} —— 环画上去了，但看不出"
+            ));
+        }
+        Ok(())
+    };
+    // 只换**环色**的两个语料（其余命令逐字节相同 ⇒ 差异只能来自环色）。
+    let with_ring_color = |c: Color| {
+        let mut l = focused_frame.1.list.clone();
+        match &mut l.cmds[ring_index] {
+            DrawCmd::StrokeRect { color, .. } => *color = c,
+            _ => unreachable!("ring_index 指向的就是焦点环描边"),
+        }
+        l
+    };
+    let render_list = |l: &DrawList| {
+        CpuRenderer::new()
+            .render(ext, l, CLEAR)
+            .expect("CPU 渲染失败")
+            .pixels
+    };
     let idle_px: &Vec<u8> = &px.iter().find(|(n, _)| *n == "idle").expect("idle 已渲染").1;
     let focused_px: &Vec<u8> = &px
         .iter()
         .find(|(n, _)| *n == "focused")
         .expect("focused 已渲染")
         .1;
-    let d_same = diff_pixels(idle_px, &same_px, ext, btn);
+
+    // ---- ② 实测：把两个数打出来，再判 ----
+    let (n_real, c_real) = mean_channel_diff(idle_px, focused_px, ext, btn);
     println!(
-        "  反向自检（按钮焦点环改回填充色）：按钮内差异 {d_same} px（可见时 {} px，下限 {FOCUS_MIN_PX}）",
-        diff_pixels(idle_px, focused_px, ext, btn),
+        "  focused 实测：按钮内差异 {n_real} px（下限 {FOCUS_MIN_PX}）｜平均通道差 {c_real:.1}\
+         （下限 {FOCUS_MIN_CONTRAST:.1}）｜判据 {:?}",
+        focus_verdict(n_real, c_real).err()
+    );
+    focus_verdict(n_real, c_real).unwrap_or_else(|e| panic!("focused 焦点环判据失败：{e}"));
+
+    // ---- ③ 坏环 a：环 = 填充色（改前那一版）⇒ 差异像素数塌掉 ⇒ 撞第①条 ----
+    let same_px = render_list(&with_ring_color(fill_color));
+    let d_same = diff_pixels(idle_px, &same_px, ext, btn);
+    let (n_same, c_same) = mean_channel_diff(idle_px, &same_px, ext, btn);
+    println!(
+        "  反向自检 a（环 = 填充色）：按钮内差异 {n_same} px（可见时 {n_real} px）｜平均通道差 {c_same:.1}\
+         ｜判据 {:?}",
+        focus_verdict(n_same, c_same).err()
+    );
+    assert_eq!(
+        n_same, d_same,
+        "前置：两条数法（`diff_pixels` / `mean_channel_diff`）必须数**同一个**像素集合"
     );
     assert!(
         d_same < FOCUS_MIN_PX,
         "下限 {FOCUS_MIN_PX} 抓不住「环与填充同色」（同色时仍有 {d_same} px 差异）⇒ 这条下限在空转"
+    );
+    assert!(
+        focus_verdict(n_same, c_same).is_err(),
+        "判据必须拒绝「环与填充同色」，否则它抓不住本次要修的缺陷"
+    );
+
+    // ---- ③ 坏环 b：环 = 填充色**提亮 5%**（技术上不同色、肉眼看不出）⇒ 撞第②条 ----
+    //
+    // 这是 parity 侧原先的覆盖缺口：`n_faint` **过得了**像素数下限（近似色照样改掉整条环带），
+    // 只有对比度下限咬得住它。所以这里两条都要断言：**前置**（像素数确实过关）与**判据必须拒绝**。
+    let faint_px = render_list(&with_ring_color(fill_color.lighten(0.05)));
+    let (n_faint, c_faint) = mean_channel_diff(idle_px, &faint_px, ext, btn);
+    println!(
+        "  反向自检 b（环 = 填充提亮 5%）：按钮内差异 {n_faint} px｜平均通道差 {c_faint:.1}\
+         ｜判据 {:?}",
+        focus_verdict(n_faint, c_faint).err()
+    );
+    assert!(
+        n_faint >= FOCUS_MIN_PX,
+        "反向自检 b 的前置：近似色**照样**改掉整条环带（{n_faint} px ≥ 下限 {FOCUS_MIN_PX}）\
+         ⇒ 光数像素数抓不住它，必须有第②条"
+    );
+    assert!(
+        c_faint < FOCUS_MIN_CONTRAST,
+        "反向自检 b：近似色的平均通道差 {c_faint:.1} 必须低于下限 {FOCUS_MIN_CONTRAST:.1}（否则对比度下限在空转）"
+    );
+    assert!(
+        focus_verdict(n_faint, c_faint).is_err(),
+        "判据必须拒绝「技术上有差异、肉眼看不出」的环，否则对比度下限是摆设"
     );
 
     // 反向自检：五档状态**两两不同**（否则「状态之间可区分」是空话）。
@@ -666,14 +759,35 @@ const STATE_MIN_PX: [(&str, usize); 4] = [
 
 /// 按钮**焦点环**的差异像素数下限（本次从「> 0」加严出来的那一条）。
 ///
-/// 出处（不是随手填的数字）：
-/// - 环带 = 按钮 42×26 内缩 `FOCUS_RING_INSET`=2、宽 `FOCUS_STROKE_WIDTH`=3 ⇒
-///   `38×22 − 32×16 = 324` px；
+/// 出处（不是随手填的数字；下面三个数都是**本语料**的实测值，由本测试的打印逐行给出）：
+/// - 环带 = 按钮 36×22（本语料的 `button_1`）内缩 `FOCUS_RING_INSET`=2、宽 `FOCUS_STROKE_WIDTH`=3
+///   ⇒ `32×18 − 26×12 = 576 − 312 = `**264** px（环带矩形实测 `RectI { x: 14, y: 42, w: 32, h: 18 }`）；
 /// - 环画在标签**之上**，标签与环同色（都是 `theme.on_accent`）的地方**不产生差异** ⇒ 实测 **228** px；
-/// - 下限取 **180**：落在**同一份语料里当场实测**的两个锚点之间 ——「可见环 228 px」与
-///   「环与填充同色 36 px」（后者由本测试最后那段反向自检打印）。两侧余量 48 / 144，
+/// - 下限取 **180**：落在两个锚点之间 ——「可见环 228 px」与「环与填充同色 36 px」
+///   （后者由本测试的**反向自检 a** 当场打印，可复核）。两侧余量 48 / 144，
 ///   而改前那条判据（`> 0`）在同色环的 36 px 面前**永远是绿的**。
+///
+/// ⚠️ 这一条只保证「环**被画出来**了」；「画出来了**看不出**」（近似色）由 [`FOCUS_MIN_CONTRAST`] 负责 ——
+/// 两条是**互补**的，缺一条就有一类坏环能过去（见 M5b 终审 Minor 1）。
 const FOCUS_MIN_PX: usize = 180;
+
+/// 按钮焦点环的**对比度下限**：按钮内差异像素的「三通道平均差」（量纲 0..255）。
+///
+/// 出处（三个数字都是**同一份语料里当场实测**出来的，`mean_channel_diff` 打印的那三行）：
+///
+/// | 语料 | 差异像素数 | 平均通道差 | 该被哪条下限拒绝 |
+/// |---|---|---|---|
+/// | 环 = `theme.on_accent`（**交付的环**） | 228 | **97.7** | 两条都过（这正是「看得见」） |
+/// | 环 = 填充色 `accent`（改前那一版） | 36 | 97.7 | 第①条（像素数）—— 只画在字上，环**没画出来** |
+/// | 环 = `accent.lighten(0.05)`（近似色） | 264 | **17.0** | 第②条（对比度）—— 环**画出来了**，但看不出 |
+///
+/// 下限取 **64**（= 256 的四分之一）：落在两个锚点 97.7 / 17.0 之间，两侧余量 33.7 / 47.0。
+/// 「近似色」那一行是本次补的漏洞现场：它 264 px **一个不少**，只数像素数的判据（264 ≥ 180）
+/// 会放行（M5b 终审 Minor 1 实测：`deer-gpu` 单测红、parity 仍绿）。
+/// **这个数值必须与 `crates/deer-gpu/src/interact.rs` 的 `FOCUS_RING_MIN_CONTRAST` 相同** ——
+/// 两边口径一致（同为「差异像素的三通道平均差」），只是分类范围不同（那边按环带内外，
+/// 这边按按钮矩形）；两个数的依据也一致：`on_accent` 压 `accent` = 97.7、提亮 5% = 17.0。
+const FOCUS_MIN_CONTRAST: f64 = 64.0;
 
 /// 在 `rect` 内逐**像素**比较（4 字节一组），返回差异像素数。
 fn diff_pixels(a: &[u8], b: &[u8], ext: Extent, rect: RectI) -> usize {
@@ -690,6 +804,39 @@ fn diff_pixels(a: &[u8], b: &[u8], ext: Extent, rect: RectI) -> usize {
         }
     }
     n
+}
+
+/// 在 `rect` 内数差异像素数**并**算它们的「三通道平均差」（返回 `(像素数, 平均通道差)`）。
+///
+/// **口径照抄** `crates/deer-gpu/src/interact.rs` 的 `ring_stats.mean_contrast`：对每个差异像素取
+/// `|ΔR| + |ΔG| + |ΔB|`，再除以 `3 × 差异像素数`（量纲 0..255）。两边同口径 ⇒ 下限可以互相印证。
+///
+/// 为什么焦点环需要这个数：环是一条**细带**，面积本身就小，「看得见」靠的是**对比度**。
+/// 只数像素数会把「填充色提亮 5%」这种技术上不同色、肉眼看不出 的环放过去 —— 它的差异像素数
+/// 一个不少，只是每个像素都几乎没变（详见 [`FOCUS_MIN_CONTRAST`]）。
+fn mean_channel_diff(a: &[u8], b: &[u8], ext: Extent, rect: RectI) -> (usize, f64) {
+    let w = ext.width.max(1) as usize;
+    let (mut n, mut sum) = (0usize, 0u64);
+    for i in (0..a.len().min(b.len())).step_by(4) {
+        if a[i..i + 4] == b[i..i + 4] {
+            continue;
+        }
+        let x = ((i / 4) % w) as i32;
+        let y = ((i / 4) / w) as i32;
+        if !rect.contains(x, y) {
+            continue;
+        }
+        n += 1;
+        for c in 0..3 {
+            sum += a[i + c].abs_diff(b[i + c]) as u64;
+        }
+    }
+    let mean = if n == 0 {
+        0.0
+    } else {
+        sum as f64 / (3.0 * n as f64)
+    };
+    (n, mean)
 }
 
 /// 把差异按「按钮矩形内 / 输入框矩形内 / 其它」分开计数。

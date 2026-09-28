@@ -576,10 +576,16 @@ impl App for Form {
 
     /// 画一帧（**只在 `dirty` 时真的碰 GPU**）。
     ///
-    /// **M5b-A2 的因果方向**：`redraw` **不**自己改状态，它只是**驱动**脚本 —— 每帧把下一条
+    /// **M5b-A2 的因果方向**：`redraw` 自身**不直接**改状态 —— 它只**驱动**脚本：每帧把下一条
     /// 脚本事件交给 [`Form::handle_input`]（输入路径，与真实窗口事件同一个入口），
     /// 然后按**输入路径置下的** `dirty` 决定画不画。于是「一条输入 ⇒ 状态 ⇒ 这一帧画出来的
     /// 东西」是同一条因果链，而「脚本推进」不再依赖「`redraw` 被调用」。
+    ///
+    /// ⚠️ 措辞要精确（M5b 终审 Minor 4）：**不要**把这条写成「`redraw` **不再改状态**」—— 逐字不准确：
+    /// 它经 `step_script → handle_input → feed` **确实仍会**改 `state`（`:591`/`:611`，这正是它推进
+    /// 脚本的方式）。准确的说法是：**状态变更只有一条路径**（唯一入口 [`Form::handle_input`]），
+    /// `redraw` 自己**不再直接**改；它另外动的只有账本与帧计数（`redraw_log` / `rendered` / `dirty`，
+    /// 以及 `OutOfDate` 时重新置脏）。
     fn redraw(&mut self) -> Result<Flow, String> {
         if self.done {
             return Ok(Flow::Exit);
