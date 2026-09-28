@@ -404,10 +404,18 @@ set "DEER_WINDOW_REDRAW=continuous" && cargo run -q -p deer-window --example <�
 而**声明这个动作是 App 主动做的**：**它不声明，本层就在 `Wait` 上睡死 —— 开机不会自己醒来，
 只有 App 说「那个时刻叫我」才醒。**
 
-**防空转最干净的判据是 `iters`（事件循环迭代次数），不是 CPU 时间**：空闲时它必须是**个位数**
-（本机实测：`DEER_WAKE_TICKS=0` 档 **`iters=7`**，其中含启动期 3 次 `resized`；另一次实测 **5** ——
-**具体数随启动期的系统事件浮动，「个位数 vs 一秒上千」这个量级才是判据**）。
-账本行：`[deer-window] 唤醒账本：wake=… wake_after=… fired=… requested=… skipped=… iters=…`。
+**`iters` 是观测值，不是判据**（这条**已修正过一次**，别再把它当证据）：
+
+- 账本行：`[deer-window] 唤醒账本：wake=… wake_after=… fired=… requested=… skipped=… iters=…`。
+- **缺口（必须写明）**：**当前仓库里没有任何断言读 `iters`** ⇒ **它不能用来判断是否空转**。
+  真正有牙的是上面那组**计数门槛**：「`wants_redraw` **答真 0 次** + 画帧 ≤ **1 + 系统帧**」。
+- **反证（复审实测）**：只把事件循环的 `Wait` 换成 `Poll` ⇒ `iters` 从 **5 → 11,695,034**、
+  进程 CPU **4.30 s / 4.5 s**（烧满一核），而**退出码 0、每条判据仍是 ✅** ——
+  即「`iters` 暴涨」**不会让任何东西变红**。
+- **本机实测（仅观测）**：`DEER_WAKE_TICKS=0` 档 `iters=7`（含启动期 3 次 `resized`）、另一次 **5** ⇒
+  连「空闲是个位数」也只是**量级印象**，不是断言。
+- **别误读**：`DEER_WINDOW_REDRAW=continuous` 档下 `iters` 本来就该很高（那一档每画完一帧就续下一帧）
+  ⇒ **高 `iters` 不等于 bug**；是否空转要看**计数门槛**，不看这个数。
 
 ⚠️ **两条使用须知**（「App 自己的要求」的直接后果，不是本层的 bug）：
 
@@ -419,8 +427,11 @@ set "DEER_WINDOW_REDRAW=continuous" && cargo run -q -p deer-window --example <�
 
 ⚠️ **`Send` 是契约，`Sync` 是巧合（别在别处依赖 `Sync`）**：`EventLoopProxy` 的 **`Send` 是 winit 的显式承诺**
 （编译期断言 + `waker_is_send` 单测钉着它）；但 **`Sync` 在 Windows 后端没有 impl** —— 它今天成立纯属两个字段的
-**自动 trait 巧合**（`HWND` = `isize`、`mpsc::Sender` 恰好 `Sync`）。⇒ 若 winit / windows-sys 哪天改回裸指针，
-**`Send` 会编译期炸（好事）**，而 **`Sync` 会静默消失（坏事）**。
+**自动 trait 巧合**（`HWND` = `isize`、`mpsc::Sender` 恰好 `Sync`）。
+**而且这个「哪天」已经来了**（复审核实、可直接查证）：**`windows-sys` 0.59 / 0.60 / 0.61 已把 `HWND` 改成 `*mut c_void`**
+（本机缓存源码对照：`0.52.0` = `pub type HWND = isize;`、`0.61.2` = `pub type HWND = *mut core::ffi::c_void;`）。
+我们**今天还是 `isize`**，只是因为 `winit 0.30` 仍钉在 `windows-sys 0.52`（`Cargo.lock` 里同时存在 0.52 / 0.59 / 0.61，但
+`winit` 用的是 0.52）⇒ **一旦 winit 升到用新 `windows-sys`：`Send` 会编译期炸（好事），`Sync` 会静默消失（坏事）。**
 
 详见 `crates/deer-window/src/lib.rs` 的「唤醒面」一节与 `crates/deer-window/examples/wake_probe.rs`
 （配套单测 `crates/deer-window/tests/wake_policy.rs`）。**仍未做**：自定义用户事件类型（对外**只有 `Waker`** 这一个面）、
@@ -480,4 +491,4 @@ set "DEER_WINDOW_REDRAW=continuous" && cargo run -q -p deer-window --example <�
 - [x] `FEATURES.md` 已登记（状态 / 指南链接 / 示例命令都对）
 - [x] 如果属于新手主线，`docs/TUTORIAL.md` 已更新（第 12 章）
 - [x] 明确写了「做不到什么」
-- [x] 重绘策略已写明（默认省电 / 如何关掉 / 两个自证标记要 grep），并登记 `Occluded` 的 Windows 边界、`DEER_IDLE_REQUIRE` 的删除、M5c 唤醒面（含 `iters` 判据、`next_deadline` 陷阱、`Send` vs `Sync`）
+- [x] 重绘策略已写明（默认省电 / 如何关掉 / 两个自证标记要 grep），并登记 `Occluded` 的 Windows 边界、`DEER_IDLE_REQUIRE` 的删除、M5c 唤醒面（含「`iters` 只是观测值、没有断言读它」、`next_deadline` 陷阱、`Send` vs `Sync` 的上游现状）
