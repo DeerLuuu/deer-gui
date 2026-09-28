@@ -25,15 +25,33 @@
 //!    （`InteractiveRenderer` 给每个有几何的节点发 `NodeHint`；`DefaultRenderer` **不发**
 //!    ⇒ 那份快照会是空的，「全不裁剪」而**看不出来**）。所以 `init` 里先断言快照非空。
 //!
-//! # 关于「已渲染帧数」与窗口帧率（别误读这一条）
+//! # 关于重绘策略（M5b 后重写：这里不再假设「每帧都会被调」）
 //!
-//! `deer-window` 的事件循环是 `ControlFlow::Poll` + `about_to_wait` 里 `request_redraw()`
-//! ⇒ `redraw()` 会被**持续**调用（见 `deer-window` 的模块文档）。所以「只在 dirty 时重绘」
-//! 在真实窗口里的准确含义是：**每一帧都先查脏位，只有脏了才真的画**；不脏的帧只打印一行。
-//! 真正的「事件驱动按需重绘」要改事件循环的控制流（`ControlFlow::Wait` + 有新事件才
-//! `request_redraw`），那是窗口层的改动，本 example **不改**它（改了会让其它 example 的行为
-//! 跟着变）。这不是缺陷，是当前窗口层的契约；dirty 账本本身是可断言的
-//! （`tests/interactive_form.rs` 里有同一判据的纯逻辑版本）。
+//! M5b 起 `deer-window` 的事件循环是 `ControlFlow::Wait`（没有事件就睡死），重绘时机由
+//! [`App::redraw_policy`] 的声明决定：
+//!
+//! | 声明 | 语义 |
+//! |---|---|
+//! | `OnDemand`（库默认，省电） | 只有 [`App::wants_redraw`] 为真（**这条输入改了状态**）或系统事件才请求一帧 |
+//! | `Continuous` | 每画完一帧续下一帧（= M5b 之前那条无条件 `ControlFlow::Poll` 的语义） |
+//!
+//! 本示例**声明 `Continuous`**，因为脚本重放必须**自己推进**：`deer-window` 没有给 App
+//! 定时器 / 用户事件（`EventLoopProxy`）这类「自己唤醒事件循环」的手段（见它的模块文档
+//! 「诚实的边界」），而脚本重放期间窗口一个真实输入都没有 ⇒ `OnDemand` 下它只会拿到建窗
+//! 引导帧那 1 帧：脚本卡在第 2 步、进程不退出（M5b-A2 实测：目标 5 条语句，35 s 超时被杀）。
+//! **这是接口边界，不是本示例在偷懒**；要在 `OnDemand` 下重放，得先给窗口层加「用户事件」面。
+//!
+//! 但「状态没变就不重绘」这条判据**没有降级**，它现在是两层、且共用同一份判据（同一个 `dirty`）：
+//!
+//! 1. **App 侧**：`redraw()` 先查 `dirty`，不脏就**不碰 GPU**、只记一笔 `false` ——
+//!    `redraw_log` / `painted` / `skipped` 就是这层的账本（`finish_script` 里断言）；
+//! 2. **窗口层**：`wants_redraw()` 返回**同一份** `dirty` ⇒ `OnDemand` 下窗口层也不会为
+//!    「没改状态」的输入请求帧（本示例声明连续，所以这一层在这里只影响账本的 `skipped` 计数；
+//!    窗口层「空闲零重绘」的完整演示是 `cargo run -p deer-window --example idle_probe`）。
+//!
+//! **脚本事件与真实窗口事件走同一个输入入口**（[`Form::handle_input`]）：状态机、命中、置脏、
+//! 记账只有一份实现 ⇒「脚本重放」与「人手点」不可能漂；脚本推进是「输入进来了」这件事本身，
+//! **不是**「`redraw` 被调用」的副作用。
 
 use std::collections::VecDeque;
 use std::path::Path;
@@ -50,7 +68,7 @@ use deer_gui::layout::layout::{self, Geometry, Measure, TextStyle};
 use deer_gui::layout::node::{Kind, Node, Rect};
 use deer_gui::prelude::*;
 use deer_gui::vk::windowed::{FrameOutcome, WindowedRenderer};
-use deer_gui::window::{App, Flow, WindowConfig, WindowInfo, run};
+use deer_gui::window::{App, Flow, RedrawPolicy, WindowConfig, WindowInfo, run};
 
 /// 清屏色（离屏对照与上屏用同一个值）。
 const CLEAR: Color = Color::rgb(0x08, 0x09, 0x0c);
@@ -203,6 +221,18 @@ fn fmt_state(s: &UiState) -> String {
     )
 }
 
+/// 一条输入事件的**来源**：只影响打印与「脚本模式下忽略窗口事件」的判定，**不影响状态机**。
+///
+/// 做成显式参数（而不是两个入口函数）是刻意的：让「脚本重放」与「人手输入」在
+/// [`Form::handle_input`] 里**合流** ⇒ Escape 语义、置脏、记账都只有一条路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    /// 脚本重放喂进来的事件（`DEER_INPUT_SCRIPT` 或内置脚本）。
+    Script,
+    /// 真实窗口事件（[`App::input`]）。
+    Window,
+}
+
 struct Form {
     theme: Theme,
     extent: Extent,
@@ -255,7 +285,10 @@ impl Form {
         }
     }
 
-    /// 喂一条输入事件：`handle` + 「状态真的变了才置脏」。返回是否要退出。
+    /// 喂一条输入事件：`handle` + 「状态真的变了才置脏」。返回是否要退出（`key:Escape`）。
+    ///
+    /// **输入路径的核心**，只被 [`Form::handle_input`] 调用 —— 脚本事件与真实窗口事件
+    /// 都经过它，所以「命中 → 状态 → 是否置脏」只有一份实现。
     fn feed(&mut self, ev: &InputEvent) -> bool {
         let f = self.frame();
         let before = self.state.clone();
@@ -273,26 +306,56 @@ impl Form {
         matches!(ev, InputEvent::KeyDown { key: Key::Escape, .. })
     }
 
+    /// **唯一的输入入口**：脚本事件与真实窗口事件都在这里落地（M5b-A2 的要点）。
+    ///
+    /// 做三件事：① 状态机（[`Form::feed`]：命中 → 更新 `UiState` → **状态变了才置脏** → 打印/记账）；
+    /// ② `key:Escape` ⇒ 与真实窗口按 Esc **同一条语义**（先收尾：打账本 + 断言，再退出）；
+    /// ③ 返回 [`Flow`]（`Exit` = 请求结束事件循环）。
+    ///
+    /// 为什么脚本推进落在这里（而不是散在 `redraw` 里）：这样「一条输入进来了」是**驱动**，
+    /// `redraw` 只负责「按 `dirty` 决定画不画」；[`App::wants_redraw`] 报的也是同一份判据。
+    fn handle_input(&mut self, ev: &InputEvent, source: Source) -> Result<Flow, String> {
+        if self.done {
+            return Ok(Flow::Exit);
+        }
+        if self.feed(ev) {
+            // 脚本里的 `key:Escape` 与真实窗口按 Esc 同一条语义（退出），但**收尾仍然要做**
+            // （先打印终态、再断言），否则「脚本结束」没有可比对的数字。
+            // 注意：这一帧**没有画过**任何输入 ⇒ 不记账（`step_script` 拿到 `Exit` 就直接返回），
+            // 所以它不会去和「重绘次数」对账（见 `finish_script` 的口径）。
+            println!(
+                "{} ⇒ 收尾并退出",
+                if source == Source::Script {
+                    "脚本里的 Escape"
+                } else {
+                    "窗口按 Esc"
+                }
+            );
+            self.finish_script()?;
+            return Ok(Flow::Exit);
+        }
+        Ok(Flow::Continue)
+    }
+
     /// 喂**一条**脚本事件（`redraw` 每帧喂一条 ⇒ 事件 → 状态 → 重绘 的关系是可数的）。
     ///
     /// 为什么不用「一次把脚本喂完」：那样整段重放会被**一帧**画完（`redraw_log` 只有 1 个
     /// `true`），于是「输入 ⇒ 置脏 ⇒ 重绘」这条链在日志里根本看不出来 —— 日志看着像通过，
     /// 实际上什么都没证明。每帧一条事件，`redraw: yes/no` 的序列就是这条链的证据。
+    ///
+    /// **M5b-A2**：事件不再直接调 `feed`，而是走 [`Form::handle_input`] —— 与真实窗口事件
+    /// **同一个入口**。脚本推进因此是「输入路径」的一环，而不是「`redraw` 顺手改了状态」。
     fn step_script(&mut self) -> Result<Option<Flow>, String> {
         let Some(ev) = self.queue.pop_front() else {
             return Ok(None);
         };
         let before = self.state.clone();
-        if self.feed(&ev) {
-            // 脚本里写了 `key:Escape` ⇒ 与真实窗口按 Esc 同一条语义（退出），
-            // 但收尾仍然要做（先打印终态、再断言），否则「脚本结束」没有可比对的数字。
-            // 注意：这一帧**没有画过**任何输入（调用方拿到退出请求就直接返回）⇒ 不记账，
-            // 所以它不会去和「重绘次数」对账。
-            println!("脚本里的 Escape ⇒ 收尾并退出");
-            self.finish_script()?;
+        let flow = self.handle_input(&ev, Source::Script)?;
+        if flow == Flow::Exit {
+            // 已经在 `handle_input` 里收尾并退出：这一帧没画过输入 ⇒ 不记账。
             return Ok(Some(Flow::Exit));
         }
-        // 记账：这一帧确实画了一条输入事件；它是否真的改了状态（= 是否该重绘那一帧）。
+        // 记账：这一帧确实喂了一条输入事件；它是否真的改了状态（= 是否该重绘那一帧）。
         self.fed_events += 1;
         self.fed_changed.push(self.state != before);
         Ok(Some(Flow::Continue))
@@ -468,20 +531,55 @@ impl App for Form {
         Ok(())
     }
 
+    /// **真实窗口事件的入口**（脚本事件由 `redraw` 每帧喂一条，见 [`Form::step_script`]）。
+    ///
+    /// 两条来源最终都进 [`Form::handle_input`] —— 状态机/置脏/记账只有那一份实现。
+    ///
+    /// `deer-window` 会在本方法返回后**立刻**读一次 [`App::wants_redraw`]（「这条输入改了状态吗」）：
+    /// 脚本模式下窗口事件被忽略 ⇒ 状态不会被真实输入改脏 ⇒ 返回 `Continue` 时 `dirty` 不变。
     fn input(&mut self, _info: &WindowInfo, ev: &InputEvent) -> Result<Flow, String> {
         if self.done {
             return Ok(Flow::Exit);
         }
-        if self.queue.is_empty() {
-            // 交互模式（或脚本已经喂完）：窗口事件直接喂。
-            // 脚本模式下队列被 `redraw` 推进，所以这里的事件只在交互模式出现。
-            return Ok(if self.feed(ev) { Flow::Exit } else { Flow::Continue });
+        if !self.queue.is_empty() {
+            // 脚本模式下**忽略**窗口事件：重放必须确定性（跑脚本时动鼠标不该改结果）。
+            println!("input: 脚本模式，忽略窗口事件 {ev:?}");
+            return Ok(Flow::Continue);
         }
-        // 脚本模式下**忽略**窗口事件：重放必须确定性（跑脚本时动鼠标不该改结果）。
-        println!("input: 脚本模式，忽略窗口事件 {ev:?}");
-        Ok(Flow::Continue)
+        // 交互模式（队列已空）：窗口事件与脚本事件走**同一个入口**。
+        self.handle_input(ev, Source::Window)
     }
 
+    /// **M5b：这一条输入改了状态吗**（`deer-window` 在每条输入派发之后**立刻**读一次）。
+    ///
+    /// 报的就是 `redraw()` 用的**同一份** `dirty`（由 `init`/`resized` 的首帧与 `feed` 里
+    /// 「状态真的变了才置脏」置上，由 `redraw` 画完清掉）⇒「窗口层要不要请求一帧」与
+    /// 「App 要不要碰 GPU」共用一份判据，两处不可能漂。
+    ///
+    /// `OnDemand` 下这就是省电的开关（本示例声明连续，所以这里只影响窗口层账本的
+    /// `skipped` 计数；窗口层的省电演示见 `cargo run -p deer-window --example idle_probe`）。
+    fn wants_redraw(&self) -> bool {
+        self.dirty
+    }
+
+    /// **M5b：显式声明 `Continuous`** —— 本示例的脚本重放必须**自己推进**（见模块文档）。
+    ///
+    /// `OnDemand` 下 `deer-window` 只给建窗引导帧 + 系统事件，而脚本重放期间没有任何真实输入
+    /// ⇒ 脚本会卡在第 2 步、进程不退出（M5b-A2 实测：35 s 超时被杀）。
+    ///
+    /// 代价说清楚：`Continuous` 每画完一帧都请求下一帧（空闲也烧 CPU）。**但「不脏就不画」
+    /// 没有丢**：`redraw` 先查 `dirty`，不脏的帧一帧都不碰 GPU（`redraw_log` 里的 `false`
+    /// 就是它），而 [`App::wants_redraw`] 把同一份判据交给窗口层。
+    fn redraw_policy(&self) -> RedrawPolicy {
+        RedrawPolicy::Continuous
+    }
+
+    /// 画一帧（**只在 `dirty` 时真的碰 GPU**）。
+    ///
+    /// **M5b-A2 的因果方向**：`redraw` **不**自己改状态，它只是**驱动**脚本 —— 每帧把下一条
+    /// 脚本事件交给 [`Form::handle_input`]（输入路径，与真实窗口事件同一个入口），
+    /// 然后按**输入路径置下的** `dirty` 决定画不画。于是「一条输入 ⇒ 状态 ⇒ 这一帧画出来的
+    /// 东西」是同一条因果链，而「脚本推进」不再依赖「`redraw` 被调用」。
     fn redraw(&mut self) -> Result<Flow, String> {
         if self.done {
             return Ok(Flow::Exit);
@@ -508,7 +606,8 @@ impl App for Form {
         self.dirty = false;
 
         // 脚本模式：**先喂一条事件、再画** —— 于是「输入 ⇒ 状态 ⇒ 这一帧画出来的东西」
-        // 是同一条因果链（与真实窗口路径的区别只是「事件从哪来」，`feed` 是同一份代码）。
+        // 是同一条因果链（与真实窗口路径的区别只是「事件从哪来」：这里走 `Source::Script`，
+        // 但落点是同一个 [`Form::handle_input`]）。
         let stepped = self.step_script()?;
         let f = self.frame();
         println!(

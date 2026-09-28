@@ -18,6 +18,15 @@
 //!
 //! 不设 `DEER_VK_WINDOW_TESTS=1` 时**显式跳过并说明**（不是伪装通过）。
 //!
+//! ## 重绘策略（M5b）：本示例显式声明 `Continuous`
+//!
+//! 判据是「**呈现**满 `DEER_HAL_FRAMES` 帧」，而 `App::redraw` 每次只呈现一帧 ⇒
+//! 必须连续拿到帧。M5b 把 `deer-window` 的默认策略改成 `OnDemand`（省电：只有输入改了状态
+//! 或系统事件才重绘），`OnDemand` 下本示例只会拿到建窗引导帧那 1 帧 ⇒ **永远到不了目标帧数、
+//! 事件循环睡死、进程不退出**（M5b-A 实测：`DEER_HAL_FRAMES=10` 跑 30 s 仍在第 1 帧）。
+//! 所以这里显式声明 [`RedrawPolicy::Continuous`] —— 代价（空闲也烧 CPU）是有意接受的：
+//! 本示例的用途就是「连续 N 帧走完 HAL 的 create_swapchain / submit_and_present」。
+//!
 //! ## 覆盖的边界
 //! - `VkBackend::open(0)` → 真设备；`create_swapchain(window, extent, format)` → 真交换链；
 //! - `begin_frame` + `record(空列表)` ✅ / `record(含绘制命令)` ⇒ **明确报 M3**（不许静默忽略）；
@@ -28,7 +37,7 @@ use std::process::ExitCode;
 
 use deer_gui::gpu::{Backend, Color, Device, DrawCmd, DrawList, PresentResult, RectI, TargetFormat};
 use deer_gui::vk::VkBackend;
-use deer_gui::window::{App, Flow, WindowConfig, WindowInfo, run};
+use deer_gui::window::{App, Flow, RedrawPolicy, WindowConfig, WindowInfo, run};
 
 /// 门槛判定（`DEER_VK_WINDOW_TESTS`）。判据住在 `deer_gui::env_gate`（有单测守着）。
 ///
@@ -137,6 +146,18 @@ impl App for HalPath {
 
     fn close_requested(&mut self) -> Flow {
         Flow::Exit
+    }
+
+    /// **M5b：显式声明「我要连续帧」**（本示例按**呈现帧数**退出，见模块文档）。
+    ///
+    /// 不声明的话走默认的 `OnDemand`：只有建窗引导帧那 1 帧 + 系统事件，
+    /// `presented` 永远到不了 `target_frames` ⇒ 事件循环在 `Wait` 上睡死、进程不退出。
+    ///
+    /// 诚实说明代价：`Continuous` 在空闲时也烧 CPU（这正是 M5b 要修的默认行为）；
+    /// 本示例要的是「连续走链」，所以接受它。运行时开关 `DEER_WINDOW_REDRAW=continuous`
+    /// 对本示例是**同向**覆盖（它已经声明连续），看不出差别。
+    fn redraw_policy(&self) -> RedrawPolicy {
+        RedrawPolicy::Continuous
     }
 }
 

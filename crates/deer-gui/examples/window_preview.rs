@@ -33,6 +33,17 @@
 //!
 //! **必须是 example 而不是 `#[test]`**：winit 要求事件循环在**主线程**，而 `cargo test`
 //! 在子线程跑测试（证据见 `crates/deer-gui/examples/hal_window_path.rs:8-12`）。
+//!
+//! ## 重绘策略（M5b）：本示例显式声明 `Continuous`
+//!
+//! 判据里有「**呈现**满 `DEER_VK_FRAMES` 帧」（`presented >= target_frames`），而
+//! `App::redraw` 每次只呈现一帧 ⇒ 必须连续拿到帧。M5b 之后 `deer-window` 的默认策略是
+//! `OnDemand`（省电），`OnDemand` 下本示例只有建窗引导帧那 1 帧 ⇒ **到不了目标帧数、
+//! 事件循环睡死、进程不退出**（M5b-A 实测：目标 20 帧，跑 40 s 仍停在第 1 帧）。
+//! 所以显式声明 [`RedrawPolicy::Continuous`]：这是**演示类**（连续呈现 N 帧给人看），
+//! 代价（空闲也烧 CPU）是有意接受的。`DEER_WINDOW_HOLD=1` 留窗观察时同样连续重绘
+//! （与 M5b 之前的行为一致：那时窗口层是无条件 `ControlFlow::Poll`）。
+//! 想看真正的省电档请用 `--example idle_probe`（`deer-window`，声明 `OnDemand`）。
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -45,7 +56,7 @@ use deer_gui::layout::layout;
 use deer_gui::layout::layout::TextStyle;
 use deer_gui::layout::node::{Kind, Rect};
 use deer_gui::vk::windowed::{FrameOutcome, WindowedRenderer};
-use deer_gui::window::{App, Flow, WindowConfig, WindowInfo, run};
+use deer_gui::window::{App, Flow, RedrawPolicy, WindowConfig, WindowInfo, run};
 
 /// 清屏色：**界面没盖住的地方**就是这个颜色（界面树的根面板会盖住大部分窗口）。
 ///
@@ -408,6 +419,14 @@ impl App for Preview {
     fn close_requested(&mut self) -> Flow {
         self.summarize_and_check();
         Flow::Exit
+    }
+
+    /// **M5b：显式声明「我要连续帧」**（判据是「呈现满 N 帧」，见模块文档的「重绘策略」一节）。
+    ///
+    /// 不声明 ⇒ 默认 `OnDemand`：只有建窗引导帧 + 系统事件 ⇒ `presented` 停在 1，
+    /// `assert!(presented >= target_frames)` 永远等不到，事件循环睡死、进程不退出。
+    fn redraw_policy(&self) -> RedrawPolicy {
+        RedrawPolicy::Continuous
     }
 }
 

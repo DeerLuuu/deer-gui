@@ -44,6 +44,21 @@
 //!
 //! ⚠️ **不许与 `cargo test` 并发跑在同一个 `target/` 上**：复审实测过并发时退出码不可信
 //! （抢 build 锁 + 抢同一块 Intel GPU）。串行跑并各留完整日志。
+//!
+//! ## 重绘策略（M5b）：本示例**不需要额外帧**，显式声明 `OnDemand`
+//!
+//! 判据全部在**一次** `App::redraw` 调用里做完：3 个语料各自在 `compare()` 内部
+//! `for _ in 0..frames` 呈现 N 帧、回读最后一帧再与 CPU 逐像素比。也就是说——
+//!
+//! - 它**不靠事件循环续帧**：`OnDemand`（M5b 的新默认，省电）下只消耗建窗引导帧那 1 帧；
+//! - 它**不靠墙钟**：`DEER_VK_FRAMES` 数的是 `compare()` 内部的呈现次数，帧数一改，
+//!   被平均的每帧统计（`stats / n`）跟着改，但结论（最大通道差）不变；
+//! - M5b-A 曾把它列为「按帧退出 ⇒ 不退出」，**实测不成立**：本文件在 `OnDemand` 下
+//!   一次就退（M5b-A2 实测 `exit=0`、0.93 s、`frames=1 requests=4 skipped=0`，
+//!   见 `.superpowers/sdd/m5b-a2-report.md`）。所以这里**不**声明 `Continuous`
+//!   —— 那是假的（本示例没有连续重绘的需求）。
+//!
+//! 验收的可数证据：`[deer-window] 重绘账本：… frames=1`（帧供给 = 1 次引导帧）。
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -60,7 +75,7 @@ use deer_gui::vk::windowed::{
     live_ui_resource_count, viewport_strategy_from_env, FrameOutcome, WindowedRenderer,
 };
 use deer_gui::vk::RenderStats;
-use deer_gui::window::{App, Flow, WindowConfig, WindowInfo, run};
+use deer_gui::window::{App, Flow, RedrawPolicy, WindowConfig, WindowInfo, run};
 
 /// 清屏色（线性 UNORM ⇒ 回读到的字节就是它本身）。
 const CLEAR: Color = Color::rgb(0x08, 0x09, 0x0C);
@@ -498,6 +513,14 @@ impl App for Parity {
             return Ok(Flow::Exit);
         }
         self.done = true;
+        // M5b：帧供给**数得出来**（别只看退出码）。本示例整段判据就在这一次 `redraw` 里跑完，
+        // 每语料 `frames` 帧的呈现发生在 `compare()` 内部 ⇒ 事件循环只要给 1 帧（建窗引导帧）。
+        // 收尾的账本行应当是 `frames=1`（由 `deer-window` 打），验收 grep 它。
+        println!(
+            "帧供给      : 本示例只要 1 帧（建窗引导帧）—— 每语料 {} 帧的呈现在 compare() 内部完成，\
+             不靠事件循环续帧、也不看墙钟",
+            self.frames
+        );
 
         // ① 语料
         let extent = self.extent;
@@ -742,6 +765,22 @@ impl App for Parity {
 
     fn close_requested(&mut self) -> Flow {
         Flow::Exit
+    }
+
+    /// **M5b：显式声明「我不需要连续帧」**（判据全在一次 `redraw` 里跑完，见模块文档）。
+    ///
+    /// 显式写出来（而不是靠默认值）是为了让「本使用方的重绘意图」在代码里可读：
+    /// 判据类示例**不**靠帧数、**不**靠墙钟 ⇒ 声明 `OnDemand`（省电，M5b 的默认）。
+    /// `DEER_WINDOW_REDRAW=continuous` 只把帧供给打开（第一帧就 `Flow::Exit`，
+    /// 像素结论必须**一字不变** —— 实测两档的 `最大通道差` 完全相同）。
+    fn redraw_policy(&self) -> RedrawPolicy {
+        RedrawPolicy::OnDemand
+    }
+
+    /// **M5b：本示例与输入无关** —— 没有任何一条输入会改变要画的东西（它不看窗口输入），
+    /// 所以一律不请求重绘。显式写出来表明意图（默认值也是 `false`）。
+    fn wants_redraw(&self) -> bool {
+        false
     }
 }
 
