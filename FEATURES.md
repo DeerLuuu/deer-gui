@@ -40,7 +40,7 @@
 | **固定与百分比尺寸**（`w` / `h`，`50%`） | ✅ | [layout](docs/features/layout.md#尺寸) | `cargo run -p deer-gui --example geometry` |
 | **命中测试**（坐标 → 哪个控件） | ✅ | [hit-testing](docs/features/hit-testing.md) | `cargo run -p deer-gui --example geometry` |
 
-## 三、渲染
+## 三、渲染与自检
 
 | 功能 | 状态 | 指南 | 可运行示例 |
 |---|---|---|---|
@@ -64,6 +64,7 @@
 | **GPU 文本渲染**（字形四边形 + 图集纹理 + 最近邻采样，与 CPU **逐字节对照**） | ✅ | [gpu-geometry](docs/features/gpu-geometry.md#3-完整-api) | `cargo run -p deer-gui --example gpu_geometry` |
 | **窗口里显示界面**（把 `DrawList` 的形状与文本**呈到窗口**，上屏像素与 CPU 逐像素对照） | ✅ | [window](docs/features/window.md) | `DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example window_parity` |
 | **输入与焦点**（事件通路 + 命中/状态机（含裁剪与禁用）+ Tab/Shift+Tab/Escape 焦点 + 文本输入（追加、`Backspace` 按 Unicode 字符删末尾）+ 脚本化重放 + **只在状态变化时重绘**） | ✅ | [input](docs/features/input.md) | `cargo run -p deer-gui --features window --example interactive_form` |
+| **测试接口（testkit）**（建面 + 输入注入（单事件/脚本 + `move @id`）+ 一帧**内置前置断言** + 离屏 CPU/GPU 渲染 + 像素/状态/绘制列表断言 + **CPU↔GPU 对照**（不透明 0 / 半透明 ≤1 LSB）+ 门槛自证 + **可复制的复现命令**） | ✅ | [testing](docs/features/testing.md) | `cargo run -p deer-gui --features testing --example testkit_demo` |
 
 ## 四、还没做的（**不要以为能跑**）
 

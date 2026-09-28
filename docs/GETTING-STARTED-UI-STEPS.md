@@ -582,7 +582,7 @@ assert!(outside == 0, "框外不许有差异（变化视觉溢出了）");
 ### 三条门禁命令（**本仓库的验收线**）
 
 ```powershell
-# ① 全套断言（本次实测基线：**447 passed / 0 failed**；数字会随里程碑涨，别写死）
+# ① 全套断言（本次实测基线：**475 passed / 0 failed**；数字会随里程碑涨，别写死）
 cargo test --workspace
 
 # ② clippy 干净（本项目 `#![deny(clippy::all)]`；本次实测 0 warning）
@@ -590,6 +590,9 @@ cargo clippy -p deer-gui --features window --all-targets
 
 # ③ 文档里提到的示例必须真实存在（本次实测 5 passed）
 cargo test -p deer-gui --test docs_consistency
+
+# ④ 上面那套样板（步骤 1–8 手写的东西）**已经变成 API**：见 `docs/features/testing.md`
+cargo run -q -p deer-gui --features testing --example testkit_demo
 ```
 
 > **示例与 `cargo test` 不要并发跑**（实测：并发不会报错，而是**串行**等构建锁 ——
@@ -598,6 +601,12 @@ cargo test -p deer-gui --test docs_consistency
 想要更硬的可回归判据（脚本重放 + 逐字段终态断言 + dirty 账本），照
 [`crates/deer-gui/examples/counter.rs`](../crates/deer-gui/examples/counter.rs) 抄
 —— 它把「点两次 `+` ⇒ 计数显示为 2」断在**绘制列表**与**像素**两个层次上。
+
+> 步骤 1–8 手写的那套样板（几何 → 列表 → 裁剪快照 → 像素 → 前置断言）已经抽成库里的
+> **testkit**：`Harness::frame()` 每次都会断言前置条件（`node_hint > 0`、裁剪快照非空、
+> 用到的 id 在快照里），`move @id` 的坐标由布局算出来，像素差异的期望矩形**自动**包含
+> 「这一帧真的变了的东西」，失败信息里自带**可复制的复现命令**。
+> 想省掉抄样板：见 [`features/testing.md`](features/testing.md)（最小示例 + 完整 API + 常见坑）。
 
 ---
 

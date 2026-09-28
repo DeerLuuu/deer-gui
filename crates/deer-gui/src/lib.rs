@@ -62,6 +62,24 @@ pub mod input_script;
 /// ⇒ **静默跳过却报 pass**（一整档验证证据因此失效）。完整实测说明与断言见模块文档。
 pub mod env_gate;
 
+/// **测试接口（testkit）**：把本项目既有的测试纪律变成 API
+/// （建面 → 输入注入 → 一帧 + 前置断言 → 离屏像素 → 像素/状态/绘制列表断言 → CPU↔GPU 对照）。
+///
+/// 让「写一条 UI 测试」从抄 600 行样板变成十几行，并**默认带上**前置断言、门槛自证、
+/// 越界为 0、CPU/GPU 对照容差、失败时打印可复制的复现命令。**不放宽任何阈值**。
+///
+/// ## 为什么门槛是 `#[cfg(any(test, feature = "testing"))]`
+///
+/// - `test` ⇒ 编译 `deer-gui` **自身**的测试目标时它就在场 ⇒ `cargo test --workspace`
+///   （默认 feature）会跑 testkit 自己的单测（**护栏进默认门禁**，否则它又会变成
+///   「没有判据的护栏」）；
+/// - `feature = "testing"` ⇒ 下游（含 workspace 外的 `test_project/deer-hello`）
+///   在**已有的** `deer-gui` 依赖上加一条 `features = ["testing"]` 就能用，
+///   不必新增 crate、也不必多一条 path 依赖；
+/// - 两者都不满足（普通生产构建）⇒ 模块不存在，**零成本**。
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
 /// 窗口层（**需要 `window` feature**）。
 ///
 /// 这是本 workspace 唯一引入第三方依赖（`winit`）的地方，理由是窗口/事件循环的

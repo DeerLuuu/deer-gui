@@ -528,7 +528,7 @@ if self.dirty && !self.done {
 ### 7.1 四条常用命令
 
 ```powershell
-# ① 全套断言（本次实测基线：42 个测试套件、**447 passed / 0 failed**；数字会随里程碑涨，别写死）
+# ① 全套断言（本次实测基线：42 个测试套件、**475 passed / 0 failed**；数字会随里程碑涨，别写死）
 cargo test --workspace
 
 # ② clippy 干净（本项目 `#![deny(clippy::all)]`；本次实测 0 warning）
@@ -539,6 +539,11 @@ cargo test -p deer-gui --test docs_consistency
 
 # ④ 本指南的主示例 + 它的离屏自检
 cargo run -q -p deer-gui --features window --example counter -- --headless
+
+# ⑤ **不想抄样板**：testkit —— 上面那套「树 → 几何 → 列表 → 裁剪快照 → 像素 → 断言」
+#    已经变成 API（前置断言 / 越界 = 0 / CPU↔GPU 对照 / 可复制的复现命令都默认带上）
+#    见 `docs/features/testing.md`
+cargo run -q -p deer-gui --features testing --example testkit_demo
 ```
 > **④ 与 ①–③ 不要并发跑**：`cargo test --workspace` 会**编译** `crates/deer-gui` 的全部 target，
 > 而窗口示例与它共用同一份构建产物与构建锁 —— 串行跑最省心（理由见第 8 节第 4 条）。
