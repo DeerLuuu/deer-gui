@@ -10,7 +10,7 @@
 //! ## 用法
 //!
 //! ```no_run
-//! use deer_window::{App, Flow, WindowConfig, WindowInfo, run};
+//! use deer_window::{App, Flow, InputEvent, Key, WindowConfig, WindowInfo, run};
 //!
 //! struct MyApp;
 //!
@@ -20,6 +20,16 @@
 //!         Ok(()) // 这里创建 Vulkan 设备 / 交换链（deer-vk 只吃 info.raw）
 //!     }
 //!     fn redraw(&mut self) -> Result<Flow, String> {
+//!         Ok(Flow::Continue)
+//!     }
+//!     fn input(&mut self, _info: &WindowInfo, ev: &InputEvent) -> Result<Flow, String> {
+//!         match ev {
+//!             InputEvent::PointerDown { x, y, .. } => println!("按下 ({x}, {y})"),
+//!             InputEvent::TextInput { text } => println!("文本 {text}"),
+//!             // 物理键与文本是**分开**的两条事件：Esc/Tab/Enter 只走 KeyDown。
+//!             InputEvent::KeyDown { key: Key::Escape, .. } => return Ok(Flow::Exit),
+//!             _ => {}
+//!         }
 //!         Ok(Flow::Continue)
 //!     }
 //! }
@@ -34,9 +44,14 @@
 //! - **只有 Windows** 的句柄填法实现了：Win32 之外的原生窗口会明确返回 [`Err`]
 //!   （见 [`UNSUPPORTED_PLATFORM_MSG`]），绝不静默填 0。窗口本身照旧用 winit，
 //!   所以别的平台「能开窗」，只是句柄交给 HAL 这一步还没实现。
-//! - **输入事件**（键盘/鼠标/IME/滚轮）不在本期范围内：事件循环只把
-//!   `Resized` / `RedrawRequested` / `CloseRequested` 转发给 [`App`]，其余事件丢弃，
-//!   留给 M5 的输入层。
+//! - **输入事件**（M5-1 起已接通）：`CursorMoved` / `MouseInput` / `MouseWheel` /
+//!   `KeyboardInput` / `Ime` / `Focused` 会被翻成 **本层自己的** [`InputEvent`]（winit 类型
+//!   不进回调签名）后交给 [`App::input`]；`ModifiersChanged` 只做内部记账（修饰键随键盘事件
+//!   的 `mods` 字段透传），不派发、也不触发重绘。
+//! - **仍未接线的输入面**（别当成已实现）：触摸/手势（`Touch`/`PinchGesture`）、拖放、
+//!   `DeviceEvent`（原始设备事件）、物理键码（`physical_key`/scancode）、按键重复的区分
+//!   （winit 的 `repeat` **没有**建模）、IME 预编辑（`Preedit` 只用来抑制重复文本，不派发）、
+//!   键盘布局无关的快捷键。
 //! - **DPI**：只透传 `Resized` 给的物理像素，不做任何缩放换算；`LogicalSize` 只在建窗时用。
 //! - 事件循环用 [`ControlFlow::Poll`] + `about_to_wait` 里 `request_redraw()` 形成连续重绘；
 //!   真正上屏时节奏由呈现（vsync）决定，本层只管「一直要下一帧」。
@@ -46,8 +61,9 @@ use std::sync::Arc;
 use deer_gpu::Extent;
 use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+use winit::keyboard::{Key as KeyboardKey, ModifiersState, NamedKey};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle as RwhRawWindowHandle};
 use winit::window::{Window, WindowId};
 
@@ -108,6 +124,186 @@ pub enum Flow {
     Exit,
 }
 
+/// 指针按键：winit 的按键在**本层模型**里的表示。
+///
+/// 只有这三个变体（M5-1 接口冻结）：winit 的 `Back`/`Forward`/`Other` **没有**对应变体，
+/// [`map_mouse_button`] 对它们返回 `None`（整条事件丢弃），**不**降级成左键 ——
+/// 那会凭空产生点击。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PointerButton {
+    Left,
+    Right,
+    Middle,
+}
+
+/// 修饰键状态：**随 [`InputEvent`] 的键盘事件透传**，本层不解释它的语义。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct Mods {
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    /// Super（Windows 键 / Command 键 / Meta）。
+    pub sup: bool,
+}
+
+/// **物理键**：不含文本语义 —— 文本一律走 [`InputEvent::TextInput`]。
+///
+/// 这条分工是刻意的（以后的文本框要靠它区分「插入字符」与「快捷键/焦点移动」）：
+/// 按 `a` 会**同时**产生 `KeyDown { key: Char('a') }` 与 `TextInput { text: "a" }`；
+/// 而 `Enter` / `Tab` / `Backspace` / `Escape` **只有** `KeyDown`
+/// （winit 给它们的 `text` 是控制字符，被 [`printable_text`] 挡掉）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Key {
+    Tab,
+    Escape,
+    Enter,
+    Backspace,
+    Left,
+    Right,
+    Up,
+    Down,
+    /// 可打印字符键：**逻辑**字符（受当前布局与 Shift 影响，`Shift+a` ⇒ `Char('A')`）。
+    Char(char),
+    /// 其它一切：修饰键、功能键、编辑键、死键、多字符组合、无法识别的键。
+    Other,
+}
+
+/// 本层自己的输入事件模型：**唯一**进入 [`App`] 的输入表示。
+///
+/// 坐标是**物理像素**、窗口左上角为原点（与 `Resized`/[`WindowInfo::extent`] 同一套口径，
+/// 本层不做 DPI 换算；压栈换算留给上层）。
+#[derive(Debug, Clone, PartialEq)]
+pub enum InputEvent {
+    PointerMoved {
+        x: f32,
+        y: f32,
+    },
+    PointerDown {
+        button: PointerButton,
+        x: f32,
+        y: f32,
+    },
+    PointerUp {
+        button: PointerButton,
+        x: f32,
+        y: f32,
+    },
+    Wheel {
+        dx: f32,
+        dy: f32,
+    },
+    KeyDown {
+        key: Key,
+        mods: Mods,
+    },
+    KeyUp {
+        key: Key,
+        mods: Mods,
+    },
+    /// 文本输入：IME 的 `Commit` 结果，或**可打印**按键产生的文本（见 [`printable_text`]）。
+    TextInput {
+        text: String,
+    },
+    FocusChanged {
+        focused: bool,
+    },
+}
+
+/// winit 的**逻辑键** → [`Key`]（纯函数：只吃字段、不吃 winit 事件 ⇒ 单测不用构造事件对象）。
+///
+/// - `Named(Tab / Escape / Enter / Backspace / Arrow{Left,Right,Up,Down})` ⇒ 同名变体；
+/// - `Named(Space)` ⇒ [`Key::Char`]`(' ')`：空格是**可打印字符**，不是命令键；
+/// - `Character(s)`：恰好一个字符 ⇒ [`Key::Char`]，多字符（死键组合等）⇒ [`Key::Other`]；
+/// - 其它命名键（修饰键、功能键、编辑键、小键盘…）、`Dead`、`Unidentified` ⇒ [`Key::Other`]。
+///
+/// `mods` **不参与**判定：Shift/Alt 的影响已由 winit 写进 `logical_key`
+/// （`Shift+a` ⇒ `Character("A")`），Ctrl 按 winit 的口径不改变 `logical_key`。
+/// 参数保留是因为计划把签名冻结成 `map_key(key, mods)`；「修饰键不改变映射结果」
+/// 这条契约由单测固定（`tests/input_map.rs`），修饰键本身由 [`InputEvent`] 的 `mods` 透传。
+pub fn map_key(key: &KeyboardKey, mods: Mods) -> Key {
+    let _ = mods;
+    match key {
+        KeyboardKey::Named(NamedKey::Tab) => Key::Tab,
+        KeyboardKey::Named(NamedKey::Escape) => Key::Escape,
+        KeyboardKey::Named(NamedKey::Enter) => Key::Enter,
+        KeyboardKey::Named(NamedKey::Backspace) => Key::Backspace,
+        KeyboardKey::Named(NamedKey::ArrowLeft) => Key::Left,
+        KeyboardKey::Named(NamedKey::ArrowRight) => Key::Right,
+        KeyboardKey::Named(NamedKey::ArrowUp) => Key::Up,
+        KeyboardKey::Named(NamedKey::ArrowDown) => Key::Down,
+        KeyboardKey::Named(NamedKey::Space) => Key::Char(' '),
+        KeyboardKey::Character(s) => match single_char(s) {
+            Some(c) => Key::Char(c),
+            None => Key::Other,
+        },
+        // 其它命名键 / Dead / Unidentified：明确落到 Other，不猜。
+        _ => Key::Other,
+    }
+}
+
+/// `Character("…")` 里恰好一个字符时取出来；空串/多字符 ⇒ `None`（⇒ [`Key::Other`]）。
+///
+/// 用 `chars()` 而不是 `len()`：`"中"` 是 3 字节但 1 个字符，`"😀"` 是 4 字节 1 个字符。
+fn single_char(s: &str) -> Option<char> {
+    let mut chars = s.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => Some(c),
+        _ => None,
+    }
+}
+
+/// winit 的鼠标按键 → [`PointerButton`]（纯函数）。
+///
+/// `Back` / `Forward` / `Other(_)` ⇒ `None`：[`PointerButton`] 没有对应变体（接口冻结，
+/// 不新增 `Other`），**丢弃**好过把它们当左键（那会凭空产生点击）。
+pub fn map_mouse_button(button: MouseButton) -> Option<PointerButton> {
+    match button {
+        MouseButton::Left => Some(PointerButton::Left),
+        MouseButton::Right => Some(PointerButton::Right),
+        MouseButton::Middle => Some(PointerButton::Middle),
+        MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => None,
+    }
+}
+
+/// winit 的修饰键位标志 → [`Mods`]（纯函数）。
+///
+/// winit 0.30 **没有**「随时查当前修饰键」的接口，所以本层自己维护：初始全 `false`，
+/// 之后由 `ModifiersChanged` 更新（`mods` 只随键盘事件透传，不单独派发）。
+pub fn map_mods(state: ModifiersState) -> Mods {
+    Mods {
+        shift: state.shift_key(),
+        ctrl: state.control_key(),
+        alt: state.alt_key(),
+        sup: state.super_key(),
+    }
+}
+
+/// 滚轮增量 → `(dx, dy)`（纯函数）。
+///
+/// - `LineDelta(x, y)`：**行**为单位，原样透传（换算成像素是上层的事）；
+/// - `PixelDelta(p)`：像素为单位，`f64 → f32`（本层坐标口径就是 f32 物理像素）。
+pub fn map_wheel(delta: &MouseScrollDelta) -> (f32, f32) {
+    match delta {
+        MouseScrollDelta::LineDelta(x, y) => (*x, *y),
+        MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
+    }
+}
+
+/// 把 winit 给的按键文本过滤成「**可打印文本**」（纯函数）。
+///
+/// - `None` / 空串 ⇒ `None`；
+/// - 含控制字符 ⇒ `None`：winit 会给 `Enter` 填 `"\r"`、`Tab` 填 `"\t"`、
+///   `Backspace` 填 `"\x08"`、`Escape` 填 `"\x1b"`、`Ctrl+A` 填 `"\u{1}"` —— 这些是
+///   **物理键**，由 [`Key`] 表达，绝不能当文本插进文本框；
+/// - 其余（含空格、CJK、emoji、死键组合出的多字符串）⇒ `Some(原样)`。
+pub fn printable_text(text: Option<&str>) -> Option<String> {
+    let text = text?;
+    if text.is_empty() || text.chars().any(char::is_control) {
+        return None;
+    }
+    Some(text.to_string())
+}
+
 /// 用户实现这个 trait；[`run()`] 负责事件循环与窗口生命周期。
 ///
 /// 所有回调都在**主线程**（事件循环线程）上被调用。
@@ -129,6 +325,23 @@ pub trait App {
 
     /// 画一帧（含呈现）。返回 `Flow::Exit` 表示请求结束事件循环。
     fn redraw(&mut self) -> Result<Flow, String>;
+
+    /// 收到一条输入事件（[`InputEvent`]）。
+    ///
+    /// 默认实现**什么都不做**并返回 `Flow::Continue` —— M5 之前写的 `App` 实现不用改。
+    /// 返回 `Flow::Exit` 与 [`App::redraw`] 同义（请求结束事件循环）；返回 `Err` 会让
+    /// `run()` 打印原因、退出事件循环并返回 `Err`（**绝不吞掉**）。
+    ///
+    /// **字符与物理键是两条事件**：文本走 [`InputEvent::TextInput`]，物理键走
+    /// [`InputEvent::KeyDown`]/[`InputEvent::KeyUp`]（见 [`Key`] 的说明）。
+    /// `info` 是**当前**窗口信息（原生句柄 + 物理尺寸，`Resized` 之后同步更新），
+    /// 口径与 [`App::resized`] 一致 —— 输入事件里的坐标就跟它同一套物理像素。
+    fn input(&mut self, info: &WindowInfo, ev: &InputEvent) -> Result<Flow, String> {
+        // 默认实现什么都不做。参数名保持与冻死 API 一致（不改名成 `_info`/`_ev`），
+        // 用 `let _` 消化掉。
+        let _ = (info, ev);
+        Ok(Flow::Continue)
+    }
 
     /// 点了关闭按钮/系统关闭：默认允许关闭。
     fn close_requested(&mut self) -> Flow {
@@ -246,8 +459,12 @@ pub fn run<A: App + 'static>(config: WindowConfig, app: A) -> Result<(), String>
         config,
         app,
         window: None,
+        info: None,
         extent: Extent { width: 0, height: 0 },
         counter: FrameCounter::new(),
+        mods: Mods::default(),
+        cursor: (0.0, 0.0),
+        ime_composing: false,
         error: None,
         exiting: false,
     };
@@ -267,9 +484,20 @@ struct RunHandler<A: App> {
     app: A,
     /// `resumed` 里建好后由事件循环持有；窗口活到 `run()` 结束。
     window: Option<Arc<Window>>,
+    /// 建窗时算好的 [`WindowInfo`]（`Resized` 时同步 `extent`）：原样转发给 `App::input`。
+    info: Option<WindowInfo>,
     /// 最近一次已知的物理尺寸（初始取自 `inner_size()`，之后由 `Resized` 更新）。
     extent: Extent,
     counter: FrameCounter,
+    /// 当前修饰键状态：由 `ModifiersChanged` 维护（winit 0.30 没有「随时查」的接口）。
+    mods: Mods,
+    /// 最近一次 `CursorMoved` 的**物理**坐标：`MouseInput` 只给按键、不给坐标，
+    /// 而 `PointerDown/Up` 需要坐标 ⇒ 用最近一次光标位置补上（还没收到移动事件时是 (0,0)）。
+    cursor: (f32, f32),
+    /// IME 正在预编辑（收到非空 `Preedit` 且还没 `Commit`/`Disabled`）。
+    /// 此时 `KeyboardInput` 的文本**不**再转 `TextInput`：否则中文输入会重复上屏
+    /// （一次来自 `Ime::Commit`，一次来自按键自带的 `text`）。
+    ime_composing: bool,
     /// 第一个错误（后续错误不再覆盖它）。
     error: Option<String>,
     /// 已经请求 `event_loop.exit()`：同一批事件里后面的回调不再处理，
@@ -285,6 +513,33 @@ impl<A: App> RunHandler<A> {
             self.error = Some(msg);
         }
         event_loop.exit();
+    }
+
+    /// 把一条输入事件交给 `App::input`，并**只在事件可能改变界面状态时**请求重绘。
+    ///
+    /// 走到这里的事件都是**已映射的输入**（hover/press/focus/text/滚轮…）⇒ 都可能改状态，
+    /// 所以统一请求重绘；反过来，**没有**映射成 [`InputEvent`] 的 winit 事件
+    /// （`ModifiersChanged`、`CursorEntered/Left`、被丢弃的侧键…）根本走不到这里，
+    /// 也就不会请求重绘 —— 「每个 winit 事件都重绘」这条被刻意避开了。
+    ///
+    /// `Err` 走 [`RunHandler::fail`]（打印 + 记住 + 退出）；`Flow::Exit` 与 `redraw` 同义。
+    fn dispatch(&mut self, event_loop: &ActiveEventLoop, ev: &InputEvent) {
+        let Some(info) = self.info else {
+            // 还没成功建窗（理论上到不了这里）：没有窗口就没有输入，直接丢弃。
+            return;
+        };
+        match self.app.input(&info, ev) {
+            Ok(Flow::Continue) => {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            Ok(Flow::Exit) => {
+                self.exiting = true;
+                event_loop.exit();
+            }
+            Err(e) => self.fail(event_loop, format!("App::input 失败：{e}")),
+        }
     }
 
     /// 收尾：打摘要、给出最终结果（回调错误优先于事件循环自身的错误）。
@@ -343,8 +598,13 @@ impl<A: App + 'static> ApplicationHandler for RunHandler<A> {
             return self.fail(event_loop, format!("App::init 失败：{e}"));
         }
 
+        // IME：winit 要求**显式允许**才会发 `Ime` 事件（`Ime::Commit` 是中文/日文输入的
+        // 文本来源）。不开的话 CJK 输入在本层完全收不到 —— 那就与「输入通路已接通」相反。
+        window.set_ime_allowed(true);
+
         // 连续重绘：Poll 让事件循环不睡死，about_to_wait 里 request_redraw 产生下一帧。
         event_loop.set_control_flow(ControlFlow::Poll);
+        self.info = Some(info);
         self.window = Some(window);
     }
 
@@ -360,6 +620,11 @@ impl<A: App + 'static> ApplicationHandler for RunHandler<A> {
         match event {
             WindowEvent::Resized(size) => {
                 self.extent = Extent { width: size.width, height: size.height };
+                // `WindowInfo` 跟着更新：`App::input` 拿到的尺寸必须与 `resized` 同口径，
+                // 否则输入坐标会按旧尺寸解释（点偏）。
+                if let Some(info) = &mut self.info {
+                    info.extent = self.extent;
+                }
                 if let Err(e) = self.app.resized(size.width, size.height) {
                     self.fail(
                         event_loop,
@@ -384,7 +649,80 @@ impl<A: App + 'static> ApplicationHandler for RunHandler<A> {
                 self.exiting = true;
                 event_loop.exit();
             }
-            // 其余事件（键盘/鼠标/IME/滚轮…）本期不转发：输入层留给 M5。
+
+            // ——— 输入事件的翻译（winit 事件 → 本层 `InputEvent` → `App::input`）———
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = (position.x as f32, position.y as f32);
+                let (x, y) = self.cursor;
+                self.dispatch(event_loop, &InputEvent::PointerMoved { x, y });
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                let Some(button) = map_mouse_button(button) else {
+                    // 侧键/未知键：`PointerButton`（接口冻结）表示不了 ⇒ 整条丢弃。
+                    // **不**派发、**不**请求重绘（也就不会产生「不明点击」）。
+                    return;
+                };
+                let (x, y) = self.cursor;
+                let ev = match state {
+                    ElementState::Pressed => InputEvent::PointerDown { button, x, y },
+                    ElementState::Released => InputEvent::PointerUp { button, x, y },
+                };
+                self.dispatch(event_loop, &ev);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let (dx, dy) = map_wheel(&delta);
+                self.dispatch(event_loop, &InputEvent::Wheel { dx, dy });
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                // 合成的按键事件（失焦时系统补发的 KeyUp）**照发**：上层的「按住的键」
+                // 靠它清掉，丢掉会留下按下的残留状态。
+                let key = map_key(&event.logical_key, self.mods);
+                let mods = self.mods;
+                match event.state {
+                    ElementState::Pressed => {
+                        // **物理键先发**：`Char('a')`/`Enter`/`Tab`… 一律先来 KeyDown。
+                        self.dispatch(event_loop, &InputEvent::KeyDown { key, mods });
+                        // **文本与物理键分开**：IME 预编辑中由 `Ime::Commit` 负责文本
+                        // （免得中文重复上屏）；`Enter/Tab/Backspace/Esc` 的 text 是
+                        // 控制字符，被 `printable_text` 挡掉 ⇒ 它们只有 KeyDown。
+                        let text = if self.ime_composing {
+                            None
+                        } else {
+                            printable_text(event.text.as_deref())
+                        };
+                        if let Some(text) = text {
+                            self.dispatch(event_loop, &InputEvent::TextInput { text });
+                        }
+                    }
+                    ElementState::Released => {
+                        self.dispatch(event_loop, &InputEvent::KeyUp { key, mods });
+                    }
+                }
+            }
+            WindowEvent::Ime(ime) => match ime {
+                Ime::Commit(text) => {
+                    self.ime_composing = false;
+                    // 空提交（预编辑被清掉）不算输入 ⇒ 不派发、不重绘。
+                    if !text.is_empty() {
+                        self.dispatch(event_loop, &InputEvent::TextInput { text });
+                    }
+                }
+                Ime::Preedit(text, _) => {
+                    // 预编辑文本**不派发**（M5 不建模预编辑）：这里只用它抑制按键文本，
+                    // 避免「预编辑中按键的 text」与「Commit」双重上屏。
+                    self.ime_composing = !text.is_empty();
+                }
+                Ime::Enabled | Ime::Disabled => self.ime_composing = false,
+            },
+            WindowEvent::Focused(focused) => {
+                self.dispatch(event_loop, &InputEvent::FocusChanged { focused });
+            }
+            WindowEvent::ModifiersChanged(modifiers) => {
+                // 只记账：修饰键在 `InputEvent` 里是键盘事件的**字段**，没有单独的事件 ⇒
+                // 不派发、也不请求重绘（单独按 Shift 不会让界面有任何变化）。
+                self.mods = map_mods(modifiers.state());
+            }
+            // 其余事件（触摸/手势/拖放/CursorEntered…）本期不转发：见模块文档的「仍未接线」。
             _ => {}
         }
     }
