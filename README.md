@@ -38,7 +38,7 @@ The layout algebra comes from a TypeScript validation prototype (which ran 28 as
 | `deer-window` — windowing layer (winit) | ✅ Real window and event loop on **Windows**; the only third-party dependency in the workspace |
 | Real glyphs — font parsing, rasterization, atlas, real metrics, line breaking | ✅ Offscreen on the CPU, and on the GPU as a coverage-texture pass (`R8_UNORM` atlas, nearest sampling, compared pixel-for-pixel against the CPU backend). Hinting and subpixel positioning are still not done |
 | On-screen rendering in a window | ✅ Shapes and text are presented through a shared pipeline layer on a linear swapchain, compared pixel-for-pixel against the CPU backend. Event dispatch and focus are still M5 |
-| Batch optimization (segment merging, cross-frame buffer reuse) | 🔄 Segment merging into one `vkCmdDraw` and persistent vertex buffers have landed; the pipeline-switch count and the unified / single-buffer variants are still open |
+| Batch optimization (unified pipeline, cross-frame buffer reuse) | 🔄 The **unified pipeline** has landed — shapes and text feed **one** vertex stream and **one** pipeline, so a frame issues **one** `vkCmdDraw` and **one** pipeline switch (the old "segment merging" helper was deleted with it) — plus **cross-frame buffer reuse**. Still open: other advanced forms (indirect draws / multi-batch submission / general textures), the per-frame `Vec` allocation in `unify`, and the window-side barrier assertion gap |
 | Input events, focus, dockable panels | ⬜ Not implemented (milestones M5/M6) |
 
 See [`FEATURES.md`](FEATURES.md) for the per-feature breakdown and [`ROADMAP.md`](ROADMAP.md) for milestones.

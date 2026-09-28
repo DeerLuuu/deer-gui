@@ -38,6 +38,10 @@ pub fn build_pipelines(device: &VkDevice, render_pass: &RenderPass, color_format
                        viewport: ViewportStrategy) -> GpuResult<PipelineSet>;
 pub enum ViewportStrategy { Static { extent: (u32, u32) }, Dynamic }
 ```
+> ⚠️ **API 已变更（历史计划留档，不重写）**：上面这组 `PipelineSet` / `build_pipelines` 在 **M3+ B5-3** 之后已不存在 ——
+> 现在只有**一条统一管线**（形状 + 文本），公开入口是 `pipelines::build_pipeline_resources` +
+> `gpu_render::build_unified_pipeline`。变更记录（删了什么、为什么）见
+> [`docs/features/gpu-geometry.md`](../features/gpu-geometry.md) 第 7.1 节。
 - **冻结**：混合状态 `SRC_ALPHA / ONE_MINUS_SRC_ALPHA`（color 与 alpha 同）、`cull_mode = NONE`、拓扑 `TRIANGLE_LIST`、文本采样 `NEAREST + ClampToEdge`、`mip_levels = 1`。
 - [ ] Step 1：先写**纯函数**测试：断言两路径产出的管线状态描述符逐字段相同（除 color format 与 viewport 策略）——**无 GPU 也能跑**。
 - [ ] Step 2：离屏路径改为调用它，**行为不得变**（M3a/M3b 的 207 条测试必须继续全绿）。
