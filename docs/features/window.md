@@ -93,7 +93,8 @@ cargo run -p deer-gui --features window --example window_preview
 （窗口尺寸/适配器帧率随机器而变，**以你自己的输出为准**。）
 
 还有一个**专测 HAL 路径**的示例（同一棵树走 `VkBackend::open(0)` → `Device::create_swapchain` →
-`begin_frame` / `record` / `submit_and_present` → `wait_idle`，并断言 `record(含绘制命令)` ⇒ `Unsupported(M3)`）：
+`begin_frame` / `record` / `submit_and_present` → `wait_idle`，并断言 `record` 边界：
+空列表 ✅ / 含形状的列表 ✅ / **含文本却缺 `TextEngine` ⇒ `Unsupported`**）：
 
 ```powershell
 $env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo run -q -p deer-gui --features window --example hal_window_path

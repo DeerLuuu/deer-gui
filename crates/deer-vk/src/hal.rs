@@ -46,7 +46,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use deer_gpu::{
-    AdapterInfo, Device, DrawCmd, DrawList, Extent, Frame, GpuError, GpuResult, PresentResult,
+    AdapterInfo, Device, DrawList, Extent, Frame, GpuError, GpuResult, PresentResult,
     RawWindowHandle, Swapchain, TargetFormat, TextureDesc, TextureId, TextureRegion,
 };
 
@@ -295,6 +295,7 @@ impl Device for VulkanDevice {
         }
         Ok(Box::new(VulkanFrame {
             chain: Rc::clone(&self.chain),
+            pending_ui: None,
         }))
     }
 
@@ -363,25 +364,57 @@ impl Swapchain for VulkanSwapchain {
 }
 
 /// 一帧（HAL 形状）。
+///
+/// ## `pending_ui`：本帧已经准备好的统一顶点流（T1.1）
+///
+/// HAL 的 `Frame` 把「录制」与「提交并呈现」拆成两个方法，而窗口路径的
+/// `draw_and_present` 是「准备 → 取图 → 录制 → 提交 → 呈现」一把梭。为复用同一段
+/// 实现，本类型在 `record` 里调 [`crate::windowed::WindowedRenderer::prepare_ui`]
+/// 做好 CPU 侧准备（建资源 / 建顶点流 / 上传缓冲 / 刷图集），把产物**暂存在这里**；
+/// `submit_and_present` 再调 `present_prepared` 走完帧舞蹈。
+///
+/// 暂存在**帧对象**上（而不是 `WindowedRenderer` 里）是刻意的：HAL 允许多次
+/// `begin_frame`，若把本帧顶点存进共享的 `chain`，两个帧对象就会互相覆盖。
 pub struct VulkanFrame {
     chain: Chain,
+    /// `record` 的准备产物；`submit_and_present` 消费它。
+    ///
+    /// `None` = 还没调过 `record`（或 `begin_frame` 之后直接提交）——
+    /// 按「空帧」处理（只清屏 + 呈现）。
+    pending_ui: Option<Vec<crate::vertex_unify::UnifiedVertex>>,
 }
 
 impl Frame for VulkanFrame {
-    fn record(&mut self, list: &DrawList) -> GpuResult<()> {
-        // `NodeHint` 只是诊断信息，忽略它是诚实的；其它任何绘制命令都意味着
-        // 「把 DrawList 送上 GPU」—— 那是 M3，必须明确报错而不是装作画了。
-        let has_real_draw = list
-            .cmds
-            .iter()
-            .any(|c| !matches!(c, DrawCmd::NodeHint { .. }));
-        if has_real_draw {
-            return Err(GpuError::Unsupported(
-                "deer-vk: 把 DrawList（矩形/圆角/文本）送上 GPU 是里程碑 M3；\
-                 M2b 的窗口路径只呈现清屏色 + 几何（见 docs/features/vulkan-swapchain.md）"
-                    .to_string(),
-            ));
-        }
+    fn record(
+        &mut self,
+        list: &DrawList,
+        text: Option<&mut deer_gpu::TextEngine>,
+    ) -> GpuResult<()> {
+        // T1.1：把 `DrawList` 真的送上 GPU —— 复用窗口路径那条链
+        // （[`crate::windowed::WindowedRenderer::prepare_ui`]，与 `draw_and_present`
+        // **共用同一段实现**）。
+        //
+        // ## 这里不再有 `Unsupported(M3)` 分支
+        //
+        // M2b 时这里对任何非 `NodeHint` 命令报错，是为了**不让「窗口里什么都没有」
+        // 变成一个查不出的 bug**（静默忽略更坏）。M3a/M3b/M3c/M3+ 已经落地
+        // （形状 + 文本 → 统一管线 → 上屏）⇒ 这个分支的**理由消失了**，删掉它。
+        //
+        // ## 错误语义（与 `draw_and_present` 逐条一致）
+        //
+        // - 有文本命令但 `text == None` ⇒ `Unsupported`（**不静默丢弃**）；
+        // - 裁剪栈不平衡 ⇒ `Unsupported`；
+        // - 形状/文本建流遇到不支持的输入 ⇒ `Unsupported`。
+        //
+        // 本方法**只做准备**；取图/录制/提交/呈现都在 `submit_and_present` ——
+        // 那才是 HAL 契约里「提交」发生的地方。
+        let mut guard = self.chain.borrow_mut();
+        let s = guard.as_mut().ok_or_else(|| GpuError::Driver {
+            code: -1,
+            message: "deer-vk: HAL 帧的交换链已被释放（create_swapchain 之后又动了 chain？）"
+                .to_string(),
+        })?;
+        self.pending_ui = Some(s.prepare_ui(list, text)?);
         Ok(())
     }
 
@@ -396,12 +429,15 @@ impl Frame for VulkanFrame {
     }
 
     fn submit_and_present(self: Box<Self>) -> GpuResult<PresentResult> {
+        // 帧舞蹈（取图 → 录制 → 提交 → 呈现）：与窗口路径 `draw_and_present` 完全同一条。
+        // `pending_ui` 为 `None`（没调过 `record`）⇒ 用空流 ⇒ 只清屏 + 呈现。
         let mut guard = self.chain.borrow_mut();
         let r = guard.as_mut().ok_or_else(|| GpuError::Driver {
             code: -1,
             message: "deer-vk: 交换链已被释放".to_string(),
         })?;
-        Ok(present_result_of(r.render_and_present()?))
+        let unified = self.pending_ui.as_deref().unwrap_or(&[]);
+        Ok(present_result_of(r.present_prepared(unified)?))
     }
 }
 
@@ -431,7 +467,6 @@ fn target_format_of(vk_format: i32) -> TargetFormat {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deer_gpu::{Color, RectI};
 
     #[test]
     fn present_outcome_mapping_never_treats_out_of_date_as_success() {
@@ -492,25 +527,42 @@ mod tests {
     }
 
     #[test]
-    fn record_rejects_real_draw_commands_until_m3() {
-        // 用空链构造一帧：record 不碰链，所以这里能独立测「诚实地报 Unsupported」。
+    fn record_reports_a_missing_engine_instead_of_silently_dropping_text() {
+        // T1.1 之后这里**不再**是「非空列表必须报 M3」——那个分支已被删掉
+        // （M3a/M3b/M3c/M3+ 已落地，理由消失）。本用例钉住的是**这条链上不依赖
+        // 真实窗口/驱动**的部分：
+        //
+        //   ① 没有交换链（空链）时 `record` 明确报错（不是 panic、不是假装成功）；
+        //   ② `read_pixels` 在提交前调用必须明确报错，并把调用方指向真正可用的 API。
+        //
+        // 为什么**不**在这里钉「有文本命令却没给引擎 ⇒ Unsupported」：
+        //   那条分支在 `prepare_ui` **之后**才可能命中，而 `prepare_ui` 需要一条真实
+        //   交换链（`begin_frame` 的窗口路径），单测里造不出来。该契约由
+        //   `deer-gpu/tests/draw_list_and_cpu_backend.rs` 里**同一条语义**的 CPU 用例
+        //   `cpu_backend_reports_text_without_engine_instead_of_dropping_it` 钉住
+        //   （两端共用同一份契约文档，见 [`Frame::record`]）。
+        //
+        // 用空链构造一帧：`prepare_ui` 会先取链，链为 `None` ⇒ 报错。
         let frame_chain: Chain = Rc::new(RefCell::new(None));
-        let mut f = VulkanFrame { chain: frame_chain };
+        let mut f = VulkanFrame {
+            chain: frame_chain,
+            pending_ui: None,
+        };
 
-        // 空列表 / 只有 NodeHint ⇒ 不报错（M2b 的窗口帧本来就只画清屏 + 几何）
-        f.record(&DrawList::new()).expect("空列表应当可以记录");
-        let mut hints = DrawList::new();
-        hints.push(DrawCmd::node_hint(RectI::new(0, 0, 1, 1), "h"));
-        f.record(&hints).expect("NodeHint 只是诊断信息，应当可以记录");
+        // 前置断言：链**确实**是空的（否则下面测的就不是「没交换链」这条路径）。
+        assert!(
+            f.chain.borrow().is_none(),
+            "前置：本用例要求一条**空**链"
+        );
 
-        // 真的绘制命令 ⇒ 明确报错（不许静默忽略）
-        let mut real = DrawList::new();
-        real.push(DrawCmd::FillRect {
-            rect: RectI::new(0, 0, 4, 4),
-            color: Color::WHITE,
-        });
-        let err = f.record(&real).expect_err("非空绘制列表必须报错");
-        assert!(err.to_string().contains("M3"), "应指明是 M3，实际：{err}");
+        // 空列表：仍然必须**先**发现「没有交换链」——这是本用例真正钉住的第一条。
+        let err = f
+            .record(&DrawList::new(), None)
+            .expect_err("没有交换链时 record 必须明确报错");
+        assert!(
+            err.to_string().contains("交换链"),
+            "错误信息要说清原因（交换链被释放/未创建），实际：{err}"
+        );
 
         // read_pixels 同样必须明确报错，并把调用方指向真正可用的路径
         let err = f

@@ -12,7 +12,7 @@
 surface/交换链 API（而不是通过门面）。
 
 **什么时候不该用它**：只想出图/断言（用离屏路径，见 [`rendering.md`](rendering.md)）；
-想在窗口里显示**界面**（`DrawList` 上屏是 **M3** —— 现在窗口里是清屏色 + M2a 验证过的几何）。
+想在窗口里走 **HAL** 的形状 + 文本（`Frame::record` 已能画界面，见第 6 节表格）。
 
 ## 2. 最小示例
 
@@ -218,11 +218,13 @@ M2b 的真实状态是：
 | `VkBackend::open(0)` | ✅ **返回真设备**（不再是「未实现」）；越界索引返回 `Err`，不 panic |
 | `Device::create_swapchain(window, extent, format)` | ✅ 真能建出可呈现的交换链；图像用途申请 `COLOR_ATTACHMENT \| TRANSFER_SRC`（回读需要后者），`supportedUsageFlags` 缺任何一个都**明确报错**，不静默去掉 |
 | `Device::begin_frame()` | ⚠️ **还没建交换链时明确报错**（错误信息里带「交换链」），不给空帧 |
-| `Frame::record(&DrawList)` | 空列表 / 只有 `NodeHint` ✅；**含真实绘制命令 ⇒ `Unsupported`**（文案指明「送上 GPU 是 M3」）。**绝不静默忽略** |
+| `Frame::record(&DrawList, Option<&mut TextEngine>)` | ✅ **已能画界面（T1.1）**：复用窗口路径的准备链（`WindowedRenderer::prepare_ui`），把形状 + 文本真的送上 GPU；`NodeHint` 是唯一被跳过的命令。**含文本命令却没给引擎 ⇒ `Unsupported`**（**绝不静默忽略**）；裁剪栈不平衡 / 建流失败同样明确报错。**签名在 T1.1 加了一个 `text` 参数**（公开 API 变更，先在 `ROADMAP.md` 登记）|
 | `Frame::read_pixels()` | ❌ `Unsupported`，**错误信息直接指向 `WindowedRenderer::read_back_last_frame()`** —— HAL 的 `read_pixels` 在**提交前**调用，而交换链图像的回读数据只有**呈现之后**才有效；deer-vk 刻意不做「隐式呈现」这种惊吓式语义。离屏回读请用 `OffscreenRenderer` |
 | `Device::create_texture` / `upload_texture` | ✅ **已落地（T1.2）**：建纹理 / **子区域**上传 / 回读四通道保真。**回读**走固有方法 `VulkanDevice::read_texture_bytes(id)`（不在 HAL trait 上）；纹理用 HAL **惰性**自己开的设备，**与窗口链的设备是两条**。判据 `cargo test -p deer-vk --test hal_texture` |
 
-所以 **HAL 的 `Frame` 还不是「能画界面」的帧**：窗口里目前只有清屏色 + M2a 的几何三角形。
+所以 **HAL 的 `Frame` 已经是「能画界面」的帧**（T1.1）：`record` 真的消费 `DrawList`；
+`submit_and_present` 走与窗口路径**同一段** `present_frame` 帧舞蹈。判据见
+`crates/deer-gui/examples/hal_window_path.rs`（真窗口、含形状列表可记录 + 文本缺引擎报错）。
 
 > **校验层开关（如实登记）**：`DEER_VK_VALIDATION=1` 在三条路径上一致生效 —— `VkBackend::new`、
 > 设备/离屏路径与**窗口路径**（`WindowedRenderer`）都读它（设备路径一度故意不读，t18 修完 3 个
@@ -330,7 +332,7 @@ DEER_VK_WINDOW_TESTS=1 cargo run -q -p deer-gui --features window --example wind
 | `render_and_present` 报「帧缓冲与交换链图像数不一致 ⇒ 请再调一次 resize」 | 上一次 `resize` 失败过（半成品状态），或自己直接改了交换链 | 再调一次 `resize` 让它重建到一致；不要绕过 `WindowedRenderer` 自己动交换链 |
 | 非 Windows 报 `Unsupported` | surface 的平台分支没实现（`vkCreateWin32SurfaceKHR` 是唯一实现） | 见 [`window.md`](window.md) 第 6 节 |
 | 画面撕裂 / 帧率不受控 | present mode 是 FIFO（跟随显示刷新），且**没有帧率上限** | 这是刻意的确定性策略；要别的模式得自己改 `choose_config` |
-| 窗口里没有界面 | **M2b 的真实边界**：这条链送上去的是清屏色 + 三角形，不是 `DrawList` | 把界面送上 GPU 是 M3 |
+| 窗口里没有界面 | M2b 的历史边界（**T1.1 起已消除**）：那条链当时送上去的是清屏色 + 三角形，不是 `DrawList` | 现在 `Frame::record(&DrawList, Option<&mut TextEngine>)` 真的走这条 UI 录制链；文本命令必须配 `TextEngine`，否则明确报 `Unsupported`（见 [`vulkan.md`](vulkan.md)） |
 
 ## 6. 相关
 
@@ -342,7 +344,8 @@ DEER_VK_WINDOW_TESTS=1 cargo run -q -p deer-gui --features window --example wind
   - **没有 mailbox / 立即呈现模式**：`choose_config` 只挑 FIFO。
   - **没有独占全屏、没有 HDR / 色彩管理**（不做 `VK_EXT_swapchain_colorspace` 之类的选择）。
   - **没有帧率上限**，也没有「跳帧」策略。
-  - **不消费 `DrawList`**：界面（文本/控件）上屏属于 **M3**；M2b 只保证「GPU 画的像素能出现在窗口上」。
+  - ~~**不消费 `DrawList`**：界面（文本/控件）上屏属于 **M3**；M2b 只保证「GPU 画的像素能出现在窗口上」。~~
+    **T1.1 起已翻转**：`Frame::record(&DrawList, Option<&mut TextEngine>)` 真的把绘制列表送上这条 swapchain 链（只是 HAL 的 `read_pixels` 仍明确 `Unsupported`，见下一条）。
   - **交换链重建会重建帧缓冲/命令缓冲**：没有做「按 image 预分配并跨 resize 复用」的小优化。
 
 ## 7. 检查清单（发布前过一遍）

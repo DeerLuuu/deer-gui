@@ -46,7 +46,7 @@ M2b 拿到窗口后接上 surface/交换链/呈现（Q-1 已决：引 `winit`）
 | **窗口层** | `crates/deer-window`：`WindowConfig` / `WindowInfo` / `App` / `Flow` / `run()`（**唯一引入 winit 的 crate**，见依赖例外登记） | ✅ 完成 | 真窗口可建（320×200）；`Resized` / `RedrawRequested` 到达；`DEER_WINDOW_HOLD=1` 能留窗观察；非 Windows 明确 `Err` |
 | **Vulkan 上屏** | `crates/deer-vk`：`surface.rs` / `swapchain.rs` / `windowed.rs`（`VkSurfaceKHR` + 交换链 + 信号量/栅栏 + 呈现） | ✅ 完成 | `pick_config` 确定性（FIFO、**线性 `*_UNORM` 优先**、extent 夹取；M3c 起格式优先级改为线性，理由见 M3c 行）；`OutOfDate`/`Suboptimal` 正确映射；真机呈现 |
 | **接入 + 示例** | `deer-gui` 的 `window` feature + `window_preview` 示例（`deer-vk` 的 HAL 接线同步完成） | ✅ 完成 | `cargo run -p deer-gui --features window --example window_preview` → 真窗口、自检全过、`exit=0` |
-| **HAL 路径真实覆盖** | `crates/deer-gui/examples/hal_window_path.rs`：真窗口下走 `VkBackend::open(0)` → `create_swapchain` → `begin_frame/record/submit_and_present` → `wait_idle`，并断言 `record(含绘制命令)` ⇒ `Unsupported(M3)` | ✅ 完成 | `DEER_VK_WINDOW_TESTS=1 DEER_VK_VALIDATION=1 cargo run -q -p deer-gui --features window --example hal_window_path` → `exit=0`、640×480 / `Rgba8Unorm`（M3c 前是 `Bgra8Srgb`，因格式优先级已改为线性）、校验层零消息 |
+| **HAL 路径真实覆盖** | `crates/deer-gui/examples/hal_window_path.rs`：真窗口下走 `VkBackend::open(0)` → `create_swapchain` → `begin_frame/record/submit_and_present` → `wait_idle`，并断言 `record` 边界：空列表 ✅ / 含形状的列表 ✅ / **含文本却缺 `TextEngine` ⇒ `Unsupported`**（**T1.1 起**；M2b 时代是「含绘制命令 ⇒ `Unsupported(M3)`」） | ✅ 完成 | `DEER_VK_WINDOW_TESTS=1 DEER_VK_VALIDATION=1 cargo run -q -p deer-gui --features window --example hal_window_path` → `exit=0`、640×480 / `Rgba8Unorm`（M3c 前是 `Bgra8Srgb`，因格式优先级已改为线性）、校验层零消息 |
 
 **M2b 的完整门禁命令**（真窗口 e2e **默认跳过**，必须显式打开）：
 
@@ -112,6 +112,74 @@ M3 原写成一条「渲染器 + 管线（矩形/圆角/裁剪/文本）」。�
 4. **半透明 1 LSB 是实测上限而非证明上界**。
 5. **文本必须用「最近邻 + ClampToEdge + `R8_UNORM` + `mip_levels = 1`」这一组**：
    CPU 是**整数查表**，线性过滤会把邻居纹素混进来；换成别的采样方式就不再逐像素等价。
+
+### M3 之后的 HAL 补课：`Frame::record` 接线（T1.1）
+
+M3 把界面**画上了窗口**（M3c），但那是走**专用快路** `WindowedRenderer::draw_and_present`；
+**HAL 的 `Frame::record` 仍然直连分叉**——M2b 时代它只接受 `NodeHint`，任何真实绘制命令一律
+`Unsupported(M3)`（理由是「不让『窗口里什么都没有』变成查不出的 bug」）。M3a/M3b/M3c/M3+ 全部落地后，
+**那条分支的理由消失了**，T1.1 把它接线到同一条 UI 录制链。
+
+#### 设计登记（改 HAL 公开 trait ⇒ 按 `agent.md` §6「改公开 API 先问」+ `DEV-PLAN.md` §3 三步走）
+
+**① 要改的公开 API**：`deer_gpu::Frame::record`
+- 改前：`fn record(&mut self, list: &DrawList) -> GpuResult<()>`
+- 改后：`fn record(&mut self, list: &DrawList, text: Option<&mut TextEngine>) -> GpuResult<()>`
+
+**② 核心决策：`TextEngine` 怎么过 HAL？** 三个候选，**选了 ③**：
+
+| # | 方案 | 为什么否决 / 采纳 |
+|---|---|---|
+| ① | `Device` 挂引擎（`device.set_text_engine(engine)`，`record` 不带参） | **否决**：HAL 的 `Device` **刻意无跨调用状态**（`create_swapchain`/`create_texture`/`begin_frame` 都不留状态）——「挂一个引擎」直接破坏这条不变式，且「引擎属于哪一层」会被 HAL 擅自决定 |
+| ② | 由后端**自己建**引擎（`record` 里 new 一个） | **否决**：字体文件由**上层**（`deer-gui` 门面）选并提供，后端（`deer-vk`）**不该**知道字体从哪来；这会把「字体是应用资产」这个事实藏进后端 |
+| ③ | **`record` 加参数 `Option<&mut TextEngine>`（逐帧传入）** | **采纳**：与**已存在**的 `WindowedRenderer::draw_and_present(list, text: Option<&mut TextEngine>)` **签名同形** —— 是既有先例，不是新发明的模式；HAL 保持无状态 |
+
+**③ 与 Godot 的对照（记录，不采纳）**：Godot 用 `TextServer` **全局单例**（按 `RID` 寻址字体/图集），
+形态接近候选 ①。**不照做**的理由：那需要一层「专门的服务层」+ 生命周期管理，属**架构级变更**，
+超出 T1.1 的范围（`UPDATE-PLAN.md` 只要求「接线」，不是「重设架构」）。记在这里备查。
+
+**④ 错误语义（两端一致，写进 `Frame::record` 文档）**：
+- 无文本命令 ⇒ `text = None` **合法**（形状列表照常上屏）；
+- **有**文本命令但 `text = None` ⇒ `GpuError::Unsupported`（**绝不静默丢弃**——那正是「形状都在、文字全没」的隐形 bug）；
+- 文本假阳性（空串 / `size <= 0` / 被裁空 / 图集放不下）⇒ **跳过并计数**，**不报错**（沿用 M3b-1 的既有语义）。
+
+**⑤ 不改的东西（T1.1 的边界）**：
+- **不改 `read_pixels`**：HAL 的 `Frame::read_pixels` **仍** `Unsupported`（交换链图像回读只在呈现后有效）—— 属 **T1.4** 的语义决策，不在本步。
+- **不改像素判据**：`window_parity` 的不透明逐字节 / 半透明 ≤1 LSB **必须不变**（`record` 与 `draw_and_present` 走**同一段实现** ⇒ 不应有像素差异）。
+
+#### 实现登记（落点）
+
+- `crates/deer-vk/src/windowed.rs`：把 `draw_and_present` 拆成
+  `prepare_ui(list, text) -> Vec<UnifiedVertex>`（步骤 ①–⑤：建流 → `unify` → 上传顶点/索引/间接命令 → 刷新图集纹理）
+  + `present_prepared(&[UnifiedVertex]) -> FrameOutcome`（步骤 ⑥：帧舞蹈）；
+  `draw_and_present` 退化成两者的**顺序调用** ⇒ **两条路径共用同一段实现**。
+- `crates/deer-vk/src/hal.rs`：`VulkanFrame` 加 `pending_ui: Option<Vec<UnifiedVertex>>`，
+  `record` 里 `prepare_ui` 后**暂存在帧对象上**（**不是**共享的 `chain` —— 否则两次 `begin_frame` 会互相覆盖），
+  `submit_and_present` 再取出来 `present_prepared`。
+- **实现中发现的真实缺陷（已修 + 已锁）**：`submit_and_present` 改走 UI 路径后，
+  `record_ui` 仍 `expect`「界面资源已建」（`self.ui` 非空），而**没调过 `record` 的空帧**
+  从未经过 `prepare_ui`（`ensure_ui` 在那里才调）⇒ `self.ui == None` ⇒ **panic**。
+  修法：`WindowedRenderer::present_prepared` 开头补一次 `ensure_ui(false)?`。
+  回归锁：示例 `hal_window_path` 把「空帧」挪到**任何 `record` 之前**（此时 `ui` 必为 `None`），
+  **双向变异已实测**（去掉 `ensure_ui(false)?` ⇒ `windowed.rs:1820` panic、exit 101 红）。
+- `crates/deer-gpu/src/null.rs`：`CpuFrame::record` 加同一条文本契约（**存在性校验**；CPU 帧的契约仍是「先收命令、提交时出图」）。
+
+#### 验收（四口径 + 双向变异）
+
+- ① `cargo test --workspace`、② `DEER_VK_WINDOW_TESTS=1 DEER_VK_VALIDATION=1 cargo test -p deer-vk`、
+  ③ `cargo test -p deer-gui --test docs_consistency`、④ `cargo clippy --workspace --all-targets` —— 全绿。
+- 端到端：`DEER_VK_WINDOW_TESTS=1 DEER_VK_VALIDATION=1 DEER_HAL_FRAMES=3 cargo run -q -p deer-gui --features window --example hal_window_path`
+  ⇒ 真窗口、校验层零消息、`[hal] record 边界 : 空=OK / 形状=OK / 文本缺引擎=Unsupported(TextEngine) ✅`。
+- **新增断言（均过双向变异）**：
+  - `cpu_backend_reports_text_without_engine_instead_of_dropping_it`（`deer-gpu` 集成测试）
+    —— 变异 A：禁掉 `has_text && text.is_none()` ⇒ 红；变异 B：把 `Unsupported` 换成 `Driver` ⇒ 红。
+  - `record_reports_a_missing_engine_instead_of_silently_dropping_text`（`deer-vk` 单测，**改写**）
+    —— 变异 C：把空链错误信息里的「交换链」抹掉 ⇒ 红。
+  - 示例 `hal_window_path` 的「空帧」用例（见上方实现登记）
+    —— 变异 D：去掉 `present_prepared` 里的 `ensure_ui(false)?` ⇒ panic 红。
+
+> **T1.1 只做「接线」，不做架构**：`TextEngine` 逐帧传入（与既有 `draw_and_present` 同形），
+> HAL 无状态不变，像素判据不变。**Godot 式全局 `TextServer` 单例**已评估但**不采纳**（架构级，超范围）。
 
 ### M4 的细步与状态
 

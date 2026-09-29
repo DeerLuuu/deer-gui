@@ -27,9 +27,11 @@
 //! 所以这里显式声明 [`RedrawPolicy::Continuous`] —— 代价（空闲也烧 CPU）是有意接受的：
 //! 本示例的用途就是「连续 N 帧走完 HAL 的 create_swapchain / submit_and_present」。
 //!
-//! ## 覆盖的边界
+//! ## 覆盖的边界（T1.1 之后）
 //! - `VkBackend::open(0)` → 真设备；`create_swapchain(window, extent, format)` → 真交换链；
-//! - `begin_frame` + `record(空列表)` ✅ / `record(含绘制命令)` ⇒ **明确报 M3**（不许静默忽略）；
+//! - `begin_frame` + `record(空列表)` ✅ / `record(含形状+文本的 DrawList)` **成功**
+//!   （T1.1 消除了 `Unsupported`，真的把 `DrawList` 送上 GPU）；
+//! - 文本命令没给 `TextEngine` ⇒ `record` **明确报错**（不许静默丢弃）；
 //! - `submit_and_present` → `PresentResult`（`Presented` 计数；过期如实上报，绝不当成功）；
 //! - `wait_idle` 干净收尾。
 
@@ -55,7 +57,10 @@ struct HalPath {
     target_frames: u64,
     presented: u64,
     out_of_date: u64,
-    m3_boundary_checked: bool,
+    /// T1.1 边界只检一次（含形状列表可记录 / 缺引擎的文本报错）。
+    record_boundary_checked: bool,
+    /// 「没调 `record` 的空帧」只检一次，且**排在所有 `record` 之前**（见 `redraw` ⓪）。
+    empty_frame_checked: bool,
     waited_idle: bool,
 }
 
@@ -66,7 +71,8 @@ impl HalPath {
             target_frames,
             presented: 0,
             out_of_date: 0,
-            m3_boundary_checked: false,
+            record_boundary_checked: false,
+            empty_frame_checked: false,
             waited_idle: false,
         }
     }
@@ -100,32 +106,89 @@ impl App for HalPath {
             return Ok(Flow::Exit);
         };
 
-        // ① 边界：空列表可以记录；含真实绘制命令必须**明确报 M3**
-        if !self.m3_boundary_checked {
+        // ⓪ **空帧要最先测、且只测一次**（T1.1 修复的回归锁）：`begin_frame` 之后**直接**
+        //    提交、没调过 `record` —— 这是「本帧唯一一次操作就是空帧」的最强形态。
+        //
+        //    为什么单独钉、且必须排在最前：T1.1 把 HAL 的 `submit_and_present` 改成走
+        //    `present_prepared`（UI 路径），而 `record_ui` 要求界面资源已建
+        //    （`self.ui` 非空，否则 `expect` panic）。空帧**没有**经过 `prepare_ui`
+        //    （`ensure_ui` 在那里才调）⇒ `present_prepared` 必须自己补 `ensure_ui`。
+        //    **放在任何 `record` 之前**，`self.ui` 此刻必然还是 `None`，
+        //    才真的踩到那条路径（若先跑边界检查，它已经 `ensure_ui` 过，就测不出来了）。
+        //    去掉 `present_prepared` 里的 `ensure_ui(false)?` ⇒ 这里 panic ⇒ 红。
+        if !self.empty_frame_checked {
+            let empty_frame = device
+                .begin_frame()
+                .map_err(|e| format!("空帧 begin_frame 失败：{e}"))?;
+            match empty_frame
+                .submit_and_present()
+                .map_err(|e| format!("空帧（没调 record）提交必须成功，却报错：{e}"))?
+            {
+                PresentResult::Presented => {
+                    println!("[hal] 空帧提交 : OK（只清屏 + 呈现，未 panic）✅")
+                }
+                PresentResult::OutOfDate => {} // 过期是正常路径，不算失败
+            }
+            self.empty_frame_checked = true;
+        }
+
+        // ① 边界（T1.1）：空列表可记录；**含形状的列表也可记录**（不再报 M3）；
+        //    但「有文本命令却没给 TextEngine」必须**明确报错**（不许静默丢弃）。
+        if !self.record_boundary_checked {
             let mut frame = device
                 .begin_frame()
                 .map_err(|e| format!("begin_frame 失败：{e}"))?;
             frame
-                .record(&DrawList::new())
+                .record(&DrawList::new(), None)
                 .map_err(|e| format!("空绘制列表应当可以记录，却报错：{e}"))?;
-            let mut real = DrawList::new();
-            real.push(DrawCmd::FillRect {
+
+            // 含形状的列表：T1.1 之后**应当成功**（旧行为是报 `Unsupported(M3)`）。
+            let mut shapes = DrawList::new();
+            shapes.push(DrawCmd::FillRect {
                 rect: RectI::new(0, 0, 8, 8),
                 color: Color::WHITE,
             });
+            frame
+                .record(&shapes, None)
+                .map_err(|e| format!("含形状的列表应当可以记录（T1.1），却报错：{e}"))?;
+
+            // 含文本却缺引擎：必须报错。
+            let mut with_text = DrawList::new();
+            with_text.push(DrawCmd::Text {
+                rect: RectI::new(0, 0, 16, 16),
+                text: "A".to_string(),
+                color: Color::WHITE,
+                size: 16.0,
+                align: 0,
+            });
             let err = frame
-                .record(&real)
-                .expect_err("含绘制命令的列表必须明确报 Unsupported（不许静默忽略）");
-            let msg = err.to_string();
-            assert!(msg.contains("M3"), "报错要指明是 M3，实际：{msg}");
-            self.m3_boundary_checked = true;
-            println!("[hal] 边界        : record(空)=OK / record(FillRect)=Unsupported(M3) ✅");
+                .record(&with_text, None)
+                .err()
+                .ok_or("含文本命令却没给 TextEngine 时必须报错，却成功了")?
+                .to_string();
+            assert!(
+                err.contains("TextEngine"),
+                "报错要指明缺 TextEngine，实际：{err}"
+            );
+
+            self.record_boundary_checked = true;
+            println!(
+                "[hal] record 边界 : 空=OK / 形状=OK / 文本缺引擎=Unsupported(TextEngine) ✅"
+            );
         }
 
-        // ② 提交并呈现
-        let frame = device
+        // ② 真的把一份含形状的 DrawList 送上 GPU，再提交呈现
+        let mut scene = DrawList::new();
+        scene.push(DrawCmd::FillRect {
+            rect: RectI::new(16, 16, 96, 96),
+            color: Color::rgb(220, 40, 40),
+        });
+        let mut frame = device
             .begin_frame()
             .map_err(|e| format!("begin_frame 失败：{e}"))?;
+        frame
+            .record(&scene, None)
+            .map_err(|e| format!("record(含形状的 DrawList) 失败：{e}"))?;
         match frame
             .submit_and_present()
             .map_err(|e| format!("submit_and_present 失败：{e}"))?

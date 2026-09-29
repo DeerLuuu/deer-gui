@@ -22,7 +22,7 @@
 | `Backend` | 后端的入口 | `name()` / `adapters()` / `open(i)` |
 | `Device` | 打开的设备 | `create_swapchain()` / `create_texture()` / `begin_frame()` / `wait_idle()` |
 | `Swapchain` | 呈现在哪、多大 | `extent()` / `format()` / `resize()` |
-| `Frame` | 一帧 | `record(&DrawList)` / `read_pixels()` / `submit_and_present()` |
+| `Frame` | 一帧 | `record(&DrawList, Option<&mut TextEngine>)` / `read_pixels()` / `submit_and_present()` |
 | `Renderer` | 树+几何 → `DrawList` | `build_draw_list()` |
 
 **约定（不是建议，是契约）**：
@@ -52,7 +52,7 @@ let fb = deer_gpu::null::CpuRenderer::new()
 | `VkBackend::open(0)` | ✅ 返回**真设备**（M1 时是「未实现」，现在不是了）；越界索引返回 `Err` |
 | `Device::create_swapchain(...)` | ✅ 真能建出可呈现的交换链（真机 **线性 `*_UNORM`** / FIFO / 3 张图；M3c 前是 `_SRGB`，格式优先级已改） |
 | `Device::begin_frame()` | ⚠️ **还没建交换链时明确报错**（错误信息带「交换链」），不给空帧 |
-| `Frame::record(&DrawList)` | 空列表 / 只有 `NodeHint` ✅；**含真实绘制命令 ⇒ `Unsupported`**（文案指明「送上 GPU 是 M3」），**不静默忽略** |
+| `Frame::record(&DrawList, Option<&mut TextEngine>)` | ✅ **T1.1 起真消费绘制列表**（形状 + 文本 → 统一管线 → 上屏，与窗口路径 `draw_and_present` **共用同一段实现**）。契约：有文本命令却传 `None` ⇒ `Unsupported`（**不静默丢弃**）；裁剪栈不平衡 ⇒ `Unsupported`；没有交换链 ⇒ 明确报错。M2b 时代那条「含绘制命令 ⇒ `Unsupported(M3)`」分支**已删**（理由消失） |
 | `Frame::read_pixels()` | ❌ `Unsupported`：HAL 在**提交前**调用，而交换链图像的回读数据只有**呈现之后**才有效 ⇒ 错误信息指向 `WindowedRenderer::read_back_last_frame()`；离屏回读用 `OffscreenRenderer`（见 [`gpu-offscreen.md`](gpu-offscreen.md)） |
 | `Device::create_texture()` / `upload_texture()` | ✅ **已落地（T1.2）**：`TextureDesc` → 真纹理，`upload_texture(id, data, region)` 支持**子区域**（布局往返以 `SHADER_READ_ONLY_OPTIMAL` 为起点 ⇒ 区域外像素保持原样）；非法尺寸/幽灵 id/越界或长度不符的区域**在碰驱动前**被拒。**回读四通道保真的判据**走固有方法 `VulkanDevice::read_texture_bytes(id)`（不在 HAL trait 上 —— 加 trait 方法属公开 API 变更，须先登记）。**边界**：纹理走 HAL 自己**惰性**开的设备，与**窗口链**的设备是两条（把两条并成一条是 M3 的工程活）；「窗口路径贴任意纹理」仍缺（见 [`vulkan.md`](vulkan.md) 与 [`textures.md`](textures.md)）。判据：`cargo test -p deer-vk --test hal_texture`（无 GPU 时跳过） |
 
@@ -61,7 +61,7 @@ let fb = deer_gpu::null::CpuRenderer::new()
 
 **HAL 窗口链的真实覆盖**在示例 `crates/deer-gui/examples/hal_window_path.rs`（进仓库门禁里跑）：
 真窗口下走 `VkBackend::open(0)` → `Device::create_swapchain` → `begin_frame` / `record` / `submit_and_present` → `wait_idle`，
-并断言 `record(含绘制命令)` ⇒ `Unsupported(M3)`：
+并断言 `record` 的**边界**（T1.1 后）：空列表 ✅ / 含形状的列表 ✅ / **含文本却缺 `TextEngine` ⇒ `Unsupported`**：
 
 ```powershell
 $env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo run -q -p deer-gui --features window --example hal_window_path
