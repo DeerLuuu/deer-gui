@@ -205,6 +205,7 @@ crates/
 
 | 文档 | 内容 |
 |---|---|
+| [中文文档站点](https://deerluuu.github.io/deer-gui-docs/) | **基于 mdBook 的中文教程 + API 参考**（独立仓库 [deer-gui-docs](https://github.com/DeerLuuu/deer-gui-docs)，推送自动部署） |
 | [教程](docs/TUTORIAL.md) | 一步一步，14 节（§0–§13），每节可独立运行 |
 | [功能清单](FEATURES.md) | **有哪些功能、做到哪一步、哪些还没做** —— 唯一真相 |
 | [逐功能指南](docs/features/) | 某个功能的完整用法与坑 |

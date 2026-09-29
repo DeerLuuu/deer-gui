@@ -207,6 +207,7 @@ Behavior that looks surprising is usually deliberate. The full list, with the de
 
 | Document | What it covers |
 |---|---|
+| [Chinese docs site](https://deerluuu.github.io/deer-gui-docs/) | **mdBook-based Chinese tutorial + API reference** (standalone repo [deer-gui-docs](https://github.com/DeerLuuu/deer-gui-docs), auto-deployed on push) |
 | [Tutorial](docs/TUTORIAL.md) | Step by step, 14 sections (§0–§13); every section runs on its own |
 | [Feature list](FEATURES.md) | **Which features exist, how far they are, and which are not done** — the single source of truth |
 | [Per-feature guides](docs/features/) | Complete usage and pitfalls for one feature at a time |

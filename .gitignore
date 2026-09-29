@@ -21,3 +21,6 @@ spirv_probe/
 # 编辑器
 .vscode/
 .idea/
+
+# WorkBuddy 工作区数据（本地记忆/技能等，机器本地文件，不入库）
+.workbuddy/
