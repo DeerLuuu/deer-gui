@@ -238,9 +238,57 @@ fn frame_path_renders_and_can_be_read_back() {
         rect: RectI::new(0, 0, 4, 4),
         color: RED,
     });
-    frame.record(&list).expect("记录绘制列表");
+    frame
+        .record(&list, None)
+        .expect("无文本的绘制列表应当可以记录");
     let res = frame.submit_and_present().expect("提交并呈现");
     assert_eq!(res, PresentResult::Presented);
+}
+
+/// T1.1 新增的 HAL 契约（`Frame::record` 的第二个参数）：
+/// **有文本命令却没有引擎 ⇒ 明确报错，不许静默丢弃**。
+///
+/// 为什么这条断言值钱：`record` 从「一个参数」变成「两个参数」，
+/// 最容易被误用的形式就是「调用方忘了传引擎，后端把文本命令悄悄跳过」——
+/// 结果是一帧「形状都在、文字全没」的画面，且**没有任何报错**。
+/// 本用例就是钉死这个退化行为。
+///
+/// 与它互补的另一半（形状列表 + `None` 必须成功）在
+/// [`frame_path_renders_and_can_be_read_back`] 里 —— 两条一起才说明
+/// 「报错」是针对**文本**而不是针对 `None` 本身。
+#[test]
+fn cpu_backend_reports_text_without_engine_instead_of_dropping_it() {
+    let backend = CpuBackend::new();
+    let mut device = backend.open(0).expect("打开 CPU 设备");
+    let mut frame = device.begin_frame().expect("开始帧");
+
+    let mut list = DrawList::new();
+    list.push(DrawCmd::FillRect {
+        rect: RectI::new(0, 0, 4, 4),
+        color: RED,
+    });
+    list.push(DrawCmd::Text {
+        rect: RectI::new(0, 0, 4, 4),
+        text: "字".to_string(),
+        color: RED,
+        size: 12.0,
+        align: 0,
+    });
+
+    // 前置断言：列表**确实**含文本命令（否则下面测的不是这条契约）。
+    assert_eq!(list.counts().text, 1, "前置：列表里必须有一条文本命令");
+
+    let err = frame
+        .record(&list, None)
+        .expect_err("有文本命令却没给引擎，必须报错而不是静默丢弃");
+    assert!(
+        matches!(err, GpuError::Unsupported(_)),
+        "应是 `Unsupported`（与 Vulkan 后端同语义），实际：{err}"
+    );
+    assert!(
+        err.to_string().contains("TextEngine"),
+        "错误信息要说清是缺 `TextEngine`，实际：{err}"
+    );
 }
 
 #[test]

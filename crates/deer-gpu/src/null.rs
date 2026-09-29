@@ -224,13 +224,29 @@ impl CpuFrame {
 }
 
 impl Frame for CpuFrame {
-    fn record(&mut self, list: &DrawList) -> GpuResult<()> {
+    fn record(&mut self, list: &DrawList, text: Option<&mut TextEngine>) -> GpuResult<()> {
         if !list.clip_balanced() {
             return Err(GpuError::Driver {
                 code: -1,
                 message: "绘制列表的裁剪栈不平衡（PushClip/PopClip 未配对）".to_string(),
             });
         }
+        // 与 Vulkan 后端同一条契约（见 [`Frame::record`] 的文档）：
+        // 有文本命令却没给引擎 ⇒ **明确报错**，不许静默丢弃。
+        //
+        // 这里刻意**不**就地用掉引擎：CPU 帧的契约是「先收命令、
+        // `submit_and_present` 时一次性出图」（见 `CpuFrame` 的文档），
+        // 本帧的光栅化走 `CpuRenderer::new()` 的占位行为；真实字形路径由
+        // `CpuRenderer::with_text` 单独驱动。引擎在此只做**存在性校验**。
+        let has_text = list.cmds.iter().any(|c| matches!(c, DrawCmd::Text { .. }));
+        if has_text && text.is_none() {
+            return Err(GpuError::Unsupported(
+                "CPU 后端收到文本命令，但调用方没有提供 TextEngine（record 的第二个参数为 None）\
+                 —— 与 Vulkan 后端一致：报告而不是静默丢弃"
+                    .to_string(),
+            ));
+        }
+        let _ = text;
         self.pending = list.cmds.clone();
         Ok(())
     }

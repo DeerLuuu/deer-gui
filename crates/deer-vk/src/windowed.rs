@@ -1427,6 +1427,26 @@ impl WindowedRenderer {
         list: &DrawList,
         text: Option<&mut TextEngine>,
     ) -> GpuResult<FrameOutcome> {
+        // T1.1：准备段（①..⑤）与帧舞蹈（⑥）各抽成一个方法 —— 与 HAL `Frame` 路径
+        // **共用同一段实现**（HAL 的 `record` 调 `prepare_ui`，`submit_and_present`
+        // 调 `present_prepared`）。
+        let unified = self.prepare_ui(list, text)?;
+        self.present_prepared(&unified)
+    }
+
+    /// **UI 录制的前半段**（T1.1 从 `draw_and_present` 抽出，供 HAL 路径复用）。
+    ///
+    /// ① `ensure_ui` → ② 单次遍历建形状/文本顶点 + 段表 → ③ `unify` 合流
+    /// → ④ 上传统一顶点缓冲 → ④b 索引 + 间接命令 → ⑤ 刷新图集纹理。
+    ///
+    /// 返回值（本帧统一顶点流）**不存进 `self`**：它要在「录制」与「呈现」之间
+    /// 活着，由调用方管 —— 这样 HAL 的 `VulkanFrame::record` 能把它暂存在帧对象上，
+    /// 两次 `begin_frame` 不会互相覆盖。
+    pub(crate) fn prepare_ui(
+        &mut self,
+        list: &DrawList,
+        text: Option<&mut TextEngine>,
+    ) -> GpuResult<Vec<crate::vertex_unify::UnifiedVertex>> {
         if self.framebuffers.len() != self.swapchain.image_count() as usize {
             return Err(GpuError::Unsupported(
                 "帧缓冲与交换链图像数不一致（上一次 resize 失败过？）⇒ 请再调一次 resize"
@@ -1619,7 +1639,23 @@ impl WindowedRenderer {
         //
         // ⚠️ 这里**不需要**任何合段：整帧只发一次 draw，段划分对录制没有影响
         // （与离屏同一条；B5-3 已把那个失去调用点的合段函数删掉）。
-        self.present_frame(|s, slot, image_index| s.record_ui(slot, image_index, &unified))
+        Ok(unified)
+    }
+
+    /// **UI 录制的后半段**（T1.1 从 `draw_and_present` 抽出，供 HAL 路径复用）。
+    ///
+    /// 取图 → 录制（[`Self::record_ui`]）→ 提交 → 呈现。
+    /// 与 `render_and_present` 共用同一段 `present_frame` 帧舞蹈。
+    ///
+    /// **`unified` 可以为空**（「空帧」= 只清屏 + 呈现）：但 `record_ui` 要求界面资源
+    /// 已建（它 `expect` `self.ui`），所以这里**先补一次 `ensure_ui(false)`** ——
+    /// HAL 的 `render_and_present` 没有「先 record」这一步，空帧路径必须自己兜住。
+    pub(crate) fn present_prepared(
+        &mut self,
+        unified: &[crate::vertex_unify::UnifiedVertex],
+    ) -> GpuResult<FrameOutcome> {
+        self.ensure_ui(false)?;
+        self.present_frame(|s, slot, image_index| s.record_ui(slot, image_index, unified))
     }
 
     /// 惰性建界面资源（**统一管线**：B5-2 起形状与文本共用一条）。

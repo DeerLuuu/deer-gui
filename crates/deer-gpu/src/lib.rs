@@ -177,7 +177,25 @@ pub trait Swapchain {
 /// 一帧：记录命令 → 提交 → 呈现。
 pub trait Frame {
     /// 记录绘制列表。
-    fn record(&mut self, list: &DrawList) -> GpuResult<()>;
+    ///
+    /// ## `TextEngine` 是**按帧传入**的参数，不是设备状态（T1.1 的设计决策）
+    ///
+    /// 绘制列表里的 `DrawCmd::Text` 需要字形图集 ⇒ 需要一个 [`TextEngine`]。
+    /// 它**不能**挂在 `Device` 上（那会让 HAL 的 `Device` 第一次变成有状态，
+    /// 而 `create_swapchain` / `create_texture` / `begin_frame` 至今都不保留跨调用状态），
+    /// 也**不能**由后端自己造（字体是上层的事）。
+    ///
+    /// 传入形态与既有的窗口路径一致：`WindowedRenderer::draw_and_present(list, text)`
+    /// 早就是这个形状（`Option<&mut TextEngine>`）—— 本 trait 只是把它对齐过来。
+    ///
+    /// ## 语义（后端**必须**遵守，不许静默忽略）
+    ///
+    /// - 列表里**没有**文本命令 ⇒ 可以传 `None`；
+    /// - 列表里**有**文本命令而传了 `None` ⇒ 返回 [`GpuError::Unsupported`]，
+    ///   **不许**静默丢弃（「窗口里少了一段字」是查不出的 bug）；
+    /// - 文本假阳性（空串 / `size <= 0` / 被裁空）不在此列：那是数据问题，
+    ///   后端跳过并计数即可。
+    fn record(&mut self, list: &DrawList, text: Option<&mut TextEngine>) -> GpuResult<()>;
     /// 回读这一帧的图像（`readable` 目标；截图与自动测试用）。
     fn read_pixels(&mut self) -> GpuResult<Vec<u8>>;
     /// 提交并呈现。返回是否成功呈现（`false` = 交换链过期，调用方应 resize 后重试）。

@@ -50,7 +50,7 @@
 | **零依赖 PNG 编码器** | ✅ | [pixels](docs/features/pixels.md#自己编码-png) | `cargo run -p deer-gui --example pixels` |
 | **绘制列表**（树 → 与后端无关的命令） | ✅ | [draw-list](docs/features/draw-list.md) | `cargo run -p deer-gui --example draw_list` |
 | **主题**（颜色 + 字号） | ✅ | [theme](docs/features/theme.md) | `cargo run -p deer-gui --example theme` |
-| **GPU HAL**（后端抽象：`Backend`/`Device`/`Frame`/`Renderer`；设备/交换链/呈现已通，`record(DrawList)` 属 M3；`read_pixels` 明确 `Unsupported` 并指向呈现帧回读） | 🔄 | [gpu-hal](docs/features/gpu-hal.md) | `cargo run -p deer-gui --example vulkan_devices` |
+| **GPU HAL**（后端抽象：`Backend`/`Device`/`Frame`/`Renderer`；设备/交换链/呈现已通，**T1.1 起 `record(&DrawList, Option<&mut TextEngine>)` 真的消费绘制列表**；`read_pixels` 明确 `Unsupported` 并指向呈现帧回读） | 🔄 | [gpu-hal](docs/features/gpu-hal.md) | `cargo run -p deer-gui --example vulkan_devices` |
 | **CPU 参考后端**（软件光栅化） | ✅ | [rendering](docs/features/rendering.md#cpu-后端软件光栅化) | `cargo run -p deer-gui --example draw_list` |
 | **Vulkan 后端**（设备 + 着色器 + 管线，真机真跑） | ✅ | [vulkan](docs/features/vulkan.md) | `cargo run -p deer-gui --example vulkan_pipeline` |
 | **Vulkan 图形管线**（渲染通道 + 管线 + 绘制，像素经真机验证） | ✅ | [vulkan-pipeline](docs/features/vulkan-pipeline.md) | `cargo run -p deer-gui --example vulkan_pipeline` |
