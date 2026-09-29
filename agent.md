@@ -122,11 +122,12 @@
 
 ### 3.3 已经明确"做不到"的（**不要以为能跑**）
 
-- **GPU 侧文本**（`DrawCmd::Text` → Vulkan）：M3b 未做。
-  现在是**无条件 `Unsupported`** —— 空串 / 零面积 / 被 clip 全裁掉时 GPU 也报错，
-  而 CPU 能正常出图（**假阳性**）。做 M3b 时必须一并处理。
-- **纹理 / 字形图集上 GPU**（`create_texture`/`upload_texture`）：`Unsupported`。
-- **窗口里显示界面**（M3c）：窗口里目前只有清屏色 + M2a 几何，`DrawList` 还没接上屏。
+- **GPU 侧文本**（`DrawCmd::Text` → Vulkan）：**M3b 已完成** —— 字形四边形 + `R8_UNORM` 覆盖率纹理 + 最近邻采样，
+  与 CPU 后端逐像素对照（不透明逐字节 0 / 半透明 ≤1 LSB）。注意仍有一条**刻意保留**的行为：
+  **不调 `GpuGeometryRenderer::with_text(engine)` 时，`DrawCmd::Text` 仍按 M3a 行为报 `Unsupported`**（不静默丢弃）。
+- **纹理 / 字形图集上 GPU**：**已落地** —— 字形图集走专用 `R8_UNORM` 覆盖率纹理；通用纹理（`RGBA8_UNORM`）
+  也已能创建/上传/回读（离屏纹理 quad 与 CPU 逐字节相同）。**仍未做**：按 RGB 调制（需新片元着色器）、窗口侧任意纹理入口。
+- **窗口里显示界面**（M3c）：**已完成** —— 形状与文本经共用管线层呈到线性交换链，上屏像素与 CPU 逐像素对照（`window_parity`）。
 - **CFF / OpenType-CFF（`OTTO`）字体**：解析层直接报错 —— **故意不静默给空轮廓**。
   只支持 `glyf` 轮廓。
 - **hinting / 字距连字（`kern`/`GSUB`/`GPOS`）/ 竖排 RTL**：都不做（hinting 现在有**实测依据**：最省的 hinting-lite 量下来没有净收益）。
@@ -199,9 +200,13 @@ cd test_project/deer-hello && cargo build
 ### 5.1 这份克隆的来路（本机特有）
 
 - 路径 `/sdcard/Download/deer_gui`，远端 `https://github.com/DeerLuuu/deer-gui.git`，
-  分支 `master`（HEAD `9df8ade`）。这是**设备上的工作副本**。
-- 传输时用了 `git config http.version HTTP/1.1`：该网络下 Git 的 **HTTP/2 会被重置**
-  （`Connection reset by peer`）。若 clone/fetch 卡死，先加这个配置。
+  分支 `master`。这是**设备上的工作副本**。
+  > **别在这里写死 HEAD**：写的时候是 `9df8ade`，几个里程碑后就成了假信息（本文件已被这条坑过一次）。
+  > 要看当前值请跑 `git log --oneline -1`。
+- **`origin` 读走 HTTPS、写走 SSH**（`git remote -v` 可见两个 URL）：该网络下 SSH 22 端口会间歇性会话超时，
+  而 HTTPS 的 HTTP/2 会被重置 —— 所以 fetch 用 HTTPS、push 用 SSH 各个绕开一半问题。
+  若 push 失败先 `ssh -T git@github.com` 验证握手；公钥在 `/root/.ssh/id_ed25519`（无口令）。
+  传输若卡死，可加 `git config http.version HTTP/1.1`。
 - **这台设备的 `/sdcard` 是 Android FUSE 挂载，重命名目录有坑**：
   对一个**曾经被删除过**的目录名做 `mv`，可能返回成功、同进程内看着也"对"，
   但换独立进程复核时**内容是空的**。规避方式：**用全新的目录名**，
