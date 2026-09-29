@@ -87,4 +87,4 @@
 
 ## 已知边界（**不要**当作已完成，也不要顺手"修"成别的语义）
 
-停靠（dock）/ 多窗口 · IME 预编辑 · 按键重复未建模 · `texts` 无光标位置 · 事件回调式 API（现在必须整树重建）· 自定义着色 · 推送常量在 Intel 不可用 · 非 Windows 窗口未实现 · 单窗口测试基建限制 · 校验层零消息**不能**证明内存域依赖正确 · `Occluded(false)` 在 Windows 未实测 · 真窗口 `DEER_IDLE_DIRTY=1` 变化档只报数不下结论 · 窗口侧 host→vertex 屏障只有计数没有断言 · README「15 runnable examples」数字已漂。
+停靠（dock）/ 多窗口 · IME 预编辑 · 按键重复未建模 · `texts` 无光标位置 · 事件回调式 API（现在必须整树重建）· 自定义着色 · 推送常量在 Intel 不可用 · 非 Windows 窗口未实现 · 单窗口测试基建限制 · 校验层零消息**不能**证明内存域依赖正确 · `Occluded(false)` 在 Windows 未实测 · 真窗口 `DEER_IDLE_DIRTY=1` 变化档只报数不下结论 · ~~窗口侧 host→vertex 屏障只有计数没有断言~~ **已补**（顶点 / 索引 / 间接**三类**均已加计数 + 三条断言 + 前置断言 + 双向变异，实测 `(0,0,0)→(1,1,1)→不增→不增`） · README「15 runnable examples」数字已漂。
