@@ -2,7 +2,7 @@
 
 Thanks for your interest in the project. This document covers the rules that this repository actually enforces, the design constraints that are easy to break by accident, and the commands worth running before you open a pull request.
 
-Rules for AI agents working in this repository are summarized in [`agent.md`](agent.md); this file is the human-facing counterpart and holds the same discipline.
+Rules for AI agents working in this repository are summarized in [`AGENTS.md`](AGENTS.md); this file is the human-facing counterpart and holds the same discipline.
 
 ## Getting set up
 
@@ -114,7 +114,7 @@ Test and assertion counts change with every milestone, so **live documentation m
 
 | Where | Rule |
 |---|---|
-| **Live documentation** — `README.md`, `README.zh-CN.md`, `FEATURES.md`, `ROADMAP.md`, `docs/features/*.md`, `CONTRIBUTING.md`, `agent.md` | Write **completion, not quantity**: `all passed / 0 failed`, or "as many as the run printed". Do **not** write `167 passed`, `24 assertions`, `共 N 条`, or any other absolute count. |
+| **Live documentation** — `README.md`, `README.zh-CN.md`, `FEATURES.md`, `ROADMAP.md`, `docs/features/*.md`, `CONTRIBUTING.md`, `AGENTS.md` | Write **completion, not quantity**: `all passed / 0 failed`, or "as many as the run printed". Do **not** write `167 passed`, `24 assertions`, `共 N 条`, or any other absolute count. |
 | **Dated snapshots** — `docs/M1-report.md`, `docs/superpowers/plans/*.md` | A count is allowed **only if** it is clearly dated and marked as "measured at that time", e.g. "cargo test --workspace at the M1 tag printed the numbers below" and "as the run printed". |
 | **Why** | An undated count in live docs is stale the moment the next test lands. `167 passed` was true at one commit and was already wrong one milestone later — that is the failure this rule prevents. |
 

@@ -211,7 +211,7 @@ crates/
 | [逐功能指南](docs/features/) | 某个功能的完整用法与坑 |
 | [路线图](ROADMAP.md) | 里程碑 M1–M7 与验收判据 |
 | [上手指南](docs/GETTING-STARTED.md) | 从没写过 Rust 时的慢速入口 |
-| [Agent 须知](agent.md) | 仓库纪律与踩坑记录（写给 AI 协作者与新维护者） |
+| [Agent 须知](AGENTS.md) | 仓库纪律与踩坑记录（写给 AI 协作者与新维护者） |
 
 ### 可运行示例
 

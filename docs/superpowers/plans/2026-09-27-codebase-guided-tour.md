@@ -8,7 +8,7 @@
 
 **Tech Stack:** Rust 2024（rust-version 1.85）、手写 Vulkan 绑定（无 ash/vulkano）、自研 SPIR-V 汇编器（无 shaderc/glslc）、winit 0.30（唯一第三方依赖，仅窗口层）。
 
-**Spec:** `README.md`、`docs/TUTORIAL.md`（14 章）、`FEATURES.md`、`ROADMAP.md`、`docs/features/*.md`、根 `AGENTS.md`（若存在）——本计划是这些文档的**地图与阅读顺序**，不替代它们。
+**Spec:** `README.md`、`docs/TUTORIAL.md`（14 章）、`FEATURES.md`、`ROADMAP.md`、`docs/features/*.md`、根 `AGENTS.md`（**2026-09-30 起存在**：由 `agent.md` 改名而来）——本计划是这些文档的**地图与阅读顺序**，不替代它们。
 
 ## Global Constraints
 
@@ -92,7 +92,7 @@
 
 | # | 我先前的说法 | 实测事实 | 来源 |
 |---|---|---|---|
-| 1 | 「根 `AGENTS.md`」可作素材 | **`AGENTS.md` 不存在**（glob ×2 + `git log --all -- AGENTS.md` 三路确认）⇒ 本仓库的纪律只能从 `FEATURES.md:3-8/89-97`、`README.md:24-25`、`ROADMAP.md:109-159`、两个 plan 的 Global Constraints、`docs/features/TEMPLATE.md` 提取 | `docs/tour/03-app-and-process.md` §5 |
+| 1 | 「根 `AGENTS.md`」可作素材 | **`AGENTS.md` 当时不存在**（glob ×2 + `git log --all -- AGENTS.md` 三路确认）⇒ 本仓库的纪律只能从 `FEATURES.md:3-8/89-97`、`README.md:24-25`、`ROADMAP.md:109-159`、两个 plan 的 Global Constraints、`docs/features/TEMPLATE.md` 提取。**2026-09-30 已翻转**：`agent.md` 改名为 `AGENTS.md` 并新增「§7 Agent 工作流」⇒ 纪律的权威入口现在是根 `AGENTS.md` | `docs/tour/03-app-and-process.md` §5 / §8 |
 | 2 | 「四道门禁」是既有约定 | **没有单一权威文档**：`docs/superpowers/plans/2026-09-27-m3a-…md:20` 只列**三条**（workspace 测试 / clippy / `DEER_VK_VALIDATION=1`）；第四道「示例全跑」是测绘员**本轮补实跑**后写进去的 | 同上 §8 |
 | 3 | 门禁数字 | **条数不写进文档**（本仓库现行口径，远端 `cb7291e` 统一）：`cargo test --workspace` 与 `DEER_VK_VALIDATION=1 cargo test -p deer-vk` 都只看 `test result:` 行是否全过，条数用 `cargo test --workspace 2>&1 \| Select-String "^test result:"` **现取**（**以运行输出为准**）；校验消息计数必须用**行首括号前缀 + `-CaseSensitive`**（`^\[VK ERROR\]\|^\[VALIDATION\]`，松散模式实测假命中 5 条全是用例名）。结构：五个 crate 各有 lib + 若干 `tests/*.rs` 靶（清单见 `docs/tour/03-app-and-process.md` §4.2）；15 个 deer-gui 示例 + `window_smoke` 的判据是 `exit=0` | 同上 §4 |
 
