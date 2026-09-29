@@ -67,7 +67,7 @@
 | **输入与焦点**（事件通路 + 命中/状态机（含裁剪与禁用）+ Tab/Shift+Tab/Escape 焦点 + 文本输入（追加、`Backspace` 按 Unicode 字符删末尾）+ 脚本化重放 + **只在状态变化时重绘**） | ✅ | [input](docs/features/input.md) | `cargo run -p deer-gui --features window --example interactive_form` |
 | **测试接口（testkit）**（建面 + 输入注入（单事件/脚本 + `move @id`）+ 一帧**内置前置断言** + 离屏 CPU/GPU 渲染 + 像素/状态/绘制列表断言 + **CPU↔GPU 对照**（不透明 0 / 半透明 ≤1 LSB）+ 门槛自证 + **可复制的复现命令**） | ✅ | [testing](docs/features/testing.md) | `cargo run -p deer-gui --features testing --example testkit_demo` |
 | **通用纹理 / `RGBA8_UNORM`**（创建 + 上传 + **回读四通道保真**；离屏**纹理 quad** 与 CPU 参考逐字节相同） | 🔄 | **尚无专门指南** —— 想升到「完成」档**必须**补一份 `docs/features/<名字>.md` | **尚无示例** —— 想升到「完成」档**必须**补一个能跑的 `example` |
-| **间接绘制**（`vkCmdBindIndexBuffer` + `vkCmdDrawIndexedIndirect(drawCount = 1, stride = 20)`，**离屏 + 窗口两条路径**；索引/间接缓冲惰性创建 + 跨帧复用 ⇒ 稳态零分配零上传） | 🔄 | **尚无专门指南** —— 同上 | **尚无示例** —— 同上 |
+| **间接绘制**（`vkCmdBindIndexBuffer` + `vkCmdDrawIndexedIndirect(drawCount = 1, stride = 20)`，**离屏 + 窗口两条路径**；`RenderStats::indirect_draws` 与真实调用同处计数 ⇒ 换回 `vkCmdDraw` 必然变红；索引/间接缓冲惰性创建 + 跨帧复用 ⇒ 稳态零分配零上传） | ✅ | [indirect-draw](docs/features/indirect-draw.md) | `cargo run -p deer-gui --example indirect_draw` |
 
 ## 四、还没做的（**不要以为能跑**）
 
