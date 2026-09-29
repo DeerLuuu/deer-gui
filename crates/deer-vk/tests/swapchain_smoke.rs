@@ -866,6 +866,119 @@ fn run_windowed_e2e() {
         (without - with) / without * 100.0
     );
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // 窗口侧 host→vertex 屏障：**从「只有计数」升级成「有断言」**
+    //
+    // ## 为什么必须补在这里（补错地方这条判据就是死的）
+    //
+    // 上面跑了 60+ 帧的 `render_and_present`，走的是 **M2b 三角形路径**（`record`），
+    // 它**根本不碰 UI 顶点缓冲** ⇒ 在那条链上读 `ui_host_to_vertex_barrier_count()`
+    // 恒为 0 —— 一条永远绿、也永远抓不到任何东西的判据。真正发这条屏障的是
+    // `record_ui`，只有 `draw_and_present` 会走到 ⇒ 断言必须挂在 UI 路径上。
+    //
+    // ## 判据的三条腿（三条都要，缺一条就被绕过）
+    //
+    // 1. **首帧必须 +1**：这一帧真的上传了顶点 ⇒ 必须发一条 host→vertex 屏障。
+    //    只发不发是「同步不对」，在同一队列同一提交里颜色几乎必然对 ⇒ 会长期潜伏。
+    // 2. **同语料第二帧不得增加**：内容逐字节相同 ⇒ 跳过重传（B3）⇒ 也不该发屏障。
+    //    这条挡住「每帧无脑发屏障」这种看似无害的退化。
+    // 3. **空帧不得增加**：没有顶点 ⇒ 既不上传也不发屏障。
+    //
+    // ## 前置断言（为什么必须有）
+    //
+    // 「计数没增长」有两种解释：① 正确地没发；② **根本没上传**（那这条判据就白测了）。
+    // 所以首帧必须**同时**断言 `buffer_uploads` 增长 —— 那是「确实有东西要同步」的证据。
+    //
+    // ## 变异验证（**已实测**，两条都确定性变红）
+    //
+    // - 删掉 `windowed.rs` 里 `self.ui_host_to_vertex_barriers += 1;`（**保留**屏障发射）
+    //   ⇒ 第 1 条红（`b1 == b0`）—— 证明计数的自增与「真的发了」这两件事被分开守着；
+    // - 删掉整个 `if self.ui_barrier { … }` 块（连发射带计数一起删）
+    //   ⇒ 第 1 条红 —— 这条是原始的「窗口路径从不发屏障」缺陷形态。
+    //
+    // 边界（诚实说明）：本判据证明「这段代码被执行了、且时机符合 B3 语义」；
+    // **屏障参数的确切位**由 `ui_barrier_constants_pin_the_exact_bits` 钉，
+    // 「驱动真的按语义用了它」属于真机逐像素对照的范畴，不在本条射程内。
+    // ─────────────────────────────────────────────────────────────────────────
+    {
+        use deer_gpu::{DrawCmd, DrawList, RectI};
+
+        let mut list = DrawList::new();
+        list.push(DrawCmd::FillRect {
+            rect: RectI::new(20, 20, 120, 60),
+            color: Color::rgb(200, 30, 40),
+        });
+        assert!(
+            !list.is_empty() && list.clip_balanced(),
+            "前置：本段判据要用一份非空且裁剪平衡的绘制列表"
+        );
+
+        // 三类屏障一起采样：**顶点 / 索引 / 间接**（顺序固定，错误信息里按这个序读）。
+        let snap = |r: &WindowedRenderer| -> (u64, u64, u64) {
+            (
+                r.ui_host_to_vertex_barrier_count(),
+                r.ui_index_barrier_count(),
+                r.ui_indirect_barrier_count(),
+            )
+        };
+
+        let s0 = snap(&r);
+        let up0 = r.render_stats().buffer_uploads;
+
+        // ① 首帧：顶点 / 索引 / 间接 三块缓冲都是第一次上传 ⇒ 三类屏障**各**发一条
+        assert!(
+            matches!(r.draw_and_present(&list, None), Ok(FrameOutcome::Presented)),
+            "前置：UI 首帧必须真的呈现出去（否则后面读到的计数没有意义）"
+        );
+        let s1 = snap(&r);
+        let up1 = r.render_stats().buffer_uploads;
+        assert!(
+            up1 > up0,
+            "前置不成立：首帧没有上传任何缓冲（buffer_uploads {} → {}）⇒ \
+             「屏障计数 +1」无从谈起，本段判据会被静默架空",
+            up0,
+            up1
+        );
+        assert_eq!(
+            s1,
+            (s0.0 + 1, s0.1 + 1, s0.2 + 1),
+            "UI 首帧上传了顶点/索引/间接 ⇒ 三类 host→缓冲屏障**各**必须发一条\
+             （顶点/索引/间接 计数 {s0:?} → {s1:?}）；\
+             不发就是「主机写完 GPU 直接取数」的原始缺陷形态"
+        );
+
+        // ② 同语料第二帧：跳过重传 ⇒ 三类都不得再发屏障
+        assert!(
+            matches!(r.draw_and_present(&list, None), Ok(FrameOutcome::Presented)),
+            "前置：同语料第二帧也要呈现成功"
+        );
+        let s2 = snap(&r);
+        assert_eq!(
+            s2, s1,
+            "语料逐字节相同 ⇒ 跳过重传 ⇒ 三类屏障都不该再发\
+             （顶点/索引/间接 计数 {s1:?} → {s2:?}）；每帧无脑发屏障属于 B3 语义的退化"
+        );
+
+        // ③ 空帧：没有顶点 ⇒ 三类都不得发屏障
+        let empty = DrawList::new();
+        assert!(empty.is_empty(), "前置：空列表必须真的是空的");
+        assert!(
+            matches!(r.draw_and_present(&empty, None), Ok(FrameOutcome::Presented)),
+            "前置：空帧也要呈现成功"
+        );
+        let s3 = snap(&r);
+        assert_eq!(
+            s3, s2,
+            "空帧没有上传 ⇒ 三类屏障都不得发（顶点/索引/间接 计数 {s2:?} → {s3:?}）"
+        );
+
+        println!(
+            "窗口侧 host→缓冲屏障（顶点/索引/间接）：初始 {s0:?} → 首帧 {s1:?}（各 +1 ✅）\
+             → 同语料 {s2:?}（不增 ✅）→ 空帧 {s3:?}（不增 ✅）；\
+             首帧 buffer_uploads {up0} → {up1}（前置成立）"
+        );
+    }
+
     // —— 收尾：wait_idle + Drop（析构顺序在 Drop 里靠字段顺序保证）——
     r.wait_idle().expect("vkDeviceWaitIdle");
     let total = r.frames_presented();

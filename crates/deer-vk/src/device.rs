@@ -1144,6 +1144,250 @@ impl VkDevice {
         // buffer / buf_mem / pool 在此按声明逆序 `Drop`，队列此刻已空闲。
     }
 
+    /// 把主机数据拷进**已存在**纹理的一个**子区域**（HAL `upload_texture` 的落地实现）。
+    ///
+    /// ## 与 [`VkDevice::create_texture`] 的关系（为什么不复用那条）
+    ///
+    /// `create_texture` 的语义是「**造**一张新图像 + 上传整张内容」，
+    /// `image_offset` 恒为 `(0,0)`、`image_extent` 恒为整张纹理
+    /// （`upload_r8_into_image` 写死的）。而 HAL 的 `upload_texture(id, data, region)`
+    /// 的语义是「往**已有**纹理的某个矩形里塞数据」—— 这是**另一条**命令的用法
+    /// （`image_offset = (region.x, region.y)`、`image_extent = (region.w, region.h)`）。
+    /// 把它硬塞进 `create_texture` 会让那条路径多出一堆「区域是不是整张」的分支，
+    /// 而 `create_texture` 是字形图集重传的热路径（改动风险大）。
+    ///
+    /// ## 布局往返（**关键**：不能假设纹理当前处于什么布局）
+    ///
+    /// ```text
+    ///   SHADER_READ_ONLY_OPTIMAL（上传完成后纹理的既定布局）
+    ///     → TRANSFER_DST_OPTIMAL → vkCmdCopyBufferToImage
+    ///     → SHADER_READ_ONLY_OPTIMAL（原样还回去）
+    /// ```
+    ///
+    /// 起点**取 `texture.layout()` 而不是 `UNDEFINED`**：置 `UNDEFINED` 会丢弃
+    /// 图像原有内容，于是「只更新一个子区域、其余像素保持原样」这条语义直接失效
+    /// （其余区域会变成未定义内容）。这是本方法唯一必须写对的地方。
+    ///
+    /// ## 参数
+    ///
+    /// `data` 必须是**该区域**的紧密打包像素（`region.width × region.height × bpp`），
+    /// 不是整张纹理的数据。长度/越界由 [`validate_texture_region`] 在**进驱动前**拦下。
+    pub fn upload_texture_region(
+        &self,
+        texture: &Texture,
+        region: UploadRegion,
+        data: &[u8],
+    ) -> GpuResult<()> {
+        let UploadRegion {
+            x,
+            y,
+            width,
+            height,
+        } = region;
+        let format = texture.format();
+        validate_texture_region(
+            texture.width(),
+            texture.height(),
+            format,
+            region,
+            data,
+        )?;
+
+        let fns = self.fns;
+        let device = self.handle;
+        let image = texture.image();
+
+        // ── staging buffer：HOST_VISIBLE | HOST_COHERENT（不需要 flush）
+        let buf_info = vk::BufferCreateInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            p_next: std::ptr::null(),
+            flags: 0,
+            size: data.len() as u64,
+            usage: vk::VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            sharing_mode: vk::VK_SHARING_MODE_EXCLUSIVE,
+            queue_family_index_count: 0,
+            p_queue_family_indices: std::ptr::null(),
+        };
+        let mut buf_handle: vk::BufferHandle = std::ptr::null_mut();
+        // SAFETY: 结构体在栈上；输出句柄可写。
+        let rc = unsafe { (fns.create_buffer)(device, &buf_info, std::ptr::null(), &mut buf_handle) };
+        check_vk("vkCreateBuffer(region upload)", rc)?;
+        let buffer = OwnedHandle::destroy(buf_handle, device, fns.destroy_buffer);
+
+        let mut breq = std::mem::MaybeUninit::<vk::MemoryRequirements>::uninit();
+        // SAFETY: 完整写入结构体。
+        unsafe { (fns.get_buffer_memory_requirements)(device, buffer.handle(), breq.as_mut_ptr()) };
+        let breq = unsafe { breq.assume_init() };
+        let host_bits =
+            vk::VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk::VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+        let bidx = pick_memory_type(self.mem_props, breq.memory_type_bits, host_bits)?;
+        let buf_mem = alloc_memory(device, &fns, breq.size, bidx, host_bits)?;
+        check_vk(
+            "vkBindBufferMemory(region upload)",
+            // SAFETY: 缓冲与内存都是本设备的新对象，尺寸匹配；offset 0 合法。
+            unsafe { (fns.bind_buffer_memory)(device, buffer.handle(), buf_mem.handle(), 0) },
+        )?;
+
+        // ── 写数据（HOST_COHERENT ⇒ 不需要 vkFlushMappedMemoryRanges）
+        {
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: 内存是 HOST_VISIBLE 且尚未映射；offset/size 在范围内。
+            let rc =
+                unsafe { (fns.map_memory)(device, buf_mem.handle(), 0, vk::WHOLE_SIZE, 0, &mut ptr) };
+            check_vk("vkMapMemory(region upload)", rc)?;
+            if ptr.is_null() {
+                return Err(GpuError::Driver {
+                    code: -1,
+                    message: "vkMapMemory 返回成功但指针为空".to_string(),
+                });
+            }
+            // SAFETY: 映射覆盖整个缓冲（`data.len()` 字节，等于缓冲大小）；
+            // 源与目标不重叠；HOST_COHERENT ⇒ 解映射后数据对设备可见。
+            unsafe {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), ptr as *mut u8, data.len());
+                (fns.unmap_memory)(device, buf_mem.handle());
+            }
+        }
+
+        // ── 一次性命令：布局转换 → 拷贝（只覆盖 region）→ 布局转换
+        let pool = self.create_transient_command_pool()?;
+        let cmd = self.alloc_one_command_buffer(pool.handle())?;
+        let begin = vk::CommandBufferBeginInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            p_next: std::ptr::null(),
+            flags: vk::VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            p_inheritance_info: std::ptr::null(),
+        };
+        check_vk(
+            "vkBeginCommandBuffer(region upload)",
+            // SAFETY: 命令缓冲由本设备分配且未在录制中。
+            unsafe { (fns.begin_command_buffer)(cmd, &begin) },
+        )?;
+
+        let range = full_subresource_range();
+        // 起点用 `texture.layout()`（= SHADER_READ_ONLY_OPTIMAL），**不是** UNDEFINED：
+        // UNDEFINED 会丢弃其他区域的内容。src/dst access 相应地是 SHADER_READ → TRANSFER_WRITE：
+        // 上一帧的采样读必须完成，才能覆盖写。
+        let to_dst = vk::ImageMemoryBarrier {
+            s_type: vk::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            p_next: std::ptr::null(),
+            src_access_mask: vk::VK_ACCESS_SHADER_READ_BIT,
+            dst_access_mask: vk::VK_ACCESS_TRANSFER_WRITE_BIT,
+            old_layout: texture.layout(),
+            new_layout: vk::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            image,
+            subresource_range: range,
+        };
+        // SAFETY: 命令缓冲正在录制；屏障在栈上存活到调用结束。
+        unsafe {
+            (fns.cmd_pipeline_barrier)(
+                cmd,
+                vk::VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                vk::VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0,
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                1,
+                &to_dst,
+            )
+        };
+
+        let copy = vk::BufferImageCopy {
+            buffer_offset: 0,
+            // 0 = 「紧密打包」：源缓冲里每行恰好 `region.width` 个像素、层高恰好 `height` 行。
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: vk::VK_IMAGE_ASPECT_COLOR_BIT,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            },
+            // **区域起点**：这是与 `create_texture` 的上传唯一不同的两个字段之一
+            image_offset: vk::Offset3D {
+                x: x as i32,
+                y: y as i32,
+                z: 0,
+            },
+            image_extent: vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            },
+        };
+        // SAFETY: 缓冲与图像都是本设备对象；区域的越界/长度已在进驱动前校验过。
+        unsafe {
+            (fns.cmd_copy_buffer_to_image)(
+                cmd,
+                buffer.handle(),
+                image,
+                vk::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                1,
+                &copy,
+            )
+        };
+
+        // 转回 SHADER_READ_ONLY_OPTIMAL（与 `Texture::layout()` 的常量事实一致）
+        let to_shader = vk::ImageMemoryBarrier {
+            s_type: vk::VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+            p_next: std::ptr::null(),
+            src_access_mask: vk::VK_ACCESS_TRANSFER_WRITE_BIT,
+            dst_access_mask: vk::VK_ACCESS_SHADER_READ_BIT,
+            old_layout: vk::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            new_layout: vk::VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            src_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family_index: vk::QUEUE_FAMILY_IGNORED,
+            image,
+            subresource_range: range,
+        };
+        // SAFETY: 同上。
+        unsafe {
+            (fns.cmd_pipeline_barrier)(
+                cmd,
+                vk::VK_PIPELINE_STAGE_TRANSFER_BIT,
+                vk::VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                0,
+                0,
+                std::ptr::null(),
+                0,
+                std::ptr::null(),
+                1,
+                &to_shader,
+            )
+        };
+
+        check_vk(
+            "vkEndCommandBuffer(region upload)",
+            // SAFETY: 命令缓冲正在录制。
+            unsafe { (fns.end_command_buffer)(cmd) },
+        )?;
+
+        let submit = vk::SubmitInfo {
+            s_type: vk::VK_STRUCTURE_TYPE_SUBMIT_INFO,
+            p_next: std::ptr::null(),
+            wait_semaphore_count: 0,
+            p_wait_semaphores: std::ptr::null(),
+            p_wait_dst_stage_mask: std::ptr::null(),
+            command_buffer_count: 1,
+            p_command_buffers: &cmd,
+            signal_semaphore_count: 0,
+            p_signal_semaphores: std::ptr::null(),
+        };
+        // SAFETY: 队列是本设备的图形队列；提交后立刻等待空闲 ⇒ 返回时区域已写入且布局已还原。
+        let rc = unsafe { (fns.queue_submit)(self.queue, 1, &submit, vk::NULL_HANDLE) };
+        check_vk("vkQueueSubmit(region upload)", rc)?;
+        // SAFETY: 队列属于本设备。
+        check_vk("vkQueueWaitIdle(region upload)", unsafe {
+            (fns.queue_wait_idle)(self.queue)
+        })?;
+        Ok(())
+        // buffer / buf_mem / pool 在此按声明逆序 `Drop`，队列此刻已空闲。
+    }
+
     /// 把纹理从设备内存**回读**到主机（`vkCmdCopyImageToBuffer` 的一次性路径）。
     ///
     /// ## 为什么需要它（这是「通用纹理」那条验收的关键证据）
@@ -2478,6 +2722,78 @@ pub fn validate_texture_args(
         return Err(GpuError::Unsupported(format!(
             "{} 纹理数据长度必须等于 宽×高×{bpp} = {w}×{h}×{bpp} = {expected} 字节，实际 {} 字节",
             format.name(),
+            data.len(),
+            bpp = format.bytes_per_pixel()
+        )));
+    }
+    Ok(())
+}
+
+/// 上传区域的四个整数（`deer-vk` 内部的形状）。
+///
+/// **为什么不直接收 HAL 的 `deer_gpu::TextureRegion`**：`device.rs` 是纯 Vulkan 层，
+/// 它认识的是 `TextureFormat` / `VkResult`，不认识 HAL 结构体。把 HAL 类型渗进来
+/// 会让「HAL 适配」这件事从 [`crate::hal`] 一处扩散到 Vulkan 层各处。
+/// 也顺便让 [`validate_texture_region`] 的负例测试有个 4 字段的最小面
+/// （8 个标量参数也会让 clippy 报 `too_many_arguments`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UploadRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// 校验「上传到纹理的某个子区域」的参数（**纯函数**：不碰 Vulkan、不碰设备）。
+///
+/// ## 为什么必须单独有这一条（而不是复用 `validate_texture_args`）
+///
+/// 区域上传的**三种错法**都能让 `vkCmdCopyBufferToImage` 读到越界内存或写坏图像，
+/// 而 Vulkan 对此**不报错**（校验层要开 `VK_LAYER_KHRONOS_validation` 才可能报，
+/// 且取决于常量数据）—— 所以必须在**进驱动之前**自己拦：
+///
+/// 1. **`region` 越过纹理边界**（`x + width > tex_w`）：驱动会按
+///    `image_offset + image_extent` 写，越界部分的行为是**未定义的**
+///    （可能静默裁掉、可能写坏相邻数据）；
+/// 2. **`data.len() != region.width × region.height × bpp`**：这是最常见的调用方错误
+///    ——把「整张图的数据」传给「一个子区域」。长度不足 ⇒ 从主机缓冲**越界读**；
+///    长度多了 ⇒ 驱动只拷贝 `image_extent` 那么多个 texel，多余数据被静默忽略，
+///    于是「我明明传了图案」变成「只有一部分生效」这种查不出的缺陷；
+/// 3. **宽或高为 0**：0 面积的拷贝在 Vulkan 里非法。
+///
+/// `region` 的 `width`/`height` 用 `u64` 累加比较：`x + width` 在 `u32` 下可能回绕，
+/// 回绕之后「越界」会变成「看似合法」（例如 `x = u32::MAX`、`width = 2`）。
+pub fn validate_texture_region(
+    tex_w: u32,
+    tex_h: u32,
+    format: TextureFormat,
+    region: UploadRegion,
+    data: &[u8],
+) -> GpuResult<()> {
+    let UploadRegion {
+        x,
+        y,
+        width,
+        height,
+    } = region;
+    if width == 0 || height == 0 {
+        return Err(GpuError::Unsupported(format!(
+            "上传区域的宽高必须 > 0，实际 {width}×{height}"
+        )));
+    }
+    let right = x as u64 + width as u64;
+    let bottom = y as u64 + height as u64;
+    if right > tex_w as u64 || bottom > tex_h as u64 {
+        return Err(GpuError::Unsupported(format!(
+            "上传区域越界：区域 ({x},{y}) {width}×{height} 的右下角 ({right},{bottom}) \
+             超出 {} 纹理的 {tex_w}×{tex_h}",
+            format.name()
+        )));
+    }
+    let expected = width as u64 * height as u64 * format.bytes_per_pixel() as u64;
+    if data.len() as u64 != expected {
+        return Err(GpuError::Unsupported(format!(
+            "上传数据长度必须等于 区域宽×高×{bpp} = {width}×{height}×{bpp} = {expected} 字节，实际 {} 字节",
             data.len(),
             bpp = format.bytes_per_pixel()
         )));

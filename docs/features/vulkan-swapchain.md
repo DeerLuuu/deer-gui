@@ -220,7 +220,7 @@ M2b 的真实状态是：
 | `Device::begin_frame()` | ⚠️ **还没建交换链时明确报错**（错误信息里带「交换链」），不给空帧 |
 | `Frame::record(&DrawList, Option<&mut TextEngine>)` | ✅ **已能画界面（T1.1）**：复用窗口路径的准备链（`WindowedRenderer::prepare_ui`），把形状 + 文本真的送上 GPU；`NodeHint` 是唯一被跳过的命令。**含文本命令却没给引擎 ⇒ `Unsupported`**（**绝不静默忽略**）；裁剪栈不平衡 / 建流失败同样明确报错。**签名在 T1.1 加了一个 `text` 参数**（公开 API 变更，先在 `ROADMAP.md` 登记）|
 | `Frame::read_pixels()` | ❌ `Unsupported`，**错误信息直接指向 `WindowedRenderer::read_back_last_frame()`** —— HAL 的 `read_pixels` 在**提交前**调用，而交换链图像的回读数据只有**呈现之后**才有效；deer-vk 刻意不做「隐式呈现」这种惊吓式语义。离屏回读请用 `OffscreenRenderer` |
-| `Device::create_texture` / `upload_texture` | ❌ `Unsupported`（字形图集上传是 M3） |
+| `Device::create_texture` / `upload_texture` | ✅ **已落地（T1.2）**：建纹理 / **子区域**上传 / 回读四通道保真。**回读**走固有方法 `VulkanDevice::read_texture_bytes(id)`（不在 HAL trait 上）；纹理用 HAL **惰性**自己开的设备，**与窗口链的设备是两条**。判据 `cargo test -p deer-vk --test hal_texture` |
 
 所以 **HAL 的 `Frame` 已经是「能画界面」的帧**（T1.1）：`record` 真的消费 `DrawList`；
 `submit_and_present` 走与窗口路径**同一段** `present_frame` 帧舞蹈。判据见

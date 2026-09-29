@@ -794,6 +794,15 @@ pub struct WindowedRenderer {
     /// （B5-2 之前还分「形状 / 文本」两个分项，那是「两块缓冲」的产物；
     ///   现在只有一块缓冲 ⇒ 分项没有意义，已删除。）
     ui_host_to_vertex_barriers: u64,
+    /// 累计发出的「主机写索引缓冲 → 索引取数」屏障条数。
+    ///
+    /// 与 [`Self::ui_host_to_vertex_barriers`] 同一套理由：索引/间接这两条一度
+    /// **只有 `ui_index_barrier` / `ui_indirect_barrier` 两个 bool、没有计数** ⇒
+    /// 「窗口路径从不发这两条屏障」这类变异在门禁下**全绿**。计数同样写在
+    /// **发屏障的同一处**（`emit_ui_buffer_barrier` 调用旁），删发射就必然删掉计数。
+    ui_index_barriers: u64,
+    /// 累计发出的「主机写间接命令 → 读间接命令」屏障条数（理由同上）。
+    ui_indirect_barriers: u64,
     /// **CPU 侧的顶点转换成本口径**（B5-2）：`unify` 的调用次数与累计输出顶点数。
     unify_calls: u64,
     unify_output_vertices: u64,
@@ -910,6 +919,8 @@ impl WindowedRenderer {
             ui_index_barrier: false,
             ui_indirect_barrier: false,
             ui_host_to_vertex_barriers: 0,
+            ui_index_barriers: 0,
+            ui_indirect_barriers: 0,
             unify_calls: 0,
             unify_output_vertices: 0,
         })
@@ -1320,6 +1331,19 @@ impl WindowedRenderer {
     /// 顶点缓冲 ⇒ 一帧最多一条 ⇒ 分项没有意义，已合并成一个。
     pub fn ui_host_to_vertex_barrier_count(&self) -> u64 {
         self.ui_host_to_vertex_barriers
+    }
+
+    /// 累计发出的「主机写索引缓冲 → 索引取数」屏障条数（护栏同 [`Self::ui_host_to_vertex_barrier_count`]）。
+    ///
+    /// 语义与顶点那条一致：只在**这一帧真的重传了**索引缓冲时才 +1（内容只在顶点数变化
+    /// 时才变 ⇒ 稳态零上传、也零屏障）。
+    pub fn ui_index_barrier_count(&self) -> u64 {
+        self.ui_index_barriers
+    }
+
+    /// 累计发出的「主机写间接命令 → 读间接命令」屏障条数（护栏同上）。
+    pub fn ui_indirect_barrier_count(&self) -> u64 {
+        self.ui_indirect_barriers
     }
 
     /// **统一顶点转换的 CPU 成本口径**（B5-2）：`unify` 的调用次数（累计）。
@@ -1865,6 +1889,8 @@ impl WindowedRenderer {
                     VK_PIPELINE_STAGE_VERTEX_INPUT,
                     VK_ACCESS_INDEX_READ,
                 );
+                // 计数与真实调用同处（与顶点那条同一套理由）：删掉发射就必然删掉计数
+                self.ui_index_barriers += 1;
             }
         }
         if self.ui_indirect_barrier {
@@ -1876,6 +1902,8 @@ impl WindowedRenderer {
                     VK_PIPELINE_STAGE_DRAW_INDIRECT,
                     VK_ACCESS_INDIRECT_COMMAND_READ,
                 );
+                // 同上
+                self.ui_indirect_barriers += 1;
             }
         }
 
