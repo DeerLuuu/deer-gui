@@ -21,7 +21,7 @@ Vulkan 符号自己声明、运行时动态加载。
 | **渲染到窗口**（`VkSurfaceKHR` + 交换链 + 帧同步 + 呈现） | ✅ **M2b** → 见 [`vulkan-swapchain.md`](vulkan-swapchain.md) |
 | 把界面（`DrawList`）送上 GPU | ❌ **M3**（`Frame::record` 对非空绘制列表明确返回 `Unsupported`；空列表/只有 `NodeHint` 可以记录） |
 | 交换链回读（HAL 的 `Frame::read_pixels`） | ❌ **明确 `Unsupported`**：HAL 的 `read_pixels` 在**提交前**调用，而交换链图像的回读数据只有**呈现之后**才有效 ⇒ 错误信息指向 `WindowedRenderer::read_back_last_frame()`。离屏回读请用 [`gpu-offscreen.md`](gpu-offscreen.md) 的 `OffscreenRenderer` |
-| 纹理（`create_texture` / `upload_texture`，字形图集上传） | ❌ **M3**（明确报 `Unsupported`） |
+| 纹理（`create_texture` / `upload_texture`） | ✅ **T1.2 已落地**（HAL 那一层可建纹理、**子区域**上传、回读四通道保真；判据 `cargo test -p deer-vk --test hal_texture`）。**仍缺**：**窗口路径**把 HAL 纹理喂进绘制的入口；**按 RGB 调制**需要新片元着色器（见下方「纹理的 RGB 采样」行与 [`textures.md`](textures.md)） |
 
 **所以现在要出「界面」的图仍然用 CPU 后端**（见 [`rendering.md`](rendering.md)）：
 Vulkan 能离屏画几何、也能把像素呈现在窗口里，但**还不消费 `DrawList`**（那是 M3）。
@@ -199,7 +199,7 @@ for _ in 0..3 { let d = deer_vk::VkDevice::open(0)?; d.wait_idle()?; }
 - GPU HAL 契约：[`gpu-hal.md`](gpu-hal.md)
 - 里程碑与剩余步骤：[`../../ROADMAP.md`](../../ROADMAP.md)（M2a-3..6、M2b）
 - 内部原理：[`../M1-report.md`](../M1-report.md)
-- **做不到**：把界面（`DrawList`）送上 GPU（M3）、纹理上传（M3）、多线程（HAL 无 `Send`/`Sync`，见 Q-4）。
+- **做不到**：把界面（`DrawList`）送上 GPU（M3）、**窗口路径**的纹理绑定（纹理**本体**已落地，见 [`textures.md`](textures.md)）、多线程（HAL 无 `Send`/`Sync`，见 Q-4）。
   交换链回读**不走 HAL**：`Frame::read_pixels()` 明确 `Unsupported`，用 `WindowedRenderer::read_back_last_frame()`（见 [`vulkan-swapchain.md`](vulkan-swapchain.md)）
 
 ## 10. 检查清单

@@ -54,7 +54,7 @@ let fb = deer_gpu::null::CpuRenderer::new()
 | `Device::begin_frame()` | ⚠️ **还没建交换链时明确报错**（错误信息带「交换链」），不给空帧 |
 | `Frame::record(&DrawList)` | 空列表 / 只有 `NodeHint` ✅；**含真实绘制命令 ⇒ `Unsupported`**（文案指明「送上 GPU 是 M3」），**不静默忽略** |
 | `Frame::read_pixels()` | ❌ `Unsupported`：HAL 在**提交前**调用，而交换链图像的回读数据只有**呈现之后**才有效 ⇒ 错误信息指向 `WindowedRenderer::read_back_last_frame()`；离屏回读用 `OffscreenRenderer`（见 [`gpu-offscreen.md`](gpu-offscreen.md)） |
-| `Device::create_texture()` / `upload_texture()` | ❌ `Unsupported`（字形图集上传是 M3） |
+| `Device::create_texture()` / `upload_texture()` | ✅ **已落地（T1.2）**：`TextureDesc` → 真纹理，`upload_texture(id, data, region)` 支持**子区域**（布局往返以 `SHADER_READ_ONLY_OPTIMAL` 为起点 ⇒ 区域外像素保持原样）；非法尺寸/幽灵 id/越界或长度不符的区域**在碰驱动前**被拒。**回读四通道保真的判据**走固有方法 `VulkanDevice::read_texture_bytes(id)`（不在 HAL trait 上 —— 加 trait 方法属公开 API 变更，须先登记）。**边界**：纹理走 HAL 自己**惰性**开的设备，与**窗口链**的设备是两条（把两条并成一条是 M3 的工程活）；「窗口路径贴任意纹理」仍缺（见 [`vulkan.md`](vulkan.md) 与 [`textures.md`](textures.md)）。判据：`cargo test -p deer-vk --test hal_texture`（无 GPU 时跳过） |
 
 上屏那条链走的是**专用快路** `deer_vk::windowed::WindowedRenderer`，见
 [`vulkan-swapchain.md`](vulkan-swapchain.md)。
@@ -152,7 +152,7 @@ $env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo run -q -p deer
 - 绘制列表（后端消费的东西）：[`draw-list.md`](draw-list.md)
 - Vulkan 后端现状：[`vulkan.md`](vulkan.md)
 - HAL 窗口路径示例：`crates/deer-gui/examples/hal_window_path.rs`（`--features window`，`DEER_VK_WINDOW_TESTS=1` 开关）
-- **做不到**：`DrawList → GPU`（矩形/圆角/文本；M3）；纹理上传（M3）；
+- **做不到**：把界面（`DrawList`）送上 GPU（矩形/圆角/文本；M3）；**窗口路径**的纹理绑定（HAL 纹理**本体**已落地，但把 HAL 纹理喂进 `WindowedRenderer` 的绘制路径仍是 M3 的工程活）；
   推送常量矩形着色器（损坏，见 [`ROADMAP.md`](../../ROADMAP.md) Q-5）。
   **`deer-vk` 的 `Frame::read_pixels()` 明确 `Unsupported`** —— 不是「以后再补」而是语义选择：
   HAL 在提交前调用，回读数据只有呈现后才有效，所以请用 `WindowedRenderer::read_back_last_frame()`

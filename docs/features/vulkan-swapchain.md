@@ -220,7 +220,7 @@ M2b 的真实状态是：
 | `Device::begin_frame()` | ⚠️ **还没建交换链时明确报错**（错误信息里带「交换链」），不给空帧 |
 | `Frame::record(&DrawList)` | 空列表 / 只有 `NodeHint` ✅；**含真实绘制命令 ⇒ `Unsupported`**（文案指明「送上 GPU 是 M3」）。**绝不静默忽略** |
 | `Frame::read_pixels()` | ❌ `Unsupported`，**错误信息直接指向 `WindowedRenderer::read_back_last_frame()`** —— HAL 的 `read_pixels` 在**提交前**调用，而交换链图像的回读数据只有**呈现之后**才有效；deer-vk 刻意不做「隐式呈现」这种惊吓式语义。离屏回读请用 `OffscreenRenderer` |
-| `Device::create_texture` / `upload_texture` | ❌ `Unsupported`（字形图集上传是 M3） |
+| `Device::create_texture` / `upload_texture` | ✅ **已落地（T1.2）**：建纹理 / **子区域**上传 / 回读四通道保真。**回读**走固有方法 `VulkanDevice::read_texture_bytes(id)`（不在 HAL trait 上）；纹理用 HAL **惰性**自己开的设备，**与窗口链的设备是两条**。判据 `cargo test -p deer-vk --test hal_texture` |
 
 所以 **HAL 的 `Frame` 还不是「能画界面」的帧**：窗口里目前只有清屏色 + M2a 的几何三角形。
 
