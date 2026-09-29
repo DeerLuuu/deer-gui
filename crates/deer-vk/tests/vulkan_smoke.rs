@@ -72,16 +72,46 @@ fn vk_backend_opens_a_real_device_and_reports_m2b_boundaries() {
         "错误信息要说清原因，实际：{err}"
     );
 
-    // 诚实边界②：纹理（字形图集上传）是 M3 ⇒ 明确报错
-    let err = device
+    // 诚实边界②：纹理已落地（T1.2）⇒ 这里改断言「能建、能上传、能回读」，
+    // 而不再是「必须报错」。**四通道保真的完整判据在 `tests/hal_texture.rs`**；
+    // 这里只做一条最小烟测，保证「HAL 的纹理口是通的」与「未建交换链不影响建纹理」。
+    let id = device
         .create_texture(deer_gpu::TextureDesc {
-            width: 4,
-            height: 4,
+            width: 2,
+            height: 2,
             format: deer_gpu::TargetFormat::Rgba8Unorm,
             readable: false,
         })
-        .expect_err("纹理创建未实现，必须报错");
-    assert!(err.to_string().contains("M3"), "实际：{err}");
+        .expect("T1.2 之后 HAL 纹理创建必须可用（不依赖交换链）");
+    // 上传整张 2×2 RGBA8（16 字节）必须成功
+    device
+        .upload_texture(
+            id,
+            &[1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16],
+            deer_gpu::TextureRegion {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+        )
+        .expect("HAL 纹理上传必须可用");
+    // 不存在的 id 仍必须明确报错（不许静默成功）
+    assert!(
+        device
+            .upload_texture(
+                deer_gpu::TextureId(999),
+                &[0u8; 4],
+                deer_gpu::TextureRegion {
+                    x: 0,
+                    y: 0,
+                    width: 1,
+                    height: 1
+                }
+            )
+            .is_err(),
+        "不存在的纹理 id 必须报错"
+    );
 
     // 越界的适配器索引也必须报错（而不是 panic）
     assert!(vk.open(999).is_err(), "越界索引必须返回错误");
