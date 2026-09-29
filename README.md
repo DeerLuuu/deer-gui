@@ -88,6 +88,9 @@ cargo run -p deer-gui --features window --example window_preview
 
 # End-to-end check: window pixels vs the CPU backend (gated; prints "this is a skip, not a pass" if the gate is unset)
 DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example window_parity
+
+# Interactive demo: click, type, Tab between fields (Windows; drives input → focus → redraw)
+cargo run -p deer-gui --features window --example interactive_form
 ```
 
 If you have never written Rust, start with the more verbose [getting-started guide](docs/GETTING-STARTED.md).
@@ -128,6 +131,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | **Real glyphs** (font parsing → rasterization → atlas → pixels) | ✅ offscreen / CPU backend |
 | **GPU-side text** (glyph quads + `R8_UNORM` atlas texture, nearest sampling) | ✅ compared byte-for-byte against the CPU backend |
 | **Rendering into a window on screen** (shapes and text) | ✅ pixel-compared against the CPU backend via `window_parity` |
+| **Scrolling and multi-line text** | ✅ `text` + `wrap` emits one `Text` command per line; `column` + `scroll` adds `max_scroll`, viewport clipping, and wheel-driven offset that clamps at the edges and does not hit-test outside the viewport — [`scroll-and-multiline`](docs/features/scroll-and-multiline.md) |
+| **Interaction and testkit** | ✅ input state machine (clip- and disabled-aware), focus, text input, scripted replay, and dirty-only redraw; `deer_gui::testing` turns the test discipline into an API (inject input, assert a frame's preconditions, compare CPU↔GPU, print a copyable repro command) — [`testing`](docs/features/testing.md) |
 | Input events and focus | ✅ hover / press / click / `Tab`·`Shift+Tab`·`Escape` focus / text input / scripted replay / dirty-only redraw (see [`docs/features/input.md`](docs/features/input.md) §6 for what is left) |
 
 One subtlety worth knowing: the older entry point `render_tree_to_png` does not load a font, so text drawn through it is still evenly spaced placeholder boxes. Real glyphs come from the text engine (`text_render`). Geometry, layering, and color are real on both paths.
@@ -202,6 +207,7 @@ Behavior that looks surprising is usually deliberate. The full list, with the de
 
 | Document | What it covers |
 |---|---|
+| [Chinese docs site](https://deerluuu.github.io/deer-gui-docs/) | **mdBook-based Chinese tutorial + API reference** (standalone repo [deer-gui-docs](https://github.com/DeerLuuu/deer-gui-docs), auto-deployed on push) |
 | [Tutorial](docs/TUTORIAL.md) | Step by step, 14 sections (§0–§13); every section runs on its own |
 | [Feature list](FEATURES.md) | **Which features exist, how far they are, and which are not done** — the single source of truth |
 | [Per-feature guides](docs/features/) | Complete usage and pitfalls for one feature at a time |
