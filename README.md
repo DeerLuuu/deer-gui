@@ -88,6 +88,9 @@ cargo run -p deer-gui --features window --example window_preview
 
 # End-to-end check: window pixels vs the CPU backend (gated; prints "this is a skip, not a pass" if the gate is unset)
 DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example window_parity
+
+# Interactive demo: click, type, Tab between fields (Windows; drives input → focus → redraw)
+cargo run -p deer-gui --features window --example interactive_form
 ```
 
 If you have never written Rust, start with the more verbose [getting-started guide](docs/GETTING-STARTED.md).
@@ -128,6 +131,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | **Real glyphs** (font parsing → rasterization → atlas → pixels) | ✅ offscreen / CPU backend |
 | **GPU-side text** (glyph quads + `R8_UNORM` atlas texture, nearest sampling) | ✅ compared byte-for-byte against the CPU backend |
 | **Rendering into a window on screen** (shapes and text) | ✅ pixel-compared against the CPU backend via `window_parity` |
+| **Scrolling and multi-line text** | ✅ `text` + `wrap` emits one `Text` command per line; `column` + `scroll` adds `max_scroll`, viewport clipping, and wheel-driven offset that clamps at the edges and does not hit-test outside the viewport — [`scroll-and-multiline`](docs/features/scroll-and-multiline.md) |
+| **Interaction and testkit** | ✅ input state machine (clip- and disabled-aware), focus, text input, scripted replay, and dirty-only redraw; `deer_gui::testing` turns the test discipline into an API (inject input, assert a frame's preconditions, compare CPU↔GPU, print a copyable repro command) — [`testing`](docs/features/testing.md) |
 | Input events and focus | ✅ hover / press / click / `Tab`·`Shift+Tab`·`Escape` focus / text input / scripted replay / dirty-only redraw (see [`docs/features/input.md`](docs/features/input.md) §6 for what is left) |
 
 One subtlety worth knowing: the older entry point `render_tree_to_png` does not load a font, so text drawn through it is still evenly spaced placeholder boxes. Real glyphs come from the text engine (`text_render`). Geometry, layering, and color are real on both paths.

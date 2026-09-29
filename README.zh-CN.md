@@ -89,6 +89,9 @@ cargo run -p deer-gui --features window --example window_preview
 
 # 端到端判据：上屏像素 vs CPU 后端（有门禁；不设门禁时会打印「这不是通过，是被跳过」）
 DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example window_parity
+
+# 交互示例：点击 / 输入 / Tab 切换焦点（仅 Windows；打通 输入 → 焦点 → 重绘）
+cargo run -p deer-gui --features window --example interactive_form
 ```
 
 从没写过 Rust，可以先看更啰嗦的[上手指南](docs/GETTING-STARTED.md)。
@@ -129,6 +132,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 | **真实字形**（字体解析 → 光栅化 → 图集 → 贴像素） | ✅ 离屏 / CPU 后端 |
 | **GPU 侧文本**（字形四边形 + `R8_UNORM` 图集纹理 + 最近邻采样） | ✅ 与 CPU 后端逐字节对照 |
 | **渲染到窗口 / 屏幕上**（形状与文本） | ✅ 经 `window_parity` 与 CPU 后端逐像素对照 |
+| **滚动与多行文本** | ✅ `text` + `wrap` 每行产出一条 `Text` 命令；`column` + `scroll` 提供 `max_scroll`、视口裁剪与滚轮驱动偏移（到边界不越界、视口外不命中）—— [`scroll-and-multiline`](docs/features/scroll-and-multiline.md) |
+| **交互与 testkit** | ✅ 输入状态机（含裁剪与禁用感知）、焦点、文本输入、脚本重放、不脏不画；`deer_gui::testing` 把测试纪律变成 API（注入输入、断言一帧前置条件、CPU↔GPU 对照、打印可复制复现命令）—— [`testing`](docs/features/testing.md) |
 | 输入事件与焦点 | ✅ 悬停 / 按下 / 点击 / `Tab`·`Shift+Tab`·`Escape` 焦点 / 文本输入 / 脚本重放 / 不脏不画（剩余部分见 [`docs/features/input.md`](docs/features/input.md) 第 6 节） |
 
 一个容易踩的点：老入口 `render_tree_to_png` 不加载字体，所以经它画出的「字」仍是等宽占位方块；真实字形来自文本引擎（`text_render`）。两条路径上，几何、层次、颜色都是真的。
