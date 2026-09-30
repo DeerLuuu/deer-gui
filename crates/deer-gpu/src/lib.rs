@@ -197,6 +197,27 @@ pub trait Frame {
     ///   后端跳过并计数即可。
     fn record(&mut self, list: &DrawList, text: Option<&mut TextEngine>) -> GpuResult<()>;
     /// 回读这一帧的图像（`readable` 目标；截图与自动测试用）。
+    ///
+    /// ## 调用时序（T1.4 的语义决策：**不引入隐式呈现**）
+    ///
+    /// 本方法在**提交之前**被调用 —— 即 [`Frame::record`] 之后、
+    /// [`Frame::submit_and_present`] 之前。这个时序对两类目标的含义完全不同：
+    ///
+    /// - **离屏 / 显式 `readable` 的目标**：数据在命令录制完就已落在目标上，本方法能拿到像素；
+    /// - **交换链**：Vulkan 的交换链图像只有**呈现之后**才保证可读。本方法偏偏在呈现前调用，
+    ///   两者**前提冲突**。此处刻意**不做「替调用方隐式呈现一次再回读」**——
+    ///   那会把一个「读」变成有副作用的动作，也让「这一帧到底有没有上屏」变得说不清。
+    ///
+    /// ## 后端**必须**遵守的行为
+    ///
+    /// - 目标确实可在提交前回读 ⇒ 返回像素；
+    /// - 目标在这个时序下拿不到有效数据（典型是交换链）⇒ 返回 [`GpuError::Unsupported`]，
+    ///   并且**错误信息要指出真正可用的入口** —— 「报错但不告诉你怎么办」等于没报错。
+    ///   `deer-vk` 的写法：`WindowedRenderer::read_back_last_frame()`（在
+    ///   `render_and_present()` **之后**调，取回上一帧的像素）；离屏回读用
+    ///   `OffscreenRenderer`。该契约由 `deer-vk` 侧的一条用例直接钉住（断言错误信息
+    ///   里出现替代入口的名字）。
+    /// - 这条不是「以后再补」的占位：`Unsupported` 是**语义选择的结果**，不是一个 TODO。
     fn read_pixels(&mut self) -> GpuResult<Vec<u8>>;
     /// 提交并呈现。返回是否成功呈现（`false` = 交换链过期，调用方应 resize 后重试）。
     fn submit_and_present(self: Box<Self>) -> GpuResult<PresentResult>;
