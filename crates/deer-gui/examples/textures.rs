@@ -131,24 +131,56 @@ fn main() {
     let gpu = r.draw_textured_quad(&tex, quad, tint).expect("纹理 quad");
     assert!(r.unsupported().is_empty(), "纹理 quad 不该有 unsupported");
 
-    // 前置断言：GPU 结果里必须同时出现「画到了 tint 色」和「保持清屏色」两种像素，
+    // 前置断言：GPU 结果里必须同时出现「保持清屏色」的像素和「**多种**被调制的像素」，
     // 否则「与 CPU 一致」可能只是「两边都是纯色」这种平凡情形。
-    let has_tint = gpu.chunks_exact(4).any(|p| p == [200, 100, 50, 255]);
-    let has_clear = gpu
-        .chunks_exact(4)
-        .any(|p| p[0] == CLEAR.r && p[1] == CLEAR.g && p[2] == CLEAR.b);
+    //
+    // 判据为什么要从「出现 tint 像素」改成「出现**多种**非清屏色」：T1.3 之前 FS 只读
+    // `.r`（覆盖率语义），而 `tint.a == 1` ⇒ 覆盖率只在 0/1 之间跳 ⇒ quad 里只有
+    // 「纯 tint」与「清屏」**两种**颜色。四个通道都参与调制后，每个 texel 给出不同的颜色。
+    let is_clear = |p: &[u8]| p[0] == CLEAR.r && p[1] == CLEAR.g && p[2] == CLEAR.b;
+    let has_clear = gpu.chunks_exact(4).any(is_clear);
+    let mut distinct = std::collections::BTreeSet::new();
+    for p in gpu.chunks_exact(4) {
+        if !is_clear(p) {
+            distinct.insert((p[0], p[1], p[2], p[3]));
+        }
+    }
     assert!(
-        has_tint && has_clear,
-        "前置条件不成立：GPU 结果里没有同时出现 tint 像素与清屏像素\
-         （tint={has_tint} clear={has_clear}）—— 对照判据是空的"
+        has_clear && distinct.len() >= 2,
+        "前置条件不成立：需要「清屏像素」+「至少两种被调制的像素」\
+         （clear={has_clear} 非清屏色数={}）—— 对照判据是空的",
+        distinct.len()
+    );
+
+    // ── T1.3 的**判别性**断言：RGB 真的参与了调制 ──────────────────────────
+    //
+    // 只看「与 CPU 一致」是不够的 —— 如果两侧都退回覆盖率语义，parity 照样是 0。
+    // 这条直接钉住「调制生效」：覆盖率语义下绿通道恒等于 `tint.g`（色不动、只压 alpha），
+    // 四通道参与后它会随纹理变化。**改回只读 `.r` ⇒ 这条必红。**
+    let mut greens = std::collections::BTreeSet::new();
+    for p in gpu.chunks_exact(4) {
+        if !is_clear(p) {
+            greens.insert(p[1]);
+        }
+    }
+    assert!(
+        greens.len() > 1,
+        "绿通道必须随纹理变化（实测 {} 种取值）—— 恒等于 tint.g 说明 FS 又退回「只读 .r」了",
+        greens.len()
     );
 
     let cpu = cpu_textured_quad(extent, TEX_W, TEX_H, &data, quad, tint);
     let worst = max_channel_diff(&gpu, &cpu);
-    println!("④ 采样 ✅ 与 CPU 参考最大通道差 {worst}（棋盘 0/255 ⇒ 判据是逐字节 0 差）");
-    assert_eq!(
-        worst, 0,
-        "纹理 quad 必须与 CPU 参考逐字节相同（最大通道差 {worst}）"
+    //
+    // 判据为什么从「逐字节 0」放宽到「≤1 LSB」：**这不是判据变松，是它终于开始混合了**。
+    // T1.3 之前纹理的 alpha 不参与（`a = tint.a * texel.r`，而 `tint.a == 1` ⇒
+    // 覆盖率只在 0/1 之间跳）⇒ 要么全取源、要么全不取，**没有真正的混合** ⇒ 0 差。
+    // 现在 `a = tint.a * texel.a` 会取到中间值 ⇒ 出现真实 alpha 混合 ⇒ 落到仓库
+    // 既有的那条口径上：**半透明 ≤1 LSB 是实测上限，不是证明上界**（`AGENTS.md` §3.1）。
+    println!("④ 采样 ✅ 与 CPU 参考最大通道差 {worst}（纹理 alpha 参与 ⇒ 有真实混合 ⇒ ≤1 LSB）");
+    assert!(
+        worst <= 1,
+        "纹理 quad 与 CPU 参考的最大通道差 {worst} 超过 1 LSB"
     );
 
     // ─────────────────────────────────────────────────────────────────────
@@ -162,17 +194,35 @@ fn main() {
         let i = ((y as u32 * W + x as u32) * 4) as usize;
         [gpu[i], gpu[i + 1], gpu[i + 2], gpu[i + 3]]
     };
-    // 纹理 (0,0) 的 R=255（亮）⇒ quad 左上角内侧应是 tint 色；
+    // 纹理 (0,0) 是「亮」texel ⇒ quad 左上角内侧应是 **tint × 那个 texel** 的颜色；
     // 纹理 (1,0) 的 R=0（透明）⇒ 同一条行往右应是清屏色。
+    //
+    // 期望值按调制公式从语料里算（**不**调用 `cpu_textured_quad`，否则这条就不再是
+    // 独立判据了）—— T1.3 之前这里写的是「纯 tint」，因为那时 alpha 不参与。
+    let expect_texel = |tx: u32, ty: u32| -> [u8; 4] {
+        let t = ((ty * TEX_W + tx) * 4) as usize;
+        let mut px = [0u8; 4];
+        for c in 0..3 {
+            let src = [200.0f32, 100.0, 50.0][c] * data[t + c] as f32 / 255.0;
+            let a = data[t + 3] as f32 / 255.0;
+            let dst = [CLEAR.r, CLEAR.g, CLEAR.b][c] as f32;
+            px[c] = (src * a + dst * (1.0 - a)).round() as u8;
+        }
+        px[3] = 255;
+        px
+    };
     assert_eq!(
         at(quad.x + 2, quad.y + 1),
-        [200, 100, 50, 255],
-        "quad 左上角内侧应是纹理 (0,0) 的亮 texel（若这里是清屏色 ⇒ V 翻转或 U 镜像）"
+        expect_texel(0, 0),
+        "quad 左上角内侧应是纹理 (0,0) 经调制后的颜色（若这里是清屏色 ⇒ V 翻转或 U 镜像）"
     );
+    // 纹理 (1,0) 的 **R=0** ⇒ 覆盖率语义下这里是清屏色；调制后它按自己四通道算
+    // （实测不是清屏色 —— 那正是「RGB 参与了」的又一个证据）。朝向判据不变：
+    // **这里必须等于 (1,0) 那个 texel 的结果，而不是 (0,1) 或 (3,0) 的**。
     assert_eq!(
         at(quad.x + 8, quad.y + 1),
-        [CLEAR.r, CLEAR.g, CLEAR.b, 255],
-        "quad 左上角右侧应是纹理 (1,0) 的透明 texel"
+        expect_texel(1, 0),
+        "quad 左上角右侧应是纹理 (1,0) 经调制后的颜色（不是它 ⇒ U 镜像了）"
     );
     println!("⑤ UV 朝向 ✅ 纹理 (0,0) 落在 quad 左上角（V 未翻转、U 未镜像）");
 
@@ -201,8 +251,10 @@ fn main() {
     // ─────────────────────────────────────────────────────────────────────
     println!("\n=== 当前边界 ===");
     println!("  ✅ 能：建 RGBA8_UNORM 纹理、上传（四通道逐字节保真）、回读、铺到矩形上采样");
-    println!("  ⚠️  采样只消费 **R 通道**（当覆盖率）⇒ G/B/A 只靠回读证明，不体现在像素里");
-    println!("  ❌ 不能：按 **RGB 调制** —— 需要新的片元着色器（尚未做，见 FEATURES.md 第四节）");
+    println!("  ✅ 能：按 **RGB 调制**（T1.3 ①）—— 四个通道都进像素；上面那条");
+    println!("     「绿通道随纹理变化」的断言就是判别式（FS 退回只读 `.r` 会红）");
+    println!("  ⚠️  字形图集那一支**仍是**覆盖率语义（`R8_UNORM` + `color.a * texel.r`）——");
+    println!("     刻意保留：那是文本渲染该有的语义，不是「还没做完」");
     println!("  ❌ 不能：在**窗口路径**贴任意纹理（`draw_textured_quad` 目前只有离屏侧）");
     println!("  ❌ 不能：把纹理作为 `DrawCmd` 进 `DrawList`（`DrawList` 是 deer-gpu 的契约，不在本项 scope）");
 
@@ -252,7 +304,8 @@ fn cpu_textured_quad(
     for _ in 0..(w * h) {
         fb.extend_from_slice(&[CLEAR.r, CLEAR.g, CLEAR.b, 255]);
     }
-    let src = [tint.r, tint.g, tint.b];
+    // T1.3 起 `src` 是**逐像素**算的（要乘纹理的 RGB），这里只是占位 —— 见循环内。
+    let _tint_rgb = [tint.r, tint.g, tint.b];
     for y in quad.y..quad.bottom() {
         for x in quad.x..quad.right() {
             if x < 0 || y < 0 || x >= w as i32 || y >= h as i32 {
@@ -262,12 +315,24 @@ fn cpu_textured_quad(
             let v = (y as f32 + 0.5 - quad.y as f32) / quad.h as f32;
             let tx = ((u * tex_w as f32).floor() as i32).clamp(0, tex_w as i32 - 1) as u32;
             let ty = ((v * tex_h as f32).floor() as i32).clamp(0, tex_h as i32 - 1) as u32;
-            let cov = tex[((ty * tex_w + tx) * 4) as usize] as f32 / 255.0;
-            let a = tint.a.clamp(0.0, 1.0) * cov.clamp(0.0, 1.0);
+            // T1.3：**RGB 调制** —— 四个通道全部参与（与 `spirv::fragment_shader_textured`
+            // 的 `out = color * texel` 逐字对应）。改之前这里只读 `.r` 当覆盖率，
+            // 于是 G/B/A 传错也看不出来 —— 那正是任务书里 ① 要修的东西。
+            let ti = ((ty * tex_w + tx) * 4) as usize;
+            let tr = tex[ti] as f32 / 255.0;
+            let tg = tex[ti + 1] as f32 / 255.0;
+            let tb = tex[ti + 2] as f32 / 255.0;
+            let ta = tex[ti + 3] as f32 / 255.0;
+            let src = [
+                _tint_rgb[0] as f32 * tr,
+                _tint_rgb[1] as f32 * tg,
+                _tint_rgb[2] as f32 * tb,
+            ];
+            let a = tint.a.clamp(0.0, 1.0) * ta;
             let i = ((y as u32 * w + x as u32) * 4) as usize;
             let inv = 1.0 - a;
             for c in 0..3 {
-                fb[i + c] = (src[c] as f32 * a + fb[i + c] as f32 * inv).round() as u8;
+                fb[i + c] = (src[c] * a + fb[i + c] as f32 * inv).round() as u8;
             }
             fb[i + 3] = ((a + (fb[i + 3] as f32 / 255.0) * inv).clamp(0.0, 1.0) * 255.0).round() as u8;
         }

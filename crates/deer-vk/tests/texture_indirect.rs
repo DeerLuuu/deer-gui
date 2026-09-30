@@ -205,12 +205,19 @@ fn rgba8_texture_upload_preserves_all_four_channels() {
 
 /// 纹理 quad 的 **CPU 参考**（独立实现：照 CPU 基线 `null.rs::blend_cov` 的公式写）：
 ///
+/// **T1.3 起改成 RGB 调制**（与 `spirv::fragment_shader_textured` 的
+/// `out = color * texel` 逐字对应）：
+///
 /// ```text
 ///   像素中心 (x+0.5, y+0.5) → 归一化 uv → NEAREST texel = (floor(u*tex_w), floor(v*tex_h))
-///   cov = tex[texel].R / 255
-///   a   = clamp(tint.a, 0, 1) * cov
-///   dst.rgb = round(tint.rgb * a + dst.rgb * (1 - a))
+///   src.rgb = tint.rgb * texel.rgb / 255        ← 四个通道都参与（以前只读 .R 当覆盖率）
+///   a       = clamp(tint.a, 0, 1) * texel.a / 255
+///   dst.rgb = round(src.rgb * a + dst.rgb * (1 - a))
 /// ```
+///
+/// 判据口径随之后果：以前 `a` 只在 `{0,1}` 里跳（因为 `cov` 取的是 0/255 的 R 通道）
+/// ⇒ **没有真正的混合** ⇒ 可以逐字节 0 差。现在 `texel.a` 会取中间值 ⇒ 出现真实
+/// alpha 混合 ⇒ 落到仓库既有的口径上（半透明 **≤1 LSB 是实测上限**）。
 ///
 /// **为什么用「像素中心」**：顶点 uv 是**像素边界**语义（`u = (px - quad.x)/quad.w`），
 /// 片元在像素中心求值 ⇒ 采样点落在 texel 中心，`NEAREST` 无平局、逐像素精确
@@ -247,12 +254,18 @@ fn cpu_textured_quad(
             let v = (y as f32 + 0.5 - quad.y as f32) / quad.h as f32;
             let tx = ((u * tex_w as f32).floor() as i32).clamp(0, tex_w as i32 - 1) as u32;
             let ty = ((v * tex_h as f32).floor() as i32).clamp(0, tex_h as i32 - 1) as u32;
-            let cov = tex[((ty * tex_w + tx) * 4) as usize] as f32 / 255.0;
-            let a = tint.a.clamp(0.0, 1.0) * cov.clamp(0.0, 1.0);
+            let ti = ((ty * tex_w + tx) * 4) as usize;
+            let t = [
+                tex[ti] as f32 / 255.0,
+                tex[ti + 1] as f32 / 255.0,
+                tex[ti + 2] as f32 / 255.0,
+            ];
+            let a = tint.a.clamp(0.0, 1.0) * (tex[ti + 3] as f32 / 255.0);
             let i = ((y as u32 * w + x as u32) * 4) as usize;
             let inv = 1.0 - a;
             for c in 0..3 {
-                fb[i + c] = (src[c] as f32 * a + fb[i + c] as f32 * inv).round() as u8;
+                let s = src[c] as f32 * t[c];
+                fb[i + c] = (s * a + fb[i + c] as f32 * inv).round() as u8;
             }
             fb[i + 3] = ((a + (fb[i + 3] as f32 / 255.0) * inv).clamp(0.0, 1.0) * 255.0).round() as u8;
         }
@@ -312,12 +325,16 @@ fn textured_quad_matches_the_cpu_reference_byte_for_byte() {
     let gpu = r.draw_textured_quad(&tex, quad, tint).expect("纹理 quad");
     assert!(r.unsupported().is_empty(), "纹理 quad 不该有 unsupported");
 
-    // 前置断言：语料必须同时覆盖「画到 tint」与「保持清屏色」两种像素
+    // 前置断言：语料必须同时覆盖「被调制过的像素」与「保持清屏色」的像素。
+    //
+    // T1.3 之前这里断言的是「出现纯 tint 像素」——那时 G/B 不参与 ⇒ 亮 texel 恰好等于
+    // tint。现在四个通道都参与 ⇒ 亮 texel 是 `tint × texel`（本语料 = [200,3,2]），
+    // **不再是** tint。判据改成「出现至少一个非清屏像素」，判别力更强而不是更弱。
     let cpu = cpu_textured_quad(extent, tw, th, &data, quad, tint);
-    let tint_b = [200u8, 100, 50, 255];
+    let is_clear = |p: &[u8]| p[0] == CLEAR.r && p[1] == CLEAR.g && p[2] == CLEAR.b;
     assert!(
-        cpu.chunks_exact(4).any(|p| p == tint_b),
-        "前置条件不成立：CPU 参考里没有任何「完全覆盖」的像素"
+        cpu.chunks_exact(4).any(|p| !is_clear(p)),
+        "前置条件不成立：CPU 参考里没有任何被调制的像素"
     );
     assert!(
         cpu.chunks_exact(4).any(|p| p[0] == CLEAR.r && p[1] == CLEAR.g && p[2] == CLEAR.b),
@@ -378,17 +395,22 @@ fn textured_quad_uv_orientation_is_top_down() {
     let cpu = cpu_textured_quad(extent, 2, 2, &data, quad, tint);
     assert_matches_cpu(&gpu, &cpu, "uv 朝向(2×2→4×4)", 0, extent);
 
-    // 直接按象限断言（**不依赖 CPU 参考**的独立判据）：白 = tint，黑 = 清屏
+    // 直接按象限断言（**不依赖 CPU 参考**的独立判据）。
+    //
+    // T1.3 起期望值按 `tint × texel` 算：本语料的 texel 是纯 R（(255,0,0,255) 与
+    // (0,0,0,255)），`tint` 是白 ⇒ 亮 texel = **红** [255,0,0]、暗 texel = **黑** [0,0,0]
+    // —— 而不是从前的「白 / 清屏」（那时 G/B 不参与，且 alpha 由 R 决定 ⇒ 暗 texel 全透明）。
+    // **朝向判据本身没变**：左上/右下必须等于「亮 texel」的结果，右上/左下等于「暗 texel」的。
     let at = |x: u32, y: u32| -> [u8; 4] {
         let i = ((y * 8 + x) * 4) as usize;
         [gpu[i], gpu[i + 1], gpu[i + 2], gpu[i + 3]]
     };
-    let white = [255u8, 255, 255, 255];
-    let clear = [CLEAR.r, CLEAR.g, CLEAR.b, 255];
-    assert_eq!(at(2, 2), white, "quad 左上应是纹理 (0,0) 的亮 texel");
-    assert_eq!(at(5, 2), clear, "quad 右上应是纹理 (1,0) 的暗 texel");
-    assert_eq!(at(2, 5), clear, "quad 左下应是纹理 (0,1) 的暗 texel");
-    assert_eq!(at(5, 5), white, "quad 右下应是纹理 (1,1) 的亮 texel");
+    let lit = [255u8, 0, 0, 255];
+    let dark = [0u8, 0, 0, 255];
+    assert_eq!(at(2, 2), lit, "quad 左上应是纹理 (0,0) 的亮 texel（红）");
+    assert_eq!(at(5, 2), dark, "quad 右上应是纹理 (1,0) 的暗 texel（黑）");
+    assert_eq!(at(2, 5), dark, "quad 左下应是纹理 (0,1) 的暗 texel（黑）");
+    assert_eq!(at(5, 5), lit, "quad 右下应是纹理 (1,1) 的亮 texel（红）");
     println!("  uv 朝向 ✅ 2×2 → 4×4 四象限全部对上（V 未翻转、U 未镜像）");
 }
 

@@ -362,16 +362,22 @@ pub(crate) fn texture_fingerprint(engine: &TextEngine) -> (u32, u32, usize) {
 ///
 /// **生命周期契约**：返回的管线引用了 `layout`（→ `text_set_layout`）与两个着色器模块
 /// ⇒ 调用方必须把它们声明在管线**之前**（Rust 按声明顺序析构 ⇒ 管线先销毁）。
-pub fn build_unified_pipeline(
+/// 建统一管线（形状 + 文本），FS 由调用方给。
+///
+/// 抽出来的理由：T1.3 的**纹理 quad** 要的是**同一支顶点着色器 + 同一套顶点布局 +
+/// 另一个片元着色器** ⇒ 另一条管线。若把建管线的过程抄第二份，「顶点布局」就会有两处
+/// 定义，而 `UnifiedVertex` 的布局是**冻结**的（`unified_vertex_layout_is_frozen` 只钉一处）。
+pub fn build_unified_pipeline_with_fs(
     device: &VkDevice,
     render_pass: &RenderPass,
     color_format: i32,
     viewport: crate::pipelines::ViewportStrategy,
     layout: &crate::device::PipelineLayout,
+    fs_bytes: &[u8],
 ) -> GpuResult<(crate::device::Pipeline, crate::device::ShaderModule, crate::device::ShaderModule)>
 {
     let vs = device.create_shader_module(&crate::spirv::vertex_shader_unified())?;
-    let fs = device.create_shader_module(&crate::spirv::fragment_shader_unified())?;
+    let fs = device.create_shader_module(fs_bytes)?;
     let state = crate::pipelines::shape_state(
         color_format,
         viewport,
@@ -388,6 +394,26 @@ pub fn build_unified_pipeline(
         render_pass,
     )?;
     Ok((pipeline, vs, fs))
+}
+
+/// 建**统一**管线（形状 + 文本，覆盖率语义）。等价于
+/// [`build_unified_pipeline_with_fs`] 传入 [`crate::spirv::fragment_shader_unified`]。
+pub fn build_unified_pipeline(
+    device: &VkDevice,
+    render_pass: &RenderPass,
+    color_format: i32,
+    viewport: crate::pipelines::ViewportStrategy,
+    layout: &crate::device::PipelineLayout,
+) -> GpuResult<(crate::device::Pipeline, crate::device::ShaderModule, crate::device::ShaderModule)>
+{
+    build_unified_pipeline_with_fs(
+        device,
+        render_pass,
+        color_format,
+        viewport,
+        layout,
+        &crate::spirv::fragment_shader_unified(),
+    )
 }
 
 
@@ -1023,6 +1049,19 @@ pub struct GpuGeometryRenderer {
     unified_vs: crate::device::ShaderModule,
     #[allow(dead_code)]
     unified_fs: crate::device::ShaderModule,
+    /// **纹理管线**（T1.3）：与 `unified` **同一支顶点着色器、同一套顶点布局**，
+    /// 只换片元着色器（[`crate::spirv::fragment_shader_textured`] ⇒ RGBA 调制，
+    /// 而不是统一 FS 的覆盖率语义）。只被
+    /// [`GpuGeometryRenderer::draw_textured_quad`] 用 —— 那条路径会把 `set 0`
+    /// 临时改指到用户纹理并单独提交，所以它与文本**从不在同一次 draw 里**。
+    ///
+    /// **字段顺序契约**同 `unified`：本管线引用 `textured_vs` / `textured_fs`
+    /// ⇒ 必须声明在它们**之前**。
+    textured: crate::device::Pipeline,
+    #[allow(dead_code)]
+    textured_vs: crate::device::ShaderModule,
+    #[allow(dead_code)]
+    textured_fs: crate::device::ShaderModule,
     image: VkObject,
     image_memory: VkObject,
     view: VkObject,
@@ -1181,6 +1220,21 @@ impl GpuGeometryRenderer {
             &pipelines.text_layout,
         )?;
 
+        // ③'a **纹理管线**（T1.3）：同一支 VS + 同一套顶点布局，只换 FS
+        //     （`fragment_shader_textured`：四通道调制，不是覆盖率）。
+        //     共用 `pipelines.text_layout` ⇒ 描述符布局**没有**被扩成两个 binding。
+        let (textured, textured_vs, textured_fs) = build_unified_pipeline_with_fs(
+            &device,
+            &pass,
+            COLOR_FORMAT,
+            crate::pipelines::ViewportStrategy::Static {
+                width: extent.width,
+                height: extent.height,
+            },
+            &pipelines.text_layout,
+            &crate::spirv::fragment_shader_textured(),
+        )?;
+
         // ③'' `set 0`（描述符集）：统一片元着色器**无条件采样** ⇒ 必须恒有效。
         //      没有 `TextEngine` 时绑 [`DUMMY_COVERAGE`] 的 1×1 `R8_UNORM` 哑纹理。
         //
@@ -1337,6 +1391,9 @@ impl GpuGeometryRenderer {
             unified,
             unified_vs,
             unified_fs,
+            textured,
+            textured_vs,
+            textured_fs,
             image,
             image_memory,
             view,
@@ -1686,7 +1743,8 @@ impl GpuGeometryRenderer {
         self.unify_output_vertices += unified.len() as u64;
 
         // ④⑤⑥⑦ 上传顶点/图集（按需）+ 录制 + 提交 + 回读
-        self.record_and_submit(&unified)?;
+        let unified_pipe = self.unified.handle();
+        self.record_and_submit(&unified, unified_pipe)?;
         self.read_back()
     }
 
@@ -1729,7 +1787,8 @@ impl GpuGeometryRenderer {
             &self.pipelines.sampler,
             texture,
         )?;
-        let recorded = self.record_and_submit(&unified);
+        let textured_pipe = self.textured.handle();
+        let recorded = self.record_and_submit(&unified, textured_pipe);
         // 无论成败都把描述符集改回默认纹理：失败路径也不该留下「指着别人纹理」的状态。
         let restored = self.rebind_default_texture();
         recorded?;
@@ -1911,7 +1970,15 @@ impl GpuGeometryRenderer {
     /// 录制一帧（清屏 + 按 z 序逐段绑定管线/顶点缓冲 + 绘制 + 屏障 + 拷贝），提交并等栅栏。
     ///
     /// 需要 `&mut self`：等待失败时要把 [`SubmitState`] 置为 `Broken`（见模块文档「同步②」）。
-    fn record_and_submit(&mut self, unified: &[UnifiedVertex]) -> GpuResult<()> {
+    /// `pipeline` 是要绑的那条管线句柄（**先取出来再进本函数**，避免与 `&mut self` 撞借用）。
+    ///
+    /// 为什么要它作参数：T1.3 起有**两条**共用顶点布局的管线（统一 / 纹理），
+    /// 「这一趟用哪条」是**调用点**的事，不该是录制函数里的常量。
+    fn record_and_submit(
+        &mut self,
+        unified: &[UnifiedVertex],
+        pipeline: vk::PipelineHandle,
+    ) -> GpuResult<()> {
         // ★ **守卫就放在破坏性操作本身**（fix round 2 / R1-3）：`render` 开头那句检查可能
         //   因为调用方漏写 `?` 而失效（reviewer 的变异 C 就是这么全绿的）。这里再查一次，
         //   于是「Broken ⇒ 绝不去碰命令缓冲/栅栏」不依赖任何调用方的写法。
@@ -2148,7 +2215,7 @@ impl GpuGeometryRenderer {
                 (self.fns.cmd_bind_pipeline)(
                     self.cmd,
                     vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
-                    self.unified.handle(),
+                    pipeline,
                 );
                 // 计数与真实调用同处（B1）：删掉这行绑定就必然删掉计数
                 self.stats.pipeline_switches += 1;
