@@ -752,7 +752,13 @@ pub fn handle(
                 out.push(UiEvent::TextChanged { id, value });
             }
         }
-        // 方向键 / `Key::Char` / `Key::Other`：本里程碑没有可移动的东西（无滚动、无光标移动）。
+        // 方向键 / `Key::Char` / `Key::Other`：不消费 —— `UiState` 里唯一的「位置」是
+        // **焦点**，而焦点是**树序**（只在 Tab / 点击 / Escape 之间移动），方向键推不动它。
+        // 输入框里的插入点（光标）还没建模，等 T3.5 落地后再在这里接。
+        //
+        // 这条注释的理由改过一次：原文写的是「本里程碑没有可移动的东西（无滚动、无光标移动）」，
+        // 其中「无滚动」已经不成立 —— 滚动有自己的分支（上面的 `Wheel`），且 `WHEEL_STEP_PX`
+        // 一档是真能滚的。别再把滚动当成这里不消费的理由：它跟 `KeyDown` 无关。
         InputEvent::KeyDown { .. } => {}
         InputEvent::KeyUp { .. } => {}
         InputEvent::TextInput { text } => {
