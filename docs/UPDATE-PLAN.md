@@ -23,7 +23,7 @@
 | 项 | 值 | 出处 |
 |---|---|---|
 | 版本 | `0.0.0`（未发布 crates.io，path 依赖消费） | `Cargo.toml` |
-| 工具链 | Rust ≥ 1.85，edition 2024，`Cargo.lock` 入库 | `Cargo.toml`、`agent.md` §1 |
+| 工具链 | Rust ≥ 1.85，edition 2024，`Cargo.lock` 入库 | `Cargo.toml`、`AGENTS.md` §1 |
 | 依赖口径 | 除窗口层（`winit 0.30`，Q-1 已登记）外**零第三方依赖** | `ROADMAP.md` 依赖纪律 |
 | 平台 | 布局/离屏全平台；Vulkan 离屏全平台；**窗口与呈现仅 Windows** | `README.md` |
 | 已交付里程碑 | M1 · M2a · M2b · M3a/b/c · M3+（统一管线+跨帧复用）· M4（真字形）· M5/M5b/M5c（输入/焦点/省电重绘/唤醒） | `ROADMAP.md` 里程碑表 |
@@ -113,7 +113,7 @@
 |---|---|
 | 主干 | `master`（默认分支），保持随时可发布状态：全部四口径门禁 0 failed |
 | 特性分支 | `feat/<name>`（功能）/ `fix/<name>` / `test/<name>`（测试基建），从 `master` 切出 |
-| Worktree | 多任务并行用 `git worktree`（仓库现状即此模式）；**动工前先 `git status`/`git log` 弄清在途改动归属**（`agent.md` 规矩 7） |
+| Worktree | 多任务并行用 `git worktree`（仓库现状即此模式）；**动工前先 `git status`/`git log` 弄清在途改动归属**（`AGENTS.md` 规矩 7） |
 | 合并 | PR → `master`（先例：PR #1 `test/window-barrier-assertions`）；PR 必须写明「验了什么（命令+环境+结果）/没验什么」 |
 | 保护 | 不 `--force` 推主干；不覆盖他人暂存（共享工作区里裸 `commit` 会吞别人的暂存 —— 已有事故案例） |
 | 清理 | WIP 分支合并/废弃后删除 worktree（残留分支有「落后基点合并会倒删功能」的风险，见 2026-09-29 `feat/scroll-multiline-2` 案例） |
@@ -237,7 +237,7 @@
 | 事件 | 预案 |
 |---|---|
 | 校验层下崩溃 | 先辨是否触达已知坏着色器（Q-5）；是 ⇒ 走既定跳过标记；否 ⇒ 二分定位 + `viewport_dynamic_probe` 类探针复现 |
-| 平台特异行为（新机器/新驱动） | 不泛化本机结论；跑四口径 + 探针；结论登记 `agent.md` §3.1 只增不删 |
+| 平台特异行为（新机器/新驱动） | 不泛化本机结论；跑四口径 + 探针；结论登记 `AGENTS.md` §3.1 只增不删 |
 | 测试基建限制 | 「每进程一个窗口」（M3+(b) 未修）窗口期：多窗口相关 e2e 用多进程脚本拼接，单窗口断言不放宽 |
 | 文档漂移 | `docs_consistency` 是第一道网；本文档族真相源表（§0）是第二道 —— 每 PR 只改一个真相源，其余引用 |
 

@@ -216,7 +216,7 @@ Behavior that looks surprising is usually deliberate. The full list, with the de
 | [Interactive UI guide (中文)](docs/GETTING-STARTED-UI.md) | From zero to a clickable, typeable, replayable UI — `--example counter` |
 | [Tree → window migration (中文)](docs/GETTING-STARTED-UI-STEPS.md) | 8 steps from "I only have a UI tree" to "a window is on screen" — `--example hello_window` |
 | [Test kit](docs/features/testing.md) | Write a UI test in a dozen lines, with the whole project discipline applied by default (preconditions, out-of-bounds = 0, CPU↔GPU parity, copy-pasteable repro commands) — `--example testkit_demo` |
-| [Agent notes](agent.md) | Repository rules and traps for AI agents and new maintainers |
+| [Agent notes](AGENTS.md) | Repository rules and traps for AI agents and new maintainers |
 
 ### Crate-level examples
 

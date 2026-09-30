@@ -40,7 +40,7 @@
 //!
 //! 纹理句柄 [`TextureId`] 映射到本模块的槽位表；`read_texture_bytes` 是**固有方法**
 //! （不在 HAL `Device` trait 上）⇒ 回读四通道保真的判据可以从 HAL 侧调用，
-//! **不动公开 trait**（改 trait 按 `agent.md` §6 需要先登记）。
+//! **不动公开 trait**（改 trait 按 `AGENTS.md` §6 需要先登记）。
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -170,7 +170,7 @@ impl VulkanDevice {
     /// ## 为什么是固有方法而不是 HAL `Device` trait 上的方法
     ///
     /// HAL `Device` 的公开面刻意小（建链 / 建纹理 / 上传 / 帧 / 等空闲）。
-    /// 加一个 `read_texture` 到 trait 上属于**公开 API 变更** —— 按 `agent.md` §6
+    /// 加一个 `read_texture` 到 trait 上属于**公开 API 变更** —— 按 `AGENTS.md` §6
     /// 与 `DEV-PLAN` T1.4 的精神，这类改动要先在 `ROADMAP.md` 登记再动手。
     /// 而本任务（T1.2）的验收判据「回读四通道保真」**不需要**改 trait 就能拿到，
     /// 所以这里用固有能力，把 trait 变更留给真正需要它的任务。

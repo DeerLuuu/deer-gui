@@ -208,9 +208,9 @@ Feature 开关（`crates/deer-gui/Cargo.toml`）：
 **关键设计取舍**：
 
 1. **不装 SDK**：符号自声明 + 运行时加载，结构体布局用 `offset_of!` 断言钉住（`README.md`「Requirements」）。
-2. **静态 vs 动态 viewport**：离屏路径用静态（当前实现事实）；窗口路径每帧真的设置 viewport。旧说法「动态画不出像素」已被本机三组对照推翻，但那是**本机实测**，不是跨设备结论（`ROADMAP.md` M3 前提 1、`agent.md` §3.1）。
+2. **静态 vs 动态 viewport**：离屏路径用静态（当前实现事实）；窗口路径每帧真的设置 viewport。旧说法「动态画不出像素」已被本机三组对照推翻，但那是**本机实测**，不是跨设备结论（`ROADMAP.md` M3 前提 1、`AGENTS.md` §3.1）。
 3. **`FrameOutcome::OutOfDate` 如实上报**，绝不当成功 —— 映射函数 `present_result_of` 有独立单测钉住（`hal.rs:206-218`：曾有验证者把映射改反而全仓测试无一变红）。
-4. **已知损坏的 SPIR-V**：`vertex_shader_rect_pushconstant` 被校验层判 `VUID-06808`，请求校验层时会崩（`agent.md` §3.1）；矩形已改走顶点缓冲，该着色器**不要用它建管线**。
+4. **已知损坏的 SPIR-V**：`vertex_shader_rect_pushconstant` 被校验层判 `VUID-06808`，请求校验层时会崩（`AGENTS.md` §3.1）；矩形已改走顶点缓冲，该着色器**不要用它建管线**。
 5. **HAL 的 `Frame::record` 已真的消费 `DrawList`**（T1.1，`hal.rs:388`）：`record` 把 UI 录到
    `pending_ui`（`hal.rs:417` 调 `WindowedRenderer::prepare_ui`），提交时喂进 `present_prepared`
    （`windowed.rs:1677`）—— 与窗口路径 `draw_and_present` **共用同一段实现**，M3c 时代的
@@ -344,7 +344,7 @@ CpuRenderer.render(extent, list, clear)           ← null.rs（with_text → �
 
 ## 5. 技术栈、配置项与外部依赖
 
-### 5.1 构建与验证命令（`README.md`、`agent.md` §4）
+### 5.1 构建与验证命令（`README.md`、`AGENTS.md` §4）
 
 ```sh
 cargo test --workspace                                          # 全量断言
@@ -358,7 +358,7 @@ DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example window_
 
 | 变量 | 作用 | 出处 |
 |---|---|---|
-| `DEER_VK_WINDOW_TESTS=1` | **门禁**：真窗口 e2e；不设则显式跳过（跳过也算 pass，**不设时的全绿不是证据**） | `deer-gui/src/env_gate.rs`、`agent.md` §4.2 |
+| `DEER_VK_WINDOW_TESTS=1` | **门禁**：真窗口 e2e；不设则显式跳过（跳过也算 pass，**不设时的全绿不是证据**） | `deer-gui/src/env_gate.rs`、`AGENTS.md` §4.2 |
 | `DEER_VK_VALIDATION=1` | 请求 `VK_LAYER_KHRONOS_validation`；三条路径（backend/设备离屏/窗口）一致尊重 | `deer-vk/src/ffi.rs::env_flag`、`ROADMAP.md` Q-5 |
 | `DEER_WINDOW_REDRAW=continuous\|on-demand` | 运行时覆盖重绘策略（关掉省电） | `deer-window/src/lib.rs::resolve_redraw_policy` |
 | `DEER_WINDOW_VIEWPORT=static\|dynamic` | 窗口路径 viewport 诊断开关（默认 dynamic） | `docs/features/window.md` |
@@ -374,7 +374,7 @@ DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example window_
 - **运行期**：`vulkan-1.dll`（Windows 系统自带 loader，运行时 `LoadLibraryW` 加载，无需 SDK）；系统 TTF 字体文件（`TextEngine::from_system_font`）。
 - **平台**：布局 / CPU 光栅化 / 离屏 PNG 全平台可构建；Vulkan 离屏 Linux/macOS 也可；**窗口与呈现仅 Windows**。
 
-### 5.4 关键陷阱（改渲染/布局/字体前必读，`agent.md` §3）
+### 5.4 关键陷阱（改渲染/布局/字体前必读，`AGENTS.md` §3）
 
 1. 布局、绘制列表、光栅化**必须同一字号、同一度量**（Q-3 纪律）。
 2. 颜色附件必须 `R8G8B8A8_UNORM` 不是 `_SRGB`（CPU 基准无 gamma；sRGB 附件混合在线性空间，实测差 44 字节）。
@@ -387,7 +387,7 @@ DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example window_
 
 ## 6. 已知边界（不要当成已实现）
 
-以下摘自 `FEATURES.md` 第四节与 `agent.md` §3.3（状态以 `FEATURES.md` 为唯一真相）：
+以下摘自 `FEATURES.md` 第四节与 `AGENTS.md` §3.3（状态以 `FEATURES.md` 为唯一真相）：
 
 - **GPU HAL 剩下的两处边界**（都不是「还没做」而是各有原因）：① `Frame::read_pixels` 明确
   `Unsupported` —— **语义选择**，本方法在提交前调用，而交换链图像只有呈现后可读，刻意不做

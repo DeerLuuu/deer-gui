@@ -3,7 +3,7 @@
 > **依据**：本文基于 HEAD `36e7b93`（2026-09-29）静态审阅 + [`ARCHITECTURE.md`](ARCHITECTURE.md) 的架构梳理产出。
 > 功能现状以 [`FEATURES.md`](../FEATURES.md) 为准，里程碑判据以 [`ROADMAP.md`](../ROADMAP.md) 为准；本文与它们冲突时以那两份为准。
 > **工作量口径**：S ≤ 1 人日；M = 1–3 人日；L = 3–10 人日（粗估，用于排序而非承诺；本环境未做性能剖析，涉及性能的项需先测量）。
-> **仓库纪律提醒**（`agent.md` §1–2）：每个功能完成 = 同一提交里「示例 + 指南 + `FEATURES.md` 登记 + `TUTORIAL.md`（若属主线）」四件套；新增依赖必须先登记；不许为变绿削弱判据。
+> **仓库纪律提醒**（`AGENTS.md` §1–2）：每个功能完成 = 同一提交里「示例 + 指南 + `FEATURES.md` 登记 + `TUTORIAL.md`（若属主线）」四件套；新增依赖必须先登记；不许为变绿削弱判据。
 
 ---
 
@@ -75,7 +75,7 @@ flowchart TB
 
 | 任务 | 内容 | 验收标准 | 依赖 | 工作量 |
 |---|---|---|---|---|
-| T1.1 UI 录制路径接入 HAL `Frame::record` | 把 `WindowedRenderer::draw_and_present(list, engine)` 的 UI 录制逻辑挂到 `VulkanFrame::record(DrawList)` 上（`hal.rs:168-184` 消除 `Unsupported`），需要解决 `TextEngine` 如何经 HAL 传入（`Device`/`Frame` 契约可能要加一个口，属公开 API 变更 —— 按 `agent.md` §6「改公开 API 先问」执行） | `hal_window_path` 示例在真窗口下 `record(含形状+文本的 DrawList)` 成功出像素；`window_parity` 判据不变（不透明逐字节 / 半透明 ≤1 LSB）；`hal.rs` 的 `Unsupported` 分支删除 | T0.1（纹理指南先定型，避免接口返工） | L |
+| T1.1 UI 录制路径接入 HAL `Frame::record` | 把 `WindowedRenderer::draw_and_present(list, engine)` 的 UI 录制逻辑挂到 `VulkanFrame::record(DrawList)` 上（`hal.rs:168-184` 消除 `Unsupported`），需要解决 `TextEngine` 如何经 HAL 传入（`Device`/`Frame` 契约可能要加一个口，属公开 API 变更 —— 按 `AGENTS.md` §6「改公开 API 先问」执行） | `hal_window_path` 示例在真窗口下 `record(含形状+文本的 DrawList)` 成功出像素；`window_parity` 判据不变（不透明逐字节 / 半透明 ≤1 LSB）；`hal.rs` 的 `Unsupported` 分支删除 | T0.1（纹理指南先定型，避免接口返工） | L |
 | T1.2 纹理契约落地 HAL | `VulkanDevice::create_texture` / `upload_texture`（`hal.rs:98-113`）接 `device.rs` 已落地的 `RGBA8_UNORM` 实现 | HAL 路径可建纹理、上传、回读四通道保真（离屏已有判据复用） | T0.1 | M |
 | T1.3 纹理 RGB 调制 | 新片元着色器：统一 FS 读 `rgba` 并与颜色调制（保留覆盖率语义为特例），过 `spirv-val`；窗口路径 `draw_textured_quad` 入口 | 离屏纹理 quad 与 CPU 参考逐字节对照；`window_parity` 不回退 | T1.2 | M–L |
 | T1.4 `read_pixels` 语义决策 | HAL `Frame::read_pixels` 现报 `Unsupported` 并指向 `read_back_last_frame`（`hal.rs:186-194`）。决策：① 契约改为「present 后回读」并实现；② 保持报错但把语义写死进 trait 文档 | trait 文档明确无歧义；若实现，`window_parity` 走 HAL 路径也能取像素 | T1.1 | S（决策）/ M（实现） |
@@ -127,7 +127,7 @@ flowchart TB
 |---|---|---|---|---|
 | T4.1 `unify` 零分配 | 消掉每帧 `Vec` 堆分配（`vertex_unify.rs`）：跨帧复用目标缓冲（先测量：`RenderStats` 的 alloc 计数口径已存在） | 稳态（语料不变）`allocs` 计数为 0；像素判据不变 | 无 | M |
 | T4.2 线程模型决策（Q-4） | 写决策记录：渲染是否独占线程、`Device` 是否要 `Send`（现状 `Rc<RefCell>` 表明单线程假设，`hal.rs:44`）；与 `Waker`（已 `Send`）的关系 | `ROADMAP.md` Q-4 从「未决」改为「已决 + 依据」；如改契约则带迁移说明 | 无（决策） | S（决策）/ L（若改 Send） |
-| T4.3 示例工程 path 修复 | `test_project/deer-hello/Cargo.toml:7` 的 `Z:/deer-gui/...` 改为可移植方案（如 `[patch]` + 环境说明，或文档写明「clone 后请改此行」——注意 `agent.md` 明令不要为跑通而随手改成自己机器的路径再提交，需与维护者确认方案） | 任一机器 clone 后按 README 一条命令可构建；方案经维护者确认 | 无 | S |
+| T4.3 示例工程 path 修复 | `test_project/deer-hello/Cargo.toml:7` 的 `Z:/deer-gui/...` 改为可移植方案（如 `[patch]` + 环境说明，或文档写明「clone 后请改此行」——注意 `AGENTS.md` 明令不要为跑通而随手改成自己机器的路径再提交，需与维护者确认方案） | 任一机器 clone 后按 README 一条命令可构建；方案经维护者确认 | 无 | S |
 | T4.4 多窗口基建 | 渲染器支持多交换链（`hal.rs`「只支持一个交换链」）+ `deer-window` 多窗口事件路由（`WindowId` 目前弃用） | 两个窗口同时呈现，各自 parity；`ROADMAP.md` M3+ (b) 勾掉 | T1.1 | L |
 | T4.5 版本与发布准备 | 版本 `0.0.0` → `0.1.0`；决定是否发 crates.io（发布 = API 冻结承诺，需先做 prelude/HAL 面审查） | `ROADMAP.md` 登记；若发布，`cargo publish --dry-run` 通过 | T1.1（API 稳定前提） | M |
 
@@ -197,6 +197,6 @@ flowchart TB
 1. **T1.1 的 API 形态**：`TextEngine` 经 HAL 传递的最佳契约（`Frame::record` 加参数？`Device` 挂文本引擎？）需要设计讨论 —— 本文只指出分叉事实与验收判据，不预设方案。
 2. **T3.3 右键语义**：仓库未登记右键的产品意图（上下文菜单 or 纯透传），需维护者决策。
 3. **T4.2 线程模型**：涉及 Vulkan 设备跨线程使用的约束（`Rc<RefCell>` 当前隐含单线程），决策需要驱动行为实测支撑。
-4. **T4.3 path 修复方案**：`agent.md` 明令「不要为跑通随手改成自己机器的路径再提交」，正确方案（相对路径/文档说明/`[patch]`）需维护者确认。
+4. **T4.3 path 修复方案**：`AGENTS.md` 明令「不要为跑通随手改成自己机器的路径再提交」，正确方案（相对路径/文档说明/`[patch]`）需维护者确认。
 5. **T2.3 macOS/Vulkan**：Metal 后端与 MoltenVK 路线二选一，仓库未表态。
 6. **性能项（T4.1、D6）的实际收益**：本环境未做剖析，`RenderStats` 只给计数口径；动手前先测量（仓库纪律：「不许只说可忽略」）。

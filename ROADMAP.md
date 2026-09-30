@@ -120,7 +120,7 @@ M3 把界面**画上了窗口**（M3c），但那是走**专用快路** `Windowe
 `Unsupported(M3)`（理由是「不让『窗口里什么都没有』变成查不出的 bug」）。M3a/M3b/M3c/M3+ 全部落地后，
 **那条分支的理由消失了**，T1.1 把它接线到同一条 UI 录制链。
 
-#### 设计登记（改 HAL 公开 trait ⇒ 按 `agent.md` §6「改公开 API 先问」+ `DEV-PLAN.md` §3 三步走）
+#### 设计登记（改 HAL 公开 trait ⇒ 按 `AGENTS.md` §6「改公开 API 先问」+ `DEV-PLAN.md` §3 三步走）
 
 **① 要改的公开 API**：`deer_gpu::Frame::record`
 - 改前：`fn record(&mut self, list: &DrawList) -> GpuResult<()>`
