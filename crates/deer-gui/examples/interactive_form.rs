@@ -1006,6 +1006,7 @@ fn expected_state() -> UiState {
         focus: Some("field_1".into()),
         pressed: None,
         texts: std::collections::BTreeMap::from([("field_1".to_string(), "hi".to_string())]),
+        carets: Default::default(),
         scroll: Default::default(),
     }
 }
