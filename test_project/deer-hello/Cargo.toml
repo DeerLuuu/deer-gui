@@ -4,4 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-deer-gui = { path = "Z:/deer-gui/crates/deer-gui" }
+# 相对路径：从本清单所在目录（`test_project/deer-hello/`）回两级就是仓库根。
+# 这样 clone 到任何盘符/目录都能直接 `cargo build`，不必按作者的机器改路径。
+deer-gui = { path = "../../crates/deer-gui" }
