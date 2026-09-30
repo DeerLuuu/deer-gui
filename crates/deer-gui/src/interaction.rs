@@ -147,6 +147,20 @@ pub struct UiState {
     pub pressed: Option<String>,
     /// 输入框的文本缓冲（id → 内容）。不在里面的输入框视为空串。
     pub texts: BTreeMap<String, String>,
+    /// **输入框的插入点**（id → 光标位置，单位：**字符位**，不是字节位）。
+    ///
+    /// 单位必须是字符：`苹果` 的第二个字在**字节**位上是 3，用字节表达就会把多字节字符
+    /// 从中间切开 —— 与 `Backspace` 早就是「删一个 `char`」而非「删一个字节」同一个道理。
+    ///
+    /// **这张表是纯追加的**（设计登记见 `ROADMAP.md`「`texts` 光标建模」节）：
+    /// 表里**没有**某个 id ⇒ 光标在**末尾** ⇒ 单看 typing 序列，行为与加这个字段之前
+    /// **逐字节相同**。于是读 [`UiState::texts`] 的既有代码一行都不用改。
+    ///
+    /// **为什么光标不单独配一个 `UiEvent`**：`TextChanged` 的语义是「文本值变了」，
+    /// 光标移动没改值；而现在**还没有任何东西渲染光标** ⇒ 也就不存在「要重绘一个看不见
+    /// 的东西」。**延迟决策**：真开始画光标时，照 `ScrollState` 的做法补
+    /// `UiEvent::CaretChanged`，并把 `carets` 加进 [`UiState::same_visual`]。
+    pub carets: BTreeMap<String, usize>,
     /// **滚动状态**（偏移 + 每个容器的上限）。偏移是**布局的输入**（调用方每帧喂给
     /// `layout_with_scroll`），上限是布局的输出（调用方每帧 `set_metrics` 灌回来）。
     ///
@@ -747,28 +761,55 @@ pub fn handle(
             key: Key::Backspace,
             ..
         } => {
-            // `String::pop` 就是「删最后一个 **char**」—— 不会把多字节字符切成半个。
-            if let Some((id, value)) = edit_focused_text(root, state, |buf| buf.pop().is_some()) {
-                out.push(UiEvent::TextChanged { id, value });
+            // 删**光标前**那一个 `char`（不再是「删末尾」）：`remove` 取的是字符边界，
+            // 多字节字符不会被切成半个 —— 这正是 `carets` 用**字符位**而非字节位的原因。
+            if let Some(id) = focused_field_id(root, state) {
+                let caret = caret_of(state, &id);
+                if caret > 0 {
+                    let buf = state.texts.entry(id.clone()).or_default();
+                    let at = byte_index_of(buf, caret - 1);
+                    buf.remove(at);
+                    let value = buf.clone();
+                    set_caret(state, &id, caret - 1);
+                    out.push(UiEvent::TextChanged { id, value });
+                }
             }
         }
-        // 方向键 / `Key::Char` / `Key::Other`：不消费 —— `UiState` 里唯一的「位置」是
-        // **焦点**，而焦点是**树序**（只在 Tab / 点击 / Escape 之间移动），方向键推不动它。
-        // 输入框里的插入点（光标）还没建模，等 T3.5 落地后再在这里接。
+        InputEvent::KeyDown { key: Key::Left, .. } => {
+            // 只挪光标，**不改文本 ⇒ 不发 `UiEvent`**（`TextChanged` 是「值变了」的意思）。
+            if let Some(id) = focused_field_id(root, state) {
+                let caret = caret_of(state, &id);
+                set_caret(state, &id, caret.saturating_sub(1));
+            }
+        }
+        InputEvent::KeyDown { key: Key::Right, .. } => {
+            if let Some(id) = focused_field_id(root, state) {
+                let caret = caret_of(state, &id);
+                set_caret(state, &id, caret + 1); // `set_caret` 自己会夹到字符数
+            }
+        }
+        // `Key::Up` / `Key::Down` / `Key::Char` / `Key::Other`：不消费 —— 上下没有对应的
+        // 「可移动的东西」（多行文本还没进入 `UiState`，只有一个文本缓冲），字符键统一由
+        // `TextInput` 那条路径进来，**不**从 `KeyDown::Char` 进来。
         //
-        // 这条注释的理由改过一次：原文写的是「本里程碑没有可移动的东西（无滚动、无光标移动）」，
-        // 其中「无滚动」已经不成立 —— 滚动有自己的分支（上面的 `Wheel`），且 `WHEEL_STEP_PX`
-        // 一档是真能滚的。别再把滚动当成这里不消费的理由：它跟 `KeyDown` 无关。
+        // 这条注释的理由改过两次：原文写「本里程碑没有可移动的东西（无滚动、无光标移动）」
+        // ⇒ 「无滚动」先不成立（滚动有自己的 `Wheel` 分支，且 `WHEEL_STEP_PX` 一档是真能滚的）
+        // ⇒ 「无光标移动」再被 T3.5 的 `Left`/`Right` 推翻（它们现在有自己的分支）。
         InputEvent::KeyDown { .. } => {}
         InputEvent::KeyUp { .. } => {}
         InputEvent::TextInput { text } => {
             // 空串不算变化（否则会白白置一次 dirty）。
             if !text.is_empty() {
-                let edit = edit_focused_text(root, state, |buf| {
-                    buf.push_str(text);
-                    true
-                });
-                if let Some((id, value)) = edit {
+                // 插在**光标处**（不再是无脑追加）：新输入进去之后，光标跟着往后移，
+                // 于是连续打字与从前一样是「追加到末尾」—— 因为没动过光标时它就在末尾。
+                if let Some(id) = focused_field_id(root, state) {
+                    let caret = caret_of(state, &id);
+                    let buf = state.texts.entry(id.clone()).or_default();
+                    let at = byte_index_of(buf, caret);
+                    buf.insert_str(at, text);
+                    let value = buf.clone();
+                    let moved = caret + text.chars().count();
+                    set_caret(state, &id, moved);
                     out.push(UiEvent::TextChanged { id, value });
                 }
             }
@@ -791,25 +832,37 @@ pub fn handle(
 ///
 /// 三道前置（缺一条就 `None`，不改任何状态）：① 有焦点；② 焦点节点是 `Field`；
 /// ③ 它不在禁用子树里。顺带把「首次输入」变成 `texts` 里的一条空缓冲。
-fn edit_focused_text(
-    root: &Node,
-    state: &mut UiState,
-    edit: impl FnOnce(&mut String) -> bool,
-) -> Option<(String, String)> {
+/// 当前焦点所在的**可用输入框** id；不是输入框 / 焦点为空 / 路径已死 ⇒ `None`。
+///
+/// 校验原本写在文本编辑的辅助函数里，**如今多了一个使用者（光标移动）**，
+/// 若把校验抄第二份，两边迟早漂 —— 「这里也算输入框」在一处为真、另一处为假是最难查的那类 bug。
+fn focused_field_id(root: &Node, state: &UiState) -> Option<String> {
     let id = state.focus.clone()?;
-    let is_field = node_by_id(root, &id).is_some_and(|n| n.kind == Kind::Field);
-    if !is_field {
-        return None;
-    }
     let node = node_by_id(root, &id)?;
-    if path_is_dead(root, node) {
+    if node.kind != Kind::Field || path_is_dead(root, node) {
         return None;
     }
-    let buf = state.texts.entry(id.clone()).or_default();
-    if !edit(buf) {
-        return None;
-    }
-    Some((id, buf.clone()))
+    Some(id)
+}
+
+/// 读输入框的光标位置（**字符位**）：表里没有 ⇒ **末尾**（于是纯追加，旧行为不变）。
+fn caret_of(state: &UiState, id: &str) -> usize {
+    let len = state.texts.get(id).map(|s| s.chars().count()).unwrap_or(0);
+    state.carets.get(id).copied().unwrap_or(len).min(len)
+}
+
+/// 写光标位置，夹在 `[0, 字符数]` 内 —— 和滚动偏移一样，**唯一**的夹取处。
+fn set_caret(state: &mut UiState, id: &str, caret: usize) {
+    let len = state.texts.get(id).map(|s| s.chars().count()).unwrap_or(0);
+    state.carets.insert(id.to_string(), caret.min(len));
+}
+
+/// 字符位 → 字节位（插/删的那个下标）。`caret == 字符数` ⇒ 返回 `len()`（串尾）。
+fn byte_index_of(s: &str, caret: usize) -> usize {
+    s.char_indices()
+        .nth(caret)
+        .map(|(i, _)| i)
+        .unwrap_or(s.len())
 }
 
 // ---------------------------------------------------------------------------
@@ -1954,6 +2007,7 @@ mod tests {
             focus: Some("name".into()),
             pressed: Some("btn_ok".into()),
             texts: BTreeMap::from([("name".to_string(), "hi".to_string())]),
+            carets: Default::default(),
             scroll: Default::default(),
         };
         // 前置：这份语料确实一个可滚动容器都没有（否则下面的 `Wheel` 断言在测空气）。
@@ -1973,7 +2027,9 @@ mod tests {
             InputEvent::KeyUp { key: Key::Tab, mods: Mods::default() },
             InputEvent::PointerDown { button: PointerButton::Right, x, y },
             InputEvent::PointerUp { button: PointerButton::Middle, x, y },
-            key(Key::Left, false),
+            // 注：`Key::Left` / `Key::Right` **不在**这张表里了 —— T3.5 起它们有自己的分支
+            // （挪输入框光标），被 `handle` **消费** ⇒ 会改状态。它们的用例挪到
+            // `r20_arrow_keys_move_the_caret_without_a_text_event` 里。
             key(Key::Char('a'), false),
             key(Key::Other, false),
         ];
@@ -1988,6 +2044,149 @@ mod tests {
     ///
     /// （「有 hover 且在可滚动容器里」的完整链路在
     /// `tests/scroll_multiline.rs` 里跑，那条用真实布局与真实绘制列表。）
+    // ---- T3.5：`texts` 光标（字符位） --------------------------------------
+
+    /// 让焦点落在一个输入框上，并返回 id（`fixture` 里的输入框叫 `name`）。
+    fn focus_the_field() -> (Node, Geometry, UiState) {
+        let (t, g) = fixture();
+        let mut s = UiState::default();
+        // 前置：这棵树里确实有一个 `Field`，否则下面的断言是在测空气。
+        let mut fields = Vec::new();
+        t.walk(
+            &mut |n, _| {
+                if n.kind == Kind::Field {
+                    fields.push(n.id.clone());
+                }
+            },
+            0,
+        );
+        assert!(
+            fields.contains(&"name".to_string()),
+            "测试前置：语料里该有一个叫 name 的输入框，实际 {fields:?}"
+        );
+        // 用**点击**把焦点放到输入框上（与既有用例同一方式：树序 Tab 不一定落到它身上）。
+        let (fx, fy) = ev_at("name", &g);
+        let out = handle(
+            &mut s,
+            &t,
+            &g,
+            ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Left, x: fx, y: fy },
+        );
+        assert!(
+            out.contains(&UiEvent::FocusChanged(Some("name".into()))),
+            "测试前置：点输入框应把焦点给它，实际 {out:?}"
+        );
+        assert_eq!(s.focus.as_deref(), Some("name"));
+        (t, g, s)
+    }
+
+    #[test]
+    fn r20_arrow_keys_move_the_caret_without_a_text_event() {
+        let (t, g, mut s) = focus_the_field();
+        let out = handle(
+            &mut s,
+            &t,
+            &g,
+            ClipSnapshot::unclipped(),
+            &InputEvent::TextInput { text: "hi".into() },
+        );
+        assert_eq!(out.len(), 1, "打字应该产生一条 TextChanged，实际 {out:?}");
+        assert_eq!(s.texts["name"], "hi");
+        // 前置：没动过光标时它就应该在末尾（= 追加语义），这是「纯追加」契约的一半。
+        assert_eq!(caret_of(&s, "name"), 2);
+
+        let before_text = s.texts.clone();
+        for k in [Key::Left, Key::Left] {
+            let out = handle(&mut s, &t, &g, ClipSnapshot::unclipped(), &key(k, false));
+            assert!(
+                out.is_empty(),
+                "方向键只挪光标，**不发 UiEvent**，实际 {out:?}"
+            );
+        }
+        assert_eq!(caret_of(&s, "name"), 0, "两次左移应到串首");
+        assert_eq!(s.texts, before_text, "挪光标不许改动文本缓冲");
+
+        // 再往左 10 次：夹在 0，不该下溢（usize 下溢会 panic 或变成一个天文数字）。
+        for _ in 0..10 {
+            handle(&mut s, &t, &g, ClipSnapshot::unclipped(), &key(Key::Left, false));
+        }
+        assert_eq!(caret_of(&s, "name"), 0, "左边界必须夹住");
+
+        let _ = handle(&mut s, &t, &g, ClipSnapshot::unclipped(), &key(Key::Right, false));
+        assert_eq!(caret_of(&s, "name"), 1);
+        for _ in 0..10 {
+            handle(&mut s, &t, &g, ClipSnapshot::unclipped(), &key(Key::Right, false));
+        }
+        assert_eq!(
+            caret_of(&s, "name"),
+            s.texts["name"].chars().count(),
+            "右边界应夹到**字符数**（不是字节数）"
+        );
+    }
+
+    #[test]
+    fn r21_caret_is_measured_in_chars_not_bytes() {
+        let (t, g, mut s) = focus_the_field();
+        handle(
+            &mut s,
+            &t,
+            &g,
+            ClipSnapshot::unclipped(),
+            &InputEvent::TextInput { text: "苹果x".into() },
+        );
+        // 前置：`苹果x` 是 3 个字符、7 个字节 —— 若光标按字节走，下面的 3 会变成 7。
+        assert_eq!(s.texts["name"].chars().count(), 3);
+        assert_eq!(s.texts["name"].len(), 7, "前置：这条语料必须是多字节的");
+
+        for _ in 0..3 {
+            handle(&mut s, &t, &g, ClipSnapshot::unclipped(), &key(Key::Left, false));
+        }
+        assert_eq!(caret_of(&s, "name"), 0, "三次左移穿过两个汉字到串首");
+
+        // 删：`Backspace` 在光标处整字删 —— 串首再删则什么都不做、也不发事件。
+        let before = s.texts.clone();
+        let out = handle(&mut s, &t, &g, ClipSnapshot::unclipped(), &key(Key::Backspace, false));
+        assert!(out.is_empty(), "串首 Backspace 不该产生事件，实际 {out:?}");
+        assert_eq!(s.texts, before);
+
+        // 光标移到「苹」之后，再 Backspace ⇒ 删掉「苹」这个**整字**（不是半个）。
+        handle(&mut s, &t, &g, ClipSnapshot::unclipped(), &key(Key::Right, false));
+        assert_eq!(caret_of(&s, "name"), 1);
+        let out = handle(&mut s, &t, &g, ClipSnapshot::unclipped(), &key(Key::Backspace, false));
+        assert_eq!(s.texts["name"], "果x", "必须删掉一个完整字符");
+        assert_eq!(out.len(), 1, "Backspace 改了值 ⇒ 要发 TextChanged");
+        assert_eq!(caret_of(&s, "name"), 0, "删完光标跟着退一位");
+    }
+
+    /// 在光标**中间**插入：这会区分「追加到末尾」与「插在光标处」两种实现。
+    #[test]
+    fn r22_text_input_inserts_at_the_caret() {
+        let (t, g, mut s) = focus_the_field();
+        handle(
+            &mut s,
+            &t,
+            &g,
+            ClipSnapshot::unclipped(),
+            &InputEvent::TextInput { text: "ac".into() },
+        );
+        assert_eq!(s.texts["name"], "ac");
+
+        // 光标退到中间（a|c），插入 B ⇒ "aBc"，且光标前进一位到 2。
+        handle(&mut s, &t, &g, ClipSnapshot::unclipped(), &key(Key::Left, false));
+        assert_eq!(caret_of(&s, "name"), 1, "前置：光标在 a 与 c 之间");
+        let out = handle(
+            &mut s,
+            &t,
+            &g,
+            ClipSnapshot::unclipped(),
+            &InputEvent::TextInput { text: "B".into() },
+        );
+        assert_eq!(s.texts["name"], "aBc", "新字符必须插在光标处，不是追加到末尾");
+        assert_eq!(caret_of(&s, "name"), 2, "插入后光标跟着往后移");
+        assert_eq!(out.len(), 1, "插成功要发 TextChanged");
+    }
+
     #[test]
     fn r19_wheel_needs_a_hover_inside_a_scrollable_container() {
         let (t, g) = fixture();

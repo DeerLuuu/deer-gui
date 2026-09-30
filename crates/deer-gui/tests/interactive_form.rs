@@ -198,6 +198,8 @@ fn scripted_replay_is_deterministic_and_matches_expected_state() {
         focus: Some("field_1".into()),
         pressed: None,
         texts: BTreeMap::from([("field_1".to_string(), "hi".to_string())]),
+        // 打完 "hi" 光标停在末尾（2 个字符）—— 这张表现在会被显式写上（值仍是「追加」的值）。
+        carets: BTreeMap::from([("field_1".to_string(), 2usize)]),
         scroll: Default::default(),
     };
     println!("期望终态 = {}", fmt_state(&expected_state));
@@ -450,6 +452,7 @@ fn states(theme: &Theme, tree: &Node, geo: &Geometry) -> Vec<(&'static str, Fram
             focus: Some("field_1".into()),
             pressed: None,
             texts,
+            carets: Default::default(),
             scroll: Default::default(),
         },
     );
@@ -740,6 +743,7 @@ fn four_states_differ_only_inside_the_expected_rectangles() {
         focus: Some("field_1".into()),
         pressed: None,
         texts: BTreeMap::from([("field_1".to_string(), "hi".to_string())]),
+        carets: Default::default(),
         // 合并提示：这条线给 `UiState` 新增了 `scroll`（合并另一条线时漏它 ⇒ E0063 全 test build 崩）。
         scroll: Default::default(),
     };

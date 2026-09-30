@@ -133,6 +133,9 @@ fn scripted_replay_is_deterministic_and_matches_expected_state() {
         focus: None,
         pressed: None,
         texts: std::collections::BTreeMap::from([("field_1".to_string(), "hi你".to_string())]),
+        // 打完字光标停在**末尾**（3 个字符：`h`、`i`、`你`）—— 这是「表里没有 id 就等于末尾」
+        // 的另一半：一旦动过文本，`carets` 就会被显式写上，但它的值仍是「追加」该有的值。
+        carets: std::collections::BTreeMap::from([("field_1".to_string(), 3usize)]),
         scroll: Default::default(),
     };
     assert_eq!(state1, expect_state, "最终状态必须逐字段相等");
