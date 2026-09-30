@@ -2638,6 +2638,105 @@ pub fn fragment_shader_unified() -> Vec<u8> {
     m.finish()
 }
 
+/// **纹理 quad 的片元着色器**（T1.3 A1）：`out = 顶点色 × 采样 rgba`。
+///
+/// ## 为什么单独一支，而不是给统一 FS 加「第三态」
+///
+/// 统一 FS 在 `uv.x >= 0` 那一支是**覆盖率语义**：`vec4(color.rgb, color.a * texel.r)`
+/// —— 只取 `.r`，因为字形图集是 `R8_UNORM`（覆盖率）。纹理 quad 要的是 **RGBA 调制**
+/// （四个通道都参与），两者在同一个 FS 里就得再分辨一次「现在绑的是图集还是用户纹理」。
+///
+/// 而这件事**不需要第三个状态**：[`crate::gpu_render::GpuGeometryRenderer::draw_textured_quad`]
+/// 本来就是把 `set 0 / binding 0` **临时改指到用户纹理**、然后**单独一次提交**
+/// （画完立刻改回图集/哑元）。也就是说 —— **纹理 quad 与文本从不在同一次 draw 里**。
+/// 既然不在同一趟，判别就该发生在**管线选择**上，而不是在片元里：
+/// 同一支顶点着色器 + 同一套顶点布局 + 另一个 FS ⇒ 另一条管线。代价是零，
+/// 比「加第三个判别符」或「扩成两个 binding」都小。
+///
+/// ## 语义（与 CPU 参考**必须**逐字一致，否则 parity 必挂）
+///
+/// ```text
+/// out.rgb = color.rgb * texel.rgb      （两个都是非预乘 ⇒ 相乘仍是调制）
+/// out.a   = color.a   * texel.a
+/// ```
+///
+/// 注意与**文本**那一支的区别：文本是 `vec4(color.rgb, color.a * cov)`（色不动、只压 alpha），
+/// 这里是**四个分量全部相乘**。别把两者写成一样 —— 一样了就是「RGB 调制没做」。
+///
+/// ## 顶点布局
+///
+/// 与 [`vertex_shader_unified`] 共用 ⇒ 复用 `UnifiedVertex`（stride 52 冻结）。
+/// 本 FS 只声明 `in_color`（location 2）与 `in_uv`（location 3）：
+/// 顶点着色器多输出的 `rect`/`radius_kind` 允许不被片元消费。
+pub fn fragment_shader_textured() -> Vec<u8> {
+    let mut m = Module::new();
+    m.shader_capability().memory_model_glsl450().source_unknown();
+
+    let void = m.type_void();
+    let f32_ty = m.type_float();
+    let v2 = m.type_vector(f32_ty, 2);
+    let v4 = m.type_vector(f32_ty, 4);
+    let img_ty = m.type_image_2d_unknown(f32_ty);
+    let sampled_ty = m.type_sampled_image(img_ty);
+    let ptr_tex = m.type_pointer(SC_UNIFORM_CONSTANT, sampled_ty);
+    let ptr_in_v2 = m.type_pointer(SC_INPUT, v2);
+    let ptr_in_v4 = m.type_pointer(SC_INPUT, v4);
+    let ptr_out_v4 = m.type_pointer(SC_OUTPUT, v4);
+    let fn_ty = m.type_function(void, &[]);
+
+    let tex = m.variable(ptr_tex, SC_UNIFORM_CONSTANT);
+    let out_color = m.variable(ptr_out_v4, SC_OUTPUT);
+    let in_color = m.variable(ptr_in_v4, SC_INPUT);
+    let in_uv = m.variable(ptr_in_v2, SC_INPUT);
+
+    let fn_id = m.id();
+    let block = m.id();
+    m.entry_point(
+        EXECUTION_MODEL_FRAGMENT,
+        fn_id,
+        "main",
+        &[out_color, in_color, in_uv],
+    );
+    m.execution_mode(fn_id, EXECUTION_MODE_ORIGIN_UPPER_LEFT, &[]);
+
+    // 描述符接口：与统一 FS **同一个** set 0 / binding 0（这就是「不改布局」的意思）
+    m.debug_name(tex, "user_texture");
+    m.decorate(tex, DECORATION_DESCRIPTOR_SET, &[0]);
+    m.decorate(tex, DECORATION_BINDING, &[0]);
+
+    m.debug_name(out_color, "out_color");
+    m.decorate(out_color, DECORATION_LOCATION, &[0]);
+    // location 必须与统一顶点着色器的输出对齐：color = 2、uv = 3
+    m.debug_name(in_color, "in_color");
+    m.decorate(in_color, DECORATION_LOCATION, &[2]);
+    m.debug_name(in_uv, "in_uv");
+    m.decorate(in_uv, DECORATION_LOCATION, &[3]);
+
+    m.function(void, fn_id, fn_ty, block);
+
+    let color = m.load(v4, in_color);
+    let uv = m.load(v2, in_uv);
+    let sampled = m.load(sampled_ty, tex);
+    let texel = m.op_image_sample_implicit_lod(v4, sampled, uv);
+
+    // out = color * texel —— 逐分量（本机 spirv-val 拒绝「标量条件 + vec4」的 OpSelect，
+    // 这里不用 OpSelect，直接四个 OpFMul）
+    let out = {
+        let mut comps = Vec::with_capacity(4);
+        for c in 0..4u32 {
+            let a = m.composite_extract(f32_ty, color, &[c]);
+            let b = m.composite_extract(f32_ty, texel, &[c]);
+            comps.push(m.f_mul(f32_ty, a, b));
+        }
+        m.composite_construct(v4, &comps)
+    };
+    m.store(out_color, out);
+
+    m.return_void();
+    m.function_end();
+    m.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
