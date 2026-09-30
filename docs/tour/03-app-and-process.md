@@ -281,7 +281,10 @@ cargo test --workspace 2>&1 | Select-String "^test result:"       # 每个靶一
 
 ## 5. 纪律与约定
 
-> ⚠️ **`AGENTS.md` 不存在**：根目录、`crates/`、`docs/` 下都**没有** `AGENTS.md`（`glob "**/AGENTS.md"`、`glob "**/*AGENT*"` 均为空；`git log --all -- AGENTS.md` 无输出）。它只被两处**条件引用**：`docs/superpowers/plans/2026-09-27-codebase-guided-tour.md:11`（「根 `AGENTS.md`（**若存在**）」）与同文件 `:79`（把 `AGENTS.md` 列为第 9 讲材料）。所以本节的纪律**全部来自仓库内的实际文档**，不是 `AGENTS.md`。
+> ⚠️ **2026-09-30 已翻转（原结论是「`AGENTS.md` 不存在」）**：测绘当时用 `glob "**/AGENTS.md"`、`glob "**/*AGENT*"`、
+> `git log --all -- AGENTS.md` 三路确认均无结果 —— 那时的纪律文件叫 **`agent.md`**（小写）。
+> **现已改名为 `AGENTS.md`**（大写是各 Agent 工具自动发现的规范名），并新增 §7「Agent 工作流」。
+> ⇒ **现在读本仓库纪律，权威入口是根 `AGENTS.md`**；本节的结论本身仍然成立，只是多了一个更靠前的来源。
 
 ### ① 每条结论要「命令 + 输出」
 
@@ -475,7 +478,7 @@ cargo test --workspace 2>&1 | Select-String "^test result:"       # 每个靶一
 
 ## 8. 未确认项（读不到 / 未实测）
 
-1. **`AGENTS.md` 不存在** —— 已用 `glob "**/AGENTS.md"`、`glob "**/*AGENT*"`、`git log --all -- AGENTS.md` 三路确认均无结果。它只被 `docs/superpowers/plans/2026-09-27-codebase-guided-tour.md:11` 以「**若存在**」的措辞条件引用。**因此本文件 §5 的纪律来源全部是仓库内实际文档，不含 `AGENTS.md`。**
+1. ~~**`AGENTS.md` 不存在**~~ —— **2026-09-30 已翻转**：测绘当时确实用 `glob "**/AGENTS.md"`、`glob "**/*AGENT*"`、`git log --all -- AGENTS.md` 三路确认无结果（纪律文件当时名为 `agent.md`）；现已**改名为 `AGENTS.md`** 并新增 §7「Agent 工作流」。**因此本文件 §5 的结论仍成立，但纪律的权威入口现在是根 `AGENTS.md`。**
 2. **`docs/tour/*` 不在 `docs_consistency` 的扫描面内**：规则 4 只遍历 `docs/features`（`crates/deer-gui/tests/docs_consistency.rs:145`），规则 1/3/5 只看 `FEATURES.md` 与 `README.md`。所以新增导览文档**不影响**该门禁（与 `docs/superpowers/plans/2026-09-27-codebase-guided-tour.md:19` 的说法一致）。
 3. **真窗口完整门禁**（`$env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo test -p deer-vk`）本轮**未实测**；文档记载它「必须显式打开」，且「不设变量时真窗口 e2e 显式跳过 —— **跳过也算 pass**」（`ROADMAP.md:51-59`、`README.md:56-57`、`docs/features/window.md:227`）。（注：该变量下的 `hal_window_path` **示例**已实测通过，见 §3。）
 4. **四道门禁的「确切命令」清单没有单一权威来源**：`docs/superpowers/plans/2026-09-27-codebase-guided-tour.md:80` 只说「跑齐四道门禁」，`docs/superpowers/plans/2026-09-27-m3a-drawlist-to-gpu-geometry.md:20` 列的是**三条**（workspace 测试 / clippy / `DEER_VK_VALIDATION=1 cargo test -p deer-vk`）。本文件 §4.2 的第四道（示例全跑）是**我在本轮把「示例」也当作门禁实跑后补上的**，命令并非抄自某一份文档；若上游另有明文，请以那份为准。
