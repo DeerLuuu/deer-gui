@@ -66,7 +66,7 @@ flowchart TB
         WINR["windowed.rs：WindowedRenderer<br/>surface+交换链+三帧同步+呈现<br/>draw_and_present(DrawList, TextEngine)"]
         GEOM["gpu_geom.rs(GpuVertex) · gpu_text.rs(TextVertex)<br/>vertex_unify.rs(UnifiedVertex 统一顶点)"]
         GPRENDER["gpu_render.rs：GpuGeometryRenderer + RenderStats"]
-        HALVK["hal.rs：VulkanDevice/Frame/Swapchain<br/>（HAL 接线；record 对非空 DrawList 仍报 Unsupported）"]
+        HALVK["hal.rs：VulkanDevice/Frame/Swapchain<br/>（T1.1 已接线：record 真的消费 DrawList，经 prepare_ui 复用 WindowedRenderer）"]
     end
 
     subgraph L1["① deer-layout —— 语言无关纯核心（零依赖、无 unsafe）"]
@@ -171,7 +171,7 @@ Feature 开关（`crates/deer-gui/Cargo.toml`）：
 
 **对外接口**（`crates/deer-gpu/src/lib.rs`）：
 
-- **HAL 契约**：`Backend`（`name`/`adapters`/`open`）、`Device`（`create_swapchain`/`create_texture`/`upload_texture`/`begin_frame`/`wait_idle`）、`Swapchain`（`resize`）、`Frame`（`record(DrawList)`/`read_pixels`/`submit_and_present`）、`Renderer` trait；资源句柄用不透明 `TextureId`，窗口用 `RawWindowHandle`（不含 winit 类型）。
+- **HAL 契约**：`Backend`（`name`/`adapters`/`open`）、`Device`（`create_swapchain`/`create_texture`/`upload_texture`/`begin_frame`/`wait_idle`）、`Swapchain`（`resize`）、`Frame`（`record(&DrawList, Option<&mut TextEngine>)` / `read_pixels` / `submit_and_present`）、`Renderer` trait；资源句柄用不透明 `TextureId`，窗口用 `RawWindowHandle`（不含 winit 类型）。
 - **绘制数据**（`draw.rs`）：`DrawCmd` 七种变体（`FillRect`/`StrokeRect`/`FillRoundRect`/`Text`/`PushClip`/`PopClip`/`NodeHint`）；`DrawList` 维护裁剪栈平衡不变式（`clip_balanced()`）。**命令是「结果」不是「控件」** —— 新增控件不需要动任何后端。
 - **默认渲染器**（`render.rs`）：`DefaultRenderer::build(tree, geo) → DrawList`，是「渲染链上唯一需要为控件类型改动的地方」；`NullRenderer` 只发 `NodeHint`（诊断/测试）。
 - **CPU 参考后端**（`null.rs`）：`CpuRenderer` 软件光栅化；`CpuRenderer::with_text(engine)` 贴真实字形。
@@ -211,7 +211,11 @@ Feature 开关（`crates/deer-gui/Cargo.toml`）：
 2. **静态 vs 动态 viewport**：离屏路径用静态（当前实现事实）；窗口路径每帧真的设置 viewport。旧说法「动态画不出像素」已被本机三组对照推翻，但那是**本机实测**，不是跨设备结论（`ROADMAP.md` M3 前提 1、`agent.md` §3.1）。
 3. **`FrameOutcome::OutOfDate` 如实上报**，绝不当成功 —— 映射函数 `present_result_of` 有独立单测钉住（`hal.rs:206-218`：曾有验证者把映射改反而全仓测试无一变红）。
 4. **已知损坏的 SPIR-V**：`vertex_shader_rect_pushconstant` 被校验层判 `VUID-06808`，请求校验层时会崩（`agent.md` §3.1）；矩形已改走顶点缓冲，该着色器**不要用它建管线**。
-5. **HAL 的 `Frame::record` 对非空 `DrawList` 仍报 `Unsupported`**（`hal.rs:168-184`）：M3c 的真实 UI 渲染走的是 `WindowedRenderer::draw_and_present` 直连路径，**没有经过 HAL 的 `record`** —— 这是当前 HAL 契约与实际渲染路径之间的一处分叉（详见开发计划 Phase 1）。
+5. **HAL 的 `Frame::record` 已真的消费 `DrawList`**（T1.1，`hal.rs:388`）：`record` 把 UI 录到
+   `pending_ui`（`hal.rs:417` 调 `WindowedRenderer::prepare_ui`），提交时喂进 `present_prepared`
+   （`windowed.rs:1677`）—— 与窗口路径 `draw_and_present` **共用同一段实现**，M3c 时代的
+   「HAL 契约与真实渲染路径分叉」已消除。`read_pixels` 的 `Unsupported` 也**不是**未实现，
+   而是 T1.4 的语义选择（时序在提交前，交换链数据只有呈现后有效；见 `Frame` trait 文档）。
 
 ### 3.4 `deer-window` —— 窗口层
 
@@ -385,8 +389,14 @@ DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example window_
 
 以下摘自 `FEATURES.md` 第四节与 `agent.md` §3.3（状态以 `FEATURES.md` 为唯一真相）：
 
-- **GPU HAL 的 `Frame::record`** 对非空 `DrawList` 报 `Unsupported`（M2b 边界残留，`hal.rs:168`）；真实 UI 呈现走 `WindowedRenderer::draw_and_present`。
-- **通用纹理 / 间接绘制**：本体已落地（`RGBA8_UNORM` 创建/上传/回读；`vkCmdDrawIndexedIndirect`），但**尚无指南与示例** ⇒ `FEATURES.md` 记 🔄 不记 ✅；纹理 RGB 调制片元着色器与窗口路径贴纹理入口未做。
+- **GPU HAL 剩下的两处边界**（都不是「还没做」而是各有原因）：① `Frame::read_pixels` 明确
+  `Unsupported` —— **语义选择**，本方法在提交前调用，而交换链图像只有呈现后可读，刻意不做
+  隐式呈现（T1.4，契约写在 `Frame` trait 文档里）；② **把 HAL 纹理喂进窗口渲染路径**的入口
+  未做 —— 那是 T1.3 的下半。真实 UI 呈现走 `WindowedRenderer::draw_and_present`，
+  HAL 路径与之**共用同一段实现**（T1.1）。
+- **通用纹理 / 间接绘制**：本体已落地（`RGBA8_UNORM` 创建/上传/回读；`vkCmdDrawIndexedIndirect`），
+  指南与示例补齐后 `FEATURES.md` 已记 ✅。**仍未做**：纹理 RGB 调制的片元着色器（现有统一 FS 只读
+  覆盖率）与窗口路径贴纹理的入口 —— 即 T1.3 的全部。
 - **窗口层只支持 Windows**；Linux/macOS 建窗返回 `UNSUPPORTED_PLATFORM_MSG`。
 - **每进程一个窗口**（测试基建限制，`ROADMAP.md` M3+）。
 - **输入剩余**：方向键导航、滚动条/惯性滚动、右/中键语义、IME 预编辑（`Preedit` 目前只用于抑制重复文本）、`texts` 光标位置、按键重复、dock/多窗口。

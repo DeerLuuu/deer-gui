@@ -1,7 +1,9 @@
 # 功能指南：GPU HAL（gpu-hal）
 
-> 状态 🔄（trait 契约完整；CPU 后端完整；Vulkan 后端的**设备/交换链/呈现已通**，
-> 但 `DrawList → GPU` 仍是 M3）·
+> 状态 🔄（五个 trait 契约完整；CPU 后端完整；Vulkan 后端的设备/交换链/呈现已通，
+> **T1.1 起 `record` 真的消费 `DrawList`** —— 界面已能经 HAL 上屏。
+> 仍挂 🔄 的两项：① `Frame::read_pixels` 按 T1.4 的**语义决策**明确 `Unsupported`；
+> ② HAL 纹理喂进**窗口**绘制路径的入口未做（T1.3 的下半））·
 > 示例 `cargo run -p deer-gui --example vulkan_devices` ·
 > 清单条目见 [`FEATURES.md`](../../FEATURES.md)
 
@@ -152,7 +154,8 @@ $env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo run -q -p deer
 - 绘制列表（后端消费的东西）：[`draw-list.md`](draw-list.md)
 - Vulkan 后端现状：[`vulkan.md`](vulkan.md)
 - HAL 窗口路径示例：`crates/deer-gui/examples/hal_window_path.rs`（`--features window`，`DEER_VK_WINDOW_TESTS=1` 开关）
-- **做不到**：把界面（`DrawList`）送上 GPU（矩形/圆角/文本；M3）；**窗口路径**的纹理绑定（HAL 纹理**本体**已落地，但把 HAL 纹理喂进 `WindowedRenderer` 的绘制路径仍是 M3 的工程活）；
+- **做不到**：**窗口路径**的纹理绑定（HAL 纹理**本体**已落地，但把 HAL 纹理喂进 `WindowedRenderer`
+  的绘制路径仍是 T1.3 的工程活）；
   推送常量矩形着色器（损坏，见 [`ROADMAP.md`](../../ROADMAP.md) Q-5）。
   **`deer-vk` 的 `Frame::read_pixels()` 明确 `Unsupported`** —— 不是「以后再补」而是语义选择：
   HAL 在提交前调用，回读数据只有呈现后才有效，所以请用 `WindowedRenderer::read_back_last_frame()`
