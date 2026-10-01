@@ -249,12 +249,19 @@ fn validation_counter_is_thread_local_not_process_wide() {
     let (tx_ready, rx_ready) = std::sync::mpsc::channel::<usize>();
     let (tx_go, rx_go) = std::sync::mpsc::channel::<()>();
 
+    // 故意违规必然要把消息交给回调；而**校验层报完就会把调用放给驱动**，驱动拿着
+    // 全零 `GraphicsPipelineCreateInfo` 去解引用空指针 ⇒ 本机 `0xc0000005`
+    // （2026-10-01 实测：崩在 `validation_counter_is_thread_local_not_process_wide`）。
+    // 打开中止开关 ⇒ 层跳过这次调用 ⇒ 驱动看不到非法参数。
+    // 开关是**进程级原子量**，所以工作线程里发的消息一样受它约束。
     let worker = std::thread::spawn(move || {
         // 设备在**本线程内**打开（VkDevice 句柄不是 Send）
         let Ok(dev) = VkDevice::open(0) else { return 0usize };
         let fns = *dev.fns();
         let handle = dev.handle();
         let before = deer_vk::ffi::validation_message_count();
+        // 中止开关是**线程局部**的 ⇒ 必须在**做违规的这个线程**里设（见 ffi.rs 的说明）。
+        deer_vk::ffi::set_validation_abort_on_message(true);
         // **故意违规**：null 渲染通道 + 零阶段 + 全零 sType ⇒ 校验层必然报若干条。
         let mut pipe: vk::PipelineHandle = std::ptr::null_mut();
         // SAFETY: 故意传非法参数 —— 本测试的目的就是**产生**校验消息。
@@ -269,6 +276,11 @@ fn validation_counter_is_thread_local_not_process_wide() {
                 &mut pipe,
             )
         };
+        deer_vk::ffi::set_validation_abort_on_message(false);
+        assert!(
+            !deer_vk::ffi::validation_abort_on_message(),
+            "中止开关没关回去 —— 会影响本线程后续所有 API 的返回行为"
+        );
         let gain = deer_vk::ffi::validation_message_count() - before;
         let _ = tx_ready.send(gain);
         // 阻塞等主线程读完 —— 保证「工作线程仍存活」这个窗口存在
@@ -340,11 +352,23 @@ fn validation_counter_actually_counts_when_a_message_is_emitted() {
     let tls_before = deer_vk::ffi::validation_message_count();
     let global_before = deer_vk::ffi::validation_message_count_global();
 
-    // 故意违规：全零 GraphicsPipelineCreateInfo（sType/stageCount/renderPass/layout 全非法）
+    // 故意违规：全零 GraphicsPipelineCreateInfo（sType/stageCount/renderPass/layout 全非法）。
+    //
+    // ⚠️ **必须配 `set_validation_abort_on_message(true)`**（2026-10-01 实测）：
+    // 校验层会把消息报出来（实测 11 条），但**报完照样把调用放给驱动** —— 驱动拿着这个
+    // 全零结构体去解引用里面的空指针，本机直接 `0xc0000005` 把整个测试二进制打死
+    // （于是 `DEER_VK_VALIDATION=1 cargo test -p deer-vk` 后面的靶全都跑不到）。
+    // 打开开关 ⇒ 回调返回 `VK_TRUE` ⇒ 层**跳过这次调用** ⇒ 驱动根本看不到非法参数。
+    // 我们要的是「有消息 ⇒ 计数自增」，不是「让驱动去啃非法内存」。
+    //
+    // 开关只在这一次调用周围打开，**紧接着关掉**（下面有一条断言钉「确实关了」）——
+    // 默认必须是「不中止」，否则会改变所有正常 API 的返回行为。
     let mut pipe: vk::PipelineHandle = std::ptr::null_mut();
-    // SAFETY: 故意传非法参数 —— 本测试的目的就是**产生**校验消息。
     let info = unsafe { std::mem::zeroed::<vk::GraphicsPipelineCreateInfo>() };
-    let _ = unsafe {
+    deer_vk::ffi::set_validation_abort_on_message(true);
+    // SAFETY: 故意传非法参数 —— 本测试的目的就是**产生**校验消息；
+    // 而上面那个开关保证校验层会拦下这次调用，不让它进驱动。
+    let rc_aborted = unsafe {
         (fns.create_graphics_pipelines)(
             handle,
             vk::NULL_HANDLE,
@@ -354,6 +378,14 @@ fn validation_counter_actually_counts_when_a_message_is_emitted() {
             &mut pipe,
         )
     };
+    deer_vk::ffi::set_validation_abort_on_message(false);
+    assert!(
+        !deer_vk::ffi::validation_abort_on_message(),
+        "用例结束了但中止开关还开着 —— 那会改变后续所有 API 的返回行为"
+    );
+    // 中止开关生效的**直接证据**：校验层拦下调用时返回的是它自己的错误码
+    // （`VK_ERROR_VALIDATION_FAILED_EXT`，负数），而不是驱动那边的结果。
+    println!("  被校验层拦下的调用返回 rc = {rc_aborted}（应为负）");
 
     let tls_gain = deer_vk::ffi::validation_message_count() - tls_before;
     let global_gain = deer_vk::ffi::validation_message_count_global() - global_before;
