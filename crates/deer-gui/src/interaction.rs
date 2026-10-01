@@ -2040,10 +2040,6 @@ mod tests {
         assert_eq!(s, before, "不消费的事件不得改变任何状态");
     }
 
-    /// 滚轮的三条前置：**没有 hover / 没有可滚动祖先 / 上限是 0** ⇒ 什么都不做。
-    ///
-    /// （「有 hover 且在可滚动容器里」的完整链路在
-    /// `tests/scroll_multiline.rs` 里跑，那条用真实布局与真实绘制列表。）
     // ---- T3.5：`texts` 光标（字符位） --------------------------------------
 
     /// 让焦点落在一个输入框上，并返回 id（`fixture` 里的输入框叫 `name`）。
@@ -2187,6 +2183,10 @@ mod tests {
         assert_eq!(out.len(), 1, "插成功要发 TextChanged");
     }
 
+    /// 滚轮的三条前置：**没有 hover / 没有可滚动祖先 / 上限是 0** ⇒ 什么都不做。
+    ///
+    /// （「有 hover 且在可滚动容器里」的完整链路在
+    /// `tests/scroll_multiline.rs` 里跑，那条用真实布局与真实绘制列表。）
     #[test]
     fn r19_wheel_needs_a_hover_inside_a_scrollable_container() {
         let (t, g) = fixture();

@@ -762,6 +762,40 @@ type PfnDebugUtilsMessengerCallback = unsafe extern "system" fn(
 /// 「全局 ≥ 本线程」钉住 ⇒ 因此**不可能出现「本线程计数把它漏掉了」而无人察觉**。
 static VALIDATION_MESSAGE_COUNT: AtomicUsize = AtomicUsize::new(0);
 
+// 开关本体（**线程局部**：理由见下面 setter 的文档）。
+thread_local! {
+    static VALIDATION_ABORT_ON_MESSAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// **收到消息时是否让校验层「中止这次调用」**（回调返回 `VK_TRUE` 的语义）。
+///
+/// 默认 **false**：消息只记录/打印，调用照常进驱动 —— 这是产品行为，也是绝大多数
+/// 用例想要的（我们只想**观察**，不想改变 API 的返回）。
+///
+/// 为什么需要这个开关（2026-10-01 实测）：`pipeline_smoke` 里有一条用例**故意**传
+/// 一个非法结构体来诱发校验消息。校验层把消息报出来了（实测 11 条），**但它不负责
+/// 拦住调用** —— 驱动随后拿着那个结构体去解引用其中的空指针，本机直接
+/// `0xc0000005` 把整个测试二进制打死，于是 `DEER_VK_VALIDATION=1 cargo test -p deer-vk`
+/// 后面的靶**根本跑不到**（真窗口门禁因此永远不能叫「全绿」）。
+///
+/// 打开它之后，校验层会在报完消息后**跳过这次 API 调用** ⇒ 驱动根本看不到非法参数
+/// ⇒ 既不崩，又能拿到「消息 ⇒ 计数自增」的证据。这正是回调返回值存在的意义。
+/// ⚠️ **必须是线程局部的，不能是进程级原子量**（2026-10-01 实测教训）：
+/// 先写成 `AtomicBool` 时，两个「故意违规」的用例并行跑会互相干扰 —— 甲开着开关时，
+/// 乙那边**正常**的 API 调用若也产生一条消息，就会同样被层拦下 ⇒ 乙拿到意外结果
+/// （实测症状：`pipeline_smoke` 并行跑 `0xc0000005`，单线程跑全过）。
+/// 而线程局部是**规范上就对**的：校验层在**发起调用的那个线程上同步投递**消息 ——
+/// 同文件的 `validation_counter_is_thread_local_not_process_wide` 正是这条事实的判据。
+/// **用完记得关**（建议紧跟一次 `false`）。只影响**当前线程**上发出的调用。
+pub fn set_validation_abort_on_message(on: bool) {
+    VALIDATION_ABORT_ON_MESSAGE.with(|c| c.set(on));
+}
+
+/// 当前线程的开关值（测试用；也让「忘了关」可被断言）。
+pub fn validation_abort_on_message() -> bool {
+    VALIDATION_ABORT_ON_MESSAGE.with(|c| c.get())
+}
+
 thread_local! {
     /// **本线程**累计收到的校验层消息数。
     ///
@@ -858,7 +892,14 @@ unsafe extern "system" fn validation_callback(
     VALIDATION_MESSAGE_COUNT.fetch_add(1, Ordering::Relaxed);
     VALIDATION_MESSAGE_COUNT_TLS.with(|c| c.set(c.get() + 1));
     eprintln!("[{kind}] {msg}");
-    0 // VK_FALSE：不中止
+    // 默认 `VK_FALSE`（不中止）：只观察，不改变 API 的返回。
+    // 打开开关时返回 `VK_TRUE` ⇒ 校验层**跳过这次调用** —— 「故意违规」类用例靠它
+    // 避免把非法参数真的交给驱动（见 [`VALIDATION_ABORT_ON_MESSAGE`]）。
+    if VALIDATION_ABORT_ON_MESSAGE.with(|c| c.get()) {
+        1 // VK_TRUE：中止
+    } else {
+        0 // VK_FALSE：不中止
+    }
 }
 
 /// 一个已创建的 VkInstance。`Drop` 保证销毁。
