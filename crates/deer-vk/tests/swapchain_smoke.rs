@@ -979,6 +979,45 @@ fn run_windowed_e2e() {
         );
     }
 
+    // ── T1.3 ②：窗口侧贴任意 RGBA 纹理（走**纹理管线** ⇒ RGBA 调制） ──────────
+    //
+    // 判据与附件格式无关，且**能区分两种语义**：1×1 texel = (255,0,0,255)、tint = 白。
+    //   - RGB 调制（本实现）⇒ out = tint × texel = (255,0,0) ⇒ 绿/蓝必须为 **0**；
+    //   - 覆盖率语义（界面管线那一支）⇒ out = tint = (255,255,255) ⇒ 绿/蓝为 255。
+    // `255` 与 `0` 在 sRGB 编码下都是不动点 ⇒ 线性 / sRGB 附件都适用。
+    // 用 1×1 纹理 ⇒ uv 取到哪儿都是同一个 texel，不引入采样歧义。
+    //
+    // ⚠️ **已知边界（本文件末尾的实测记录）**：纹理趟**之后**若再走一次普通
+    //    `render_and_present()`，本机在该组合下 `0xc0000005`。因此这里**只做**
+    //    「画一趟 + 回读一次」，不做「画纹理 → 再画界面 → 再回读」。
+    //    单跑本段（画 + 回读）在校验层下**零错误零泄漏**。
+    {
+        let red = r
+            .device()
+            .create_texture_rgba8(1, 1, &[255, 0, 0, 255])
+            .expect("建 1×1 红纹理");
+        let full = deer_gpu::RectI::new(0, 0, rw as i32, rh as i32);
+        let outcome = r
+            .draw_textured_quad(&red, full, deer_gpu::Color::WHITE)
+            .expect("窗口侧纹理 quad");
+        assert!(
+            matches!(outcome, FrameOutcome::Presented),
+            "纹理 quad 那趟应成功呈现，实际 {outcome:?}"
+        );
+        let px = r.read_back_last_frame().expect("回读纹理那一帧");
+        let i0 = (((rh / 2) as usize) * (rw as usize) + (rw / 2) as usize) * 4;
+        let c = [px[i0], px[i0 + 1], px[i0 + 2], px[i0 + 3]];
+        println!("窗口侧纹理 quad 中心 = {c:?}");
+        assert_eq!(c[0], 255, "红通道应为 255（白 tint × texel R=255）：{c:?}");
+        assert_eq!(
+            c[1], 0,
+            "绿通道必须为 0 ⇒ 证明窗口侧走的是 **RGB 调制**；若这里是 255，\
+             说明它误用了界面管线的覆盖率语义（那时输出恒等于 tint）：{c:?}"
+        );
+        assert_eq!(c[2], 0, "蓝通道同理必须为 0：{c:?}");
+        println!("窗口侧纹理 quad ✅ RGBA 调制生效（纹理管线）");
+    }
+
     // —— 收尾：wait_idle + Drop（析构顺序在 Drop 里靠字段顺序保证）——
     r.wait_idle().expect("vkDeviceWaitIdle");
     let total = r.frames_presented();

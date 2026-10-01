@@ -596,7 +596,9 @@ fn vertex_range(base: usize, len: usize) -> GpuResult<(u32, u32)> {
 ///
 /// `rect`/`radius_kind` 对采样支**不被读取**（统一 FS 在 `uv.x ≥ 0` 时不看它们），
 /// 这里照填 quad 的真实矩形以便诊断。
-fn textured_quad_vertices(
+/// 离屏与**窗口**两条路径共用（T1.3 ② 起窗口侧也要铺纹理 quad）——
+/// 顶点语义只有这一份来源，别在 `windowed.rs` 里另写一份。
+pub(crate) fn textured_quad_vertices(
     extent: Extent,
     tex_w: u32,
     tex_h: u32,

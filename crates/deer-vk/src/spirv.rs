@@ -2680,12 +2680,15 @@ pub fn fragment_shader_textured() -> Vec<u8> {
     let sampled_ty = m.type_sampled_image(img_ty);
     let ptr_tex = m.type_pointer(SC_UNIFORM_CONSTANT, sampled_ty);
     let ptr_in_v2 = m.type_pointer(SC_INPUT, v2);
+    let ptr_in_f32 = m.type_pointer(SC_INPUT, f32_ty);
     let ptr_in_v4 = m.type_pointer(SC_INPUT, v4);
     let ptr_out_v4 = m.type_pointer(SC_OUTPUT, v4);
     let fn_ty = m.type_function(void, &[]);
 
     let tex = m.variable(ptr_tex, SC_UNIFORM_CONSTANT);
     let out_color = m.variable(ptr_out_v4, SC_OUTPUT);
+    let in_rect = m.variable(ptr_in_v4, SC_INPUT);
+    let in_rk = m.variable(ptr_in_f32, SC_INPUT);
     let in_color = m.variable(ptr_in_v4, SC_INPUT);
     let in_uv = m.variable(ptr_in_v2, SC_INPUT);
 
@@ -2695,7 +2698,7 @@ pub fn fragment_shader_textured() -> Vec<u8> {
         EXECUTION_MODEL_FRAGMENT,
         fn_id,
         "main",
-        &[out_color, in_color, in_uv],
+        &[out_color, in_rect, in_rk, in_color, in_uv],
     );
     m.execution_mode(fn_id, EXECUTION_MODE_ORIGIN_UPPER_LEFT, &[]);
 
@@ -2706,7 +2709,19 @@ pub fn fragment_shader_textured() -> Vec<u8> {
 
     m.debug_name(out_color, "out_color");
     m.decorate(out_color, DECORATION_LOCATION, &[0]);
-    // location 必须与统一顶点着色器的输出对齐：color = 2、uv = 3
+    // ⚠️ **输入必须与 `vertex_shader_unified` 的输出逐条对齐**（location 0..3）。
+    //
+    // 本 FS 只**用** location 2/3（color / uv）；但 0（rect）与 1（radius_kind）
+    // **仍要声明**。实测依据：只声明 2/3 时校验层报
+    // 「[VERTEX] has an Output value declared at Location 1 ... but there is no
+    //   corresponding Input declared in [FRAGMENT]」—— 这正是 `windowed.rs` 里
+    // M3c 那段教训的镜像（当时是 FS 有 Input、VS 没 Output）。本机驱动对这类
+    // 接口不一致**照样建管线成功、照样画出正确像素**，只有校验层说得出问题；
+    // 而它属于「规范上就是错的」，不该留着。
+    m.debug_name(in_rect, "in_rect");
+    m.decorate(in_rect, DECORATION_LOCATION, &[0]);
+    m.debug_name(in_rk, "in_radius_kind");
+    m.decorate(in_rk, DECORATION_LOCATION, &[1]);
     m.debug_name(in_color, "in_color");
     m.decorate(in_color, DECORATION_LOCATION, &[2]);
     m.debug_name(in_uv, "in_uv");
