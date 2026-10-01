@@ -164,8 +164,8 @@ assert_eq!(max_channel_diff(&gpu_px, &cpu_reference), 0);
   （`R8` 字形图集 + `color.a * texel.r`），那是文本该有的语义，**刻意保留**，不是没做完。
 - **窗口路径贴任意纹理**：**已做**（T1.3 ②）—— `WindowedRenderer::draw_textured_quad`，
   与离屏侧同形同语义（同一支顶点着色器、同一套顶点布局、另一条管线）。
-  **已知边界**：纹理趟**之后**再走一次普通 `render_and_present()`，本机在该组合下
-  `0xc0000005`（已收敛到该组合，未修，见 §6 末）。
+  纹理趟是**单独一趟 present**（画完还原描述符），所以它会**清屏**：
+  纹理**没法与界面同帧叠加**（要叠就得在同一趟里两次 draw + 中途换描述符，未做）。
 - **纹理作为 `DrawCmd`**：`DrawList` 属于 `deer-gpu` 的契约，「一张任意纹理铺到矩形上」
   目前只有测试/诊断需要，所以**没有**进 `DrawCmd`。界面树里贴图 = 控件的活（M6 `Icon`）。
 - **mipmap / 各向异性 / 重复寻址**：采样器是 `NEAREST` + `CLAMP_TO_EDGE`，没有 mip 链
