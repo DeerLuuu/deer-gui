@@ -1,9 +1,11 @@
 # 功能指南：GPU HAL（gpu-hal）
 
-> 状态 🔄（五个 trait 契约完整；CPU 后端完整；Vulkan 后端的设备/交换链/呈现已通，
+> 状态 ✅（五个 trait 契约完整；CPU 后端完整；Vulkan 后端的设备/交换链/呈现已通，
 > **T1.1 起 `record` 真的消费 `DrawList`** —— 界面已能经 HAL 上屏。
-> 仍挂 🔄 的两项：① `Frame::read_pixels` 按 T1.4 的**语义决策**明确 `Unsupported`；
-> ② HAL 纹理喂进**窗口**绘制路径的入口未做（T1.3 的下半））·
+> 两个曾经的挂账都已清：① `Frame::read_pixels` 的 `Unsupported` 是 **T1.4 的语义决策**
+> （时序在提交前、交换链数据只有呈现后有效），契约写在 trait 文档里；
+> ② **HAL 纹理喂进窗口绘制路径**已做（T1.3 ②：`WindowedRenderer::draw_textured_quad`，
+> 配上 T1.3 ① 的 RGB 调制）。）·
 > 示例 `cargo run -p deer-gui --example vulkan_devices` ·
 > 清单条目见 [`FEATURES.md`](../../FEATURES.md)
 
