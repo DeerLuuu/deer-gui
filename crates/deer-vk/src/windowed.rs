@@ -168,6 +168,20 @@ struct UiResources {
     unified_vs: ShaderModule,
     #[allow(dead_code)]
     unified_fs: ShaderModule,
+    /// **窗口侧的纹理管线**（T1.3 ②）：与 `unified` **同一支顶点着色器、同一套顶点布局**
+    /// （`UnifiedVertex` stride 52），只换片元着色器
+    /// （[`crate::spirv::fragment_shader_textured`] ⇒ RGBA 调制）。
+    ///
+    /// 只被 [`WindowedRenderer::draw_textured_quad`] 用；那条路径把 `set` 临时改指到
+    /// 用户纹理、单独走一次 present，画完立刻还原 —— 所以它与界面绘制**不在同一趟**。
+    ///
+    /// **声明顺序契约**同 `unified`：本管线引用 `textured_vs`/`textured_fs` ⇒ 必须
+    /// 声明在它们**之前**（Rust 按声明顺序析构 ⇒ 管线先销毁）。
+    textured: Pipeline,
+    #[allow(dead_code)]
+    textured_vs: ShaderModule,
+    #[allow(dead_code)]
+    textured_fs: ShaderModule,
     /// `set 0 / binding 0`：**恒有效**（统一 FS 无条件采样）。
     ///
     /// **必须在 `pool` 之前声明**（见类型文档的字段顺序契约）。
@@ -930,6 +944,16 @@ impl WindowedRenderer {
         self.device.adapter()
     }
 
+    /// 本渲染器打开的设备。
+    ///
+    /// 为什么需要它：T1.3 ② 的 [`Self::draw_textured_quad`] 吃的是
+    /// [`crate::device::Texture`]，而要建纹理就得有设备 —— 没有这个 getter，
+    /// 调用方（含集成测试）只能自己再开一个设备，而**纹理必须在同一个设备上**才有意义。
+    /// 纯读取，不暴露任何可变状态。
+    pub fn device(&self) -> &crate::device::VkDevice {
+        &self.device
+    }
+
     pub fn extent(&self) -> Extent {
         self.extent
     }
@@ -1458,6 +1482,120 @@ impl WindowedRenderer {
         self.present_prepared(&unified)
     }
 
+    /// **缓冲准备**（④ 顶点 + ④b 索引/间接）：从 `prepare_ui` 抽出来，供
+    /// 「界面录制」与「窗口侧纹理 quad」**两条路径共用**（T1.3 ②）。
+    ///
+    /// 抽出来的理由：两条路径的差别只在**顶点流从哪来**（`prepare_ui` 由
+    /// `unify` 合流得到 / 纹理 quad 由 `textured_quad_vertices` 直接生成）与
+    /// **绑哪条管线**；而「怎么把顶点流变成可绘制的三种缓冲」是同一件事。
+    /// 抄第二份的话，`uploaded_*` 那套「句柄变了就作废」的跳过条件迟早只在一处生效。
+    ///
+    /// 屏障标志（`ui_barrier` / `ui_index_barrier` / `ui_indirect_barrier`）
+    /// 在这里被**赋值**（真上传了才置真）—— 录制侧据此决定发不发屏障。
+    fn prepare_buffers(
+        &mut self,
+        unified: &[crate::vertex_unify::UnifiedVertex],
+    ) -> GpuResult<()> {
+        // ④ 上传：**一块**统一顶点缓冲（**内容变化才重传**；容量不足才重建）
+        //
+        // 计数（`buffer_uploads` / `buffer_allocations`）在**被调用方**里自增，
+        // 与真实调用同处 —— 删掉上传就必然删掉计数。
+        // B3：内容逐字节相同的帧跳过重传（UI 帧的顶点数据通常与上一帧相同）。
+        let mut uploaded_now = false;
+        if !unified.is_empty() {
+            // 注意：本方法的 `unified` 是**切片**（`prepare_ui` 那边是 `Vec`）
+            // ⇒ 这里不能写 `.as_slice()`（那会解析到 `str` 的 unstable 方法）。
+            let bytes = std::mem::size_of_val(unified);
+            let dev = &self.device;
+            let stats = &mut self.stats;
+            let ui = self.ui.as_mut().expect("ensure_ui 之后必有资源");
+            ensure_ui_vertex_capacity(
+                dev,
+                &mut ui.vb,
+                bytes as u64,
+                stats,
+                vk::VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                "窗口统一顶点缓冲",
+            )?;
+            // SAFETY: `UnifiedVertex` 是 `#[repr(C)]` 纯 `f32`（无指针、无 Drop）⇒ 字节视图合法。
+            let src = unsafe { std::slice::from_raw_parts(unified.as_ptr() as *const u8, bytes) };
+            let handle = ui.vb.as_ref().expect("刚 ensure 过").buffer.handle();
+            // 跳过条件：**同一块缓冲**（句柄相等）且字节相同 —— 句柄一变就自动作废（I-1）
+            let same =
+                matches!(&ui.uploaded_vertices, Some((h, b)) if *h == handle && b.as_slice() == src);
+            if !same {
+                let vb = ui.vb.as_ref().expect("刚 ensure 过");
+                upload_ui_vertices(dev, vb, src, "vkMapMemory(窗口统一顶点)", stats)?;
+                ui.uploaded_vertices = Some((handle, src.to_vec()));
+                uploaded_now = true;
+            }
+        }
+        // 屏障只在**这一帧真的上传了**时发（B3 收紧后的语义，与离屏一致）
+        self.ui_barrier = uploaded_now;
+
+        // ④b **索引 + 间接命令**（M3+ 第 4 项下半）：与离屏同一条设计 ——
+        //     内容只在顶点数变化时才变 ⇒ 稳态零上传、零分配；三种缓冲各有自己的计数器。
+        self.ui_index_barrier = false;
+        self.ui_indirect_barrier = false;
+        if !unified.is_empty() {
+            let vertex_count = unified.len() as u32;
+            let dev = &self.device;
+            let stats = &mut self.stats;
+            let ui = self.ui.as_mut().expect("ensure_ui 之后必有资源");
+
+            let mut index_slot = ui.index.take();
+            ensure_ui_vertex_capacity(
+                dev,
+                &mut index_slot,
+                vertex_count as u64 * 4,
+                stats,
+                crate::device::VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
+                "窗口索引缓冲",
+            )?;
+            ui.index = index_slot;
+            let index_handle = ui.index.as_ref().expect("刚 ensure 过").buffer.handle();
+            let index_changed = !matches!(
+                &ui.uploaded_indices,
+                Some((h, n)) if *h == index_handle && *n == vertex_count
+            );
+            if index_changed {
+                let buf = ui.index.as_ref().expect("刚 ensure 过");
+                let indices = DrawIndexedIndirectCommand::sequential_indices(vertex_count);
+                upload_ui_vertices(dev, buf, &indices, "vkMapMemory(窗口索引)", stats)?;
+                // 计数与真实调用同处
+                stats.index_uploads += 1;
+                ui.uploaded_indices = Some((index_handle, vertex_count));
+                self.ui_index_barrier = true;
+            }
+
+            let mut indirect_slot = ui.indirect.take();
+            ensure_ui_vertex_capacity(
+                dev,
+                &mut indirect_slot,
+                std::mem::size_of::<DrawIndexedIndirectCommand>() as u64,
+                stats,
+                crate::device::VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
+                "窗口间接命令缓冲",
+            )?;
+            ui.indirect = indirect_slot;
+            let indirect_handle = ui.indirect.as_ref().expect("刚 ensure 过").buffer.handle();
+            let query = DrawIndexedIndirectCommand::for_vertex_count(vertex_count);
+            let command_changed = !matches!(
+                &ui.uploaded_indirect,
+                Some((h, c)) if *h == indirect_handle && *c == query
+            );
+            if command_changed {
+                let buf = ui.indirect.as_ref().expect("刚 ensure 过");
+                upload_ui_vertices(dev, buf, &query.to_bytes(), "vkMapMemory(窗口间接命令)", stats)?;
+                // 计数与真实调用同处
+                stats.indirect_uploads += 1;
+                ui.uploaded_indirect = Some((indirect_handle, query));
+                self.ui_indirect_barrier = true;
+            }
+        }
+        Ok(())
+    }
+
     /// **UI 录制的前半段**（T1.1 从 `draw_and_present` 抽出，供 HAL 路径复用）。
     ///
     /// ① `ensure_ui` → ② 单次遍历建形状/文本顶点 + 段表 → ③ `unify` 合流
@@ -1558,101 +1696,7 @@ impl WindowedRenderer {
             crate::vertex_unify::unify(&shape_verts, &text_verts, &calls);
         self.unify_output_vertices += unified.len() as u64;
 
-        // ④ 上传：**一块**统一顶点缓冲（**内容变化才重传**；容量不足才重建）
-        //
-        // 计数（`buffer_uploads` / `buffer_allocations`）在**被调用方**里自增，
-        // 与真实调用同处 —— 删掉上传就必然删掉计数。
-        // B3：内容逐字节相同的帧跳过重传（UI 帧的顶点数据通常与上一帧相同）。
-        let mut uploaded_now = false;
-        if !unified.is_empty() {
-            let bytes = std::mem::size_of_val(unified.as_slice());
-            let dev = &self.device;
-            let stats = &mut self.stats;
-            let ui = self.ui.as_mut().expect("ensure_ui 之后必有资源");
-            ensure_ui_vertex_capacity(
-                dev,
-                &mut ui.vb,
-                bytes as u64,
-                stats,
-                vk::VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                "窗口统一顶点缓冲",
-            )?;
-            // SAFETY: `UnifiedVertex` 是 `#[repr(C)]` 纯 `f32`（无指针、无 Drop）⇒ 字节视图合法。
-            let src = unsafe { std::slice::from_raw_parts(unified.as_ptr() as *const u8, bytes) };
-            let handle = ui.vb.as_ref().expect("刚 ensure 过").buffer.handle();
-            // 跳过条件：**同一块缓冲**（句柄相等）且字节相同 —— 句柄一变就自动作废（I-1）
-            let same =
-                matches!(&ui.uploaded_vertices, Some((h, b)) if *h == handle && b.as_slice() == src);
-            if !same {
-                let vb = ui.vb.as_ref().expect("刚 ensure 过");
-                upload_ui_vertices(dev, vb, src, "vkMapMemory(窗口统一顶点)", stats)?;
-                ui.uploaded_vertices = Some((handle, src.to_vec()));
-                uploaded_now = true;
-            }
-        }
-        // 屏障只在**这一帧真的上传了**时发（B3 收紧后的语义，与离屏一致）
-        self.ui_barrier = uploaded_now;
-
-        // ④b **索引 + 间接命令**（M3+ 第 4 项下半）：与离屏同一条设计 ——
-        //     内容只在顶点数变化时才变 ⇒ 稳态零上传、零分配；三种缓冲各有自己的计数器。
-        self.ui_index_barrier = false;
-        self.ui_indirect_barrier = false;
-        if !unified.is_empty() {
-            let vertex_count = unified.len() as u32;
-            let dev = &self.device;
-            let stats = &mut self.stats;
-            let ui = self.ui.as_mut().expect("ensure_ui 之后必有资源");
-
-            let mut index_slot = ui.index.take();
-            ensure_ui_vertex_capacity(
-                dev,
-                &mut index_slot,
-                vertex_count as u64 * 4,
-                stats,
-                crate::device::VK_BUFFER_USAGE_INDEX_BUFFER_BIT,
-                "窗口索引缓冲",
-            )?;
-            ui.index = index_slot;
-            let index_handle = ui.index.as_ref().expect("刚 ensure 过").buffer.handle();
-            let index_changed = !matches!(
-                &ui.uploaded_indices,
-                Some((h, n)) if *h == index_handle && *n == vertex_count
-            );
-            if index_changed {
-                let buf = ui.index.as_ref().expect("刚 ensure 过");
-                let indices = DrawIndexedIndirectCommand::sequential_indices(vertex_count);
-                upload_ui_vertices(dev, buf, &indices, "vkMapMemory(窗口索引)", stats)?;
-                // 计数与真实调用同处
-                stats.index_uploads += 1;
-                ui.uploaded_indices = Some((index_handle, vertex_count));
-                self.ui_index_barrier = true;
-            }
-
-            let mut indirect_slot = ui.indirect.take();
-            ensure_ui_vertex_capacity(
-                dev,
-                &mut indirect_slot,
-                std::mem::size_of::<DrawIndexedIndirectCommand>() as u64,
-                stats,
-                crate::device::VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT,
-                "窗口间接命令缓冲",
-            )?;
-            ui.indirect = indirect_slot;
-            let indirect_handle = ui.indirect.as_ref().expect("刚 ensure 过").buffer.handle();
-            let query = DrawIndexedIndirectCommand::for_vertex_count(vertex_count);
-            let command_changed = !matches!(
-                &ui.uploaded_indirect,
-                Some((h, c)) if *h == indirect_handle && *c == query
-            );
-            if command_changed {
-                let buf = ui.indirect.as_ref().expect("刚 ensure 过");
-                upload_ui_vertices(dev, buf, &query.to_bytes(), "vkMapMemory(窗口间接命令)", stats)?;
-                // 计数与真实调用同处
-                stats.indirect_uploads += 1;
-                ui.uploaded_indirect = Some((indirect_handle, query));
-                self.ui_indirect_barrier = true;
-            }
-        }
+        self.prepare_buffers(&unified)?;
 
         // ⑤ 图集纹理：指纹变化才重传（与离屏同一条契约）
         if let Some(engine) = engine.as_deref() {
@@ -1679,7 +1723,121 @@ impl WindowedRenderer {
         unified: &[crate::vertex_unify::UnifiedVertex],
     ) -> GpuResult<FrameOutcome> {
         self.ensure_ui(false)?;
-        self.present_frame(|s, slot, image_index| s.record_ui(slot, image_index, unified))
+        let pipe = self
+            .ui
+            .as_ref()
+            .map(|u| u.unified.handle())
+            .ok_or_else(|| GpuError::Driver {
+                code: -1,
+                message: "deer-vk: ensure_ui 之后仍没有界面资源".to_string(),
+            })?;
+        self.present_frame(|s, slot, image_index| {
+            s.record_ui(slot, image_index, unified, pipe)
+        })
+    }
+
+    /// 与 [`Self::present_prepared`] 同一条帧舞蹈，只把管线换成**纹理管线**（T1.3 ②）。
+    pub(crate) fn present_textured(
+        &mut self,
+        unified: &[crate::vertex_unify::UnifiedVertex],
+    ) -> GpuResult<FrameOutcome> {
+        self.ensure_ui(false)?;
+        let pipe = self
+            .ui
+            .as_ref()
+            .map(|u| u.textured.handle())
+            .ok_or_else(|| GpuError::Driver {
+                code: -1,
+                message: "deer-vk: ensure_ui 之后仍没有界面资源".to_string(),
+            })?;
+        self.present_frame(|s, slot, image_index| {
+            s.record_ui(slot, image_index, unified, pipe)
+        })
+    }
+
+    /// **在窗口上贴一张任意 RGBA 纹理**（T1.3 ② 的窗口侧入口）。
+    ///
+    /// 与离屏侧 [`crate::gpu_render::GpuGeometryRenderer::draw_textured_quad`] **同形同语义**：
+    /// 顶点由同一个 [`crate::gpu_render::textured_quad_vertices`] 生成（离屏/窗口共用一份），
+    /// 片元走**纹理管线**（RGBA 调制），而不是界面管线的覆盖率语义。
+    ///
+    /// ## 为什么是「单独一趟 present」
+    ///
+    /// 一次 draw 只有**一个** `set 0 / binding 0`。要把用户纹理喂进去，就得让描述符
+    /// **临时**指着它 —— 而界面绘制那一趟要用图集。两者不能同趟 ⇒ 本方法自成一趟
+    /// （`acquire → record → submit → present`），与离屏侧的做法一致。
+    /// **成功与失败都要还原描述符**（失败路径留下「指着别人纹理」的状态，下一帧的界面
+    /// 就会拿错图集，而且错得很安静）。
+    ///
+    /// ## 与界面绘制的顺序
+    ///
+    /// 每一趟都会**清屏**（`record_ui` 里 `LOAD_OP_CLEAR`），所以本方法画的纹理
+    /// 会覆盖上一趟的界面、也会被下一趟覆盖。要把纹理**叠在界面上**，需要
+    /// 「同趟两次 draw + 中途换描述符」，那是另一件工程（登记在 `FEATURES.md` 第四节）。
+    pub fn draw_textured_quad(
+        &mut self,
+        texture: &crate::device::Texture,
+        rect: deer_gpu::RectI,
+        tint: deer_gpu::Color,
+    ) -> GpuResult<FrameOutcome> {
+        self.ensure_ui(false)?;
+        // ⚠️ **改指描述符之前也要排空**：上一帧（`render_and_present` / 上一次本方法）
+        // 的命令缓冲可能还在飞，而 `set 0` 正被它引用。此时 `vkUpdateDescriptorSets`
+        // 是**未定义行为** —— 实测本机直接把设备打成 `VK_ERROR_DEVICE_LOST`。
+        // 离屏侧没有这个坑：它的 `record_and_submit` 自带回读 ⇒ 每一帧都天然被排空。
+        self.wait_idle()?;
+        let unified = crate::gpu_render::textured_quad_vertices(
+            self.extent,
+            texture.width(),
+            texture.height(),
+            rect,
+            tint,
+        );
+        // 改指 + **同处记录**（读数只能来自那个函数的返回值）。
+        if let Some(ui) = self.ui.as_mut() {
+            let points = crate::gpu_render::point_descriptor_at(
+                &self.device,
+                &ui.set,
+                &ui.pipes.sampler,
+                texture,
+            )?;
+            ui.descriptor_points_at = points;
+        }
+        self.prepare_buffers(&unified)?;
+        let outcome = self.present_textured(&unified);
+        // ⚠️ **改指描述符之前必须先等 GPU 把这一趟用完**（T1.3 ② 的排查记录）。
+        //
+        // `present` 是**异步**的：提交完就返回，命令缓冲可能还在飞。此时
+        // `vkUpdateDescriptorSets` 改 `set 0` 是**未定义行为** —— 实测在本机直接
+        // 把设备打成 `VK_ERROR_DEVICE_LOST`（随后 `wait_idle` 报 -4，销毁阶段
+        // 0xc0000005）。症状是「画出来是对的，收尾才崩」，很容易被误判成析构顺序问题。
+        //
+        // 离屏侧没有这个坑：它的 `record_and_submit` 自带回读 ⇒ 天然等到完成才返回。
+        // 窗口侧要自己补这一等。
+        let drained = self.wait_idle();
+        let restored = self.rebind_ui_default_texture();
+        let outcome = outcome?;
+        drained?;
+        restored?;
+        Ok(outcome)
+    }
+
+    /// 把描述符改回**本渲染器当前该指的纹理**（有图集则图集，否则 1×1 哑纹理）。
+    ///
+    /// 与 `gpu_render.rs::GpuGeometryRenderer::rebind_default_texture` 同一契约：
+    /// **成功与失败路径都要还原**，绝不留下「指着别人纹理」的状态。
+    fn rebind_ui_default_texture(&mut self) -> GpuResult<()> {
+        if let Some(ui) = self.ui.as_mut() {
+            let target = ui.texture.as_ref().unwrap_or(&ui.dummy_texture);
+            let points = crate::gpu_render::point_descriptor_at(
+                &self.device,
+                &ui.set,
+                &ui.pipes.sampler,
+                target,
+            )?;
+            ui.descriptor_points_at = points;
+        }
+        Ok(())
     }
 
     /// 惰性建界面资源（**统一管线**：B5-2 起形状与文本共用一条）。
@@ -1726,6 +1884,17 @@ impl WindowedRenderer {
                 viewport,
                 &pipes.text_layout,
             )?;
+            // ★ 纹理管线（T1.3 ②）：同一支 VS + 同一套顶点布局，只换 FS（RGBA 调制）。
+            //   共用 `pipes.text_layout` ⇒ 描述符布局**没有**多出第二个 binding。
+            let (textured, textured_vs, textured_fs) =
+                crate::gpu_render::build_unified_pipeline_with_fs(
+                    &self.device,
+                    &self.render_pass,
+                    self.swapchain.format(),
+                    viewport,
+                    &pipes.text_layout,
+                    &crate::spirv::fragment_shader_textured(),
+                )?;
             let pool = self.device.create_descriptor_pool(1)?;
             let set = self
                 .device
@@ -1750,6 +1919,9 @@ impl WindowedRenderer {
                 unified,
                 unified_vs,
                 unified_fs,
+                textured,
+                textured_vs,
+                textured_fs,
                 set,
                 pool,
                 dummy_texture,
@@ -1809,11 +1981,16 @@ impl WindowedRenderer {
     ///
     /// 需要 `&mut self`（M3+ B1）：要在**发真实调用的地方**自增 `stats`
     /// （draw call / 管线切换）——计数与调用同处，删掉发射就必然删掉计数。
+    /// `pipeline` = 这一趟要绑的管线（**句柄先取好再进来**，避免与 `&mut self` 撞借用）。
+    ///
+    /// 为什么要它作参数：T1.3 ② 起窗口侧有**两条**共用顶点布局的管线（界面 / 纹理），
+    /// 「这一趟用哪条」是**调用点**的事，不该是录制函数里的常量。
     fn record_ui(
         &mut self,
         slot: usize,
         image_index: u32,
         unified: &[crate::vertex_unify::UnifiedVertex],
+        pipeline: vk::PipelineHandle,
     ) -> GpuResult<()> {
         let fns = *self.device.fns();
         let cmd = self.command_buffers[slot];
@@ -1967,7 +2144,7 @@ impl WindowedRenderer {
                 (fns.cmd_bind_pipeline)(
                     cmd,
                     vk::VK_PIPELINE_BIND_POINT_GRAPHICS,
-                    ui.unified.handle(),
+                    pipeline,
                 );
                 // 计数与真实调用同处（B1）
                 self.stats.pipeline_switches += 1;
