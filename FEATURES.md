@@ -64,7 +64,7 @@
 | **GPU 几何渲染**（`DrawList` 形状命令 → GPU，与 CPU **逐像素对照**） | ✅ | [gpu-geometry](docs/features/gpu-geometry.md) | `cargo run -p deer-gui --example gpu_geometry` |
 | **GPU 文本渲染**（字形四边形 + 图集纹理 + 最近邻采样，与 CPU **逐字节对照**） | ✅ | [gpu-geometry](docs/features/gpu-geometry.md#3-完整-api) | `cargo run -p deer-gui --example gpu_geometry` |
 | **窗口里显示界面**（把 `DrawList` 的形状与文本**呈到窗口**，上屏像素与 CPU 逐像素对照） | ✅ | [window](docs/features/window.md) | `DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example window_parity` |
-| **输入与焦点**（事件通路 + 命中/状态机（含裁剪与禁用）+ Tab/Shift+Tab/Escape 焦点 + 文本输入（追加、`Backspace` 按 Unicode 字符删末尾）+ 脚本化重放 + **只在状态变化时重绘**） | ✅ | [input](docs/features/input.md) | `cargo run -p deer-gui --features window --example interactive_form` |
+| **输入与焦点**（事件通路 + 命中/状态机（含裁剪与禁用）+ Tab/Shift+Tab/Escape 焦点 + 文本输入 + **输入框光标**（T3.5：在光标处插入 / `Backspace` 删**光标前一个 Unicode 字符** / **左右方向键**移动光标，单位是**字符位**）+ 脚本化重放 + **只在状态变化时重绘**） | ✅ | [input](docs/features/input.md) | `cargo run -p deer-gui --features window --example interactive_form` |
 | **测试接口（testkit）**（建面 + 输入注入（单事件/脚本 + `move @id`）+ 一帧**内置前置断言** + 离屏 CPU/GPU 渲染 + 像素/状态/绘制列表断言 + **CPU↔GPU 对照**（不透明 0 / 半透明 ≤1 LSB）+ 门槛自证 + **可复制的复现命令**） | ✅ | [testing](docs/features/testing.md) | `cargo run -p deer-gui --features testing --example testkit_demo` |
 | **通用纹理 / `RGBA8_UNORM`**（创建 + 上传 + **回读四通道保真**；离屏**纹理 quad** 与 CPU 参考逐字节相同；uv 朝向钉住 V 翻转） | ✅ | [textures](docs/features/textures.md) | `cargo run -p deer-gui --example textures` |
 | **间接绘制**（`vkCmdBindIndexBuffer` + `vkCmdDrawIndexedIndirect(drawCount = 1, stride = 20)`，**离屏 + 窗口两条路径**；`RenderStats::indirect_draws` 与真实调用同处计数 ⇒ 换回 `vkCmdDraw` 必然变红；索引/间接缓冲惰性创建 + 跨帧复用 ⇒ 稳态零分配零上传） | ✅ | [indirect-draw](docs/features/indirect-draw.md) | `cargo run -p deer-gui --example indirect_draw` |
@@ -81,7 +81,7 @@
 | **字距与连字**（`kern` / `GSUB` / `GPOS`） | M4 残余 | 不做整形，`advance` 就是 `hmtx` 的原始值 |
 | **CFF / OpenType-CFF 字体**（`OTTO`） | M4 残余 | 解析层直接报错，不静默给空轮廓；只支持 `glyf` 轮廓 |
 | **竖排 / RTL / 复杂脚本整形** | M4 残余 | 完全没有；不读 `GSUB`/`GPOS` |
-| **输入与焦点的剩余部分**（停靠 / 多窗口、方向键导航、滚动条与惯性滚动、右键 / 中键、IME 预编辑、`texts` 光标位置、按键重复） | M5/M6 | 输入通路、命中/状态机、Tab/Escape 焦点、文本输入、脚本重放、**事件驱动重绘（默认省电）**、**滚轮驱动的垂直滚动**都已落地（见第三节与 [`scroll-and-multiline.md`](docs/features/scroll-and-multiline.md)）；剩下的见 [`input.md`](docs/features/input.md) 第 6 节「仍未做」 |
+| **输入与焦点的剩余部分**（停靠 / 多窗口、方向键**上下**导航、滚动条与惯性滚动、右键 / 中键、IME 预编辑、按键重复） | M5/M6 | 输入通路、命中/状态机、Tab/Escape 焦点、文本输入、脚本重放、**事件驱动重绘（默认省电）**、**滚轮驱动的垂直滚动**、**输入框光标（左右方向键 + 在光标处编辑）**都已落地（见第三节与 [`scroll-and-multiline.md`](docs/features/scroll-and-multiline.md)）；剩下的见 [`input.md`](docs/features/input.md) 第 6 节「仍未做」 |
 | **可停靠面板 dock**（拖动改位置 / 边缘折叠） | M6 | 完全没有 |
 | **控件族**（12 个 `deer-ui` 控件的语义） | M6 | 现在只有 5 种节点：`column`/`row`/`text`/`button`/`field` |
 | **DX12 / Metal 后端** | M7 | 完全没有 |
