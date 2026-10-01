@@ -470,7 +470,7 @@ set "DEER_WINDOW_REDRAW=continuous" && cargo run -q -p deer-window --example <�
   - **只有 Windows 的句柄映射**：winit 在别的平台也能开窗，但「原生句柄 → HAL 句柄」未实现 ⇒ `run()` 明确返回 `Err`（不静默填 0）。
   - **输入事件**：**已支持**（M5-1..M5-4：`InputEvent` + winit 映射 + `App::input` → 命中/状态机 → 重绘；
     见 [`input.md`](input.md)）。**M5b 起重绘也改成事件驱动**（默认省电，见第 6 节）；
-    **仍未做**：方向键导航 / 右键中键 / IME 预编辑。（**滚轮已消费**：`MouseWheel` → `InputEvent::Wheel`
+    **仍未做**：方向键**上下**导航 / 右键中键 / IME 预编辑（**左右**方向键已做：输入框光标，T3.5）。（**滚轮已消费**：`MouseWheel` → `InputEvent::Wheel`
     → 滚动偏移 → 几何/绘制/命中，见 [`scroll-and-multiline.md`](scroll-and-multiline.md)；
     仍未做的是**滚动条**、惯性滚动与按键滚动。）
   - **窗口里显示的界面**：**已支持**（M3c，见第 5 节）——窗口里是真实的形状 + 文本，且上屏像素与 CPU 逐像素对照过

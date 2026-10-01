@@ -319,7 +319,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-deer-gui = { path = "Z:/deer-gui/crates/deer-gui" }
+# 相对路径：从**你这个工程的 Cargo.toml 所在目录**指向 deer-gui 源码。
+# 例：若你的工程在 deer-gui 仓库的**同级目录**，就是 `../deer-gui/crates/deer-gui`。
+# 写成绝对路径（如 `Z:/...`）在别人机器上必然编不过 —— 仓库里的
+# `test_project/deer-hello` 就是照这个相对写法建的，可以直接抄。
+deer-gui = { path = "../deer-gui/crates/deer-gui" }
 ```
 
 `src/main.rs` 用第 1 章的代码，然后 `cargo run`。
@@ -340,10 +344,10 @@ deer-gui = { path = "Z:/deer-gui/crates/deer-gui" }
 | 界面显示在**窗口**里 | ✅ **窗口里就是真实界面**（M3c，**仅 Windows**）：形状 + 文本呈现到窗口，且上屏像素与 CPU 逐像素对照（不透明 0 / 半透明 ≤1 LSB）；跑 `--example window_parity` 看判据 |
 | **GPU 渲染**出图 | ✅ 离屏 Vulkan 已画出正确像素（M2a-6 修复了 SPIR-V 段序缺陷）；✅ 窗口呈现已打通（M2b）；✅ **消费 `DrawList`（形状 M3a + 文本 M3b + 上屏 M3c）**：三种路径都能与 CPU 逐像素对照（第 13 章） |
 | 图片里的字是**真字体** | ✅ **离屏**已支持（第 11 章 CPU 侧、第 13 章 **GPU 侧 M3b**）：GPU 画真字形与 CPU 逐字节相同 |
-| **鼠标点击 / 键盘输入** | ✅ 已支持：悬停 / 按下 / 点击 / 文本输入（追加 + `Backspace` 按 Unicode 字符删末尾）；见 [`features/input.md`](features/input.md) |
+| **鼠标点击 / 键盘输入** | ✅ 已支持：悬停 / 按下 / 点击 / 文本输入 + **输入框光标**（T3.5：在光标处插入 / `Backspace` 删**光标前一个 Unicode 字符** / **左右方向键**移动光标，单位是**字符位**）；见 [`features/input.md`](features/input.md) |
 | **Tab 焦点** | ✅ 已支持：`Tab` / `Shift+Tab` 循环（树序）、`Escape` 清焦点、点击可聚焦控件即聚焦 |
 | **滚轮 / 滚动容器 / 多行文本** | ✅ 已支持（剩余工作第 1 项）：`column` + `scroll` ⇒ `max_scroll` + 视口裁剪，`text` + `wrap` ⇒ 每行一条 `DrawCmd::Text`；滚轮滚 `hover` 所在容器、到边界不越界；见 [`features/scroll-and-multiline.md`](features/scroll-and-multiline.md) |
-| **方向键导航 / IME 预编辑 / 滚动条 / 惯性滚动** | ❌ 未做（见 [`features/input.md`](features/input.md) 第 6 节） |
+| **方向键上下导航（焦点在容器内移动） / IME 预编辑 / 滚动条 / 惯性滚动** | ❌ 未做（见 [`features/input.md`](features/input.md) 第 6 节）。**左右方向键已做**：移动输入框光标 |
 | **可停靠面板 dock** / 多窗口 | ❌ M6 |
 | 12 个 `deer-ui` 控件的语义 | ❌ M6（现在只有 5 种节点） |
 
@@ -448,7 +452,7 @@ $env:DEER_WINDOW_HOLD='1'; cargo run -p deer-gui --features window --example win
   回读**强制一次 GPU→CPU 同步**，所以只在第一帧做一次。
 - 目前**只有 Windows** 实现了窗口句柄的填充；非 Windows 会明确返回 `Err`。
 
-**仍然做不到**：方向键导航 / 滚动条 / 惯性滚动 / 右键中键 / IME 预编辑（M5 剩余）、多窗口 / 全屏 / HDR / 帧率上限、
+**仍然做不到**：方向键上下导航（焦点在容器内移动） / 滚动条 / 惯性滚动 / 右键中键 / IME 预编辑（M5 剩余）、多窗口 / 全屏 / HDR / 帧率上限、
 `size <= 0` 的文本与 CPU 一致（见第 13 章）。输入与焦点**已可用**，**重绘也已是事件驱动（默认省电）**——
 见 [`features/input.md`](features/input.md) 与 [`features/window.md`](features/window.md) 第 6 节。
 完整边界见 [`features/window.md`](features/window.md) 与
