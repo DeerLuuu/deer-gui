@@ -224,7 +224,10 @@ cargo test -p deer-gui --features testing --lib testing -- --nocapture
   testkit 只提供能进 `cargo test` 的那半（门槛判定 + 帧数解析 + 自证标记）。
   ② **不替代**该功能自己的语料判据：testkit 是「把纪律变成 API」，语料仍然要你自己写。
   ③ **不放宽**任何阈值：容差只有两档，没有 `max_allowed` 参数。
-  ④ 只有**一个**窗口/一次一帧：没有多窗口、没有 IME、没有滚动（见 [`input.md`](input.md) 第 6 节）。
+  ④ 只有**一个**窗口/一次一帧：没有多窗口；**脚本动词**是
+  `move` / `down` / `up` / `key` / `keyup` / `text` / `focus` / `wheel` 这一组，**没有 IME 预编辑的动词**
+  （`ImePreedit` 只能直接 `send` 事件对象注入）。功能本身都已落地 —— 见
+  [`ime.md`](ime.md) 与 [`scrollbar.md`](scrollbar.md)。
 
 ## 7. 检查清单
 

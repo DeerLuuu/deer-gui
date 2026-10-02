@@ -375,7 +375,10 @@ deer-gui = { path = "../deer-gui/crates/deer-gui" }
 | **鼠标点击 / 键盘输入** | ✅ 已支持：悬停 / 按下 / 点击 / 文本输入 + **输入框光标**（T3.5：在光标处插入 / `Backspace` 删**光标前一个 Unicode 字符** / **左右方向键**移动光标，单位是**字符位**）；见 [`features/input.md`](features/input.md) |
 | **Tab 焦点** | ✅ 已支持：`Tab` / `Shift+Tab` 循环（树序）、`Escape` 清焦点、点击可聚焦控件即聚焦 |
 | **滚轮 / 滚动容器 / 多行文本** | ✅ 已支持（剩余工作第 1 项）：`column` + `scroll` ⇒ `max_scroll` + 视口裁剪，`text` + `wrap` ⇒ 每行一条 `DrawCmd::Text`；滚轮滚 `hover` 所在容器、到边界不越界；见 [`features/scroll-and-multiline.md`](features/scroll-and-multiline.md) |
-| **方向键上下导航（焦点在容器内移动） / IME 预编辑 / 滚动条 / 惯性滚动** | ❌ 未做（见 [`features/input.md`](features/input.md) 第 6 节）。**左右方向键已做**：移动输入框光标 |
+| **滚动条** | ✅ 已支持（**拖滑块**改偏移；**默认 opt-in**）：内容装不下就长出「轨道 + 滑块」，内容装得下则不画；见 [`features/scrollbar.md`](features/scrollbar.md)。**点轨道跳转未做**（点空白处不会跳页） |
+| **惯性滚动** | 🔄 **只有一半**：纯逻辑（`ScrollInertia` + 到边界即停）与判据都在，但**窗口层没人按时调 `inertia_step`** ⇒ **真实窗口里看不到**（要 App 自己在唤醒回调里驱动）；见 [`features/scrollbar.md`](features/scrollbar.md#做不到什么) |
+| **输入法（IME 预编辑）** | ✅ 已支持：中文/日文还没上屏的那一段画在光标处 + 下划线，提交才进内容 ⇒ 无双写；见 [`features/ime.md`](features/ime.md) |
+| **方向键上下导航（焦点在容器内移动） / 右键中键 / 按键滚动（`PageUp` / `Home` / `End`）/ 按键重复** | ❌ 未做（见 [`features/input.md`](features/input.md) 第 6 节）。**左右方向键已做**：移动输入框光标 |
 | **可停靠面板 dock** / 多窗口 | ❌ M6 |
 | 12 个 `deer-ui` 控件的语义 | ❌ M6（现在只有 5 种节点） |
 
@@ -480,8 +483,12 @@ $env:DEER_WINDOW_HOLD='1'; cargo run -p deer-gui --features window --example win
   回读**强制一次 GPU→CPU 同步**，所以只在第一帧做一次。
 - 目前**只有 Windows** 实现了窗口句柄的填充；非 Windows 会明确返回 `Err`。
 
-**仍然做不到**：方向键上下导航（焦点在容器内移动） / 滚动条 / 惯性滚动 / 右键中键 / IME 预编辑（M5 剩余）、多窗口 / 全屏 / HDR / 帧率上限、
-`size <= 0` 的文本与 CPU 一致（见第 13 章）。输入与焦点**已可用**，**重绘也已是事件驱动（默认省电）**——
+**仍然做不到**：方向键上下导航（焦点在容器内移动） / 右键中键 / 按键滚动（`PageUp` / `Home` / `End`）/
+按键重复（M5 剩余）、多窗口 / 全屏 / HDR / 帧率上限、
+`size <= 0` 的文本与 CPU 一致（见第 13 章）。
+**滚动条、IME 预编辑已经做到了**（[`features/scrollbar.md`](features/scrollbar.md)、
+[`features/ime.md`](features/ime.md)）—— 但**惯性滚动**只落到纯逻辑，窗口里还得自己驱动才算能用。
+输入与焦点**已可用**，**重绘也已是事件驱动（默认省电）** ——
 见 [`features/input.md`](features/input.md) 与 [`features/window.md`](features/window.md) 第 6 节。
 完整边界见 [`features/window.md`](features/window.md) 与
 [`features/vulkan-swapchain.md`](features/vulkan-swapchain.md) 第 7 节。

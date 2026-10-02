@@ -30,8 +30,9 @@
 
 **所以它现在适合**：验证布局、生成界面设计稿/示意图、给文档配图、做布局算法的实验，
 以及（Windows 上）验证「窗口 + Vulkan 上屏」这条链。
-**不适合**：做一个真正能用的桌面软件（还缺 12 个控件的语义（M6）、停靠/多窗口、滚动条与惯性滚动 —— 输入与焦点已可用，
-**滚动容器 + 多行文本已落地**（[`features/scroll-and-multiline.md`](features/scroll-and-multiline.md)），**重绘也已是事件驱动（默认省电）**，
+**不适合**：做一个真正能用的桌面软件（还缺 12 个控件的语义（M6）、停靠/多窗口、按键滚动与按键重复 —— 输入与焦点已可用，
+**滚动容器 + 多行文本 + 可视滚动条已落地**（[`features/scroll-and-multiline.md`](features/scroll-and-multiline.md)、
+[`features/scrollbar.md`](features/scrollbar.md)；**惯性**只有纯逻辑，要 App 自己驱动，**重绘也已是事件驱动（默认省电）**，
 见 [`features/input.md`](features/input.md) 与 [`features/window.md`](features/window.md) 第 6 节）。
 
 ---

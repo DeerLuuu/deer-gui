@@ -15,7 +15,7 @@
 | D2 | **窗口层平台锁死 Windows**：`raw_handle_from_rwh06` 只实现 Win32，其余平台 `Err` | `crates/deer-window/src/lib.rs:209-210, 993-1009` | Linux/macOS 无法开窗（尽管离屏 Vulkan 可跑）；跨平台叙事不成立 |
 | D3 | **通用纹理与间接绘制缺「指南 + 示例」**：本体已落地但按仓库纪律不能算完成 | `FEATURES.md` 三节末两行 🔄、`ROADMAP.md` M3+ | 交付物缺口（纪律红线：`docs_consistency.rs` 会管 ✅ 行，🔄 是主动降档） |
 | D4 | **纹理 RGB 调制缺失**：统一 FS 只读 `texture(tex, uv).r`（覆盖率语义）；窗口路径贴纹理入口只有离屏侧 | `FEATURES.md` 第四节「纹理的 RGB 采样」 | 图片/图标类控件（M6 `Icon`）无法实现 |
-| D5 | **输入面剩余**：方向键导航、滚动条/惯性滚动、右/中键语义、IME 预编辑、`texts` 光标、按键重复 | `FEATURES.md` 第四节、`docs/features/input.md` §6；右/中键仅有变体（`interaction.rs` 测试证实只有左键驱动 Clicked） | M6 控件（`Switch`/`ScrubNum`/`DropMenu`）缺输入地基 |
+| D5 | **输入面剩余**（**2026-10-02 部分清偿**）：~~可视滚动条 + 拖滑块改偏移~~（T3.2 上半 ✅）、~~IME 预编辑~~（T3.4 ✅）、~~`texts` 光标~~（T3.5 ✅ + T3.8 光标渲染 ✅）已落地。**剩余**：方向键上下导航、**按键滚动**（`PageUp`/`Home`/`End`）、右/中键语义、按键重复、**惯性的窗口层接线**（T3.2 下半）、**滚动条的点轨道跳转** | `FEATURES.md` 第四节、`docs/features/input.md` §6；右/中键仅有变体（`interaction.rs` 测试证实只有左键驱动 Clicked） | M6 控件（`Switch`/`ScrubNum`/`DropMenu`）缺输入地基 |
 | D6 | **每帧 `unify` 的 `Vec` 堆分配** | `ROADMAP.md` M3+「仍未做」 | 性能债（程度未测量） |
 | D7 | **单窗口限制**（渲染器与测试基建） | `ROADMAP.md` M3+ 方案 (b) 未修、`hal.rs`「只支持一个交换链」 | 多窗口/dock（M5 剩余）被阻塞 |
 | D8 | **线程模型未定（Q-4）**：HAL 不要求 `Send`/`Sync`，渲染线程 vs UI 线程边界未决 | `ROADMAP.md` Q-4 | 后台线程驱动 UI 只能靠 `Waker`；架构级决策悬置 |
@@ -108,10 +108,10 @@ flowchart TB
 | 任务 | 内容 | 验收标准 | 依赖 | 工作量 |
 |---|---|---|---|---|
 | T3.1 方向键导航 | `Key::Left/Right/Up/Down` 已有变体（`deer-window/src/lib.rs:603-616`）但交互层不消费。在 `interaction.rs` 的 `handle` 中实现焦点在容器内的方向移动（与 `Tab` 同一地位的「焦点序」规则需先定义） | 纯逻辑单测（无窗口）；`interactive_form` 扩展场景演示；`input.md` §6 清单勾掉该项 | 无 | M |
-| T3.2 滚动条与惯性滚动 | 滚轮垂直滚动已落地（`scroll-and-multiline.md`）；补：可视滚动条命中/拖动、惯性动画（用 `Waker::wake_after` 推进，**不**退化成 `Continuous`） | 滚动条拖动改变 offset；惯性衰减到停在边界内；账本可证明无空转（`iters` 观测） | 无 | M–L |
+| T3.2 🔄 **滚动条与惯性滚动**（**上半已落地**） | **已落地**：可视滚动条几何（绘制与命中共用 `scrollbar_geom`）+ **拖滑块**改 offset；指南 `scrollbar.md` + 示例 `scroll_bar` 已补齐。**还没做**：① **点轨道跳转**（点空白处跳到那一页）；② **惯性滚动的窗口层接线** —— `ScrollInertia` 只是纯逻辑，`deer-window` 里**没人按 `INERTIA_TICK_MS` 调 `inertia_step`** ⇒ App 要自己在唤醒回调里驱动 ⇒ **真实窗口里看不到惯性** | 滚动条拖动改变 offset；惯性衰减到停在边界内；账本可证明无空转（`iters` 观测） | 无 | M–L |
 | T3.3 右/中键语义 | `PointerButton::Right/Middle` 变体已在（`interaction.rs` 测试证实不触发 Clicked）。定义右键语义（上下文菜单？仅事件透传？）并在 `handle` 中产生对应 `UiEvent` | 决策登记 `ROADMAP.md`；实现 + 单测 + 指南更新 | 无 | S–M |
-| T3.4 IME 预编辑 | `deer-window` 已开 `set_ime_allowed(true)` 且 `Preedit` 用于抑制重复文本（`lib.rs:1503-1517`）。补 `InputEvent::ImePreedit` 变体 + 交互层「预编辑缓冲」状态 + Field 光标处显示 | 中文输入法预编辑可见、Commit 后上屏一次；`input.md` 更新 | T3.5（光标位置） | M–L |
-| T3.5 `texts` 光标位置 | `UiState.texts` 目前只有内容（`BTreeMap<String,String>`）。加光标（字节/字符位）建模 + `Backspace` 删光标处 + 方向键移动光标 | 单测覆盖多字节字符（中文/emoji）边界；`counter`/`interactive_form` 示例更新 | 无 | M |
+| T3.4 ✅ **IME 预编辑** | **已落地**（2026-10-02）：`InputEvent::ImePreedit` 变体 + `UiState::preedit` 缓冲（不进 `texts` ⇒ 无双写）+ 画在光标处带下划线、光标推到它之后；`deer-window` 侧 `Preedit` 已**真的派发** | 中文输入法预编辑可见、Commit 后上屏一次；`input.md` 更新 | T3.5（光标位置） | M–L |
+| T3.5 ✅ **`texts` 光标位置**（渲染另记 T3.8 ✅） | **已落地**：光标（字符位）建模 + `Backspace` 删光标处 + 左右方向键移动光标；**T3.8** 补上画面上的那根竖线（用 `measure` 量光标前缀宽度定 x，失焦不画） | 单测覆盖多字节字符（中文/emoji）边界；`counter`/`interactive_form` 示例更新 | 无 | M |
 | T3.6 按键重复 | winit 的 `repeat` 未建模（`deer-window`「仍未接线」清单）。`KeyDown` 加 `repeat: bool` 字段（接口变更需冻结审查：既有 match 是否被破坏） | `input.md` §6 勾掉；镜像定义同步（`interaction.rs` mirror 与 `deer-window` 逐字一致纪律） | 无 | S |
 
 **并行性**：全部与 Phase 1/2 并行；T3.4 依赖 T3.5；建议顺序 T3.5 → T3.4，T3.1/T3.2/T3.3/T3.6 任意。
