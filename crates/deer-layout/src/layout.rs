@@ -702,6 +702,36 @@ pub fn hit_test<'a>(root: &'a Node, geo: &Geometry, px: f32, py: f32) -> Option<
     found
 }
 
+/// **反解**：指针在 `pointer_y`、且抓取点距滑块顶 `grab_dy` 像素时，偏移该是多少。
+///
+/// 与 [`scrollbar_geom`] 是**同一套映射的两个方向**，所以放在一起 ——
+/// 各写一份的话「拖到哪儿对应哪个偏移」迟早对不上，而那种错**只在拖动时**能看出来。
+///
+/// 三条语义：
+/// 1. 滑块高度只由视口与上限决定（与偏移无关）⇒ 这里先用 `offset = 0` 求一次几何拿到它；
+/// 2. 指针位置换算成「滑块顶应该在哪儿」，再沿轨道长度归一化 ⇒ 映射回 `[0, max_scroll]`；
+/// 3. 结果**夹在 `[0, max_scroll]`**（拖出轨道两端不该越界）。
+pub fn scrollbar_offset_for_pointer(
+    viewport: Rect,
+    max_scroll: i32,
+    pointer_y: f32,
+    grab_dy: f32,
+) -> i32 {
+    if max_scroll <= 0 {
+        return 0;
+    }
+    let Some(g) = scrollbar_geom(viewport, 0, max_scroll) else {
+        return 0;
+    };
+    let travel = g.track.h - g.thumb.h;
+    if travel <= 0.0 {
+        return 0; // 滑块占满轨道 ⇒ 没有可移动的余量
+    }
+    let want_thumb_top = pointer_y - grab_dy;
+    let frac = ((want_thumb_top - g.track.y) / travel).clamp(0.0, 1.0);
+    (frac * max_scroll as f32).round() as i32
+}
+
 #[cfg(test)]
 mod scrollbar_tests {
     use super::*;
@@ -815,5 +845,52 @@ mod scrollbar_tests {
         let a = scrollbar_geom(v, 137, 999).expect("要画");
         let b = scrollbar_geom(v, 137, 999).expect("要画");
         assert_eq!(a, b);
+    }
+
+    /// ⑧ **往返一致**：偏移 → 几何 → 反解 ⇒ 回到同一个偏移。
+    ///
+    /// 这条是「正解与反解是同一套映射」的判据 —— 只测单方向的话，两边各错一点也能过。
+    #[test]
+    fn pointer_inverse_round_trips() {
+        let v = viewport();
+        let max = 400;
+        for off in [0, 7, 100, 199, 200, 399, 400] {
+            let g = scrollbar_geom(v, off, max).expect("要画");
+            // 抓在滑块正中
+            let grab = g.thumb.h / 2.0;
+            let pointer_y = g.thumb.y + grab;
+            let back = scrollbar_offset_for_pointer(v, max, pointer_y, grab);
+            // 浮点往返允许 1 像素误差（偏移是整数、轨道是浮点）
+            assert!(
+                (back - off).abs() <= 1,
+                "偏移 {off} 往返后变成 {back}（几何 {g:?}）"
+            );
+        }
+    }
+
+    /// ⑨ 拖出轨道两端 ⇒ 夹在 `[0, max_scroll]`，不越界。
+    #[test]
+    fn pointer_inverse_clamps_to_bounds() {
+        let v = viewport();
+        let max = 400;
+        let grab = 10.0;
+        // 指针远在轨道上方 / 下方
+        assert_eq!(scrollbar_offset_for_pointer(v, max, -10_000.0, grab), 0);
+        assert_eq!(scrollbar_offset_for_pointer(v, max, 10_000.0, grab), max);
+        // 上限为 0 ⇒ 永远是 0（连几何都不该求）
+        assert_eq!(scrollbar_offset_for_pointer(v, 0, 123.0, 0.0), 0);
+    }
+
+    /// ⑩ 单调：指针越往下，反解出的偏移越大（否则拖动方向会反）。
+    #[test]
+    fn pointer_inverse_is_monotonic() {
+        let v = viewport();
+        let max = 400;
+        let mut prev = -1;
+        for py in [20.0, 60.0, 100.0, 140.0, 180.0, 220.0] {
+            let off = scrollbar_offset_for_pointer(v, max, py, 5.0);
+            assert!(off >= prev, "指针 y={py} 时偏移 {off} 比上一个小（{prev}）");
+            prev = off;
+        }
     }
 }
