@@ -1971,6 +1971,7 @@ fn build_with<M: Measure>(
         pressed: state.pressed.clone(),
         scroll: Default::default(),
         carets: Default::default(),
+        preedit: None,
     };
     // `FieldText::Content` ⇒ 输入框画的是 `state.texts[id]`；
     // `InteractiveRenderer` 会给**每个有几何的节点**发一条 `NodeHint` ⇒ 裁剪快照非空。

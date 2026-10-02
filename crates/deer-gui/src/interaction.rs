@@ -384,6 +384,10 @@ impl UiState {
                 metrics: self.scroll.metrics.clone(),
             },
             carets: self.carets.clone(),
+            preedit: self.preedit.as_ref().map(|p| crate::gpu::interact::PreeditView {
+                id: p.id.clone(),
+                text: p.text.clone(),
+            }),
         }
     }
 
@@ -2678,6 +2682,9 @@ mod tests {
             ..Default::default()
         };
         s.scroll.set_metrics(&metrics);
+        // ⚠️ 预编辑也要**非空** —— 空值上「带没带」恒等，判据就没判别力
+        //    （今天第二条判据栽在这个模式上，见记忆）
+        s.preedit = Some(Preedit { id: "box".into(), text: "zhong".into() });
         assert_eq!(
             s.scroll.scroll_to("box", 40),
             Some(40),
@@ -2692,6 +2699,7 @@ mod tests {
             pressed,
             scroll,
             carets,
+            preedit,
         } = i;
         assert_eq!(hover, s.hover, "hover 必须原样带过去");
         assert_eq!(focus, s.focus);
@@ -2708,6 +2716,12 @@ mod tests {
         );
         // 光标表也必须带过去（T3.8）：漏了它输入框里不画光标
         assert_eq!(carets, s.carets, "光标表必须带过去 —— 漏了它输入框里看不到光标");
+        // 预编辑也必须带过去（T3.4）：漏了它中文输入时看不到正在拼的那一段
+        assert_eq!(
+            preedit.as_ref().map(|p| (p.id.as_str(), p.text.as_str())),
+            s.preedit.as_ref().map(|p| (p.id.as_str(), p.text.as_str())),
+            "预编辑必须带过去 —— 漏了它看不到正在拼的那一段"
+        );
     }
 
     // ---- T3.5：`texts` 光标（字符位） --------------------------------------
