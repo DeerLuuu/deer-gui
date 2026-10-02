@@ -7,6 +7,10 @@
 //! **本 crate 是本 workspace 唯一引入第三方依赖的地方**（`winit`）。理由与替代方案
 //! （自写 Win32）的对比登记在 `ROADMAP.md` 的 Q-1 里。
 //!
+//! **分层归属（2026-10-02 v2）**：本文件混装两层 —— **L1 DisplayServer**（winit/输入/DPI/剪贴板
+//! 的平台映射）与 **L3 host**（`App`/`Waker`/`RedrawPolicy` 的事件循环与脏重绘）。物理拆分待
+//! 单独立项（1571 行大文件、高风险，须独立 P2 任务）。见 `docs/ARCHITECTURE.md` §2.3。
+//!
 //! ## 用法
 //!
 //! ```no_run

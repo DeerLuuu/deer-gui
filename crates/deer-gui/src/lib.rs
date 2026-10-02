@@ -47,6 +47,10 @@ pub use deer_vk::{self as vk, VkBackend};
 ///
 /// 不碰窗口、不碰 GPU —— 输入是值、输出是值，所以整条交互链能在无 winit / 无 Vulkan
 /// 的环境里被单测覆盖（`cargo test -p deer-gui --lib interaction`）。
+///
+/// **分层归属（2026-10-02 v2）**：本模块属 **L2 framework**（交互状态机），**不属 core** ——
+/// `UiState`（hover/pressed/focus/texts）无设备/句柄/平台，但也不是纯数据契约；
+/// 它是控件族与 App 之间的状态层。见 `docs/ARCHITECTURE.md` §2.3。
 pub mod interaction;
 
 /// 输入脚本（M5-4，**纯逻辑**）：`DEER_INPUT_SCRIPT` 那种字符串 → 一串

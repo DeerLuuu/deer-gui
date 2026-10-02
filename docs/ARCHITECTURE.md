@@ -144,6 +144,31 @@ Feature 开关（`crates/deer-gui/Cargo.toml`）：
 
 ---
 
+### 2.3 分层归属规则（Godot 式 L0–L3 重述，2026-10-02 v2）
+
+§2.1 是**部署视角**（以 crate 为单位）；本节是**归属视角**，按"有没有设备/句柄/平台/全局状态"判定，把同一套代码重述成 Godot 式四层，用于回答"新东西放哪"。`Server` 沿用 Godot 语义 = **进程内单例服务对象**，非网络服务端。
+
+| 层 | 名 | 规则 | 现状归属 |
+|---|---|---|---|
+| **L0** | core | 纯数据 + 纯函数 + 与平台无关的契约；零依赖 | `deer-layout` 全部 + `deer-gpu` 的 `draw`/`error`/`measure` + HAL trait（`Backend`/`Device`/`Swapchain`/`Frame`，定义在 `deer-gpu/src/lib.rs` 根） |
+| **L1** | servers | 凡有设备/句柄/平台/全局状态即在此层 | **RenderServer** = `deer-vk` + `deer-gpu` 的 `null`/`render`/`interact`（CPU 参考后端）；**TextServer** = `deer-gpu` 的 `font`/`glyph`/`raster`/`atlas`/`text`；**DisplayServer** = `deer-window` 的平台部分（winit/输入/DPI/剪贴板） |
+| **L2** | framework | 控件族 + 交互状态机 + 主题令牌 | `deer-gui::interaction`（`UiState`/命中/状态机）；M6 控件族待建 |
+| **L3** | host | App 运行时：事件循环 + Waker + 脏重绘 | `deer-window` 的 `App`/`Waker`/`RedrawPolicy` 部分 |
+
+**一句话判据**：它有没有「设备 / 句柄 / 平台 / 全局状态」？有 ⇒ Server；没有 ⇒ core。例：`DrawCmd` 无设备 ⇒ core；`create_texture` 有设备 ⇒ RenderServer；`font → 字形位图` 有缓存与字体文件 ⇒ TextServer；`UiState`（hover/pressed）既无设备也无平台 ⇒ **不属 core，属 framework**。
+
+**两处已知错位**（待物理拆分时纠正；当前用 `deer-gpu` 的 `core_layer`/`text_layer`/`backend_layer` 门面模块先行逻辑分层，零行为改动、零路径破坏）：
+
+1. `deer-gpu` 把 **L0 契约**（`draw.rs`、HAL trait）与 **L1 一个后端 + 文本服务**（`null`/`render`/`interact` + `font`/`glyph`/`raster`/`atlas`/`text`）混装在同一 crate；
+2. `deer-window` 一个文件（1571 行）混装 **L1 DisplayServer**（winit/输入/DPI/剪贴板）与 **L3 host**（`App`/`Waker`/脏重绘）—— 物理拆分待单独立项（大文件、高风险，须独立 P2 任务）。
+
+**待人裁断的两点**（不臆造）：
+
+- **"Server" 命名**：Godot 用法是"单例服务对象（进程内）"，中文语境易误读为"服务端"；保留 `Server` 还是换 `Host`/`Service`/`Runtime`？
+- **物理拆 crate 的时机**：当前用门面模块做逻辑分层（`deer_gpu::core_layer::DrawList` 等），零风险且为下游提供迁移路径；真拆 crate 的触发条件建议为**"某模块开始被两个不同上层共用"**——在那之前同 crate 内分模块够用，成本低得多（每加一条 crate 边界 = 多一层 trait + 转发，"改一个字段动 5 个 crate"的代价已在本仓库体会过）。
+
+---
+
 ## 3. 核心模块说明
 
 ### 3.1 `deer-layout` —— 语言无关纯核心
