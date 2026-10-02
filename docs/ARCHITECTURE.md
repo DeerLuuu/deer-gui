@@ -426,8 +426,7 @@ DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example window_
 - **每进程一个窗口**（测试基建限制，`ROADMAP.md` M3+）。
 - **输入剩余**：方向键**上下**导航（焦点在容器内移动）、**按键滚动**（`PageUp` / `Home` / `End`）、右/中键语义、按键重复、dock/多窗口。
   （**已落地**：左右方向键与 `texts` 光标 —— T3.5；**光标也会被真的画出来** —— T3.8；
-  **可视滚动条 + 拖滑块改偏移** —— T3.2 上半（**点轨道跳转**、**惯性的窗口层接线**仍未做：
-  `ScrollInertia` 只是纯逻辑，`deer-window` 里没人按时调 `inertia_step` ⇒ 真窗口看不到惯性）；**IME 预编辑** —— T3.4，`InputEvent::ImePreedit` 现已派发，
+  **可视滚动条（拖滑块 + 点轨道跳转）与惯性驱动收口**（`advance_inertia`/`inertia_deadline`）—— T3.2/T3.2b；**IME 预编辑** —— T3.4，`InputEvent::ImePreedit` 现已派发，
   不再是「`Preedit` 只用于抑制重复文本」；**真机输入法**仍只能人肉验证。）
 - **文本**：不支持 CFF/OTTO（明确报错）；无 kern/GSUB/GPOS；无竖排/RTL；hinting 有实测依据地不做（hinting-lite 净收益 +0.4%）；亚像素水平定位已落光栅化 opt-in 路径但**未接进文本引擎**。
 - **控件只有 5 种**；M6 的 12 个 `deer-ui` 控件语义未迁移。

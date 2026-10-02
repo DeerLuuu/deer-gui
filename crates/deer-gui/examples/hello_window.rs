@@ -54,7 +54,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use deer_gui::env_gate;
-use deer_gui::gpu::interact::{FieldText, InteractState, InteractiveRenderer};
+use deer_gui::gpu::interact::{FieldText, InteractiveRenderer};
 use deer_gui::gpu::measure::find_system_font;
 use deer_gui::gpu::null::CpuRenderer;
 use deer_gui::interaction::{self, ClipSnapshot, InputEvent, Key, PointerButton, UiEvent, UiState};

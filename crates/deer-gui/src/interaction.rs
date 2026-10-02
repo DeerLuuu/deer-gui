@@ -339,6 +339,44 @@ impl ScrollState {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 三b、惯性驱动（T3.2b 的窗口接线半）：推进 + 「还要不要再排一次唤醒」
+// ---------------------------------------------------------------------------
+
+/// **推进一步惯性**并把它翻译成 `UiEvent`（窗口层 `redraw` 每 [`INERTIA_TICK_MS`] 调一次）。
+///
+/// 这是「纯逻辑（`ScrollState::inertia_step`）」与「窗口层（`Waker::wake_after` / `next_deadline`）」
+/// 之间**唯一**的接缝：之前两半都在、中间这层没人写 ⇒ App 各写各的（或不写）⇒
+/// **真实窗口里看不到惯性**（PR #43 修文档时登记的缺口）。收口成一个函数之后，
+/// 「推进一步」只有一处实现，判据（每步都真的动、停了就 `None`、事件只有 `Scrolled`）
+/// 也只钉一次。
+///
+/// 返回值：这一步产生了哪些事件（空 = 惯性已停，**不必再排下一次唤醒**）。
+/// 配套的「要不要排下一次」判据用 [`inertia_deadline`]。
+pub fn advance_inertia(state: &mut UiState) -> Vec<UiEvent> {
+    let mut out = Vec::new();
+    if let Some((id, offset)) = state.scroll.inertia_step() {
+        out.push(UiEvent::Scrolled { id, offset });
+    }
+    out
+}
+
+/// 惯性还在滚 ⇒ 下一次推进的 deadline（`now + INERTIA_TICK_MS`）；停了 ⇒ `None`。
+///
+/// 给 [`crate::window::App::next_deadline`]（拉式）当实现；推式（`Waker::wake_after`）
+/// 用同一个 [`INERTIA_TICK_MS`] 常量。**两条纪律**（与窗口层「唤醒面」文档一致）：
+///
+/// 1. **只在 `inertia_active()` 时给 `Some`** —— 停了还给 ⇒ 每 16ms 醒一次却什么都不做
+///    （空转，正是 `WakeStats::iters` 上界判据要抓的东西）；
+/// 2. 返回的是**固定时刻**（`now + tick`），到点由事件循环兑现 —— 不会出现
+///    「永远差 50ms」的追不到点。
+pub fn inertia_deadline(state: &UiState) -> Option<std::time::Instant> {
+    state
+        .scroll
+        .inertia_active()
+        .then(|| std::time::Instant::now() + std::time::Duration::from_millis(INERTIA_TICK_MS))
+}
+
 /// 一次 `handle` 产生的「发生了什么」。窗口层据此置 dirty 并重绘。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UiEvent {
@@ -843,13 +881,39 @@ pub fn handle(
             y,
         } => {
             if let Some(drag) = scrollbar_grab(root, geo, state, *x, *y) {
-                // ★ 按在**滚动条滑块**上 ⇒ 开始拖动，**不**进入下面的焦点/按下语义：
-                // 按滚动条不是「点击内容」（按了它不该让某个按钮看起来被按下、
-                // 更不该在抬起时发 `Clicked`）。
+                // ★ 按在**滚动条竖带**上（滑块或轨道空白）⇒ 开始拖动，**不**进入下面的
+                // 焦点/按下语义：按滚动条不是「点击内容」（按了它不该让某个按钮看起来
+                // 被按下、更不该在抬起时发 `Clicked`）。
                 //
                 // 默认状态下没有任何滚动条 ⇒ 这条永远不触发 ⇒ 既有行为逐字节不变。
                 // 开始拖动 ⇒ **惯性立刻停**（否则两种位移会打架）
                 state.scroll.stop_inertia();
+                // ★ T3.2b **点轨道跳转**：按在轨道空白上 ⇒ 按下这一刻就跳一格。
+                // 与拖动共用同一条反解（`scrollbar_offset_for_pointer`），所以
+                // 「跳到哪儿」与「拖到哪儿」是同一套映射，不会各写一份。
+                // 按在滑块上时这次反解得到的就是**当前偏移**（没变 ⇒ 不发事件）⇒
+                // 既有「按下滑块不动」的行为也逐字节保留。
+                if let Some(f) = geo.get(&drag.id) {
+                    let vp = crate::layout::Rect {
+                        x: f.x,
+                        y: f.y,
+                        w: f.w,
+                        h: f.h,
+                    };
+                    let max = state.scroll.max_of(&drag.id);
+                    let want = crate::layout::scrollbar_offset_for_pointer(
+                        vp,
+                        max,
+                        *y,
+                        drag.grab_dy as f32,
+                    );
+                    if let Some(offset) = state.scroll.scroll_to(&drag.id, want) {
+                        out.push(UiEvent::Scrolled {
+                            id: drag.id.clone(),
+                            offset,
+                        });
+                    }
+                }
                 state.scroll.drag = Some(drag);
                 let id = node_id_at(root, geo, clip, *x, *y);
                 sync_hover(state, &mut out, id);
@@ -1043,7 +1107,15 @@ pub fn handle(
 /// **最深的优先**：内层滚动条画在外层之上，所以指针压在同一条竖带时应当抓内层。
 /// 命中判据直接调 `deer_layout::scrollbar_geom` —— 与**绘制侧同一份实现**
 /// （各写一份的话，「看得见的滑块」与「抓得到的滑块」迟早错开）。
+///
+/// T3.2b 起语义扩成**两档**：按在滑块上 ⇒ 普通拖动（`grab_dy` = 指针距滑块顶）；
+/// 按在**轨道空白**（竖带内但不在滑块上）⇒ **点轨道跳转**（`grab_dy` = 滑块半高 ——
+/// 滑块「跳到指针处」而不是「以顶对齐」），跳完仍可继续拖。
 fn scrollbar_grab(root: &Node, geo: &Geometry, state: &UiState, x: f32, y: f32) -> Option<ScrollDrag> {
+    /// 一个点是否在矩形内（闭区间，与既有滑块判据同一口径）。
+    fn inside(r: &crate::layout::Rect, x: f32, y: f32) -> bool {
+        x >= r.x && x <= r.x + r.w && y >= r.y && y <= r.y + r.h
+    }
     fn walk(
         n: &Node,
         geo: &Geometry,
@@ -1065,18 +1137,26 @@ fn scrollbar_grab(root: &Node, geo: &Geometry, state: &UiState, x: f32, y: f32) 
                     };
                     let off = state.scroll.offset_of(&n.id);
                     if let Some(g) = crate::layout::scrollbar_geom(vp, off, max) {
-                        let inside = x >= g.thumb.x
-                            && x <= g.thumb.x + g.thumb.w
-                            && y >= g.thumb.y
-                            && y <= g.thumb.y + g.thumb.h;
-                        if inside && best.as_ref().is_none_or(|(d, _)| depth > *d) {
-                            *best = Some((
-                                depth,
-                                ScrollDrag {
-                                    id: n.id.clone(),
-                                    grab_dy: (y - g.thumb.y).round() as i32,
-                                },
-                            ));
+                        // 两档命中：先试滑块（普通拖动），再试轨道空白（跳转 + 可续拖）。
+                        // 抓取点也分两档：滑块上 = 真实指针偏移（拖动不跳）；轨道上 = 滑块半高
+                        // （跳到指针处后，指针大致压在滑块中间 —— 行业惯例手感）。
+                        let grab = if inside(&g.thumb, x, y) {
+                            Some((y - g.thumb.y).round() as i32)
+                        } else if inside(&g.track, x, y) {
+                            Some((g.thumb.h / 2.0).round() as i32)
+                        } else {
+                            None
+                        };
+                        if let Some(grab_dy) = grab {
+                            if best.as_ref().is_none_or(|(d, _)| depth > *d) {
+                                *best = Some((
+                                    depth,
+                                    ScrollDrag {
+                                        id: n.id.clone(),
+                                        grab_dy,
+                                    },
+                                ));
+                            }
                         }
                     }
                 }
@@ -2464,6 +2544,119 @@ mod tests {
         assert!(st.scroll.drag.is_none(), "没按在滑块上就不该开始拖动");
         assert_eq!(st.pressed.as_deref(), Some("b0"), "内容上的按下照旧记 pressed");
         assert!(!out.iter().any(|e| matches!(e, UiEvent::Scrolled { .. })), "不该发 Scrolled：{out:?}");
+    }
+
+    // ---- T3.2b：点轨道跳转 ---------------------------------------------------
+
+    /// ① 按在**轨道空白**（竖带内、滑块外）⇒ 按下这一刻就跳一格并进入拖动。
+    #[test]
+    fn clicking_the_track_jumps_one_page_on_press() {
+        let (tree, geo, mut st) = scroller_fixture();
+        let (_, _, vp, _) = thumb_point(&geo, &st);
+        // 初始滑块贴顶（约 y∈[4,14]）⇒ 点轨道**下段**才是空白。
+        let px = vp.x + vp.w - 6.0; // 竖带中心附近（SCROLLBAR_W=8、INSET=4）
+        let py = vp.y + 30.0;
+        let out = handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Left, x: px, y: py });
+        assert!(
+            out.iter().any(|e| matches!(e, UiEvent::Scrolled { .. })),
+            "点轨道空白必须在按下这一刻跳一格并发 Scrolled：{out:?}"
+        );
+        assert!(st.scroll.offset_of("box") > 0, "按下后偏移应当已经离开 0");
+        assert!(st.scroll.drag.is_some(), "点轨道之后处于拖动态（可继续拖）");
+        assert!(st.pressed.is_none(), "点轨道不是点内容");
+    }
+
+    /// ② 跳转之后**还能继续拖**（一次手势里「跳 + 拖」连着做）。
+    #[test]
+    fn after_track_jump_you_can_still_drag() {
+        let (tree, geo, mut st) = scroller_fixture();
+        let (_, _, vp, max) = thumb_point(&geo, &st);
+        let px = vp.x + vp.w - 6.0;
+        // 先在轨道底部点一下（跳到底部那一页）
+        handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Left, x: px, y: vp.y + vp.h - 6.0 });
+        let after_jump = st.scroll.offset_of("box");
+        assert!(after_jump > 0, "前置：点轨道确实跳了（{}）", after_jump);
+        // 同一次按住不放，拖到轨道最顶
+        handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::PointerMoved { x: px, y: vp.y + 6.0 });
+        assert!(
+            st.scroll.offset_of("box") < after_jump,
+            "跳转之后继续拖必须还能改偏移（{} → {}）",
+            after_jump,
+            st.scroll.offset_of("box")
+        );
+        let _ = max;
+    }
+
+    /// ③ 跳转幅度**有判别力**：按在滑块下方空白 ⇒ 跳**下一页**（偏移增大）；
+    ///    按在滑块上方空白 ⇒ 跳**上一页**（偏移减小）。点同一处两次不会叠到 0。
+    #[test]
+    fn track_jump_follows_the_pointer_not_a_fixed_direction() {
+        let (tree, geo, mut st) = scroller_fixture();
+        let (_, _, vp, _) = thumb_point(&geo, &st);
+        let px = vp.x + vp.w - 6.0;
+        // 先滚到中间（滚两格 ⇒ 偏移 80）
+        st.hover = Some("b0".into());
+        for _ in 0..2 {
+            handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+                &InputEvent::Wheel { dx: 0.0, dy: -1.0 });
+        }
+        st.scroll.stop_inertia();
+        let mid = st.scroll.offset_of("box");
+        assert!(mid > 0, "前置：先滚到中间（{mid}）");
+        // 现在滑块在中段 ⇒ 轨道顶端在它上方、底端在下方。
+        // 点**底端**空白 ⇒ 跳向下（偏移增大）
+        handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::PointerUp { button: PointerButton::Left, x: px, y: vp.y + vp.h - 6.0 });
+        handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Left, x: px, y: vp.y + vp.h - 6.0 });
+        assert!(
+            st.scroll.offset_of("box") > mid,
+            "点底部空白应当向下跳（{mid} → {}）",
+            st.scroll.offset_of("box")
+        );
+    }
+
+    /// ④ 点轨道跳转**立刻杀惯性**（与拖滑块同一条规则：两种位移不许打架）。
+    #[test]
+    fn track_jump_cancels_inertia_too() {
+        let (tree, geo, mut st) = scroller_fixture();
+        st.hover = Some("b0".into());
+        handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::Wheel { dx: 0.0, dy: -1.0 });
+        assert!(st.scroll.inertia_active(), "前置：滚轮之后在滑");
+        let (_, _, vp, _) = thumb_point(&geo, &st);
+        handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Left, x: vp.x + vp.w - 6.0, y: vp.y + vp.h - 6.0 });
+        assert!(!st.scroll.inertia_active(), "点轨道（任何滚动条手势）都必须停惯性");
+    }
+
+    /// ⑤ 既有行为不回退：按在**滑块上**（不在空白）⇒ 按下这一刻**不**跳
+    ///    （反解得回当前偏移 ⇒ `scroll_to` 返回 `None` ⇒ 不发事件）。
+    #[test]
+    fn pressing_the_thumb_still_does_not_jump() {
+        let (tree, geo, mut st) = scroller_fixture();
+        st.hover = Some("b0".into());
+        for _ in 0..2 {
+            handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+                &InputEvent::Wheel { dx: 0.0, dy: -1.0 });
+        }
+        st.scroll.stop_inertia();
+        let before = st.scroll.offset_of("box");
+        let (px, py, _, _) = thumb_point(&geo, &st);
+        let out = handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Left, x: px, y: py });
+        assert_eq!(
+            st.scroll.offset_of("box"), before,
+            "按在滑块上按下的这一刻不许动（既有手感）：{before} → {}",
+            st.scroll.offset_of("box")
+        );
+        assert!(
+            !out.iter().any(|e| matches!(e, UiEvent::Scrolled { .. })),
+            "按滑块不该在按下时发 Scrolled：{out:?}"
+        );
     }
 
     // ---- T3.2：惯性滚动 ------------------------------------------------------

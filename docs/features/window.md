@@ -473,10 +473,10 @@ set "DEER_WINDOW_REDRAW=continuous" && cargo run -q -p deer-window --example <�
     **仍未做**：方向键**上下**导航 / 右键中键 / **按键滚动**（`PageUp` / `Home` / `End`）/ **按键重复**。
     （**左右**方向键已做：输入框光标，T3.5；画面上的那根竖线是 T3.8。）
     **滚动那一支已落地**：`MouseWheel` → `InputEvent::Wheel` → 滚动偏移 → 几何/绘制/命中，
-    见 [`scroll-and-multiline.md`](scroll-and-multiline.md)；**可视滚动条**也已落地（**拖滑块**改偏移，
-    **点轨道跳转未做**），见 [`scrollbar.md`](scrollbar.md)。
-    ⚠️ **惯性滚动没有接线**：`ScrollInertia` 是纯逻辑，本层没有人按时调 `inertia_step` ⇒ 窗口里看不到惯性
-    （要 App 自己在 `Waker::wake_after` 回调里驱动）。
+    见 [`scroll-and-multiline.md`](scroll-and-multiline.md)；**可视滚动条**（拖滑块改偏移 +
+    **点轨道跳转**）与**惯性驱动**（App 在 `redraw`/`next_deadline` 里接
+    `advance_inertia`/`inertia_deadline` 两行即可，参考 `--example scroll_inertia_window`）
+    见 [`scrollbar.md`](scrollbar.md)。
     **IME 预编辑已落地**（`Ime::Preedit` ⇒ `InputEvent::ImePreedit`，见 [`ime.md`](ime.md)），
     **仍未做**的只有「真机输入法」的自动化验证 —— 那条只能人肉。
   - **窗口里显示的界面**：**已支持**（M3c，见第 5 节）——窗口里是真实的形状 + 文本，且上屏像素与 CPU 逐像素对照过

@@ -194,9 +194,8 @@ assert_eq!(lines_i, i as i32 * 18, "第 i 行必须落在 i × 行高 上");
 - **做不到**（本期边界，都如实登记）：
   - **没有水平滚动**（`row` 上的 `scroll` 被忽略）；**滚动条已落地** —— 内容装不下视口的容器会自己长出
     「轨道 + 滑块」，按滑块拖动改偏移（默认 opt-in，见 [`scrollbar.md`](scrollbar.md)）；
-  - **惯性滚动只有一半**：纯逻辑已落地（滚轮 / 拖动松手后按 `INERTIA_DECAY_*` 衰减，**到边界即停**不空转），
-    但**窗口层没人按 `INERTIA_TICK_MS` 调 `inertia_step`** ⇒ **真实窗口里看不到惯性**，
-    要 App 自己在唤醒回调里驱动（见 [`scrollbar.md`](scrollbar.md#做不到什么)）；
+  - **惯性滚动已收口**（T3.2b）：App 在 `redraw`/`next_deadline` 里接 `advance_inertia`/`inertia_deadline`
+    两行即可（参考 `--example scroll_inertia_window`，见 [`scrollbar.md`](scrollbar.md)）；
   - `scroll_to` 只能按像素设偏移，**没有**「把某个节点滚到可见」（nearest-into-view）的 API；
   - 命中侧有两道闸：**几何**（滚到容器矩形之外的子节点根本探不到，因为 `hit_test` 只从
     「矩形包含该点」的祖先往下探）与**裁剪**（`ClipSnapshot` 的视口裁剪）。两者在滚动容器上
