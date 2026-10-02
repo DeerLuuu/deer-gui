@@ -119,6 +119,23 @@ pub struct InteractState {
     /// 默认空 ⇒ **一根光标都不画**（既有语料逐字节不变，opt-in —— 与 `scroll` 同一条纪律）。
     /// 想看到光标，就把 `UiState::carets` 灌进来。
     pub carets: std::collections::BTreeMap<String, usize>,
+    /// **正在预编辑的那一段**（还没上屏的拼写）。`None` = 没有预编辑。
+    ///
+    /// 默认 `None` ⇒ 什么都不画（既有语料逐字节不变）。想看到它就把
+    /// `deer-gui` 那边 `UiState::preedit` 的内容灌进来。
+    pub preedit: Option<PreeditView>,
+}
+
+/// 绘制时读的**预编辑**（还没上屏的一段拼写 + 它挂在哪个输入框上）。
+///
+/// 与 `deer-gui::interaction::Preedit` 同形但**不复用**那个类型 ——
+/// `deer-gpu` 不能反向依赖 `deer-gui`（与 `ScrollView` 同一个理由）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreeditView {
+    /// 挂在哪个 `Field` 上。
+    pub id: String,
+    /// 正在拼的那一段。
+    pub text: String,
 }
 
 /// 绘制时读的滚动状态（偏移 + 每个容器的上限）。
@@ -185,6 +202,9 @@ pub const FILL_ROUND_RADIUS: i32 = 4;
 pub const FOCUS_RING_INSET: i32 = 2;
 /// 文本相对控件矩形的内缩（像素）：让文字与描边不重叠 —— 于是「文本变化」只发生在框内。
 const TEXT_INSET: i32 = 2;
+
+/// 预编辑**下划线**的厚度（像素）。
+pub const PREEDIT_UNDERLINE_H: i32 = 1;
 
 /// **光标竖线**的宽度（像素）。1px 足够看得见，且不会盖住相邻字形。
 pub const CARET_W: i32 = 1;
@@ -266,6 +286,19 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
     }
 
     /// `Field` 这一帧显示的文本（见 [`FieldText`]）。
+    /// 该字段**光标前那一段**的像素宽度（字符位 → 像素的**唯一**桥）。
+    ///
+    /// 必须与文本布局用**同一个度量**（Q-3 的纪律：布局/绘制/光栅化不许各算各的字宽）；
+    /// 越界的字符位夹到末尾（不 panic、不画到框外）。
+    fn caret_dx(&self, label: &str, id: &str) -> i32 {
+        let caret = self.state.carets.get(id).copied().unwrap_or(0);
+        let keep = caret.min(label.chars().count());
+        let prefix: String = label.chars().take(keep).collect();
+        self.measure
+            .width(&prefix, self.text_style())
+            .round() as i32
+    }
+
     fn field_label(&self, n: &Node) -> String {
         match self.field_text {
             FieldText::Label => n.props.label.clone().unwrap_or_default(),
@@ -423,6 +456,46 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
                         size: self.theme.font_size,
                         align: 0,
                     });
+                    // **IME 预编辑**（T3.4 渲染半）：把「还没上屏的那一段」画在**光标处**，
+                    // 并加一条**下划线** —— 下划线是「这段还没定」的通用视觉约定。
+                    //
+                    // 它画在**光标位置**（字符位）之后：光标在它**前面**，因为它正是从那里长出来的。
+                    // 之后再画光标时要把光标推到预编辑**之后**（见下）—— 那是 IME 的常态：
+                    // 拼写过程中，插入符跟着拼写走。
+                    let mut caret_x = text_rect.x + self.caret_dx(&label, &n.id);
+                    if focused {
+                        if let Some(p) = self
+                            .state
+                            .preedit
+                            .as_ref()
+                            .filter(|p| p.id == n.id && !p.text.is_empty())
+                        {
+                            let w = self
+                                .measure
+                                .width(&p.text, self.text_style())
+                                .round() as i32;
+                            list.push(DrawCmd::Text {
+                                rect: RectI::new(caret_x, text_rect.y, text_rect.w, text_rect.h),
+                                text: p.text.clone(),
+                                // 暗一档：与**已上屏**的文字区分开（它还不是内容）
+                                color: self.theme.text_dim,
+                                size: self.theme.font_size,
+                                align: 0,
+                            });
+                            list.push(DrawCmd::FillRoundRect {
+                                rect: RectI::new(
+                                    caret_x,
+                                    text_rect.y + text_rect.h - PREEDIT_UNDERLINE_H,
+                                    w,
+                                    PREEDIT_UNDERLINE_H,
+                                ),
+                                radius: 0,
+                                color: self.theme.text_dim,
+                            });
+                            // 光标推到预编辑之后
+                            caret_x += w;
+                        }
+                    }
                     // **光标**（T3.8）：只在焦点框里画，位置 = 文本起点 + 「光标前那一段」的宽度。
                     //
                     // 为什么要 `measure`：光标位置是**字符位**（T3.5 的模型），
@@ -431,27 +504,14 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
                     // 布局、绘制、光栅化不许各算各的字宽）。
                     //
                     // 默认 `carets` 为空 ⇒ 这条不触发 ⇒ 既有语料逐字节不变。
-                    if focused {
-                        if let Some(&caret_chars) = self.state.carets.get(&n.id) {
-                            let total = label.chars().count();
-                            let keep = caret_chars.min(total);
-                            let prefix: String = label.chars().take(keep).collect();
-                            let dx = self
-                                .measure
-                                .width(&prefix, self.text_style())
-                                .round() as i32;
+                    if focused && self.state.carets.contains_key(&n.id) {
                             list.push(DrawCmd::FillRoundRect {
                                 // 半径 0 = 纯矩形：光标要一条实心竖线，不需要圆角
-                                rect: RectI::new(
-                                    text_rect.x + dx,
-                                    text_rect.y,
-                                    CARET_W,
-                                    text_rect.h,
-                                ),
+                                rect: RectI::new(caret_x, text_rect.y, CARET_W, text_rect.h),
                                 radius: 0,
                                 color: self.theme.text,
                             });
-                        }
+
                     }
                 }
             }
@@ -1730,6 +1790,106 @@ mod tests {
         println!("节点 {node_p:?}｜不换行 ⇒ {texts_p:?}");
         assert_eq!(texts_p.len(), 1);
         assert_eq!(texts_p[0], (node_p, "alpha beta gamma delta".to_string()));
+    }
+
+    // ---- T3.4：预编辑渲染 ----------------------------------------------------
+
+    /// 聚焦的 `Field`（标签 `abcd`）+ 光标位 + 预编辑 ⇒ 绘制列表。
+    fn field_frame(caret: Option<usize>, preedit: Option<(&str, &str)>) -> crate::DrawList {
+        let mut f = Node::new(Kind::Field, "f");
+        f.props.label = Some("abcd".into());
+        let mut root = Node::new(Kind::Column, "root");
+        root.children.push(f);
+        let geo = layout(
+            &root,
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 60.0 },
+            deer_layout::TextStyle { font_size: 14.0, line_height: 18.0 },
+            &ApproxMeasure,
+        );
+        let mut carets = std::collections::BTreeMap::new();
+        if let Some(c) = caret {
+            carets.insert("f".to_string(), c);
+        }
+        let state = InteractState {
+            focus: Some("f".into()),
+            carets,
+            preedit: preedit.map(|(id, text)| PreeditView {
+                id: id.to_string(),
+                text: text.to_string(),
+            }),
+            ..Default::default()
+        };
+        InteractiveRenderer::new(Theme::default(), &ApproxMeasure, &state).build(&root, &geo)
+    }
+
+    /// 列表里**文字等于 `want`** 的那条 `Text` 命令的 x（没有则 `None`）。
+    fn text_x(list: &crate::DrawList, want: &str) -> Option<i32> {
+        list.cmds.iter().find_map(|c| match c {
+            DrawCmd::Text { rect, text, .. } if text == want => Some(rect.x),
+            _ => None,
+        })
+    }
+
+    /// 下划线（高 `PREEDIT_UNDERLINE_H`、半径 0 的填充矩形）的 (x, w)。
+    fn underline(list: &crate::DrawList) -> Option<(i32, i32)> {
+        list.cmds.iter().find_map(|c| match c {
+            DrawCmd::FillRoundRect { rect, radius, .. }
+                if *radius == 0 && rect.h == PREEDIT_UNDERLINE_H =>
+            {
+                Some((rect.x, rect.w))
+            }
+            _ => None,
+        })
+    }
+
+    /// ① 没有预编辑 ⇒ **一条多的命令都没有**（既有像素逐字节不变）。
+    #[test]
+    fn no_preedit_draws_nothing_extra() {
+        let base = field_frame(Some(2), None);
+        assert!(underline(&base).is_none(), "没有预编辑就不该有下划线");
+        assert!(text_x(&base, "zh").is_none(), "没有预编辑就不该有那段文字");
+    }
+
+    /// ② 有预编辑 ⇒ **多两条**：那段文字（暗色）+ 一条下划线；两者**左端对齐、都在光标处**。
+    #[test]
+    fn preedit_draws_text_and_underline_at_the_caret() {
+        let base = field_frame(Some(2), None);
+        let with = field_frame(Some(2), Some(("f", "zh")));
+        assert_eq!(
+            with.cmds.len(),
+            base.cmds.len() + 2,
+            "预编辑应当**恰好**多出「那段文字 + 下划线」两条"
+        );
+        let x_text = text_x(&with, "zh").expect("应当画出了预编辑那段文字");
+        let (ux, uw) = underline(&with).expect("应当有下划线");
+        assert_eq!(x_text, ux, "文字与下划线的左端必须对齐");
+        assert!(uw > 0, "下划线要盖住那段文字的宽度：{uw}");
+    }
+
+    /// ③ **光标被推到预编辑之后**（IME 常态：拼写时插入符跟着拼写走）。
+    #[test]
+    fn caret_sits_after_the_preedit() {
+        let without = field_frame(Some(2), None);
+        let with = field_frame(Some(2), Some(("f", "zh")));
+        let c0 = caret_x(&without)[0];
+        let c1 = caret_x(&with)[0];
+        let (_, uw) = underline(&with).expect("应当有下划线");
+        assert_eq!(
+            c1,
+            c0 + uw,
+            "预编辑出现后光标应当右移「预编辑那一段的宽度」（{c0} → {c1}，宽 {uw}）"
+        );
+    }
+
+    /// ④ **别人的预编辑不许画到我身上**（挂错 id 的那种错，画面上很怪但不会报错）。
+    #[test]
+    fn preedit_for_another_field_is_not_drawn_here() {
+        let list = field_frame(Some(2), Some(("other", "zh")));
+        assert!(
+            text_x(&list, "zh").is_none(),
+            "预编辑挂在别的输入框上，不该画到这个输入框里"
+        );
+        assert!(underline(&list).is_none());
     }
 
     // ---- T3.8：光标渲染 ------------------------------------------------------
