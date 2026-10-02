@@ -365,6 +365,78 @@ impl ScrollMetrics {
     }
 }
 
+// ---------------------------------------------------------------------------
+// 滚动条几何（T3.2 的第一块：绘制与命中**共用**的唯一来源）
+// ---------------------------------------------------------------------------
+
+/// 滚动条**轨道**的宽度（像素）。
+///
+/// **唯一来源**：绘制侧（`deer-gpu` 画轨道/滑块）与命中侧（`deer-gui` 判「按下点在滚动条上」）
+/// 都读这一个常量。各写一份的话，「看得见的滚动条」与「点得到的滚动条」迟早错开 ——
+/// 而那种错**不报错**，只是偶尔点不中。
+pub const SCROLLBAR_W: f32 = 8.0;
+
+/// 轨道与视口边缘的间距（像素）—— 让滚动条不贴着边框。
+pub const SCROLLBAR_INSET: f32 = 2.0;
+
+/// 滑块的**最小**高度（像素）：内容极长时滑块仍要看得见、点得中。
+pub const SCROLLBAR_MIN_THUMB: f32 = 24.0;
+
+/// 一个可滚动容器的滚动条几何。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ScrollbarGeom {
+    /// 轨道（视口右侧的一条竖带）。
+    pub track: Rect,
+    /// 滑块（在轨道内；位置由 `offset / max_scroll` 决定）。
+    pub thumb: Rect,
+}
+
+/// 由「视口矩形 + 当前偏移 + 滚动上限」算滚动条几何。
+///
+/// ## 语义（三条，都有单测钉）
+///
+/// 1. **`max_scroll <= 0` ⇒ `None`** —— 内容没超出视口就不画：一条满格滑块是纯噪音，
+///    而且它会盖住内容最右边 8 像素；
+/// 2. **滑块高 = `max(SCROLLBAR_MIN_THUMB, 轨道高 × 视口高 / 内容高)`**，
+///    其中 `内容高 = 视口高 + max_scroll` ⇒ 这就是「可见比例」，被下限与轨道高夹住；
+/// 3. **滑块顶 = `offset / max_scroll × (轨道高 − 滑块高)`** ⇒ 到顶贴顶、到底贴底，
+///    中间不会越界（`max_scroll > 0` 才走到这里，除数取不到 0）。
+///
+/// ## 为什么返回**浮点**矩形
+///
+/// 取整交给调用方：绘制要整数（转 `RectI`）、命中要浮点（判「按下的点落在滑块里」）。
+/// 在这里取整会让两侧各取一次整、可能差 1 像素 ⇒ 边界上「看得见却点不中」。
+/// 偏移本身是整数，所以 `frac` 是确定的 —— 同一组输入永远给出同一组几何。
+pub fn scrollbar_geom(viewport: Rect, offset: i32, max_scroll: i32) -> Option<ScrollbarGeom> {
+    if max_scroll <= 0 {
+        return None;
+    }
+    let track_x = viewport.x + viewport.w - SCROLLBAR_INSET - SCROLLBAR_W;
+    let track_y = viewport.y + SCROLLBAR_INSET;
+    let track_h = (viewport.h - 2.0 * SCROLLBAR_INSET).max(1.0);
+    let track = Rect {
+        x: track_x,
+        y: track_y,
+        w: SCROLLBAR_W,
+        h: track_h,
+    };
+
+    let viewport_h = viewport.h.max(1.0);
+    let content_h = viewport_h + max_scroll as f32;
+    let visible_ratio = track_h * viewport_h / content_h;
+    let thumb_h = visible_ratio.max(SCROLLBAR_MIN_THUMB).min(track_h);
+    // 夹过再算：偏移越界时几何不该跟着越界（越界偏移本身由 `clamp` 那一层挡）
+    let frac = offset.clamp(0, max_scroll) as f32 / max_scroll as f32;
+    let travel = (track_h - thumb_h).max(0.0);
+    let thumb = Rect {
+        x: track_x,
+        y: track_y + frac * travel,
+        w: SCROLLBAR_W,
+        h: thumb_h,
+    };
+    Some(ScrollbarGeom { track, thumb })
+}
+
 /// 排布：把树算成几何表（**不滚动** —— 等价于所有偏移为 0）。
 pub fn layout(root: &Node, box_: Rect, style: TextStyle, m: &impl Measure) -> Geometry {
     layout_with_scroll(root, box_, style, m, &ScrollOffsets::new()).0
@@ -628,4 +700,120 @@ pub fn hit_test<'a>(root: &'a Node, geo: &Geometry, px: f32, py: f32) -> Option<
     let mut found = None;
     probe(root, geo, px, py, &mut found);
     found
+}
+
+#[cfg(test)]
+mod scrollbar_tests {
+    use super::*;
+
+    fn viewport() -> Rect {
+        Rect {
+            x: 10.0,
+            y: 20.0,
+            w: 100.0,
+            h: 200.0,
+        }
+    }
+
+    /// ① 内容没超出 ⇒ 不画（`max_scroll == 0` 与负数都算）。
+    #[test]
+    fn no_scrollbar_when_content_fits() {
+        assert!(scrollbar_geom(viewport(), 0, 0).is_none(), "max_scroll=0 不该画");
+        assert!(scrollbar_geom(viewport(), 0, -5).is_none(), "负上限不该画");
+    }
+
+    /// ② 到顶贴顶、到底贴底（`thumb.y` 的两个端点）。
+    #[test]
+    fn thumb_is_pinned_to_both_ends() {
+        let v = viewport();
+        let max = 400;
+        let top = scrollbar_geom(v, 0, max).expect("要画").thumb;
+        assert!(
+            (top.y - (v.y + SCROLLBAR_INSET)).abs() < 0.01,
+            "偏移 0 时滑块该贴轨道顶：{top:?}"
+        );
+
+        let bottom = scrollbar_geom(v, max, max).expect("要画");
+        let track_bottom = bottom.track.y + bottom.track.h;
+        let thumb_bottom = bottom.thumb.y + bottom.thumb.h;
+        assert!(
+            (thumb_bottom - track_bottom).abs() < 0.01,
+            "到底时滑块该贴轨道底（滑块底 {thumb_bottom} vs 轨道底 {track_bottom}）"
+        );
+    }
+
+    /// ③ 位移单调：偏移增大，滑块**不会**往上跑。
+    #[test]
+    fn thumb_moves_monotonically_with_offset() {
+        let v = viewport();
+        let max = 400;
+        let mut prev = f32::NEG_INFINITY;
+        for off in [0, 1, 50, 100, 200, 399, 400] {
+            let y = scrollbar_geom(v, off, max).expect("要画").thumb.y;
+            assert!(y >= prev, "偏移 {off} 时滑块往上跑了（{y} < {prev}）");
+            prev = y;
+        }
+    }
+
+    /// ④ **滑块永远在轨道内** —— 含越界偏移与极端内容长度（这是「不越界」的判据）。
+    #[test]
+    fn thumb_never_escapes_the_track() {
+        let v = viewport();
+        for max in [1, 2, 50, 400, 100_000] {
+            for off in [-100, -1, 0, 1, max / 2, max - 1, max, max + 1, max * 3] {
+                let g = scrollbar_geom(v, off, max).expect("要画");
+                assert!(
+                    g.thumb.y >= g.track.y - 0.01,
+                    "max={max} off={off}: 滑块顶越过轨道顶 {:?} vs {:?}",
+                    g.thumb,
+                    g.track
+                );
+                assert!(
+                    g.thumb.y + g.thumb.h <= g.track.y + g.track.h + 0.01,
+                    "max={max} off={off}: 滑块底越过轨道底 {:?} vs {:?}",
+                    g.thumb,
+                    g.track
+                );
+                assert!(g.thumb.h >= 0.0 && g.thumb.h <= g.track.h + 0.01);
+            }
+        }
+    }
+
+    /// ⑤ 内容越长滑块越矮；但**不低于下限**（否则极端内容下会矮成一条看不见的线）。
+    #[test]
+    fn thumb_shrinks_with_content_but_honors_the_minimum() {
+        let v = viewport();
+        let short = scrollbar_geom(v, 0, 10).expect("要画").thumb.h;
+        let long = scrollbar_geom(v, 0, 10_000).expect("要画").thumb.h;
+        assert!(long < short, "内容更长时滑块该更矮（{long} vs {short}）");
+        assert!(
+            (long - SCROLLBAR_MIN_THUMB).abs() < 0.01,
+            "极长内容下滑块该停在最小高度 {SCROLLBAR_MIN_THUMB}，实际 {long}"
+        );
+    }
+
+    /// ⑥ 轨道贴在视口**右**边且不越出视口（右边界的容纳关系，不是「大概在那个位置」）。
+    #[test]
+    fn track_sits_inside_the_right_edge() {
+        let v = viewport();
+        let t = scrollbar_geom(v, 0, 100).expect("要画").track;
+        assert!(
+            (t.x + t.w - (v.x + v.w - SCROLLBAR_INSET)).abs() < 0.01,
+            "轨道右边该离视口右边 {SCROLLBAR_INSET} 像素：{t:?} vs {v:?}"
+        );
+        assert!(t.x >= v.x, "轨道不能跑到视口左边去：{t:?}");
+        assert!(
+            t.y >= v.y && t.y + t.h <= v.y + v.h + 0.01,
+            "轨道不能超出视口上下：{t:?} vs {v:?}"
+        );
+    }
+
+    /// ⑦ 同一组输入 ⇒ 逐位相同的输出（滚动条几何也必须是**确定性纯函数**）。
+    #[test]
+    fn geometry_is_deterministic() {
+        let v = viewport();
+        let a = scrollbar_geom(v, 137, 999).expect("要画");
+        let b = scrollbar_geom(v, 137, 999).expect("要画");
+        assert_eq!(a, b);
+    }
 }
