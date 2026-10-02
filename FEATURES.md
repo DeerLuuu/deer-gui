@@ -40,6 +40,7 @@
 | **对齐**（`main` / `cross`：start/center/end/stretch） | ✅ | [layout](docs/features/layout.md#对齐) | `cargo run -p deer-gui --example scene_file`（`main=end`） |
 | **固定与百分比尺寸**（`w` / `h`，`50%`） | ✅ | [layout](docs/features/layout.md#尺寸) | `cargo run -p deer-gui --example geometry` |
 | **多行文本 + 垂直滚动容器**（`text` + `wrap` ⇒ 每行一条 `Text` 命令；`column` + `scroll` ⇒ `max_scroll` + 视口裁剪 + 滚轮驱动偏移，到边界不越界、视口外不命中） | ✅ | [scroll-and-multiline](docs/features/scroll-and-multiline.md) | `cargo run -p deer-gui --example scroll` |
+| **滚动条**（可视：轨道 + 滑块，位置与高度反映当前偏移；内容装得下 ⇒ 不画；默认 opt-in） | ✅ | [scrollbar](docs/features/scrollbar.md) | `cargo run -p deer-gui --example scroll_bar` |
 | **命中测试**（坐标 → 哪个控件） | ✅ | [hit-testing](docs/features/hit-testing.md) | `cargo run -p deer-gui --example geometry` |
 
 ## 三、渲染与自检
