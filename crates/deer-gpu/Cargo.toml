@@ -12,4 +12,4 @@ path = "src/lib.rs"
 
 [dependencies]
 deer-log.workspace = true
-deer-layout.workspace = true
+deer-core.workspace = true

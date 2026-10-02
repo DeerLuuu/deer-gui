@@ -24,12 +24,16 @@
 #![deny(clippy::all)]
 
 pub mod builder;
+pub mod draw;
+pub mod error;
 pub mod layout;
 pub mod node;
 pub mod registry;
 pub mod scene;
 
 pub use builder::{Builder, L};
+pub use draw::{Color, DrawCmd, DrawList, RectI, TextureId};
+pub use error::{GpuError, GpuResult};
 pub use layout::{ApproxMeasure, Geometry, Intrinsics, Measure, TextStyle, hit_test, layout, measure_tree, metrics};
 pub use layout::{
     SCROLLBAR_INSET, SCROLLBAR_MIN_THUMB, SCROLLBAR_W, ScrollbarGeom, scrollbar_geom,
