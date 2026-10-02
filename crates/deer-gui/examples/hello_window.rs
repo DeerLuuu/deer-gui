@@ -169,11 +169,7 @@ fn build_frame(
         measure,
     );
     // `UiState` 是交互层的真相；渲染层只认它的**只读子集** `InteractState`。
-    let interact = InteractState {
-        hover: state.hover.clone(),
-        focus: state.focus.clone(),
-        pressed: state.pressed.clone(),
-    };
+        let interact = state.to_interact_state();
     // `FieldText::Content` ⇒ 输入框画的是 `state.texts["input"]`（没打过字时退回占位 label）。
     let list = InteractiveRenderer::with_texts(
         theme.clone(),

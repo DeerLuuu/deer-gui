@@ -41,7 +41,7 @@ pub use error::{GpuError, GpuResult};
 pub use font::{Contour, Font, Glyph, Point, Segment};
 pub use glyph::{AtlasSlot, GlyphImage, GlyphKey};
 pub use interact::{
-    FieldText, InteractState, InteractiveRenderer, build_interactive_draw_list,
+    FieldText, InteractState, InteractiveRenderer, ScrollView, build_interactive_draw_list,
     build_interactive_draw_list_with_texts,
 };
 pub use measure::FontMeasure;
