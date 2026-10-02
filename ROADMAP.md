@@ -341,7 +341,7 @@ pub enum Pos {
 
 **① 缘起**：`docs/ARCHITECTURE.md` §2.3 已登记 Godot 式 L0–L3 归属规则（2026-10-02 v2），其中列出**两处已知错位**与**两个待人裁断点**：
 
-1. **`deer-gpu` 混装**：同一个 crate 里既有 **L0 契约**（`draw`/`error`/`measure`、HAL traits），又有 **L1 后端 + 文本服务**（`null`/`render`/`interact` + `font`/`glyph`/`raster`/`atlas`/`text`）；
+1. **`deer-gpu` 混装**：同一个 crate 里既有 **L0 契约**（`draw`/`error`/`measure`、HAL traits），又有 **L1 后端 + 文本服务**（`null`/`render`/`interact` + `font`/`glyph`/`raster`/`atlas`/`text`）—— 其中 **`measure` 与 HAL traits 的实际归属已由 ⑨⑩ 两处修订改正**（它们**不**进 L0）；
 2. **`deer-window` 单文件 1571 行混装**：同一个 `lib.rs` 里既有 **L1 DisplayServer**（winit/输入/DPI/剪贴板），又有 **L3 host**（`App`/`Waker`/脏重绘）。
 
 此前用 `deer_gpu::core_layer` 等**门面模块**做逻辑分层过渡（零行为改动、零路径破坏）。
@@ -357,9 +357,9 @@ pub enum Pos {
 
 | crate | 层 | 内容 |
 |---|---|---|
-| **`deer-core`**（新） | **L0** | **零内部依赖**：原 `deer-layout` **全部** + `deer-gpu` 的 `draw` / `error` / `measure` + **HAL traits 迁入新 `hal.rs`** |
-| **`deer-text`**（新） | L1 **TextServer** | `font` / `glyph` / `raster` / `atlas` / `text` |
-| **`deer-gpu`**（收缩） | L1 **RenderServer · CPU** | `null` / `render` / `interact` / `png` |
+| **`deer-core`**（新） | **L0** | **零内部依赖**：原 `deer-layout` **全部** + `deer-gpu` 的 `draw` / `error`。**不含** `measure.rs` 与 HAL traits（见 ⑨⑩ 两处修订） |
+| **`deer-text`**（新） | L1 **TextServer** | `font` / `glyph` / `raster` / `atlas` / `text` + **`measure.rs`**（`FontMeasure`，LY2 随文本一起迁入） |
+| **`deer-gpu`**（收缩） | L1 **RenderServer · CPU** | `null` / `render` / `interact` / `png` + **HAL traits 暂驻本 crate**（本轮不迁，见 ⑨） |
 | **`deer-vk`** | L1 RenderServer · Vulkan | **不变** —— 只把依赖改指 `deer-core` |
 | **`deer-window`** | L1 DisplayServer + L3 host | **crate 不拆**；`lib.rs` **内部**拆 `display`(L1) / `host`(L3) 两个模块；**公开 API 逐字不变** |
 | **`deer-gui`**（L2）/ **`deer-log`** | L2 / 工具 | **只更新依赖路径**，不改内容语义 |
@@ -387,6 +387,26 @@ deer-gui  → 全部
 **⑦ 今后再拆的触发条件（保留 §2.3 原文）**：**某模块开始被两个不同上层共用**。在那之前**不再新增 crate 边界** —— 每加一条边界 = 多一层 trait + 转发，本仓库已体会过「改一个字段动 5 个 crate」的代价。
 
 **⑧ 落点**：本节只登记**设计与红线**（登记先行）；`docs/ARCHITECTURE.md` §2.1/§2.2/§2.3 与各 crate 的模块文档、`FEATURES.md` 的 crate 名在**实现轮**同步更新 —— 否则文档会指向已经不存在的 crate。
+
+**⑨ 修订一：HAL traits 本轮**不迁** `deer-core`，暂驻 `deer-gpu`（LY1 实施中被编译器逼出来的事实）**
+
+- **原登记**写的是「HAL traits 迁入新 `hal.rs`（属 L0）」—— 这条**已被实施证据推翻**。
+- **证据**：`Frame::record` 的签名是 `record(&mut self, list: &DrawList, text: Option<&mut TextEngine>) -> GpuResult<()>`
+  （`crates/deer-gpu/src/lib.rs`，远端 PR #6 引入）—— **签名级引用 TextServer 的类型**。
+- **按 §2.3 归属判据**：HAL 接口目前是「**与 TextServer 耦合的 RenderServer 家族契约**」。**Godot 对照**：
+  `RenderingServer` 本身就在 **L1** ⇒「**服务接口随服务走**」，不硬塞进 L0。
+- ⇒ **本轮处置**：**HAL traits 暂驻 `deer-gpu`**（`hal.rs` 已删除；HAL 定义继续留在 `deer-gpu/src/lib.rs`）。
+- ⇒ **新增未来契约任务（登记即可、不排期）**：**`Frame::record` 去 `TextEngine` 化** ——
+  改成 Godot 式 **RID 不透明句柄**（或同等解耦）。**完成之后** HAL traits 才配下沉 L0 `deer-core`。
+
+**⑩ 修订二：`measure.rs` / `FontMeasure` 归 **TextServer**，不进 L0**
+
+- **原登记**写的是 `measure.rs` 进 core —— 这条同样**被实施证据推翻**。
+- **证据**：`FontMeasure` 的定义体消费 `crate::font::Font`（自带字体文件与缓存语义 ⇒ 属 TextServer）
+  ⇒ **放进 L0 就造出 L0→L1 反向依赖**（同样的事实记录在 `feat/layer-core` @ `ed78605` 提交信息的「与计划的两处偏差」里）。
+- ⇒ **本轮处置**：`measure.rs` **留在 `deer-gpu`**，**随 LY2 迁入 `deer-text`**（与 `font`/`text` 一起）。
+- ⇒ **L0 的排版契约**是 `Measure` / `TextStyle` / `wrap_greedy`（在 `crates/deer-layout/src/layout.rs`，
+  **已随 `deer-layout` 进 `deer-core`**）—— 「契约在 L0、具体度量实现在 L1」这个切分是刻意的。
 
 ### M4 的细步与状态
 
