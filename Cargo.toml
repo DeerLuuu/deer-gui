@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/deer-log",
     "crates/deer-layout",
     "crates/deer-gpu",
     "crates/deer-vk",
@@ -20,6 +21,7 @@ license = "MIT"
 rust-version = "1.85"
 
 [workspace.dependencies]
+deer-log = { path = "crates/deer-log" }
 deer-layout = { path = "crates/deer-layout" }
 deer-gpu = { path = "crates/deer-gpu" }
 deer-vk = { path = "crates/deer-vk" }

@@ -459,6 +459,28 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
         let offset = self.state.scroll.offsets.get(&n.id);
         let max_scroll = self.state.scroll.metrics.max_of(&n.id);
         let Some(g) = deer_layout::scrollbar_geom(viewport, offset, max_scroll) else {
+            // ⚠️ 这里是最容易「静默失败」的地方：可滚动容器一条滚动条都没画出来，
+            // 而画面看起来只是「滚动条没出现」—— 分不清是「内容装得下」（正常）
+            // 还是「调用方忘了 `set_metrics`」（bug）。日志把这两种情况分开。
+            if deer_log::enabled(deer_log::Level::Debug, "deer_gpu::interact") {
+                if self.state.scroll.metrics.is_empty() {
+                    deer_log::debug_at(
+                        "deer_gpu::interact",
+                        format_args!(
+                            "可滚动容器 `{}` 没有滚动上限（`ScrollView::metrics` 为空）⇒ 不画滚动条；多半是忘了把 `layout_with_scroll` 的 `ScrollMetrics` 灌回状态（`set_metrics`）",
+                            n.id
+                        ),
+                    );
+                } else {
+                    deer_log::debug_at(
+                        "deer_gpu::interact",
+                        format_args!(
+                            "可滚动容器 `{}` 上限为 0（内容装得下视口）⇒ 不画滚动条（正常）",
+                            n.id
+                        ),
+                    );
+                }
+            }
             return;
         };
         let radius = (deer_layout::SCROLLBAR_W / 2.0) as i32;
