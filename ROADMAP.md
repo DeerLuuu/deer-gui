@@ -337,6 +337,57 @@ pub enum Pos {
 > **不需要升版本**（升了反而让老库拒绝读新文件，而新文件其实老库读得动 —— 只是忽略那个属性）。
 > 记在这里，免得实现时顺手把版本号加了。
 
+### 设计登记：分层物理化（L0–L3）（2026-10-02）
+
+**① 缘起**：`docs/ARCHITECTURE.md` §2.3 已登记 Godot 式 L0–L3 归属规则（2026-10-02 v2），其中列出**两处已知错位**与**两个待人裁断点**：
+
+1. **`deer-gpu` 混装**：同一个 crate 里既有 **L0 契约**（`draw`/`error`/`measure`、HAL traits），又有 **L1 后端 + 文本服务**（`null`/`render`/`interact` + `font`/`glyph`/`raster`/`atlas`/`text`）；
+2. **`deer-window` 单文件 1571 行混装**：同一个 `lib.rs` 里既有 **L1 DisplayServer**（winit/输入/DPI/剪贴板），又有 **L3 host**（`App`/`Waker`/脏重绘）。
+
+此前用 `deer_gpu::core_layer` 等**门面模块**做逻辑分层过渡（零行为改动、零路径破坏）。
+
+**② 维护者已确认（本次工作会话）** —— 这两条**覆盖** §2.3 里「不急拆」的倾向：
+
+| # | 裁断 | 依据 / 原话 |
+|---|---|---|
+| 1 | **「Server」命名保留** | 采纳 Godot 语义 = **进程内单例服务对象**，**不是**网络服务端；用户原话：「像 Godot 那样子分层核心与各个 Server」 |
+| 2 | **物理拆分现在执行** | 不再等 §2.3 建议的触发条件；原触发条件**降级为「今后再拆」的判据**（见 ⑦） |
+
+**③ 目标拓扑（crate 级）**
+
+| crate | 层 | 内容 |
+|---|---|---|
+| **`deer-core`**（新） | **L0** | **零内部依赖**：原 `deer-layout` **全部** + `deer-gpu` 的 `draw` / `error` / `measure` + **HAL traits 迁入新 `hal.rs`** |
+| **`deer-text`**（新） | L1 **TextServer** | `font` / `glyph` / `raster` / `atlas` / `text` |
+| **`deer-gpu`**（收缩） | L1 **RenderServer · CPU** | `null` / `render` / `interact` / `png` |
+| **`deer-vk`** | L1 RenderServer · Vulkan | **不变** —— 只把依赖改指 `deer-core` |
+| **`deer-window`** | L1 DisplayServer + L3 host | **crate 不拆**；`lib.rs` **内部**拆 `display`(L1) / `host`(L3) 两个模块；**公开 API 逐字不变** |
+| **`deer-gui`**（L2）/ **`deer-log`** | L2 / 工具 | **只更新依赖路径**，不改内容语义 |
+
+**④ 依赖图**
+
+```text
+deer-core ← { deer-text, deer-vk, deer-gpu }
+deer-text ← deer-gpu
+deer-gui  → 全部
+```
+
+**⑤ 决策（含「不改动什么」）**
+
+- **不留旧路径 re-export**：**全量更新调用点**。理由：本工作区**无外部消费者**；留 re-export 会造成**双路径漂移**（两条 import 路径并存 ⇒ 迟早有人只改一条，另一条悄悄过期）。
+- **公开 API 的类型与签名逐字不变**：这是**纯搬家（move-only）** —— 不改语义、不改可见性、不改集合形状，只改「东西住在哪个 crate / 哪个模块」。
+
+**⑥ 验收红线（纯重构）** —— 四条一起看，缺一条都不算完成：
+
+- **像素判据逐字节不变**（不透明 0 / 半透明 ≤1 LSB），与重构前**同一套**判据、**不放松**；
+- **测试不掉数**：基线 **627 passed / 0 failed、50 个测试套件** @ master `b775b4b`（**登记时的实测值**；**判定以运行输出为准**，且**禁止为变绿削弱判据**）；
+- **`docs_consistency` 绿**（当前 5 passed）、**`clippy` 0 warning / 0 error**；
+- **无新增第三方依赖**（唯一登记在案的仍是 `deer-window` 的 `winit`，见 Q-1）、**`Cargo.lock` 只由 cargo 命令生成**（不手改）。
+
+**⑦ 今后再拆的触发条件（保留 §2.3 原文）**：**某模块开始被两个不同上层共用**。在那之前**不再新增 crate 边界** —— 每加一条边界 = 多一层 trait + 转发，本仓库已体会过「改一个字段动 5 个 crate」的代价。
+
+**⑧ 落点**：本节只登记**设计与红线**（登记先行）；`docs/ARCHITECTURE.md` §2.1/§2.2/§2.3 与各 crate 的模块文档、`FEATURES.md` 的 crate 名在**实现轮**同步更新 —— 否则文档会指向已经不存在的 crate。
+
 ### M4 的细步与状态
 
 M4 原来写成一条「字体解析 + 光栅化 + 图集 + 度量 + 换行」。实际按「**先让字变成像素**、
