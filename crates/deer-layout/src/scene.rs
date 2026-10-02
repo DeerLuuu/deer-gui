@@ -217,7 +217,70 @@ fn node_at<'a>(root: &'a mut Node, path: &[usize]) -> &'a mut Node {
 }
 
 /// 把 `.dui` 文本解析成节点树。
+/// `.dui` 场景格式的**当前版本**。写进文件头的就是它。
+///
+/// ## 为什么现在就要版本头（而不是等需要时再加）
+///
+/// 编辑器**一旦开始产出用户文件**，格式就冻结了：以后再改语法，「旧文件在新库里怎么读、
+/// 新文件在旧库里怎么读」这两件事都必须有答案。**在有用户文件之前锁格式是最便宜的时刻**
+/// —— 之后每一次改动都要带着历史包袱。
+///
+/// 版本头用 `#` 注释行（`preprocess` 会把它当注释剥掉，所以**必须在本函数里先读**）：
+/// ```text
+/// # deer-gui-scene: 1
+/// [column name=app]
+///   [button name=ok text="好"]
+/// ```
+///
+/// **没有头的文件 = v0**（头还没发明出来的那一版）—— 向后兼容是硬要求，
+/// 否则仓库里既有的 `.dui` 语料全得改一遍。
+pub const SCENE_FORMAT_VERSION: u32 = 1;
+
+/// 版本头的前缀（`: ` 之后是数字）。
+const SCENE_HEADER_PREFIX: &str = "# deer-gui-scene:";
+
+/// 读文件头声明的版本。
+///
+/// 返回 `None` = **没有头**（老文件 ⇒ 按 v0 处理）；
+/// `Some(Err(msg))` = **有头但写坏了**（这必须报错，不能当成「没有头」——
+/// 静默降级会让一个手滑的版本号变成「读进去了但属性全丢」那种最难查的错）。
+fn declared_version(src: &str) -> Option<Result<u32, String>> {
+    // 只看**第一个非空行**：头必须在最前面，否则它只是普通注释
+    let first = src.lines().find(|l| !l.trim().is_empty())?;
+    let t = first.trim();
+    let rest = t.strip_prefix(SCENE_HEADER_PREFIX)?;
+    let rest = rest.trim();
+    Some(
+        rest.parse::<u32>()
+            .map_err(|_| format!("版本号 `{rest}` 不是数字")),
+    )
+}
+
 pub fn parse_scene(src: &str, source: &str) -> Result<Node, SceneError> {
+    // **版本头必须先读**：`preprocess` 会把 `#` 行当注释剥掉，之后就再也看不见它了。
+    match declared_version(src) {
+        Some(Ok(v)) if v > SCENE_FORMAT_VERSION => {
+            return Err(err(
+                format!(
+                    "场景格式版本 v{v} **高于**本库支持的 v{SCENE_FORMAT_VERSION} \
+                     —— 这不是文件坏了，是这个文件用了更晚的格式。请升级 deer-gui，\
+                     或用能读懂 v{v} 的版本打开（**不要**手工删掉头，那会读出错的内容）"
+                ),
+                1,
+                source,
+            ));
+        }
+        Some(Err(msg)) => {
+            return Err(err(
+                format!("场景版本头无法解析：{msg}（期望形如 `{SCENE_HEADER_PREFIX} 1`）"),
+                1,
+                source,
+            ));
+        }
+        // 没头（老文件）或版本不高于当前 ⇒ 正常解析
+        _ => {}
+    }
+
     let lines = preprocess(src, source)?;
     if lines.is_empty() {
         return Err(err("场景为空（至少要有一个根节点）", 1, source));
@@ -402,7 +465,9 @@ pub fn encode_scene(root: &Node) -> String {
             emit(c, depth + 1, out);
         }
     }
-    let mut out = String::new();
+    // **版本头写在最前面**（`#` 注释行）：它就是「这个文件按哪一版语法写的」的声明。
+    // 解析侧会先读它、再解析（`preprocess` 之后这行就没了，所以必须抢在前面）。
+    let mut out = format!("{SCENE_HEADER_PREFIX} {SCENE_FORMAT_VERSION}\n");
     emit(root, 0, &mut out);
     out
 }
@@ -432,5 +497,78 @@ fn quote(s: &str) -> String {
         format!("\"{}\"", s.replace('"', "\\\""))
     } else {
         s.to_string()
+    }
+}
+
+#[cfg(test)]
+mod e2_version_header_tests {
+    use super::*;
+
+    /// 老文件（**没有头**）：仓库里既有的 `.dui` 语料就是这一种，必须照样能读。
+    fn tree() -> Node {
+        parse_scene("[column name=app]\n  [button name=ok label=\"好\"]\n", "t.dui")
+            .expect("无头的老文件必须能读")
+    }
+
+    /// ① 编码出来的文件**第一行就是版本头**。
+    #[test]
+    fn encode_writes_the_version_header() {
+        let out = encode_scene(&tree());
+        let first = out.lines().next().unwrap_or_default();
+        assert!(
+            first.starts_with("# deer-gui-scene:"),
+            "第一行应当是版本头，实际 {first:?}"
+        );
+        assert!(
+            first.contains(&SCENE_FORMAT_VERSION.to_string()),
+            "头里应当是当前版本 {SCENE_FORMAT_VERSION}：{first:?}"
+        );
+    }
+
+    /// ② **往返两次逐字节相同**（round-trip²）—— 编辑器反复存盘的稳定性就靠这条。
+    #[test]
+    fn round_trip_is_stable_twice() {
+        let once = encode_scene(&tree());
+        let t2 = parse_scene(&once, "t.dui").expect("带头的文件必须能读");
+        let twice = encode_scene(&t2);
+        assert_eq!(once, twice, "往返两次必须逐字节相同（round-trip²）");
+        // 第三次也一样（防止「稳在第二版」这种假稳定）
+        let t3 = parse_scene(&twice, "t.dui").expect("再读一次");
+        assert_eq!(encode_scene(&t3), twice, "第三次往返也要稳定");
+    }
+
+    /// ③ **更高版本 ⇒ 明确说「版本不支持」，不是一堆奇怪的解析错**。
+    #[test]
+    fn newer_version_is_an_explicit_error() {
+        let src = format!(
+            "# deer-gui-scene: {}\n[column name=app]\n",
+            SCENE_FORMAT_VERSION + 1
+        );
+        let e = parse_scene(&src, "new.dui").expect_err("更高版本应当报错");
+        let m = format!("{e}");
+        assert!(
+            m.contains("高于") && m.contains("升级"),
+            "错误信息要说清是**版本**问题（而不是文件坏了，更不是一堆看不懂的语法错）：{m}"
+        );
+    }
+
+    /// ④ **头写坏了 ⇒ 明确报错**（不许静默当成「没有头」——
+    /// 那会让一个手滑的版本号变成「读进去了但内容不对」）。
+    #[test]
+    fn malformed_header_is_an_explicit_error() {
+        let e = parse_scene("# deer-gui-scene: abc\n[column name=app]\n", "bad.dui")
+            .expect_err("坏头应当报错");
+        assert!(
+            format!("{e}").contains("版本头"),
+            "应当指出是版本头的问题：{e}"
+        );
+    }
+
+    /// ⑤ 头必须在**最前面**：写在中间的 `# deer-gui-scene:` 只是普通注释，不影响解析。
+    #[test]
+    fn header_must_be_the_first_non_empty_line() {
+        let t = parse_scene("[column name=app]\n# deer-gui-scene: 999\n", "mid.dui")
+            .expect("中间的注释不该当版本头");
+        assert_eq!(t.id, "app");
     }
 }
