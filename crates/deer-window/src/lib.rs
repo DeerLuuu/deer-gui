@@ -95,8 +95,9 @@
 //!   的 `mods` 字段透传），不派发、也不触发重绘。
 //! - **仍未接线的输入面**（别当成已实现）：触摸/手势（`Touch`/`PinchGesture`）、拖放、
 //!   `DeviceEvent`（原始设备事件）、物理键码（`physical_key`/scancode）、按键重复的区分
-//!   （winit 的 `repeat` **没有**建模）、IME 预编辑（`Preedit` 只用来抑制重复文本，不派发）、
-//!   键盘布局无关的快捷键。
+//!   （winit 的 `repeat` **没有**建模）、键盘布局无关的快捷键。
+//!   （**IME 预编辑不再是这一栏的**：T3.4 起 `Ime::Preedit` 会翻成 [`InputEvent::ImePreedit`]
+//!   并**真的派发**给 `App::input`，同时仍用它抑制按键文本避免双写。）
 //! - **DPI**：只透传 `Resized` 给的物理像素，不做任何缩放换算；`LogicalSize` 只在建窗时用。
 //!
 //! ## 重绘策略（M5b：从「连续重绘」改成「事件驱动重绘」）

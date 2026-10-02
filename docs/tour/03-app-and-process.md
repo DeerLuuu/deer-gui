@@ -98,7 +98,7 @@ pub fn raw_handle_from_rwh06(raw: RwhRawWindowHandle) -> Result<deer_gpu::RawWin
   | `Resized` | `:361-369` | 更新物理 `extent` → `app.resized(w, h)` |
   | `RedrawRequested` | `:370-381` | `app.redraw()` → `FrameCounter::on_redraw` → 若 `Exit` 则 `event_loop.exit()` |
   | `CloseRequested` | `:383-386` | 只有 `app.close_requested() == Flow::Exit` 才退 |
-  | 其它（键盘/鼠标/滚轮/焦点） | `deer-window/src/lib.rs:47-53` | **M5-1 起已接入**：`CursorMoved`/`MouseInput`/`MouseWheel`/`KeyboardInput`/`Focused` 翻成 `InputEvent` → `App::input`（见 [`docs/features/input.md`](../features/input.md)）；**仍未接的是 IME 预编辑**（`Ime::Commit` 已直译但只能人肉验证） |
+  | 其它（键盘/鼠标/滚轮/焦点） | `deer-window/src/lib.rs:47-53` | **M5-1 起已接入**：`CursorMoved`/`MouseInput`/`MouseWheel`/`KeyboardInput`/`Focused` 翻成 `InputEvent` → `App::input`（见 [`docs/features/input.md`](../features/input.md)）；**IME 预编辑也已接入**（T3.4：`Ime::Preedit` ⇒ `InputEvent::ImePreedit` 真的派发，见 [`docs/features/ime.md`](../features/ime.md)；**仍未自动化验证的是真机输入法**，那条只能人肉） |
 - **重绘策略（M5b 起默认省电，不再是「连续重绘」）**：`ControlFlow::Wait`（**纯阻塞**）+ `App::wants_redraw()`（只有输入真的改了状态才请求重绘）；`App::redraw_policy()` 默认 `OnDemand`，`Continuous` ⇒ 每画完一帧再请求下一帧（`about_to_wait` 里 `window.request_redraw()`）。`DEER_WINDOW_REDRAW=continuous` 可**无条件**关掉省电。**M5c 起 App 也能自己唤醒事件循环**：`App::wake_handle(Waker)`（建窗后一次）+ `Waker::wake()`（提示性，**先问 `wants_redraw`**）/ `Waker::wake_after(d)`（预约，到点**一律画一帧**）/ `App::next_deadline()`（拉式）—— 这**不是**被否掉的「凭空超时兜底」，而是 **App 自己下单**：不声明就 `Wait` 睡死，声明了才用 `WaitUntil`。防空转要看的**计数门槛**是「`wants_redraw` **答真 0 次** + 画帧 ≤ **1 + 系统帧**」；账本里的 **`iters`** 只是**观测值、仓库内没有任何断言读它**（复审实测：把 `Wait` 换成 `Poll` ⇒ `iters` 5 → 11,695,034 而**判据全绿**）—— 另外 `DEER_WINDOW_REDRAW=continuous` 档下高 `iters` **本来就是预期**，别当成 bug。启动打印 `[deer-window] 重绘策略：请求=… 实际=…`，收尾打印 `[deer-window] 重绘账本：requests=… skipped=… frames=…` 与 `[deer-window] 唤醒账本：… iters=…` —— **验收 grep 这些标记，别只看退出码**。详见 [`docs/features/window.md`](../features/window.md) 第 6 节与 `crates/deer-window/src/lib.rs` 的「唤醒面」一节。
 - **退出时的可断言输出**：无论成败都往 stdout 打一行摘要，供脚本断言（`:293-299`）：
   `[deer-window] 事件循环结束：frames=<n> extent=<w>x<h> result=ok|error`
@@ -463,7 +463,9 @@ cargo test --workspace 2>&1 | Select-String "^test result:"       # 每个靶一
 
 ### 7.5 改窗口行为（例如加一个新事件转发 / 加一个环境变量）
 
-1. 事件 → 回调的映射表在 `crates/deer-window/src/lib.rs:351-390`；加事件就在 `window_event` 的 `match` 里加臂。**注意这句已更新过**：M5-1 起键盘/鼠标/滚轮/焦点**都已接入**（`InputEvent` → `App::input`，见 [`docs/features/input.md`](../features/input.md)），**仍未接的是 IME 预编辑**（`Ime::Commit` 已直译但只能人肉验证）。
+1. 事件 → 回调的映射表在 `crates/deer-window/src/lib.rs:351-390`；加事件就在 `window_event` 的 `match` 里加臂。**注意这句已更新过**：M5-1 起键盘/鼠标/滚轮/焦点**都已接入**（`InputEvent` → `App::input`，见 [`docs/features/input.md`](../features/input.md)），
+**IME 预编辑也已接入**（T3.4：`Ime::Preedit` ⇒ `InputEvent::ImePreedit`，见 [`docs/features/ime.md`](../features/ime.md)；
+只剩「真机输入法」的人肉验证）。**仍未建模的是按键重复**（winit 的 `repeat` 没有进 `InputEvent`）。
 2. 若是新的 `App` 回调：改 `trait App`（`:114-137`）—— 加**带默认实现**的方法可保持既有调用方不破；同时更新 crate 文档里的用法示例（`:12-30`）。
 3. 纯逻辑部分必须能单测：把状态机放进像 `FrameCounter`（`:143-179`）那样的「不碰窗口」结构，测试写进 `crates/deer-window/tests/window_logic.rs`。
 4. 真窗口行为只能靠**示例**验证：`crates/deer-window/examples/window_smoke.rs` 或 `crates/deer-gui/examples/window_preview.rs`（原因见 §1.5）。

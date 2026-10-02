@@ -36,9 +36,9 @@
 | 布局 | 布局代数（I-1…I-8 不变式）、对齐/百分比/grow、多行文本、滚动容器、命中测试 | ✅ |
 | 渲染 | CPU 参考后端、Vulkan 后端（自研 FFI+SPIR-V）、离屏 PNG、GPU 几何+文本（与 CPU 逐像素对照）、窗口上屏、统一管线（1 draw/帧） | ✅ |
 | 文本 | TTF 解析、光栅化、图集、真实度量换行；亚像素定位 opt-in（未接引擎） | ✅ / 🔄 |
-| 输入 | 事件通路、命中/状态机、Tab 焦点、文本输入、脚本重放、事件驱动重绘、滚轮垂直滚动 | ✅ |
+| 输入 | 事件通路、命中/状态机、Tab 焦点、文本输入、脚本重放、事件驱动重绘、滚轮垂直滚动、**可视滚动条 + 拖滑块改偏移**（T3.2 **上半** ✅）、**输入框光标**（T3.5 + T3.8 渲染竖线）、**IME 预编辑**（T3.4） | ✅ / 🔄（惯性只到纯逻辑，窗口层接线未做） |
 | 待补 | 通用纹理/间接绘制（**缺指南与示例** ⇒ 🔄） | 🔄 |
-| 未做 | M6 控件族（现仅 5 种节点）、M7 DX12/Metal、方向键导航、IME、多窗口/dock、纹理 RGB 调制 | ⬜ |
+| 未做 | M6 控件族（现仅 5 种节点）、M7 DX12/Metal、方向键上下导航、**按键滚动**（`PageUp`/`Home`/`End`）、**按键重复**、**惯性的窗口层接线 + 点轨道跳转**（T3.2 下半）、多窗口/dock、~~纹理 RGB 调制~~（T1.3 已 ✅） | ⬜ |
 
 ### 1.3 后续迭代核心目标与优先级依据
 
@@ -73,9 +73,9 @@
 
 | 周期 | 任务 | 交付物 | 里程碑判据 |
 |---|---|---|---|
-| M1 | T3.5 `texts` 光标 → T3.4 IME 预编辑 | `InputEvent::ImePreedit`、光标建模、Field 光标渲染 | 中文输入法预编辑可见、Commit 一次上屏；多字节边界单测 |
+| M1 ✅ | T3.5 `texts` 光标 → T3.4 IME 预编辑（**另补 T3.8 光标渲染** —— 执行中发现「光标从未被画出来」，否则 T3.4 的「预编辑可见」写不出判据） | `InputEvent::ImePreedit`、光标建模、Field 光标渲染 | 中文输入法预编辑可见、Commit 一次上屏；多字节边界单测 |
 | M2 | T3.1 方向键导航、T3.6 按键重复、T3.3 右/中键语义（先决策后实现） | 焦点序规则定义 + `handle` 扩展 + `input.md` 更新 | 纯逻辑单测（无窗口）；`interactive_form` 扩展示例 |
-| M2 | T3.2 滚动条 + 惯性滚动 | 可视滚动条命中/拖动、`Waker::wake_after` 惯性衰减 | 惯性停在边界内；唤醒账本证明无空转 |
+| M2 🔄 | T3.2 上半：滚动条（拖滑块改偏移）+ 惯性滚动**纯逻辑**。⏸ **下半未做**：点轨道跳转、惯性的窗口层接线 ⇒ 真窗口看不到惯性 | 可视滚动条命中/拖动、`Waker::wake_after` 惯性衰减 | 惯性停在边界内；唤醒账本证明无空转 |
 | M1–M2 | T2.1 X11 句柄 + surface（有 Linux 环境窗口期插入） | `raw_handle_from_rwh06` X11 臂 | Linux `window_preview` 开窗呈现、`window_parity` 通过 |
 | M2 | T4.1 `unify` 零分配、T4.2 线程模型决策（Q-4）、T4.3 示例工程 path 修复 | 稳态零分配；Q-4 决策记录；可移植 path 方案 | `RenderStats` allocs=0；像素判据不变 |
 | M3 | T4.4 多窗口基建 | 渲染器多交换链 + 事件路由 | 两窗口各自 parity；`ROADMAP.md` M3+(b) 勾掉 |
@@ -170,7 +170,7 @@
 | **HAL `record` 接线**（T1.1） | `VulkanFrame::record(DrawList)` 消费 UI 命令，替代直连分叉 | `deer-vk/src/hal.rs:168-184`、`windowed.rs`、`deer-gpu/src/lib.rs`（`Frame` trait 可能扩签名） | **`TextEngine` 传递契约是核心决策**：`record` 加参数 vs `Device` 挂引擎 vs 预编译顶点流 —— 须先在 `ROADMAP.md` 登记设计再动手（改公开 API 先问的纪律） |
 | **纹理 RGB 调制**（T1.3） | 统一 FS 增加「读 rgba 并与颜色调制」分支，保留覆盖率语义为特例 | `deer-vk/src/spirv.rs`（新 FS，**过 `spirv-val`**）、`device.rs`（描述符）、`windowed.rs`（`draw_textured_quad` 窗口入口） | 判别符沿用 `uv.x < 0`（形状）/`≥0`（文本）之外需第三态或独立管线；与 CPU 参考逐字节对照 |
 | **方向键焦点序**（T3.1） | 定义「容器内方向移动」的焦点规则 | `deer-gui/src/interaction.rs`（`handle`）、`deer-layout`（可能需几何邻近查询） | 与 `Tab` 焦点序同源定义；纯逻辑可单测；**先修 `interaction.rs:755` 的过期注释**（「无滚动所以方向键没意义」已不成立） |
-| **IME 预编辑**（T3.4） | `InputEvent::ImePreedit` + 预编辑缓冲状态 + Field 光标处显示 | `deer-window/src/lib.rs`（`Preedit` 现只用于抑制重复文本，`lib.rs:1503-1517`）、`interaction.rs` | 依赖 T3.5 光标建模；`Preedit`/`Commit` 状态机须单测 |
+| **IME 预编辑**（T3.4，**已落地** ✅） | `InputEvent::ImePreedit` + 预编辑缓冲状态 + Field 光标处显示 | `deer-window/src/lib.rs`（T3.4 前 `Preedit` 只用于抑制重复文本；现在**仍然用它抑制按键文本**避免双写，**并且**真的派发 `ImePreedit`）、`interaction.rs` | 依赖 T3.5 光标建模；`Preedit`/`Commit` 状态机须单测。**真机输入法**仍只能人肉验证 |
 | **多窗口**（T4.4） | 渲染器多交换链 + `WindowId` 事件路由 | `deer-vk/src/hal.rs`（现「只支持一个交换链」）、`deer-window`（`WindowId` 现弃用） | `Rc<RefCell<Option<WindowedRenderer>>` 改为按窗口索引的表 |
 | **线程模型**（T4.2 / Q-4） | 决定 `Device` 是否 `Send`、渲染是否独占线程 | `deer-gpu` HAL 契约、`windowed.rs` | 现状 `Rc<RefCell>` 隐含单线程；与 `Waker`（已 `Send`）的分工；决策需驱动行为实测支撑 |
 | **`unify` 零分配**（T4.1） | 跨帧复用目标缓冲消掉每帧 `Vec` | `deer-vk/src/vertex_unify.rs` | **先测量后动手**：`RenderStats` 的 alloc 口径已存在 |
