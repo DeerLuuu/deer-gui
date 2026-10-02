@@ -94,10 +94,9 @@
 //!   不进回调签名）后交给 [`App::input`]；`ModifiersChanged` 只做内部记账（修饰键随键盘事件
 //!   的 `mods` 字段透传），不派发、也不触发重绘。
 //! - **仍未接线的输入面**（别当成已实现）：触摸/手势（`Touch`/`PinchGesture`）、拖放、
-//!   `DeviceEvent`（原始设备事件）、物理键码（`physical_key`/scancode）、按键重复的区分
-//!   （winit 的 `repeat` **没有**建模）、键盘布局无关的快捷键。
-//!   （**IME 预编辑不再是这一栏的**：T3.4 起 `Ime::Preedit` 会翻成 [`InputEvent::ImePreedit`]
-//!   并**真的派发**给 `App::input`，同时仍用它抑制按键文本避免双写。）
+//!   `DeviceEvent`（原始设备事件）、物理键码（`physical_key`/scancode）、键盘布局无关的快捷键。
+//!   （已先后摘出本栏：**IME 预编辑** —— T3.4 起 `Ime::Preedit` ⇒ [`InputEvent::ImePreedit`]
+//!   真的派发；**按键重复** —— T3.6 起 winit 的 `event.repeat` 进 `KeyDown.repeat`。）
 //! - **DPI**：只透传 `Resized` 给的物理像素，不做任何缩放换算；`LogicalSize` 只在建窗时用。
 //!
 //! ## 重绘策略（M5b：从「连续重绘」改成「事件驱动重绘」）
@@ -614,6 +613,11 @@ pub enum Key {
     Right,
     Up,
     Down,
+    /// 滚动键（T3.2 剩余）：`PageUp` / `PageDown` 翻页，`Home` / `End` 到顶/到底。
+    PageUp,
+    PageDown,
+    Home,
+    End,
     /// 可打印字符键：**逻辑**字符（受当前布局与 Shift 影响，`Shift+a` ⇒ `Char('A')`）。
     Char(char),
     /// 其它一切：修饰键、功能键、编辑键、死键、多字符组合、无法识别的键。
@@ -647,6 +651,12 @@ pub enum InputEvent {
     KeyDown {
         key: Key,
         mods: Mods,
+        /// **系统按键重复**（长按不松时 OS 补发的 KeyDown）：`true` = 这是一条重复，
+        /// `false` = 用户真的按下了一次（T3.6，winit 的 `event.repeat` 首次建模）。
+        ///
+        /// 交互层默认**不区分**（`handle` 照常消费）—— 要「忽略重复」的调用方自己过滤；
+        /// 建模的意义是「能区分」而不是「替你决定」。
+        repeat: bool,
     },
     KeyUp {
         key: Key,
@@ -689,6 +699,11 @@ pub fn map_key(key: &KeyboardKey, mods: Mods) -> Key {
         KeyboardKey::Named(NamedKey::ArrowLeft) => Key::Left,
         KeyboardKey::Named(NamedKey::ArrowRight) => Key::Right,
         KeyboardKey::Named(NamedKey::ArrowUp) => Key::Up,
+        // 滚动键（T3.2 剩余）：PageUp/PageDown/Home/End 首次映射（此前落进 `Other`）。
+        KeyboardKey::Named(NamedKey::PageUp) => Key::PageUp,
+        KeyboardKey::Named(NamedKey::PageDown) => Key::PageDown,
+        KeyboardKey::Named(NamedKey::Home) => Key::Home,
+        KeyboardKey::Named(NamedKey::End) => Key::End,
         KeyboardKey::Named(NamedKey::ArrowDown) => Key::Down,
         KeyboardKey::Named(NamedKey::Space) => Key::Char(' '),
         KeyboardKey::Character(s) => match single_char(s) {
@@ -1494,7 +1509,9 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
                 match event.state {
                     ElementState::Pressed => {
                         // **物理键先发**：`Char('a')`/`Enter`/`Tab`… 一律先来 KeyDown。
-                        self.dispatch(event_loop, &InputEvent::KeyDown { key, mods }, Gate::AppDecides);
+                        // T3.6：winit 的 `event.repeat` 首次建模进事件 —— OS 的按键重复
+                        // （长按补发）从此**可区分**；`Gate::AppDecides` 照旧。
+                        self.dispatch(event_loop, &InputEvent::KeyDown { key, mods, repeat: event.repeat }, Gate::AppDecides);
                         // **文本与物理键分开**：IME 预编辑中由 `Ime::Commit` 负责文本
                         // （免得中文重复上屏）；`Enter/Tab/Backspace/Esc` 的 text 是
                         // 控制字符，被 `printable_text` 挡掉 ⇒ 它们只有 KeyDown。

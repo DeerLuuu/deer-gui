@@ -69,7 +69,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use deer_gui::gpu::interact::{FieldText, InteractState, InteractiveRenderer};
+use deer_gui::gpu::interact::{FieldText, InteractiveRenderer};
 use deer_gui::gpu::measure::find_system_font;
 use deer_gui::gpu::null::CpuRenderer;
 use deer_gui::gpu::{Color, DrawCmd, DrawList, Extent, TextEngine, Theme};
@@ -167,11 +167,10 @@ impl Frame {
             },
             measure,
         );
-        let interact = InteractState {
-            hover: state.hover.clone(),
-            focus: state.focus.clone(),
-            pressed: state.pressed.clone(),
-        };
+        // ⚠️ 不要手抄这份转换 —— 用 `UiState::to_interact_state()`（唯一收口）。
+        // 这里保留字面写法只是历史示例，但字段必须齐（T3.2/T3.4 加的 scroll/preedit/carets），
+        // 否则 `--features window` 的 examples 编不过（master 上一度真红过：PR 里只跑了默认 feature）。
+        let interact = state.to_interact_state();
         let list = InteractiveRenderer::with_texts(
             theme.clone(),
             measure,
@@ -1008,6 +1007,7 @@ fn expected_state() -> UiState {
         texts: std::collections::BTreeMap::from([("field_1".to_string(), "hi".to_string())]),
         carets: Default::default(),
         scroll: Default::default(),
+        preedit: Default::default(),
     }
 }
 

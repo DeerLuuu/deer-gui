@@ -17,7 +17,7 @@
 //! | `move:X,Y` | 指针移到 `(X, Y)`（f32，贴边/负数都允许） |
 //! | `down:left` / `down:right` / `down:middle` | 指针按下（坐标为**最近一次 `move`**；还没 move 过就是 `(0,0)`） |
 //! | `up:left`（同上三档） | 指针抬起（坐标口径同 `down`） |
-//! | `key:Tab` | `KeyDown`。可写 `Escape`/`Enter`/`Backspace`/`Left`/`Right`/`Up`/`Down`/`Other`/`Char(a)` |
+//! | `key:Tab` | `KeyDown`。可写 `Escape`/`Enter`/`Backspace`/`Left`/`Right`/`Up`/`Down`/`Other`/`Char(a)`。**键名后加 `*`（`key:Tab*`）= 系统按键重复**（`repeat: true`，T3.6） |
 //! | `shift+key:Tab`（或 `key:shift+Tab`） | 同上，带 Shift。`ctrl+`/`alt+`/`sup+` 同档，用 `+` 可叠加；前缀写在**动词一侧或键名一侧都行** |
 //! | `text:hi` | 一段文本输入（原样，含空格与中文；是**追加**不是覆盖） |
 //! | `focus:off` / `focus:on` | 窗口失焦 / 重新获得窗口焦点（`FocusChanged`） |
@@ -43,7 +43,7 @@
 //!     evs[1],
 //!     InputEvent::PointerDown { button: PointerButton::Left, x: 10.0, y: 20.0 }
 //! );
-//! assert_eq!(evs[3], InputEvent::KeyDown { key: Key::Tab, mods: Default::default() });
+//! assert_eq!(evs[3], InputEvent::KeyDown { key: Key::Tab, mods: Default::default(), repeat: false });
 //! assert_eq!(evs[4], InputEvent::TextInput { text: "hi".to_string() });
 //! ```
 
@@ -100,8 +100,16 @@ pub fn parse_script(src: &str) -> Result<Vec<InputEvent>, String> {
                 out.push(InputEvent::Wheel { dx, dy });
             }
             "key" | "keydown" => {
-                let (key, mods) = parse_key(arg, mods_prefix).map_err(|e| format!("{where_} {e}"))?;
-                out.push(InputEvent::KeyDown { key, mods });
+                // `repeat` 默认 false：脚本重放写的是「用户按下一次」；
+                // 要模拟长按重复，键名后加 `*`（`key:Tab*`）—— 与坐标的 `@id` 定位
+                // 一样是「动词参数的修饰」，不另立新动词。
+                let (name, repeat) = match arg.strip_suffix('*') {
+                    Some(rest) => (rest, true),
+                    None => (arg, false),
+                };
+                let (key, mods) = parse_key(name, mods_prefix)
+                    .map_err(|e| format!("{where_} {e}"))?;
+                out.push(InputEvent::KeyDown { key, mods, repeat });
             }
             "keyup" => {
                 let (key, mods) = parse_key(arg, mods_prefix).map_err(|e| format!("{where_} {e}"))?;
@@ -200,6 +208,10 @@ fn parse_key(s: &str, mods: Mods) -> Result<(Key, Mods), String> {
         "Left" => Key::Left,
         "Right" => Key::Right,
         "Up" => Key::Up,
+        "PageUp" => Key::PageUp,
+        "PageDown" => Key::PageDown,
+        "Home" => Key::Home,
+        "End" => Key::End,
         "Down" => Key::Down,
         "Other" => Key::Other,
         other => {
@@ -285,6 +297,23 @@ pub fn texts_of(state: &UiState) -> BTreeMap<String, String> {
 mod tests {
     use super::*;
 
+    /// T3.6：键名后加 `*` ⇒ `repeat: true`（模拟系统按键重复）；不加 ⇒ `false`。
+    #[test]
+    fn key_star_suffix_means_repeat() {
+        let evs = parse_script("key:Tab*; key:Tab").unwrap();
+        assert_eq!(evs.len(), 2);
+        assert_eq!(
+            evs[0],
+            InputEvent::KeyDown { key: Key::Tab, mods: Default::default(), repeat: true },
+            "`key:Tab*` 应解析成带 repeat 的 KeyDown"
+        );
+        assert_eq!(
+            evs[1],
+            InputEvent::KeyDown { key: Key::Tab, mods: Default::default(), repeat: false },
+            "不带 `*` 的仍是普通按下（repeat=false）—— 既有脚本语义不回退"
+        );
+    }
+
     #[test]
     fn parses_the_documented_syntax() {
         let evs = parse_script("move:120,80;down:left;up:left;key:Tab;text:hi").unwrap();
@@ -312,7 +341,8 @@ mod tests {
             evs[3],
             InputEvent::KeyDown {
                 key: Key::Tab,
-                mods: Mods::default()
+                mods: Mods::default(),
+                repeat: false,
             }
         );
         assert_eq!(evs[4], InputEvent::TextInput { text: "hi".into() });
@@ -343,7 +373,8 @@ mod tests {
                 mods: Mods {
                     shift: true,
                     ..Default::default()
-                }
+                },
+                repeat: false,
             }
         );
 
@@ -357,7 +388,8 @@ mod tests {
                     ctrl: true,
                     alt: true,
                     ..Default::default()
-                }
+                },
+                repeat: false,
             }
         );
 
@@ -382,7 +414,8 @@ mod tests {
                 mods: Mods {
                     shift: true,
                     ..Default::default()
-                }
+                },
+                repeat: false,
             }
         );
         assert_eq!(evs[1], InputEvent::TextInput { text: "hello world".into() });

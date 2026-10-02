@@ -193,6 +193,7 @@ fn single_event_and_script_both_report_ui_events() -> Result<(), String> {
     let s = h.send(&InputEvent::KeyDown {
         key: Key::Tab,
         mods: Default::default(),
+        repeat: false,
     })?;
     assert!(s.changed);
     assert!(matches!(&s.events[0], UiEvent::FocusChanged(Some(id)) if id == "plus"));

@@ -262,8 +262,11 @@ assert_eq!(hit.map(|n| n.id.as_str()), Some("button_1"));
 
 > 对应示例：`cargo run -p deer-gui --example geometry`
 
-**滚动条**：滚动容器现在会自己长出「轨道 + 滑块」（几何与将来命中侧共用一份实现）。
-跑 `cargo run -p deer-gui --example scroll_bar` 看实测输出；
+**滚动条**：滚动容器现在会自己长出「轨道 + 滑块」（几何与命中侧共用一份实现），
+滑块能**拖**、轨道空白**点一下跳到指针处**（T3.2b）。跑 `cargo run -p deer-gui --example scroll_bar`
+看实测输出；真窗口里的**惯性滚动**（滚轮之后继续滑一段再自己停）看
+`cargo run -p deer-gui --features window --example scroll_inertia_window` —— App 侧接线只要两行
+（`redraw()` 里 `advance_inertia`、`next_deadline()` 返回 `inertia_deadline`）。
 注意 `layout_with_scroll` 给出的上限**每帧**都要 `set_metrics` 灌回状态，否则滚动条不出现
 （见 [`features/scrollbar.md`](features/scrollbar.md)）。
 
@@ -375,10 +378,10 @@ deer-gui = { path = "../deer-gui/crates/deer-gui" }
 | **鼠标点击 / 键盘输入** | ✅ 已支持：悬停 / 按下 / 点击 / 文本输入 + **输入框光标**（T3.5：在光标处插入 / `Backspace` 删**光标前一个 Unicode 字符** / **左右方向键**移动光标，单位是**字符位**）；见 [`features/input.md`](features/input.md) |
 | **Tab 焦点** | ✅ 已支持：`Tab` / `Shift+Tab` 循环（树序）、`Escape` 清焦点、点击可聚焦控件即聚焦 |
 | **滚轮 / 滚动容器 / 多行文本** | ✅ 已支持（剩余工作第 1 项）：`column` + `scroll` ⇒ `max_scroll` + 视口裁剪，`text` + `wrap` ⇒ 每行一条 `DrawCmd::Text`；滚轮滚 `hover` 所在容器、到边界不越界；见 [`features/scroll-and-multiline.md`](features/scroll-and-multiline.md) |
-| **滚动条** | ✅ 已支持（**拖滑块**改偏移；**默认 opt-in**）：内容装不下就长出「轨道 + 滑块」，内容装得下则不画；见 [`features/scrollbar.md`](features/scrollbar.md)。**点轨道跳转未做**（点空白处不会跳页） |
-| **惯性滚动** | 🔄 **只有一半**：纯逻辑（`ScrollInertia` + 到边界即停）与判据都在，但**窗口层没人按时调 `inertia_step`** ⇒ **真实窗口里看不到**（要 App 自己在唤醒回调里驱动）；见 [`features/scrollbar.md`](features/scrollbar.md#做不到什么) |
+| **滚动条** | ✅ 已支持（**拖滑块**改偏移 + **点轨道空白跳到指针处**并可续拖；**默认 opt-in**）：内容装不下就长出「轨道 + 滑块」，内容装得下则不画；见 [`features/scrollbar.md`](features/scrollbar.md) |
+| **惯性滚动** | ✅ 已支持（T3.2b）：App 在 `redraw()` 里调 `advance_inertia`、`next_deadline()` 返回 `inertia_deadline` 即可（两行接线；参考 `--example scroll_inertia_window`）；衰减、到边界即停、停了不空转都有判据 |
 | **输入法（IME 预编辑）** | ✅ 已支持：中文/日文还没上屏的那一段画在光标处 + 下划线，提交才进内容 ⇒ 无双写；见 [`features/ime.md`](features/ime.md) |
-| **方向键上下导航（焦点在容器内移动） / 右键中键 / 按键滚动（`PageUp` / `Home` / `End`）/ 按键重复** | ❌ 未做（见 [`features/input.md`](features/input.md) 第 6 节）。**左右方向键已做**：移动输入框光标 |
+| **方向键上下导航 / 按键滚动（`PageUp`/`Home`/`End`）/ 右键透传 / 按键重复** | ✅ 已支持（T3.1/T3.2/T3.3/T3.6）：上下按**几何邻近**移焦点；翻页/到顶到底滚**焦点容器**；右键发 `PointerRight`；`KeyDown.repeat` 可区分长按重复。见 [`features/input.md`](features/input.md) |
 | **可停靠面板 dock** / 多窗口 | ❌ M6 |
 | 12 个 `deer-ui` 控件的语义 | ❌ M6（现在只有 5 种节点） |
 
@@ -483,11 +486,11 @@ $env:DEER_WINDOW_HOLD='1'; cargo run -p deer-gui --features window --example win
   回读**强制一次 GPU→CPU 同步**，所以只在第一帧做一次。
 - 目前**只有 Windows** 实现了窗口句柄的填充；非 Windows 会明确返回 `Err`。
 
-**仍然做不到**：方向键上下导航（焦点在容器内移动） / 右键中键 / 按键滚动（`PageUp` / `Home` / `End`）/
-按键重复（M5 剩余）、多窗口 / 全屏 / HDR / 帧率上限、
+**仍然做不到**：多窗口 / 全屏 / HDR / 帧率上限、
 `size <= 0` 的文本与 CPU 一致（见第 13 章）。
-**滚动条、IME 预编辑已经做到了**（[`features/scrollbar.md`](features/scrollbar.md)、
-[`features/ime.md`](features/ime.md)）—— 但**惯性滚动**只落到纯逻辑，窗口里还得自己驱动才算能用。
+（方向键导航、按键滚动、右键透传、按键重复都已落地 —— 见 [`features/input.md`](features/input.md)。）
+**滚动（滚动条 + 点轨道跳转 + 惯性）与 IME 预编辑已经做到了**（[`features/scrollbar.md`](features/scrollbar.md)、
+[`features/ime.md`](features/ime.md)）—— 惯性的接线只剩两行（`advance_inertia` + `inertia_deadline`）。
 输入与焦点**已可用**，**重绘也已是事件驱动（默认省电）** ——
 见 [`features/input.md`](features/input.md) 与 [`features/window.md`](features/window.md) 第 6 节。
 完整边界见 [`features/window.md`](features/window.md) 与

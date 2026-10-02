@@ -51,6 +51,13 @@ required-features = ["window"]
 name = "interactive_form"
 required-features = ["window"]
 
+# T3.2b：惯性滚动的窗口接线（推进 + 拉式唤醒 + 点轨道跳转的参考实现）。
+# 窗口路径 ⇒ 必须显式写 required-features，否则默认（无 feature）构建会去编译它而失败
+# —— 那不是「跳过」，是 `cargo test --workspace` 直接红（理由与 interactive_form 那段逐字相同）。
+[[example]]
+name = "scroll_inertia_window"
+required-features = ["window"]
+
 # 上手教程的主角（`docs/GETTING-STARTED-UI.md`）：最小但有真功能的交互界面。
 # 同样是窗口路径 ⇒ 必须显式写 `required-features`，否则 `cargo test --workspace` 直接红
 # （理由与上面 interactive_form 那段逐字相同）。

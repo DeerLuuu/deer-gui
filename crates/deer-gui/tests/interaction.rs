@@ -48,6 +48,7 @@ fn press(k: Key, shift: bool) -> InputEvent {
     InputEvent::KeyDown {
         key: k,
         mods: Mods { shift, ..Default::default() },
+        repeat: false,
     }
 }
 

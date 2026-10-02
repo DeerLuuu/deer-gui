@@ -21,14 +21,14 @@
 
 **什么时候不该用它**：
 - 你只想要一张图 / 一组断言 —— 用离屏出图（[`rendering.md`](rendering.md)），别开窗口；
-- 你想要**方向键上下导航、右键 / 中键语义、按键重复、按键滚动**（`PageUp`/`Home`/`End`） —— 这些**还没做**（第 6 节）。
+- 你想要**方向键上下导航、右/中键语义、按键重复、按键滚动** —— 这些**都已经做了**（见第 6 节「已落地」）。
   **已经可以做到的**（别再当成没做）：**输入框光标**（T3.5：在光标处插入 / `Backspace` 删**光标前一个 Unicode 字符** /
   **左右方向键**移动光标，单位是**字符位**；T3.8 起画面上**真的画出了那根竖线**）、**IME 预编辑**
   （画在光标处 + 下划线、光标推到它之后，见 [`ime.md`](ime.md)）、**可视滚动条 + 拖滑块改偏移**
   （见 [`scrollbar.md`](scrollbar.md)）、滚轮驱动的**垂直滚动**
   （见 [`scroll-and-multiline.md`](scroll-and-multiline.md)）。
-  ⚠️ **惯性别算进来**：`ScrollInertia` 只有**纯逻辑**就位，**窗口层没人按 `INERTIA_TICK_MS` 调 `inertia_step`**
-  ⇒ **真实窗口里看不到惯性**（详见 [`scrollbar.md`](scrollbar.md#做不到什么)）。
+  惯性的窗口侧用法（两行）：`redraw()` 开头 `advance_inertia(&mut state)`、
+  `next_deadline()` 返回 `inertia_deadline(&state)`（见 [`scrollbar.md`](scrollbar.md)）。
 - 你想把命中测试当**通用碰撞检测** —— 它是**输入路由**，语义见第 3.2 节（禁用子树不回退、半开区间）。
 
 ## 2. 最小示例
@@ -275,24 +275,29 @@ assert!(parse_script("# 注释行\nbad:3").unwrap_err().contains("第 2 条"));
 ### 6.2 仍未做 / 边界（**不要以为能跑**）
 
 **已经落地的**（别再当成没做）：
+- **方向键上下导航**（T3.1，D2 几何邻近）：严格方向 + 垂直最近 + 水平平手 + 树序兜底；
+  无焦点不定义、到边停、聚焦输入框时不消费；
+- **按键滚动**（T3.2 收尾）：`PageUp`/`PageDown` 翻一页（视口高）、`Home`/`End` 到顶/到底；
+  目标 = 焦点容器优先、退 `hover`（与滚轮同规则）；输入框聚焦时不消费；
+- **右键**（T3.3，Q1 纯透传）：按下即发 `PointerRight { id }`（不 pressed/不焦点；禁用子树不发）；
+  **中键**只同步 hover；
+- **按键重复**（T3.6）：`KeyDown` 带 `repeat: bool`（winit 的 `event.repeat` 首次建模；
+  交互层不区分、调用方可过滤；脚本 `key:Tab*` 生成 `repeat: true`）；
 - **按时间的动画**：**M5c 起可以在 `OnDemand` 下自驱** —— 用唤醒面（`App::wake_handle` + `Waker::wake_after` /
   `App::next_deadline`，见 [`window.md`](window.md) 第 6 节），**不再必须**声明 `Continuous`（声明了仍然可以）。
   注意 `next_deadline()` 必须返回**固定时刻并自己往前走**（返回 `now()+50ms` 会永远不到点 ⇒ 空转），
   且**本层不做防护**（那等于凭空造超时）；
 - **滚动那一支**：滚轮 → `ScrollState` 偏移 → 几何/绘制/命中（见
-  [`scroll-and-multiline.md`](scroll-and-multiline.md)）；**可视滚动条**（轨道 + 滑块、**按滑块拖动**改偏移、
-  内容装得下就不画），见 [`scrollbar.md`](scrollbar.md)；
+  [`scroll-and-multiline.md`](scroll-and-multiline.md)）；**可视滚动条**（拖滑块改偏移、
+  **点轨道空白跳到指针处**并可续拖）与**惯性驱动的收口函数**（`advance_inertia` +
+  `inertia_deadline`，参考实现 `scroll_inertia_window`），见 [`scrollbar.md`](scrollbar.md)；
 - **IME 预编辑**（见 [`ime.md`](ime.md)）：只进 `UiState::preedit`、提交才进 `texts` 并清缓冲 ⇒ **无双写**，
   画在光标处 + 下划线、光标推到它之后；
 - **输入框光标**（T3.5 建模 + T3.8 渲染）：画面上真的有一根竖线，失焦时不画。
 
 **仍未做**：
-- **停靠面板 / 多窗口**；**方向键上下导航**（焦点在容器内移动；`hit-testing.md` 记的缺口）；**右键 / 中键**的语义；
-- **按键滚动**（方向键 / `PageUp` / `Home` / `End` 改偏移）；
-- **惯性的窗口层接线**：纯逻辑与判据都在（`ScrollInertia` / `inertia_step` / `inertia_active`），
-  但**没有人按 `INERTIA_TICK_MS` 调它** ⇒ App 要在自己的唤醒回调里驱动 ⇒ **真实窗口里看不见惯性**；
-- **滚动条的「点轨道跳转」**（点空白处跳到那一页）：只能拖滑块或滚轮；
-- **按键重复未建模**（长按会产生重复 `KeyDown`，状态机不区分「重复」与「新按」）；
+- **停靠面板 / 多窗口**；
+
 - **`Focused` 只能人肉验证**（`DEER_INPUT_HOLD=1` 留窗观察），没有自动判据
   （`Ime` 那半已有自动判据，见 [`ime.md`](ime.md)；**真机输入法**仍需人拼一段中文肉眼确认）。
 

@@ -145,7 +145,7 @@ fn idle_event(i: u64) -> InputEvent {
 
 /// 一条「改变状态」的事件。
 fn changing_event() -> InputEvent {
-    InputEvent::KeyDown { key: Key::Char('a'), mods: Mods::default() }
+    InputEvent::KeyDown { key: Key::Char('a'), mods: Mods::default(), repeat: false }
 }
 
 // ——————————————— 1. 真值表 ———————————————
