@@ -245,6 +245,7 @@ name = "deer-gpu"
 version = "0.0.0"
 dependencies = [
  "deer-layout",
+ "deer-log",
 ]
 
 [[package]]
@@ -253,12 +254,17 @@ version = "0.0.0"
 dependencies = [
  "deer-gpu",
  "deer-layout",
+ "deer-log",
  "deer-vk",
  "deer-window",
 ]
 
 [[package]]
 name = "deer-layout"
+version = "0.0.0"
+
+[[package]]
+name = "deer-log"
 version = "0.0.0"
 
 [[package]]
