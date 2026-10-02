@@ -44,6 +44,7 @@
 | **绝对定位 / 层叠**（L1：`position: Pos::Offset` ⇒ 子节点脱离流内（不占槽、不计入父固有尺寸），位置 = 父内容盒原点 + 像素偏移（可负）；层叠 = **声明序**（后声明者后画且命中优先）；`.dui` 写法 `pos=x,y`；默认 opt-in ⇒ 未设时既有树逐字节不变） | ✅ | [absolute-positioning](docs/features/absolute-positioning.md) | `cargo run -p deer-gui --example overlay_demo` |
 | **每子节点交叉轴对齐**（L2：`cross_self: Option<Align>` **覆盖**容器级 `cross_axis`，只对该流内子节点生效（对齐与 stretch 吃满都按它算）；`None` 回落容器级；流外（`position`）子节点不生效；`.dui` 写法 `cross-self=`；默认 opt-in ⇒ 未设时既有树逐字节不变） | ✅ | [align-self](docs/features/align-self.md) | `cargo run -p deer-gui --example layout_refine_demo` |
 | **最小/最大尺寸**（L3：`min_w`/`max_w`/`min_h`/`max_h`（`Option<Size>`，像素/百分比），min 下限、max 上限，**measure 与 place 两处都生效**（固有尺寸聚合、显式尺寸、grow/stretch 分配结果都夹进 `[min,max]`）；`min > max` ⇒ min 赢；滚动容器主轴 bound=无穷时照常生效；流外子节点同样受夹；`.dui` 写法 `min-w=`/`max-w=`/`min-h=`/`max-h=`；默认 opt-in ⇒ 未设时既有树逐字节不变） | ✅ | [min-max-sizes](docs/features/min-max-sizes.md) | `cargo run -p deer-gui --example layout_refine_demo` |
+| **anchors 锚定**（L4：`position: Pos::Anchors { l, t, r, b, ox, oy }` 与 `Offset` **同一个机制**（Q5）——`l/t/r/b` 是父内容盒锚点比例（可缺省 = 该边无锚，可超 [0,1]），`ox/oy` 是内缩式像素修正；一轴双锚 ⇒ 尺寸由锚点对导出（显式 w/h 被忽略），单锚 ⇒ 显式/固有；**resize 时锚定边跟随新盒、偏移保持**；min/max 照常夹取；流外共则（不占流 / 不计入父固有 / 声明序层叠 / 滚动平移）；`.dui` 逐边 `anchor-=` 或规范形 `pos=anchors:…`；默认 opt-in ⇒ 未设时既有树逐字节不变） | ✅ | [anchors](docs/features/anchors.md) | `cargo run -p deer-gui --example anchors_demo` |
 | **命中测试**（坐标 → 哪个控件） | ✅ | [hit-testing](docs/features/hit-testing.md) | `cargo run -p deer-gui --example geometry` |
 
 ## 三、渲染与自检

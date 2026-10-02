@@ -11,7 +11,7 @@
 
 什么时候用它：徽标（角标）、悬浮提示、下拉菜单这类「盖在别人上面、不挤动兄弟」的东西。
 什么时候**不**用它：想让父容器跟着它变大变高的时候 —— 流外节点不计入父固有尺寸，
-父容器不会为它撑大；那是要流内布局，或者（将来）anchors。
+父容器不会为它撑大；那是要流内布局，或者（要跟随父盒子 resize 的）[anchors](anchors.md)。
 
 **opt-in，最高红线**：不设 `position`（默认 `None`）的树，布局、绘制、命中**逐字节不变**。
 
@@ -94,9 +94,9 @@ assert_eq!(hit_test(&tree, &geo, 20.0, 20.0).map(|n| n.id.as_str()), Some("badge
 - 滚动容器与裁剪（流外节点在滚动容器里的行为见第 3 节）：[scroll-and-multiline](scroll-and-multiline.md)
 - 属性注册表（`position` 已登记）：[prop-registry](prop-registry.md)
 - **做不到什么**（都如实登记，不要误以为能跑）：
-  - **anchors 未做**（L4）：不能按比例锚定四边（如 `l=0, r=1` 撑满）。`Pos` 本轮只有
-    `Offset` 一个变体 —— anchors 会以**新变体**并入同一个机制（ROADMAP D6/Q5 的裁定），
-    不会另起第二个定位机制；
+  - **anchors 已落地（L4）**：按比例锚定四边（如 `l=0, r=1` 撑满、resize 跟随）见
+    [anchors](anchors.md) —— 它是**同一个机制的第二种取值**（`Pos::Anchors`，Q5 裁定），
+    不是第二套定位；本篇的 `Offset` 仍是「位置固定、不跟盒子走」的最短写法；
   - **相对视口 fixed 未做**：偏移的参照物永远是**父容器内容盒**，没有「钉在窗口角落」的语义；
   - **z-index 数值层级未做**：层叠只有**声明序**（后声明者在上、命中优先），没有数值；
   - 被偏移出**父矩形之外**的部分**点不到**（`hit_test` 按祖先矩形剪枝）；能不能「画出来」
@@ -109,4 +109,5 @@ assert_eq!(hit_test(&tree, &geo, 20.0, 20.0).map(|n| n.id.as_str()), Some("badge
 - [x] 示例有自检断言（固有尺寸 / 偏移数值 / 重叠点像素 / 命中优先 / `.dui` 往返）
 - [x] `FEATURES.md` 已登记（状态 / 指南链接 / 示例命令都对）
 - [x] `docs/TUTORIAL.md` 已提及（第 6 章与第 10 章边界表）
-- [x] 明确写了「做不到什么」（anchors / fixed / z-index / 父矩形外命中）
+- [x] 明确写了「做不到什么」（fixed / z-index / 父矩形外命中；anchors 已落地，
+      见 [anchors.md](anchors.md)）

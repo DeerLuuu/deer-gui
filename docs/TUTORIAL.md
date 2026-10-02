@@ -283,7 +283,7 @@ assert_eq!(hit.map(|n| n.id.as_str()), Some("button_1"));
 `n.layout.position = Some(Pos::Offset { x, y })`），它就**脱离流内布局** ——
 不占兄弟的槽位、父容器也不为它撑大，位置 = 父内容盒原点 + 偏移（可为负，允许伸出父盒子）。
 层叠 = **声明序**：后声明者后画（在上）且命中优先 —— 徽标、悬浮提示、下拉面板就用它。
-边界：anchors（按比例锚定）、相对视口 fixed、z-index 数值层级都**没有**（见
+边界：相对视口 fixed、z-index 数值层级都**没有**（见
 [`features/absolute-positioning.md`](features/absolute-positioning.md) 第 6 节）。
 
 ```rust
@@ -292,6 +292,23 @@ r.button_opts("徽标", |n| n.layout.position = Some(Pos::Offset { x: 120, y: 30
 ```
 
 > 对应示例：`cargo run -p deer-gui --example overlay_demo`
+
+**anchors 锚定**（L4）：`position` 的第二种取值 `Pos::Anchors` —— 四边「钉」在
+**父内容盒**的比例位置上（`l/t/r/b`，0=左/上边、1=右/下边），`ox/oy` 是像素修正
+（内缩式：正 = 向内、负 = 向外）。**resize 时锚定边跟着新盒走、偏移保持** ——
+`l=0, r=1` 的面板窗口一拉就自动撑满，这是它与 `Offset` 的本质区别。
+一轴两侧都有锚 ⇒ 该轴尺寸由锚点对导出（显式 `w`/`h` 被忽略）；只锚一边 ⇒ 显式/固有尺寸；
+min/max 照常夹取；层叠 / 命中 / 滚动行为与 `Offset` 完全一致。
+
+```rust
+// 撑满父内容盒、四边各内缩 8px：父盒子 resize 时自动跟随
+n.layout.position = Some(Pos::Anchors {
+    l: Some(0.0), t: Some(0.0), r: Some(1.0), b: Some(1.0), ox: 8, oy: 8,
+});
+```
+
+> 对应示例：`cargo run -p deer-gui --example anchors_demo`
+> （边界与「做不到什么」见 [`features/anchors.md`](features/anchors.md)）
 
 **交叉轴单独对齐 + 尺寸夹具**（L2/L3）：某个子节点不想跟大队时，给它设
 `cross_self`（或 `.dui` 的 `cross-self=center`）—— **覆盖**容器级 `cross`，只对它一个生效
@@ -415,7 +432,8 @@ deer-gui = { path = "../deer-gui/crates/deer-gui" }
 | **惯性滚动** | ✅ 已支持（T3.2b）：App 在 `redraw()` 里调 `advance_inertia`、`next_deadline()` 返回 `inertia_deadline` 即可（两行接线；参考 `--example scroll_inertia_window`）；衰减、到边界即停、停了不空转都有判据 |
 | **输入法（IME 预编辑）** | ✅ 已支持：中文/日文还没上屏的那一段画在光标处 + 下划线，提交才进内容 ⇒ 无双写；见 [`features/ime.md`](features/ime.md) |
 | **方向键上下导航 / 按键滚动（`PageUp`/`Home`/`End`）/ 右键透传 / 按键重复** | ✅ 已支持（T3.1/T3.2/T3.3/T3.6）：上下按**几何邻近**移焦点；翻页/到顶到底滚**焦点容器**；右键发 `PointerRight`；`KeyDown.repeat` 可区分长按重复。见 [`features/input.md`](features/input.md) |
-| **绝对定位 / 层叠** | ✅ 已支持（L1）：`pos=x,y` ⇒ 脱离流内布局，位置 = 父内容盒原点 + 偏移（可负）；层叠 = 声明序（后声明者在上且命中优先）。**没有** anchors / 视口 fixed / z-index 数值层级。见 [`features/absolute-positioning.md`](features/absolute-positioning.md) |
+| **绝对定位 / 层叠** | ✅ 已支持（L1）：`pos=x,y` ⇒ 脱离流内布局，位置 = 父内容盒原点 + 偏移（可负）；层叠 = 声明序（后声明者在上且命中优先）。见 [`features/absolute-positioning.md`](features/absolute-positioning.md)。**没有**视口 fixed / z-index 数值层级 |
+| **anchors 锚定** | ✅ 已支持（L4）：`Pos::Anchors` ⇒ 四边钉在父内容盒的比例位置，**resize 时锚定边跟随、偏移保持**；与 `Offset` 同一个机制（同一个 `position` 字段）。**没有**百分比偏移（偏移是像素）/ 跨层锚定。见 [`features/anchors.md`](features/anchors.md) |
 | **可停靠面板 dock** / 多窗口 | ❌ M6 |
 | 12 个 `deer-ui` 控件的语义 | ❌ M6（现在只有 5 种节点） |
 

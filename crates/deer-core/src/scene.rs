@@ -174,7 +174,8 @@ fn parse_attrs(s: &str, line: usize, source: &str) -> Result<Vec<(String, AttrVa
 
 const KNOWN_ATTRS: &[&str] = &[
     "name", "w", "h", "min-w", "max-w", "min-h", "max-h", "pad", "gap", "main", "cross",
-    "cross-self", "grow", "scroll", "wrap", "pos", "label", "disabled",
+    "cross-self", "grow", "scroll", "wrap", "pos", "anchor-l", "anchor-t", "anchor-r", "anchor-b",
+    "anchor-ox", "anchor-oy", "label", "disabled",
 ];
 
 /// 开关属性（裸属性 = 真；**带值就报错**）。
@@ -236,11 +237,68 @@ fn as_align(v: &AttrVal, key: &str, line: usize, source: &str) -> Result<Align, 
 }
 
 /// `pos=x,y`（L1 流外定位；与 [`Pos::parse`] 共用一份语法，裸属性报错）。
+///
+/// `Pos::parse` 同时认得 `anchors:` 规范形（[`Pos::to_attr`] 的输出，L4）⇒
+/// `pos=anchors:l,t,r,b,ox,oy` 也从这条路进来，两种拼法同一个机制。
 fn as_pos(v: &AttrVal, key: &str, line: usize, source: &str) -> Result<Pos, SceneError> {
     match v {
-        AttrVal::Bare => Err(err(format!("{key} 需要一个值（形如 pos=10,-20）"), line, source)),
-        AttrVal::Str(s) => Pos::parse(s)
-            .ok_or_else(|| err(format!("{key} 必须是 \"整数,整数\"（可为负），实际 \"{s}\""), line, source)),
+        AttrVal::Bare => Err(err(
+            format!("{key} 需要一个值（形如 {key}=10,-20 或 {key}=anchors:0,0,1,1,8,8）"),
+            line,
+            source,
+        )),
+        AttrVal::Str(s) => Pos::parse(s).ok_or_else(|| {
+            err(
+                format!(
+                    "{key} 必须是 \"整数,整数\"（可为负）或 \
+                     \"anchors:边,边,边,边,偏移,偏移\"（边 = 数字或 - 表示无锚），实际 \"{s}\""
+                ),
+                line,
+                source,
+            )
+        }),
+    }
+}
+
+/// `anchor-l/t/r/b=<比例>`（L4）：数字；**裸属性报错**（「写错但不生效」最难查，
+/// 与 `as_flag` 同一条哲学）。缺省（属性没出现）= 该边**没有锚** —— 用 `Option` 表达，
+/// 不用 `0.0` 兜底：`anchor-r=1` 单独出现时 l/t/b 必须是「无锚」，而不是 0。
+fn as_anchor_side(
+    v: Option<&AttrVal>,
+    key: &str,
+    line: usize,
+    source: &str,
+) -> Result<Option<f32>, SceneError> {
+    match v {
+        None => Ok(None),
+        Some(AttrVal::Bare) => Err(err(
+            format!("{key} 需要一个值（形如 {key}=0.5）"),
+            line,
+            source,
+        )),
+        Some(AttrVal::Str(s)) => s.parse::<f32>().map(Some).map_err(|_| {
+            err(format!("{key} 必须是数字（锚点比例），实际 \"{s}\""), line, source)
+        }),
+    }
+}
+
+/// `anchor-ox/oy=<整数像素>`（L4）：偏移是像素，小数直接报错（不许静默截断）。
+fn as_anchor_px(
+    v: Option<&AttrVal>,
+    key: &str,
+    line: usize,
+    source: &str,
+) -> Result<Option<i32>, SceneError> {
+    match v {
+        None => Ok(None),
+        Some(AttrVal::Bare) => Err(err(
+            format!("{key} 需要一个值（形如 {key}=8）"),
+            line,
+            source,
+        )),
+        Some(AttrVal::Str(s)) => s.parse::<i32>().map(Some).map_err(|_| {
+            err(format!("{key} 必须是整数（像素偏移），实际 \"{s}\""), line, source)
+        }),
     }
 }
 
@@ -452,6 +510,40 @@ pub fn parse_scene_collect(src: &str, source: &str) -> Result<(Node, Vec<String>
         if let Some(v) = get("pos") {
             layout.position = Some(as_pos(v, "pos", line, source)?);
         }
+        // 流外锚定（L4）：`anchor-l/t/r/b=<比例>` + `anchor-ox/oy=<像素>`。
+        // **任一 anchor-* 出现 ⇒ `Pos::Anchors`**（没出现的边 = 无锚、偏移缺省 0）；
+        // 与 `pos=` **同时出现是硬报错** —— 两种拼法写的是同一个 `position` 字段，
+        // 「同时设了谁赢」是无解问题（Q5 合并机制就是为了消掉它，不许它换个面目回来）。
+        let a_l = as_anchor_side(get("anchor-l"), "anchor-l", line, source)?;
+        let a_t = as_anchor_side(get("anchor-t"), "anchor-t", line, source)?;
+        let a_r = as_anchor_side(get("anchor-r"), "anchor-r", line, source)?;
+        let a_b = as_anchor_side(get("anchor-b"), "anchor-b", line, source)?;
+        let a_ox = as_anchor_px(get("anchor-ox"), "anchor-ox", line, source)?;
+        let a_oy = as_anchor_px(get("anchor-oy"), "anchor-oy", line, source)?;
+        if a_l.is_some()
+            || a_t.is_some()
+            || a_r.is_some()
+            || a_b.is_some()
+            || a_ox.is_some()
+            || a_oy.is_some()
+        {
+            if get("pos").is_some() {
+                return Err(err(
+                    "pos 与 anchor-* 不能同时设置（两者写的是同一个 position；\
+                     逐边属性或 pos=anchors:… 二选一）",
+                    line,
+                    source,
+                ));
+            }
+            layout.position = Some(Pos::Anchors {
+                l: a_l,
+                t: a_t,
+                r: a_r,
+                b: a_b,
+                ox: a_ox.unwrap_or(0),
+                oy: a_oy.unwrap_or(0),
+            });
+        }
 
         let mut nprops = NodeProps::default();
         if let Some(AttrVal::Str(s)) = get("label") {
@@ -589,8 +681,9 @@ pub fn encode_scene(root: &Node) -> String {
         if l.wrap {
             attrs.push("wrap".to_string());
         }
-        // 流外定位（L1）：`Some` 才写 ⇒ 未设时编码**不多写一个字节**（既有语料逐字节不变）。
-        // 值形如 `10,-20`（无空格 ⇒ 不需要引号；`Pos::parse` 与 `to_attr` 互逆 ⇒ 往返稳定）。
+        // 流外定位（L1 偏移 / L4 锚定）：`Some` 才写 ⇒ 未设时编码**不多写一个字节**
+        // （既有语料逐字节不变）。值形如 `10,-20`，或（L4）`anchors:l,t,r,b,ox,oy`
+        // 规范形（无空格 ⇒ 不需要引号；`Pos::parse` 与 `to_attr` 互逆 ⇒ 往返稳定）。
         if let Some(p) = l.position {
             attrs.push(format!("pos={}", p.to_attr()));
         }

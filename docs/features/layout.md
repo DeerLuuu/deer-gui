@@ -110,8 +110,10 @@ assert_eq!(a, b);
 - **滚动容器 + 多行文本**：[`scroll-and-multiline.md`](scroll-and-multiline.md)（`scroll` / `wrap`
   两个开关、`max_scroll` 的口径、换行宽度取哪里）
 - 内部原理：[`../M1-report.md`](../M1-report.md)（含 8 条布局不变量与踩过的坑）
-- **做不到**：没有绝对定位、没有 z-index 层叠、**没有水平滚动**（`row` 上的 `scroll` 被忽略）、
-  没有网格/表格布局。多行文本与垂直滚动容器**已有**（见
+- **做不到**：没有 z-index 层叠、**没有水平滚动**（`row` 上的 `scroll` 被忽略）、
+  没有网格/表格布局。**流外定位已有**（L1 偏移 + L4 锚定，opt-in）：
+  见 [absolute-positioning](absolute-positioning.md) 与 [anchors](anchors.md)。
+  多行文本与垂直滚动容器**已有**（见
   [`scroll-and-multiline.md`](scroll-and-multiline.md)），但都是 opt-in 的开关。
 
 ## 7. 检查清单

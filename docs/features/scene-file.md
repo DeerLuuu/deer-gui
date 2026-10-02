@@ -68,6 +68,8 @@ let tree = parse_scene(&text, "ui.dui")?;    // 第二个参数只用于报错�
 | `scroll` | 裸标记 | **垂直滚动容器**（只对 `column` 有意义）：`[column name=list w=200 h=120 scroll]` |
 | `wrap` | 裸标记 | **文本按宽度换行**（只对 `text` 有意义，换行宽度取节点的 `w=`）：`[text w=120 wrap label="…"]` |
 | `pos=` | `x,y`（整数，可为负） | **流外绝对定位**（L1）：脱离流内布局，位置 = 父内容盒原点 + 偏移；层叠 = 声明序。见 [absolute-positioning](absolute-positioning.md) |
+| `anchor-l=` / `anchor-t=` / `anchor-r=` / `anchor-b=` | 数字（比例，可缺省） | **流外锚定**（L4）：父内容盒的锚点比例（0=左/上边、1=右/下边，可超 [0,1]）；没写的边 = 没有锚。一轴两侧都有锚 ⇒ 该轴尺寸由锚点对导出（显式 `w=`/`h=` 被忽略）。**与 `pos=` 同写报错**（同一个 `position`）。见 [anchors](anchors.md) |
+| `anchor-ox=` / `anchor-oy=` | 整数（像素） | 锚定的像素修正（L4）：内缩式 —— 起点边（l/t）加、终点边（r/b）减，正 = 向内、负 = 向外。也可写规范形 `pos=anchors:l,t,r,b,ox,oy`（无锚边写 `-`），两者可逆互转 |
 
 > 写**未知属性（**D8 起改为「警告 + 原样保留」**，不再报错）会被报错**（不静默忽略）——因为「场景写错了但不生效」是最难查的一类 bug。
 > **开关属性（`disabled` / `scroll` / `wrap`）带值也会报错**（`scroll=1` 这种写法看起来生效、

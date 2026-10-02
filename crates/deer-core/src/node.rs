@@ -87,26 +87,76 @@ pub enum Size {
     Pct(f32),
 }
 
-/// **流外定位**（L1 · D6/D10）：[`LayoutProps::position`] 的取值。
+/// **流外定位**（L1 偏移 · L4 锚定 · D6/D10/Q5）：[`LayoutProps::position`] 的取值。
 ///
-/// **本轮只有 [`Pos::Offset`] 一个变体**（登记口径：anchors 属 L4，本轮不做）。
-/// 设了 `position` 的子节点**脱离流内布局** —— 不参与主轴分配、不占流内空间
+/// Q5 裁定 anchors 与 position 是**同一个机制**：anchors 以新变体并入 `Pos`，
+/// **不另起第二套定位** —— 两个变体共用同一条流外判据（[`Node::is_positioned`]）：
+/// 设了 `position` 的子节点脱离流内布局 —— 不参与主轴分配、不占流内空间
 /// （含间隙）、不计入父容器固有尺寸（measure 阶段同样跳过）；
-/// 位置 = **父容器内容盒原点** + 偏移（D10 定死的参照矩形 = 父内容盒，与百分比解析基准一致）。
+/// 参照矩形 = **父容器内容盒**（D10 定死，与百分比解析基准一致）；层叠序 = **声明序**。
 ///
 /// **默认 `None` ⇒ 既有树逐字节不变**（opt-in，最高红线；沿用 `scroll` / `wrap` 的先例）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Pos {
     /// 相对父容器内容盒原点的**像素**偏移。可为负（节点可以伸出父盒子之外；
     /// 能不能被画到 / 点到由裁剪与命中边界决定，见绝对定位指南的「做不到什么」）。
     Offset { x: i32, y: i32 },
+    /// **四边锚定**（L4）：`l/t/r/b` 是父内容盒的**锚点比例**（0.0 = 左/上边、
+    /// 1.0 = 右/下边，可超出 `[0, 1]`），`ox/oy` 是**像素**修正 —— 偏移是「内缩式」：
+    /// **起点边（l/t）加、终点边（r/b）减**（正 = 向内容盒内缩，负 = 向外；理由见
+    /// `layout.rs` 的 L4 落位段：这一套代数让「撑满内缩」与「角标跨越角点」共用同一对偏移）。
+    ///
+    /// 每轴独立（这就是四边用 `Option` 的原因 —— 一轴两侧各自可选「有没有锚」，
+    /// `f32` 表达不了「缺」，NaN 哨兵会破坏 `PartialEq` ⇒ 往返判据失效）：
+    /// - 两侧都有锚（如 l+r）⇒ 该轴**尺寸由锚点对导出**，显式 `w`/`h` 不参与
+    ///   （D10 定死「忽略、不是报错」；min/max（L3）照常夹取最终尺寸）；
+    /// - 只锚一边（或都不锚）⇒ 该轴用显式/固有尺寸；
+    /// - **resize 行为是本特性的存在意义**：父盒子变大，锚定边跟随新盒，偏移保持。
+    Anchors {
+        l: Option<f32>,
+        t: Option<f32>,
+        r: Option<f32>,
+        b: Option<f32>,
+        ox: i32,
+        oy: i32,
+    },
+}
+
+/// 锚点比例的字符串形态：有锚 = 数字，无锚 = `"-"`（`"-"` 不是合法数字 ⇒ 无歧义）。
+fn anchor_side(v: Option<f32>) -> String {
+    v.map_or("-".to_string(), |f| format!("{f}"))
 }
 
 impl Pos {
-    /// 解析 `.dui` 属性值：`"x,y"`（两个整数，逗号分隔，允许负号）。
+    /// 解析 `.dui` 属性值。两种形态：
+    /// - `"x,y"`（两个整数，逗号分隔，允许负号）⇒ [`Pos::Offset`]；
+    /// - `"anchors:l,t,r,b,ox,oy"`（[`Pos::to_attr`] 的规范形；每边是数字或 `"-"`
+    ///   = 无锚，偏移是整数）⇒ [`Pos::Anchors`]。
     ///
     /// 场景侧与命令侧**共用这一份语法** —— 各写一份迟早漂（同 `Align::parse` 的理由）。
+    /// 文件里的惯用写法是逐边属性（`anchor-l=…`，见 `scene.rs`），与这里是同一机制
+    /// 的两种可逆拼法。
     pub fn parse(s: &str) -> Option<Pos> {
+        if let Some(rest) = s.strip_prefix("anchors:") {
+            let mut it = rest.split(',');
+            let side = |t: Option<&str>| -> Option<Option<f32>> {
+                let t = t?;
+                if t == "-" {
+                    return Some(None);
+                }
+                t.parse::<f32>().ok().map(Some)
+            };
+            let l = side(it.next())?;
+            let t = side(it.next())?;
+            let r = side(it.next())?;
+            let b = side(it.next())?;
+            let ox = it.next()?.trim().parse::<i32>().ok()?;
+            let oy = it.next()?.trim().parse::<i32>().ok()?;
+            if it.next().is_some() {
+                return None; // 多出来的字段 = 写错了，不许静默截断
+            }
+            return Some(Pos::Anchors { l, t, r, b, ox, oy });
+        }
         let (x, y) = s.split_once(',')?;
         Some(Pos::Offset {
             x: x.trim().parse().ok()?,
@@ -115,9 +165,19 @@ impl Pos {
     }
 
     /// 编码回 `.dui` 属性值（与 [`Pos::parse`] 互逆 ⇒ 往返逐字节稳定）。
+    /// `Anchors` 编码成规范形 `anchors:l,t,r,b,ox,oy`（逐边属性的拼法由 `scene.rs` 负责）。
     pub fn to_attr(self) -> String {
         match self {
             Pos::Offset { x, y } => format!("{x},{y}"),
+            Pos::Anchors { l, t, r, b, ox, oy } => format!(
+                "anchors:{},{},{},{},{},{}",
+                anchor_side(l),
+                anchor_side(t),
+                anchor_side(r),
+                anchor_side(b),
+                ox,
+                oy
+            ),
         }
     }
 }
