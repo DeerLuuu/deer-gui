@@ -54,7 +54,8 @@ pub use vertex_unify::{UnifiedVertex, SHAPE_UV_SENTINEL};
 pub use swapchain::{Acquire, Present, Semaphore, Swapchain, SwapchainConfig};
 pub use windowed::{FrameOutcome, WindowedRenderer};
 
-use deer_gpu::{AdapterInfo, AdapterKind, Backend, Device, GpuError, GpuResult};
+use deer_core::{ GpuError, GpuResult };
+use deer_gpu::{ AdapterInfo, AdapterKind, Backend, Device };
 use ffi::PhysicalDeviceType;
 
 /// Vulkan 后端。

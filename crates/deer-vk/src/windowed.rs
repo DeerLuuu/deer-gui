@@ -41,10 +41,8 @@
 use std::ffi::c_void;
 use std::ptr;
 
-use deer_gpu::{
-    AdapterInfo, Color, DrawCmd, DrawList, Extent, GpuError, GpuResult, RawWindowHandle, RectI,
-    TextEngine,
-};
+use deer_core::{ Color, DrawCmd, DrawList, GpuError, GpuResult, RectI };
+use deer_gpu::{ AdapterInfo, Extent, RawWindowHandle, TextEngine };
 
 use crate::device::{
     vk_result_name, DescriptorPool, DescriptorSet, Pipeline, PipelineLayout, RenderPass,
@@ -1777,8 +1775,8 @@ impl WindowedRenderer {
     pub fn draw_textured_quad(
         &mut self,
         texture: &crate::device::Texture,
-        rect: deer_gpu::RectI,
-        tint: deer_gpu::Color,
+        rect: deer_core::RectI,
+        tint: deer_core::Color,
     ) -> GpuResult<FrameOutcome> {
         self.ensure_ui(false)?;
         // ⚠️ **改指描述符之前也要排空**：上一帧（`render_and_present` / 上一次本方法）

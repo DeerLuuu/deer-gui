@@ -5,10 +5,11 @@
 
 use deer_gpu::null::CpuRenderer;
 use deer_gpu::render::{DefaultRenderer, NullRenderer, build_draw_list};
-use deer_gpu::{DrawCmd, Extent, Theme};
-use deer_layout::builder::{Builder, L};
-use deer_layout::layout::{ApproxMeasure, TextStyle, layout};
-use deer_layout::node::{Kind, Rect};
+use deer_core::{ DrawCmd };
+use deer_gpu::{ Extent, Theme };
+use deer_core::builder::{Builder, L};
+use deer_core::layout::{ApproxMeasure, TextStyle, layout};
+use deer_core::node::{Kind, Rect};
 
 fn theme() -> Theme {
     Theme::default()
@@ -21,7 +22,7 @@ fn style(t: &Theme) -> TextStyle {
     }
 }
 
-fn ui() -> deer_layout::Node {
+fn ui() -> deer_core::Node {
     let mut app = Builder::new(Kind::Column, "app").padding(12.0).gap(8.0);
     app.text("标题");
     app.container_opts(Kind::Row, "bar", L::new().gap(8.0).to_props(), |r| {
@@ -100,7 +101,7 @@ fn button_text_is_centered_by_the_same_measure_as_layout() {
     let list = DefaultRenderer::new(t.clone(), &ApproxMeasure).build(&tree, &geo);
 
     let btn = geo["button_1"];
-    let tw = deer_layout::Measure::width(&ApproxMeasure, "确定", style(&t));
+    let tw = deer_core::Measure::width(&ApproxMeasure, "确定", style(&t));
     let expected_x = btn.x + ((btn.w - tw) / 2.0).floor();
     let found = list.cmds.iter().any(|c| match c {
         DrawCmd::Text { rect, text, .. } if text == "确定" => rect.x as f32 == expected_x,
@@ -160,7 +161,7 @@ fn render_is_deterministic_end_to_end() {
     assert!(a.bytes_eq(&b), "两次端到端渲染必须逐字节相同");
 }
 
-fn deer_gui_render_once(tree: &deer_layout::Node, t: &Theme) -> deer_gpu::null::Framebuffer {
+fn deer_gui_render_once(tree: &deer_core::Node, t: &Theme) -> deer_gpu::null::Framebuffer {
     let geo = layout(tree, Rect::new(0.0, 0.0, 320.0, 200.0), style(t), &ApproxMeasure);
     let list = build_draw_list(tree, &geo, t.clone(), &ApproxMeasure);
     CpuRenderer::new()

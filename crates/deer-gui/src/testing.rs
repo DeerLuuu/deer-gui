@@ -84,11 +84,12 @@ use std::path::{Path, PathBuf};
 use deer_gpu::interact::{FieldText, InteractiveRenderer, InteractState};
 use deer_gpu::measure::find_system_font;
 use deer_gpu::null::{CpuRenderer, Framebuffer};
-use deer_gpu::draw::DrawCounts;
-use deer_gpu::{Color, DrawCmd, DrawList, Extent, RectI, TextEngine, Theme};
-use deer_layout::builder::Builder;
-use deer_layout::layout::{self, ApproxMeasure, Geometry, Measure, TextStyle};
-use deer_layout::node::{Node, Rect};
+use deer_core::draw::DrawCounts;
+use deer_core::{ Color, DrawCmd, DrawList, RectI };
+use deer_gpu::{ Extent, TextEngine, Theme };
+use deer_core::builder::Builder;
+use deer_core::layout::{self, ApproxMeasure, Geometry, Measure, TextStyle};
+use deer_core::node::{Node, Rect};
 
 use crate::input_script;
 use crate::interaction::{self, ClipSnapshot, InputEvent, PointerButton, UiEvent, UiState};
@@ -2072,9 +2073,9 @@ pub mod window {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deer_gpu::draw::DrawCounts;
-    use deer_layout::builder::L;
-    use deer_layout::node::{Kind, LayoutProps};
+    use deer_core::draw::DrawCounts;
+    use deer_core::builder::L;
+    use deer_core::node::{Kind, LayoutProps};
 
     /// 计数显示的前缀（与 `examples/counter.rs` 的 `COUNT_PREFIX` 逐字相同）。
     const PREFIX: &str = "count = ";

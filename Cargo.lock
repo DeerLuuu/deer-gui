@@ -241,10 +241,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f27ae1dd37df86211c42e150270f82743308803d90a6f6e6651cd730d5e1732f"
 
 [[package]]
+name = "deer-core"
+version = "0.0.0"
+
+[[package]]
 name = "deer-gpu"
 version = "0.0.0"
 dependencies = [
- "deer-layout",
+ "deer-core",
  "deer-log",
 ]
 
@@ -252,16 +256,12 @@ dependencies = [
 name = "deer-gui"
 version = "0.0.0"
 dependencies = [
+ "deer-core",
  "deer-gpu",
- "deer-layout",
  "deer-log",
  "deer-vk",
  "deer-window",
 ]
-
-[[package]]
-name = "deer-layout"
-version = "0.0.0"
 
 [[package]]
 name = "deer-log"
@@ -271,8 +271,8 @@ version = "0.0.0"
 name = "deer-vk"
 version = "0.0.0"
 dependencies = [
+ "deer-core",
  "deer-gpu",
- "deer-layout",
 ]
 
 [[package]]

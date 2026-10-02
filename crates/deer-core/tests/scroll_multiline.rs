@@ -23,12 +23,12 @@
 //! | `wrap_needs_an_explicit_width_and_reserves_one_line_per_wrapped_line` | `wrap` + `w=60` ⇒ 固有高 = 行数 × 18；`wrap` 关 ⇒ 18 |
 //! | `approx_measure_wrap_agrees_with_its_height_model` | `wrap().len()*line_height == height(...)`（与 `FontMeasure` 同一条一致性判据） |
 
-use deer_layout::builder::{Builder, L};
-use deer_layout::layout::{
+use deer_core::builder::{Builder, L};
+use deer_core::layout::{
     ApproxMeasure, Geometry, Measure, ScrollOffsets, TextStyle, layout, layout_with_scroll,
     measure_tree,
 };
-use deer_layout::node::{Kind, Node, Rect, Size};
+use deer_core::node::{Kind, Node, Rect, Size};
 
 const STYLE: TextStyle = TextStyle {
     font_size: 13.0,
@@ -101,7 +101,7 @@ fn box_() -> Rect {
     Rect::new(0.0, 0.0, W, 260.0)
 }
 
-fn geo_with(offsets: &ScrollOffsets) -> (Geometry, deer_layout::layout::ScrollMetrics) {
+fn geo_with(offsets: &ScrollOffsets) -> (Geometry, deer_core::layout::ScrollMetrics) {
     layout_with_scroll(&scroll_corpus(), box_(), STYLE, &ApproxMeasure, offsets)
 }
 
@@ -442,7 +442,7 @@ fn scene_files_can_express_scroll_and_wrap() {
     [button label=B]
   [text w=60 wrap label=\"alpha beta gamma delta\"]
 ";
-    let tree = deer_layout::scene::parse_scene(src, "scroll.dui").expect("场景应能解析");
+    let tree = deer_core::scene::parse_scene(src, "scroll.dui").expect("场景应能解析");
     println!("解析结果：outer.scroll={}｜t.wrap={}", tree.children[0].layout.scroll, tree.children[1].layout.wrap);
     assert!(tree.children[0].layout.scroll, "`scroll` 裸属性 ⇒ true");
     assert!(tree.children[1].layout.wrap, "`wrap` 裸属性 ⇒ true");
@@ -453,16 +453,16 @@ fn scene_files_can_express_scroll_and_wrap() {
     assert!(tree.children[1].wraps_text(), "`text` + `wrap` ⇒ 换行文本");
 
     // 往返：编码必须带上这两个开关，否则「解析回来的树」会丢掉它们。
-    let text = deer_layout::scene::encode_scene(&tree);
+    let text = deer_core::scene::encode_scene(&tree);
     println!("编码：\n{text}");
     assert!(text.contains("scroll"), "编码必须写出 `scroll`");
     assert!(text.contains("wrap"), "编码必须写出 `wrap`");
-    let back = deer_layout::scene::parse_scene(&text, "roundtrip.dui").expect("往返应可解析");
+    let back = deer_core::scene::parse_scene(&text, "roundtrip.dui").expect("往返应可解析");
     assert!(
         tree.structurally_eq(&back),
         "往返必须结构相等（两条构筑路径同一份真相）"
     );
-    assert_eq!(text, deer_layout::scene::encode_scene(&back), "二次编码逐字稳定");
+    assert_eq!(text, deer_core::scene::encode_scene(&back), "二次编码逐字稳定");
 
     // 场景与命令式两条路径产出**同一棵树**（B-1 不变式）。
     let mut b = Builder::new(Kind::Column, "app");
@@ -496,7 +496,7 @@ fn scene_files_can_express_scroll_and_wrap() {
 #[test]
 fn flag_attributes_with_a_value_are_rejected() {
     for src in ["[column name=app scroll=1]\n", "[text name=t wrap=true label=x]\n", "[button name=b disabled=false]\n"] {
-        let err = deer_layout::scene::parse_scene(src, "flag.dui").unwrap_err();
+        let err = deer_core::scene::parse_scene(src, "flag.dui").unwrap_err();
         println!("{src:?} ⇒ {}", err.message);
         assert!(
             err.message.contains("开关属性"),
@@ -506,7 +506,7 @@ fn flag_attributes_with_a_value_are_rejected() {
     }
     // 前置：不带值时它照样能解析（否则上面那条在测一个「永远报错」的解析器）。
     assert!(
-        deer_layout::scene::parse_scene("[column name=app scroll]\n", "flag.dui").is_ok(),
+        deer_core::scene::parse_scene("[column name=app scroll]\n", "flag.dui").is_ok(),
         "裸属性必须能解析"
     );
 }

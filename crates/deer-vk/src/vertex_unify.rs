@@ -141,7 +141,7 @@ pub(crate) fn unify(shape: &[GpuVertex], text: &[TextVertex], segments: &[DrawCa
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deer_gpu::draw::Color;
+    use deer_core::draw::Color;
 
     /// 造一个形状顶点（M3a 布局：stride 44）。
     fn shape_v(pos: [f32; 2], rect: [f32; 4], radius_kind: f32) -> GpuVertex {

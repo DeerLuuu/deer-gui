@@ -14,12 +14,13 @@
 //! ```
 
 use deer_gpu::render::{DefaultRenderer, NullRenderer, text_lines};
-use deer_gpu::{DrawCmd, RectI, Theme};
-use deer_layout::builder::{Builder, L};
-use deer_layout::layout::{
+use deer_core::{ DrawCmd, RectI };
+use deer_gpu::{ Theme };
+use deer_core::builder::{Builder, L};
+use deer_core::layout::{
     ApproxMeasure, Geometry, ScrollOffsets, TextStyle, layout, layout_with_scroll,
 };
-use deer_layout::node::{Kind, Node, Rect, Size};
+use deer_core::node::{Kind, Node, Rect, Size};
 
 const STYLE: TextStyle = TextStyle {
     font_size: 13.0,
@@ -156,7 +157,7 @@ fn wrapped_text_emits_one_command_per_line_and_single_line_stays_one() {
     );
 }
 
-fn theme_text() -> deer_gpu::Color {
+fn theme_text() -> deer_core::Color {
     Theme::default().text
 }
 

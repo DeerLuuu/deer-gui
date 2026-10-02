@@ -85,7 +85,7 @@
 //! 而「建了不用」是实打实的创建成本。`spirv` 里那 4 支旧着色器函数**保留**
 //! （`fragment_shader_rect_shape` 是 M3a 冻结产物的 fixture，见 `spirv_val.rs`）。
 
-use deer_gpu::GpuResult;
+use deer_core::GpuResult;
 
 use crate::device::{PipelineLayout, VkDevice};
 use crate::ffi_dev as vk;

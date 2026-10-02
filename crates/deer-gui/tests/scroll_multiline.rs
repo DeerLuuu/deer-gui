@@ -20,11 +20,12 @@
 use deer_gpu::interact::{InteractState, InteractiveRenderer};
 use deer_gpu::null::CpuRenderer;
 use deer_gpu::render::{DefaultRenderer, NullRenderer};
-use deer_gpu::{DrawCmd, DrawList, Extent, RectI, TextEngine, Theme};
+use deer_core::{ DrawCmd, DrawList, RectI };
+use deer_gpu::{ Extent, TextEngine, Theme };
 use deer_gui::interaction::{self, ClipSnapshot, InputEvent, UiEvent, UiState};
-use deer_layout::builder::Builder;
-use deer_layout::layout::{ApproxMeasure, Geometry, ScrollOffsets, TextStyle, layout};
-use deer_layout::node::{Kind, Node, Rect};
+use deer_core::builder::Builder;
+use deer_core::layout::{ApproxMeasure, Geometry, ScrollOffsets, TextStyle, layout};
+use deer_core::node::{Kind, Node, Rect};
 
 /// 某个节点几何的中心（键盘/鼠标脚本里用得最多）。
 fn center(geo: &Geometry, id: &str) -> (f32, f32) {
@@ -49,7 +50,7 @@ fn corpus_a() -> Node {
     app.container_opts(
         Kind::Row,
         "bar",
-        deer_layout::builder::L::new().gap(8.0).to_props(),
+        deer_core::builder::L::new().gap(8.0).to_props(),
         |r| {
             r.button("确定");
             r.button_opts("禁用", |n| n.props.disabled = true);
@@ -65,7 +66,7 @@ fn corpus_b() -> Node {
     app.container_opts(
         Kind::Row,
         "row",
-        deer_layout::builder::L::new().gap(8.0).to_props(),
+        deer_core::builder::L::new().gap(8.0).to_props(),
         |r| {
             r.button("OK");
             r.field("name");
@@ -141,8 +142,8 @@ fn render(list: &DrawList, w: u32, h: u32) -> Vec<u8> {
 }
 
 /// 与既有像素语料同一个 clear 色（`interactive_form.rs` 的 `CLEAR`）。
-fn clear_color() -> deer_gpu::Color {
-    deer_gpu::Color::rgb(0x08, 0x09, 0x0c)
+fn clear_color() -> deer_core::Color {
+    deer_core::Color::rgb(0x08, 0x09, 0x0c)
 }
 
 /// 语料里**一条 `PushClip` 都没有**吗（冻结护栏的前置）。
@@ -327,13 +328,13 @@ fn scroll_corpus() -> Node {
     app.container_opts(
         Kind::Column,
         "spacer",
-        deer_layout::builder::L::new().w(200.0).h(100.0).to_props(),
+        deer_core::builder::L::new().w(200.0).h(100.0).to_props(),
         |_| {},
     );
     app.container_opts(
         Kind::Column,
         "outer",
-        deer_layout::builder::L::new()
+        deer_core::builder::L::new()
             .w(200.0)
             .h(100.0)
             .scroll(true)
@@ -356,14 +357,14 @@ fn scroll_style() -> TextStyle {
 /// 一帧：几何（带偏移）+ 绘制列表（含 `NodeHint` 与视口裁剪）+ 裁剪快照。
 struct ScrollFrame {
     geo: Geometry,
-    metrics: deer_layout::layout::ScrollMetrics,
+    metrics: deer_core::layout::ScrollMetrics,
     list: DrawList,
     clip: ClipSnapshot,
 }
 
 fn scroll_frame(tree: &Node, offsets: &ScrollOffsets) -> ScrollFrame {
     let t = theme();
-    let (geo, metrics) = deer_layout::layout::layout_with_scroll(
+    let (geo, metrics) = deer_core::layout::layout_with_scroll(
         tree,
         Rect::new(0.0, 0.0, SW as f32, SH as f32),
         scroll_style(),
@@ -563,7 +564,7 @@ fn wheel_without_a_scrollable_ancestor_changes_nothing() {
     let list = DefaultRenderer::new(t, &ApproxMeasure).build(&tree, &geo);
     let clip = ClipSnapshot::from_draw_list(&list, &tree, &geo);
     let mut s = UiState::default();
-    s.scroll.set_metrics(&deer_layout::layout::ScrollMetrics::new());
+    s.scroll.set_metrics(&deer_core::layout::ScrollMetrics::new());
     let (x, y) = center(&geo, "button_1");
     interaction::handle(&mut s, &tree, &geo, clip.clone(), &InputEvent::PointerMoved { x, y });
     assert_eq!(s.hover.as_deref(), Some("button_1"), "前置：悬停在按钮上");
@@ -581,7 +582,7 @@ fn wheel_on_a_disabled_scroll_container_changes_nothing() {
     app.container_opts(
         Kind::Column,
         "outer",
-        deer_layout::builder::L::new()
+        deer_core::builder::L::new()
             .w(200.0)
             .h(100.0)
             .scroll(true)
@@ -648,7 +649,7 @@ fn hits_follow_the_scroll_offset_and_respect_the_viewport() {
         b2.y + b2.h <= at_bottom.geo["outer"].y,
         "前置：button_2 已经完全在视口**上方**（几何上不在容器矩形内）"
     );
-    let raw = deer_layout::hit_test(&tree, &at_bottom.geo, outside.0, outside.1).map(|n| n.id.clone());
+    let raw = deer_core::hit_test(&tree, &at_bottom.geo, outside.0, outside.1).map(|n| n.id.clone());
     println!("视口外的点 {outside:?}：hit_test = {raw:?}");
     assert_ne!(
         raw.as_deref(),
@@ -801,7 +802,7 @@ const WRAP_LABEL: &str = "alpha beta gamma delta";
 fn wrap_corpus_gui(wrap: bool) -> Node {
     let mut b = Builder::new(Kind::Column, "app");
     b.text_opts(WRAP_LABEL, |n| {
-        n.layout.width = Some(deer_layout::node::Size::Px(60.0));
+        n.layout.width = Some(deer_core::node::Size::Px(60.0));
         n.layout.wrap = wrap;
     });
     b.build()
@@ -919,7 +920,7 @@ fn scrolled_and_wrapped_corpus_matches_the_gpu_backend() {
         b.container_opts(
             Kind::Column,
             "outer",
-            deer_layout::builder::L::new()
+            deer_core::builder::L::new()
                 .w(200.0)
                 .h(100.0)
                 .scroll(true)
@@ -932,7 +933,7 @@ fn scrolled_and_wrapped_corpus_matches_the_gpu_backend() {
         );
         b.button("below");
         b.text_opts("alpha beta gamma delta epsilon", |n| {
-            n.layout.width = Some(deer_layout::node::Size::Px(120.0));
+            n.layout.width = Some(deer_core::node::Size::Px(120.0));
             n.layout.wrap = true;
         });
         b.build()
@@ -958,7 +959,7 @@ fn scrolled_and_wrapped_corpus_matches_the_gpu_backend() {
     let mut cases: Vec<(i32, i32, DrawList)> = Vec::new();
     for offset in [0i32, 26, 40, MAX_SCROLL] {
         let offsets = ScrollOffsets::new().with("outer", offset);
-        let (geo, metrics) = deer_layout::layout::layout_with_scroll(
+        let (geo, metrics) = deer_core::layout::layout_with_scroll(
             &tree,
             Rect::new(0.0, 0.0, SW as f32, SH as f32),
             style,

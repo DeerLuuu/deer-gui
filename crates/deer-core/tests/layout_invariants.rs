@@ -5,17 +5,17 @@
 //! / B-3 容器固有尺寸漏算子节点显式尺寸），**每个都有对应的回归守卫**，
 //! 且都用「改坏 → 红 → 改回」验证过判据真的会红。
 
-use deer_layout::builder::{Builder, L};
-use deer_layout::layout::{ApproxMeasure, TextStyle, hit_test, layout, measure_tree};
-use deer_layout::node::{Align, Kind, Node, Rect, Size};
-use deer_layout::scene::{encode_scene, parse_scene};
+use deer_core::builder::{Builder, L};
+use deer_core::layout::{ApproxMeasure, TextStyle, hit_test, layout, measure_tree};
+use deer_core::node::{Align, Kind, Node, Rect, Size};
+use deer_core::scene::{encode_scene, parse_scene};
 
 const STYLE: TextStyle = TextStyle {
     font_size: 13.0,
     line_height: 18.0,
 };
 
-fn geo(tree: &Node, w: f32, h: f32) -> deer_layout::Geometry {
+fn geo(tree: &Node, w: f32, h: f32) -> deer_core::Geometry {
     layout(tree, Rect::new(0.0, 0.0, w, h), STYLE, &ApproxMeasure)
 }
 
@@ -363,7 +363,7 @@ fn t14_container_cross_axis_is_max_not_sum() {
 fn t11b_unknown_attrs_are_warned_not_rejected() {
     let src = "[text label=x nope=1]\n";
     let (tree, warnings) =
-        deer_layout::scene::parse_scene_collect(src, "ok.dui").expect("未知属性不该让解析失败");
+        deer_core::scene::parse_scene_collect(src, "ok.dui").expect("未知属性不该让解析失败");
     assert_eq!(warnings.len(), 1, "应当有一条警告：{warnings:?}");
     assert!(
         warnings[0].contains("nope"),

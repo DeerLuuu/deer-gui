@@ -2,7 +2,7 @@
 resolver = "2"
 members = [
     "crates/deer-log",
-    "crates/deer-layout",
+    "crates/deer-core",
     "crates/deer-gpu",
     "crates/deer-vk",
     "crates/deer-window",
@@ -22,7 +22,7 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 deer-log = { path = "crates/deer-log" }
-deer-layout = { path = "crates/deer-layout" }
+deer-core = { path = "crates/deer-core" }
 deer-gpu = { path = "crates/deer-gpu" }
 deer-vk = { path = "crates/deer-vk" }
 deer-window = { path = "crates/deer-window" }

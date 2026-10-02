@@ -8,7 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 deer-log.workspace = true
-deer-layout.workspace = true
+deer-core.workspace = true
 deer-gpu.workspace = true
 deer-vk.workspace = true
 # 窗口层是**可选**的：只有开 `window` feature 才会把 winit 拉进来，

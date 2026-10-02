@@ -17,7 +17,8 @@
 //! 领队的端到端验证在 `deer-gui --features window --example window_preview`（走 winit），
 //! 这里这条是为了「不依赖任何第三方 crate 也能自证驱动链路是通的」。
 
-use deer_gpu::{Color, Extent, GpuError, Platform, RawWindowHandle};
+use deer_core::{ Color, GpuError };
+use deer_gpu::{ Extent, Platform, RawWindowHandle };
 use deer_vk::ffi;
 use deer_vk::ffi_dev as vk;
 use deer_vk::surface::{self, Surface, SurfaceCapabilitiesKHR, SurfaceFormatKHR};
@@ -901,7 +902,7 @@ fn run_windowed_e2e() {
     // 「驱动真的按语义用了它」属于真机逐像素对照的范畴，不在本条射程内。
     // ─────────────────────────────────────────────────────────────────────────
     {
-        use deer_gpu::{DrawCmd, DrawList, RectI};
+        use deer_core::{ DrawCmd, DrawList, RectI };
 
         let mut list = DrawList::new();
         list.push(DrawCmd::FillRect {
@@ -994,9 +995,9 @@ fn run_windowed_e2e() {
             .device()
             .create_texture_rgba8(1, 1, &[255, 0, 0, 255])
             .expect("建 1×1 红纹理");
-        let full = deer_gpu::RectI::new(0, 0, rw as i32, rh as i32);
+        let full = deer_core::RectI::new(0, 0, rw as i32, rh as i32);
         let outcome = r
-            .draw_textured_quad(&red, full, deer_gpu::Color::WHITE)
+            .draw_textured_quad(&red, full, deer_core::Color::WHITE)
             .expect("窗口侧纹理 quad");
         assert!(
             matches!(outcome, FrameOutcome::Presented),
@@ -1355,9 +1356,9 @@ fn child_probe_windowed_renderer_release() {
         }
     };
     // 画一帧界面树（**必须**：`UiResources` 是惰性建的，不画就没有描述符集/池可析构）
-    let mut shapes = deer_gpu::DrawList::new();
-    shapes.push(deer_gpu::DrawCmd::FillRect {
-        rect: deer_gpu::RectI::new(4, 4, 100, 60),
+    let mut shapes = deer_core::DrawList::new();
+    shapes.push(deer_core::DrawCmd::FillRect {
+        rect: deer_core::RectI::new(4, 4, 100, 60),
         color: Color::WHITE,
     });
     r.draw_and_present(&shapes, None)
@@ -1366,8 +1367,8 @@ fn child_probe_windowed_renderer_release() {
     let text_ran = match deer_gpu::text::TextEngine::from_system_font(16.0) {
         Ok(mut engine) => {
             let mut with_text = shapes.clone();
-            with_text.push(deer_gpu::DrawCmd::Text {
-                rect: deer_gpu::RectI::new(4, 4, 120, 30),
+            with_text.push(deer_core::DrawCmd::Text {
+                rect: deer_core::RectI::new(4, 4, 120, 30),
                 text: "Wg".into(),
                 color: Color::WHITE,
                 size: 16.0,

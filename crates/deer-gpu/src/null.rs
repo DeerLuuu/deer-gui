@@ -7,13 +7,11 @@
 //!
 //! 它**故意不引任何图形库**，也是「自研渲染」这条路上第一个能跑出图的实现。
 
-use crate::draw::{Color, DrawCmd, DrawList, RectI};
-use crate::error::{GpuError, GpuResult};
+use deer_core::draw::{Color, DrawCmd, DrawList, RectI};
+use deer_core::error::{GpuError, GpuResult};
 use crate::text::{GlyphPlacement, TextEngine};
-use crate::{
-    AdapterInfo, AdapterKind, Backend, Device, Extent, Frame, PresentResult, RawWindowHandle, Swapchain,
-    TargetFormat, TextureDesc, TextureId, TextureRegion,
-};
+use deer_core::{ TextureId };
+use crate::{ AdapterInfo, AdapterKind, Backend, Device, Extent, Frame, PresentResult, RawWindowHandle, Swapchain, TargetFormat, TextureDesc, TextureRegion };
 
 /// CPU 后端的适配器名（供 `adapters()` 与诊断）。
 pub const CPU_ADAPTER_NAME: &str = "deer-cpu (software rasterizer)";

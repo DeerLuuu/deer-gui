@@ -24,7 +24,8 @@
 use std::collections::BTreeSet;
 
 use deer_gpu::null::CpuRenderer;
-use deer_gpu::{Color, DrawCmd, DrawList, Extent, RectI};
+use deer_core::{ Color, DrawCmd, DrawList, RectI };
+use deer_gpu::{ Extent };
 use deer_vk::device::{DrawIndexedIndirectCommand, TextureFormat, VkDevice, validate_texture_args};
 use deer_vk::GpuGeometryRenderer;
 

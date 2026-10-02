@@ -35,7 +35,8 @@
 //! 打印原因并 `return`（与既有 GPU 示例一致）；CPU 侧出图请用
 //! `cargo run -p deer-gui --example render_to_png`。
 
-use deer_gpu::{Color, Extent, RectI};
+use deer_core::{ Color, RectI };
+use deer_gpu::{ Extent };
 use deer_vk::device::TextureFormat;
 use deer_vk::GpuGeometryRenderer;
 

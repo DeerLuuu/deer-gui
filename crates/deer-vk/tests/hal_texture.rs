@@ -27,7 +27,7 @@
 //! 打印原因并跳过（与既有 GPU 测试一致）；**请求了校验层却建不起设备 = 失败**，
 //! 不是跳过 —— 用「跳过」掩盖「校验层没生效」会让这个文件变成安慰剂。
 
-use deer_gpu::{AdapterInfo, Device, TargetFormat, TextureDesc, TextureRegion};
+use deer_gpu::{ AdapterInfo, Device, TargetFormat, TextureDesc, TextureRegion };
 use deer_vk::device::{TextureFormat, UploadRegion, validate_texture_region};
 use deer_vk::hal::VulkanDevice;
 use deer_vk::VkBackend;
@@ -421,7 +421,7 @@ fn hal_texture_rejects_bad_inputs_without_allocating() {
     assert_eq!(id.0, 0, "第一张纹理的句柄应是 0");
 
     // ③ 不存在的 id：读 / 上传都必须报错（**不许**静默成功或 panic）
-    let ghost = deer_gpu::TextureId(99);
+    let ghost = deer_core::TextureId(99);
     assert!(
         dev.read_texture_bytes(ghost).is_err(),
         "不存在的纹理 id 回读必须报错"
@@ -494,12 +494,12 @@ fn hal_device_is_lazy_about_the_logical_device() {
     };
     // 还没建任何纹理 ⇒ 槽位表为空（`with_store` 也还没被调用过）
     assert_eq!(
-        dev.texture_extent(deer_gpu::TextureId(0)),
+        dev.texture_extent(deer_core::TextureId(0)),
         None,
         "未建纹理前不该有任何句柄"
     );
     assert!(
-        dev.read_texture_bytes(deer_gpu::TextureId(0)).is_err(),
+        dev.read_texture_bytes(deer_core::TextureId(0)).is_err(),
         "未建纹理前回读必须报错"
     );
     // 只读的适配器信息一直可用（不需要设备）

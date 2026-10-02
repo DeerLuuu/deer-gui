@@ -16,7 +16,7 @@
 use std::sync::mpsc::{Receiver, Sender};
 use std::thread::JoinHandle;
 
-use deer_gpu::{GpuError, GpuResult};
+use deer_core::{ GpuError, GpuResult };
 
 use crate::ffi;
 use crate::ffi_dev as vk;

@@ -25,7 +25,8 @@ use std::cell::Cell;
 use std::ffi::c_void;
 use std::ptr;
 
-use deer_gpu::{Extent, GpuError, GpuResult};
+use deer_core::{ GpuError, GpuResult };
+use deer_gpu::{ Extent };
 
 use crate::device::{vk_result_name, DeviceFns, VkDevice};
 use crate::ffi;

@@ -29,7 +29,7 @@
 //! 缩放到像素是调用方的事（见 `deer-gpu::text`）。
 //! 这样解析层保持纯粹，度量与缩放可以在别处单测。
 
-use crate::error::{GpuError, GpuResult};
+use deer_core::error::{GpuError, GpuResult};
 
 /// 一个轮廓点：`(x, y, on_curve)`。
 ///

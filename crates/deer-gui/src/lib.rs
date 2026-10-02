@@ -39,8 +39,9 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]
 
-pub use deer_gpu::{self as gpu, DrawCmd, DrawList, GpuError, GpuResult, Theme};
-pub use deer_layout::{self as layout, Node};
+pub use deer_gpu::{ self as gpu, Theme };
+pub use deer_core::{ DrawCmd, DrawList, GpuError, GpuResult };
+pub use deer_core::{self as layout, Node};
 pub use deer_vk::{self as vk, VkBackend};
 
 /// 交互层（M5-2/M5-3，**纯逻辑**）：命中测试、裁剪快照、悬停/按下/点击/焦点/文本输入。
@@ -94,13 +95,14 @@ pub use deer_window as window;
 
 use std::path::Path;
 
-use deer_layout::layout::{ApproxMeasure, TextStyle};
+use deer_core::layout::{ApproxMeasure, TextStyle};
 
 /// 常用类型的集中导入。
 pub mod prelude {
     pub use crate::gpu::render::{DefaultRenderer, build_draw_list};
     pub use crate::gpu::null::{CpuRenderer, Framebuffer};
-    pub use crate::gpu::{Color, DrawCmd, DrawList, Extent, RectI, Theme};
+    pub use crate::gpu::{ Extent, Theme };
+    pub use deer_core::{ Color, DrawCmd, DrawList, RectI };
     pub use crate::gpu::atlas::GlyphAtlas;
     pub use crate::gpu::glyph::{GlyphImage, GlyphKey};
     pub use crate::gpu::measure::FontMeasure;

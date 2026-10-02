@@ -4,9 +4,10 @@
 //! 后续 Vulkan/CPU 两个后端应当对同一份绘制列表给出**相同像素**，
 //! 而「相同」的基准就是这里钉死的 CPU 结果。
 
-use deer_gpu::draw::{Color, DrawCmd, DrawList, RectI};
+use deer_core::draw::{Color, DrawCmd, DrawList, RectI};
 use deer_gpu::null::{CpuBackend, CpuRenderer, Framebuffer};
-use deer_gpu::{Backend, Extent, GpuError, PresentResult};
+use deer_core::{ GpuError };
+use deer_gpu::{ Backend, Extent, PresentResult };
 
 const RED: Color = Color::rgb(255, 0, 0);
 const BG: Color = Color::rgb(0, 0, 0);
@@ -311,7 +312,7 @@ fn cpu_framebuffer_helpers_work() {
 /// 下面「等长不同 id 必须不同指纹」与**钉住的具体值**至少有一条会红。
 #[test]
 fn node_id_fingerprint_is_deterministic_and_discriminates_equal_length_ids() {
-    use deer_gpu::draw::node_id_fp;
+    use deer_core::draw::node_id_fp;
 
     // ① 确定性：同一输入每次都一样（没有随机种子）。
     for id in ["app", "button_1", "button_2", "名字", ""] {
@@ -353,7 +354,7 @@ fn node_id_fingerprint_is_deterministic_and_discriminates_equal_length_ids() {
 /// `DrawCmd::node_hint` 是**唯一**构造点：长度与指纹都必须与 id 一致。
 #[test]
 fn node_hint_constructor_fills_both_checksums() {
-    use deer_gpu::draw::node_id_fp;
+    use deer_core::draw::node_id_fp;
 
     let c = DrawCmd::node_hint(RectI::new(1, 2, 3, 4), "button_1");
     assert_eq!(

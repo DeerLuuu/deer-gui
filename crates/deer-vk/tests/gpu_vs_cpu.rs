@@ -20,7 +20,8 @@
 //! 绝不伪装成通过。
 
 use deer_gpu::null::CpuRenderer;
-use deer_gpu::{Color, DrawCmd, DrawList, Extent, RectI};
+use deer_core::{ Color, DrawCmd, DrawList, RectI };
+use deer_gpu::{ Extent };
 use deer_vk::device::VkDevice;
 use deer_vk::gpu_geom::GpuVertex;
 use deer_vk::GpuGeometryRenderer;

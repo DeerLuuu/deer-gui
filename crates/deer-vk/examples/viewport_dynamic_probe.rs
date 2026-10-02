@@ -44,7 +44,7 @@
 
 use std::process::Command;
 
-use deer_gpu::GpuResult;
+use deer_core::GpuResult;
 use deer_vk::device::VkDevice;
 use deer_vk::ffi;
 use deer_vk::ffi_dev as vk;
@@ -716,7 +716,7 @@ fn check(what: &str, rc: i32) -> GpuResult<()> {
     if rc == ffi::VK_SUCCESS {
         Ok(())
     } else {
-        Err(deer_gpu::GpuError::Driver {
+        Err(deer_core::GpuError::Driver {
             code: rc,
             message: format!("{what} 失败：rc={rc:#x}"),
         })

@@ -75,9 +75,9 @@
 //! `engine: &mut TextEngine`。若强行要 `&TextEngine`，就只能要求调用方预先「把要画的字全热一遍」，
 //! 否则新字形会被静默跳过（那才是真的会画错）。以「与 CPU 逐字一致」为准 ⇒ 取 `&mut`。
 
-use deer_gpu::draw::{Color, DrawCmd, DrawList, RectI};
+use deer_core::draw::{Color, DrawCmd, DrawList, RectI};
 use deer_gpu::text::GlyphPlacement;
-use deer_gpu::{Extent, TextEngine};
+use deer_gpu::{ Extent, TextEngine };
 
 /// 文本管线的一个顶点：位置（NDC）+ 图集 `uv` + 颜色（**不预乘**）。
 ///

@@ -22,7 +22,7 @@
 //! 行优先、**无 padding**（`bufferRowLength = 0` 表示与图像宽度一致）。
 //! 这一点对断言很重要 —— 用 `B8G8R8A8` 会让红蓝互换，是极容易踩的坑。
 
-use deer_gpu::{GpuError, GpuResult};
+use deer_core::{ GpuError, GpuResult };
 
 use crate::device::{vk_result_name, DeviceFns};
 use crate::ffi;

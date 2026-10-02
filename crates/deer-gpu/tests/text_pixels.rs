@@ -11,7 +11,7 @@
 //! 不伪装通过 —— 这些断言针对的是任意正常字体都成立的性质，不是某个字体的位图指纹。
 //! 机器无关的确定性断言在 `tests/text_raster.rs`（手工构造轮廓）。
 
-use deer_gpu::draw::{Color, DrawCmd, DrawList, RectI};
+use deer_core::draw::{Color, DrawCmd, DrawList, RectI};
 use deer_gpu::null::{CpuRenderer, Framebuffer};
 use deer_gpu::text::TextEngine;
 use deer_gpu::Extent;

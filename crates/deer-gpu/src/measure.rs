@@ -4,8 +4,8 @@
 //!
 //! [`FontMeasure`] 把 [`crate::font::Font`] 的真实度量（`unitsPerEm`、`hmtx` 的
 //! advance width、`hhea` 的升部/降部/行距）换算成**像素**，并实现
-//! [`deer_layout::Measure`] —— 布局引擎于是可以注入它，替换
-//! [`deer_layout::ApproxMeasure`]（后者**保持不变**：它是确定性测试用的近似实现，
+//! [`deer_core::Measure`] —— 布局引擎于是可以注入它，替换
+//! [`deer_core::ApproxMeasure`]（后者**保持不变**：它是确定性测试用的近似实现，
 //! 故意与字体环境解耦）。
 //!
 //! 换算只有一个比例因子：`scale = font_size / units_per_em`。
@@ -29,7 +29,7 @@
 //! - 单词自身宽度 > `max_width` 时**按字符硬切**（一个字符就超宽时该行允许超宽 ——
 //!   这是唯一例外，否则会死循环）；
 //! - `max_width <= 0` → 不换行，返回 `vec![text.to_string()]`；
-//! - 空字符串 → `vec![String::new()]`（**算 1 行**，与 [`deer_layout::Measure::height`]
+//! - 空字符串 → `vec![String::new()]`（**算 1 行**，与 [`deer_core::Measure::height`]
 //!   的约定一致）。
 //!
 //! `wrap` 保留全部非空白字符：`wrap(text).concat()` 去掉空白后与 `text` 去掉空白后逐字符相同
@@ -38,7 +38,7 @@
 use std::path::PathBuf;
 
 use crate::font::Font;
-use deer_layout::layout::{Measure, TextStyle};
+use deer_core::layout::{Measure, TextStyle};
 
 /// 把字体度量换算成像素，并提供换行。
 ///
@@ -109,7 +109,7 @@ impl<'a> FontMeasure<'a> {
 
     /// 文本宽度（像素）：逐字符 advance 求和后 **`ceil()`**。
     ///
-    /// 向上取整是刻意的：与 [`deer_layout::ApproxMeasure`] 的「整数友好」约定一致，
+    /// 向上取整是刻意的：与 [`deer_core::ApproxMeasure`] 的「整数友好」约定一致，
     /// 便于布局与像素级断言；也让 `text_width("")` 精确等于 `0.0`。
     pub fn text_width(&self, text: &str) -> f32 {
         self.sum_advances(text).ceil()
@@ -122,12 +122,12 @@ impl<'a> FontMeasure<'a> {
 
     /// 贪心换行。规则见[模块文档](self)。
     ///
-    /// 实现**委托**给 `deer_layout::layout::wrap_greedy`（唯一的词切分/硬切算法），
+    /// 实现**委托**给 `deer_core::layout::wrap_greedy`（唯一的词切分/硬切算法），
     /// 只注入「宽度怎么算」= [`FontMeasure::text_width`]。这样 `ApproxMeasure::wrap`
     /// （近似度量）与本函数的行为**逐字相同** —— 否则「换行点随度量的类别而分叉」
     /// 这类问题要在两个实现里各查一遍。
     pub fn wrap(&self, text: &str, max_width: f32) -> Vec<String> {
-        deer_layout::layout::wrap_greedy(text, max_width, |s| self.text_width(s))
+        deer_core::layout::wrap_greedy(text, max_width, |s| self.text_width(s))
     }
 }
 

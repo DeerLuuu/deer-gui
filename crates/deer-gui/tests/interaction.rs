@@ -8,7 +8,8 @@
 //! 的 `examples/interactive_form.rs`（那是窗口侧的例子）；这里重放的是**同一串事件的
 //! 值形式**，避免两边各定义一套脚本语法。
 
-use deer_gui::gpu::{DrawCmd, DrawList, NullRenderer, RectI};
+use deer_core::{DrawCmd, DrawList, RectI};
+use deer_gui::gpu::NullRenderer;
 use deer_gui::interaction::{
     ClipSnapshot, InputEvent, Key, Mods, PointerButton, UiEvent, UiState, focusables, handle, hit,
 };

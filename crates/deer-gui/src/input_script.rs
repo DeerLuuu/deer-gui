@@ -49,8 +49,8 @@
 
 use std::collections::BTreeMap;
 
-use deer_layout::layout::Geometry;
-use deer_layout::node::Node;
+use deer_core::layout::Geometry;
+use deer_core::node::Node;
 
 use crate::interaction::{
     ClipSnapshot, InputEvent, Key, Mods, PointerButton, UiEvent, UiState, handle,

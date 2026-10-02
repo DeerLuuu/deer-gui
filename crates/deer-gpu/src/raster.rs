@@ -45,7 +45,7 @@
 //! - `ppem <= 0`、`units_per_em == 0`、非有限缩放、位图单边超过 `MAX_BITMAP_DIM`
 //!   ⇒ 返回 `GlyphImage::blank(0.0)`（**不 panic**，也不尝试巨额分配）。
 
-use crate::error::GpuResult;
+use deer_core::error::GpuResult;
 use crate::font::{Font, Glyph, Segment};
 use crate::glyph::GlyphImage;
 

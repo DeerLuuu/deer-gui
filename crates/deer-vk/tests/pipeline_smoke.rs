@@ -1019,8 +1019,9 @@ fn child_probe_offscreen_renderer_release() {
     if std::env::var("DEER_VK_DTOR_PROBE").is_err() {
         return;
     }
-    use deer_gpu::draw::{Color, DrawCmd, DrawList};
-    use deer_gpu::{Extent, RectI};
+    use deer_core::draw::{Color, DrawCmd, DrawList};
+    use deer_core::{ RectI };
+use deer_gpu::{ Extent };
 
     let extent = Extent {
         width: 48,

@@ -22,9 +22,9 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]
 
+use deer_core::{Color, DrawList, GpuResult, TextureId};
+
 pub mod atlas;
-pub mod draw;
-pub mod error;
 pub mod font;
 pub mod glyph;
 pub mod interact;
@@ -36,8 +36,6 @@ pub mod render;
 pub mod text;
 
 pub use atlas::GlyphAtlas;
-pub use draw::{Color, DrawCmd, DrawList, RectI, TextureId};
-pub use error::{GpuError, GpuResult};
 pub use font::{Contour, Font, Glyph, Point, Segment};
 pub use glyph::{AtlasSlot, GlyphImage, GlyphKey};
 pub use interact::{
@@ -55,15 +53,10 @@ pub use text::{GlyphPlacement, TextEngine};
 // （如 `deer_gpu::core_layer::DrawList`），为将来物理拆 crate（→ `deer-core` / `deer-text` 等）铺路。
 // **不移动文件、不改既有 crate 根 `pub use` 路径**——零行为改动、零破坏。
 // 物理拆分的触发条件与"Server"命名待维护者裁断（见 ARCHITECTURE.md §2.3 末两点）。
-
-/// **L0 core**：与后端无关的契约 + 平台无关数据（`DrawCmd` 无设备 ⇒ core）。
-/// 将来随 `deer-layout` 并入 `deer-core`；HAL trait（`Backend`/`Device`/`Frame`…）定义在本
-/// crate 根，也属 L0 契约（实现它们才进 L1）。
-pub mod core_layer {
-    pub use crate::draw::{Color, DrawCmd, DrawList, RectI, TextureId};
-    pub use crate::error::{GpuError, GpuResult};
-    pub use crate::measure::FontMeasure;
-}
+//
+// LY1（2026-10-XX）：`core_layer` 门面已删除 —— 它的条目（`DrawList`/`DrawCmd`/`Color`/
+// `RectI`/`TextureId`/`GpuError`/`GpuResult`）已物理迁到 L0 crate **`deer-core`**，
+// 下沉后的路径就是 `deer_core::…`，再留一个同名门面只会造成双路径。
 
 /// **L1 TextServer**：字体解析 / 字形光栅化 / 图集 / 换行（有缓存与字体文件 ⇒ 服务级）。
 pub mod text_layer {
@@ -85,8 +78,7 @@ pub mod backend_layer {
     };
 }
 
-use deer_layout::Geometry;
-use deer_layout::node::Node;
+use deer_core::{Geometry, node::Node};
 
 /// 一个 GPU 后端的入口。实现它即可被 deer-gui 使用。
 ///

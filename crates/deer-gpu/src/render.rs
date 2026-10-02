@@ -18,10 +18,10 @@
 //!   `PushClip`（= 视口矩形），走完子节点再 `PopClip`。裁剪栈的语义照抄
 //!   `null.rs`（求交 / 出栈），所以 GPU 后端与 CPU 后端看到的完全是同一份数据。
 
-use deer_layout::node::{Kind, Node};
-use deer_layout::layout::{Geometry, Measure, TextStyle};
+use deer_core::node::{Kind, Node};
+use deer_core::layout::{Geometry, Measure, TextStyle};
 
-use crate::draw::{Color, DrawCmd, DrawList, RectI};
+use deer_core::draw::{Color, DrawCmd, DrawList, RectI};
 use crate::Theme;
 
 /// **一个文本节点的每一行**：`(该行的矩形, 该行的文本)`。
@@ -177,8 +177,8 @@ impl<'a, M: Measure> DefaultRenderer<'a, M> {
         }
     }
 
-    fn text_style(&self) -> deer_layout::TextStyle {
-        deer_layout::TextStyle {
+    fn text_style(&self) -> deer_core::TextStyle {
+        deer_core::TextStyle {
             font_size: self.theme.font_size,
             line_height: self.theme.line_height,
         }

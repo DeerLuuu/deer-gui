@@ -9,7 +9,8 @@
 //! 指南：[`docs/features/ime.md`](../../../docs/features/ime.md)
 
 use deer_gui::gpu::interact::{InteractiveRenderer, InteractState};
-use deer_gui::gpu::{DrawCmd, Theme};
+use deer_core::DrawCmd;
+use deer_gui::gpu::Theme;
 use deer_gui::interaction::{InputEvent, UiState, handle};
 use deer_gui::layout::TextStyle;
 use deer_gui::layout::layout::{ApproxMeasure, ScrollOffsets, layout_with_scroll};
@@ -101,13 +102,13 @@ fn main() {
 }
 
 /// 用当前状态画一帧（走**唯一**的状态转换）。
-fn draw(tree: &Node, geo: &deer_gui::layout::Geometry, state: &UiState) -> deer_gui::gpu::DrawList {
+fn draw(tree: &Node, geo: &deer_gui::layout::Geometry, state: &UiState) -> deer_core::DrawList {
     let interact: InteractState = state.to_interact_state();
     InteractiveRenderer::new(Theme::default(), &ApproxMeasure, &interact).build(tree, geo)
 }
 
 /// 找出预编辑那段文字与下划线：返回 (文字 x, 下划线宽)；没有则 (-1, -1)。
-fn preedit_facts(list: &deer_gui::gpu::DrawList) -> (i32, i32) {
+fn preedit_facts(list: &deer_core::DrawList) -> (i32, i32) {
     let text = list.cmds.iter().find_map(|c| match c {
         DrawCmd::Text { rect, text, .. } if text == "zhong" => Some(rect.x),
         _ => None,
@@ -120,7 +121,7 @@ fn preedit_facts(list: &deer_gui::gpu::DrawList) -> (i32, i32) {
 }
 
 /// 光标（宽 1、半径 0 的填充矩形）的 x。
-fn caret_x(list: &deer_gui::gpu::DrawList) -> Vec<i32> {
+fn caret_x(list: &deer_core::DrawList) -> Vec<i32> {
     list.cmds
         .iter()
         .filter_map(|c| match c {
