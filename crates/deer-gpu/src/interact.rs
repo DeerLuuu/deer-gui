@@ -109,6 +109,22 @@ pub struct InteractState {
     pub hover: Option<String>,
     pub focus: Option<String>,
     pub pressed: Option<String>,
+    /// **只读的滚动快照**（偏移 + 上限）—— 画滚动条要用它。
+    ///
+    /// 默认空 ⇒ **一个滚动条都不画**（既有语料逐字节不变）。这是刻意的 opt-in：
+    /// 想看到滚动条，就把 `deer-gui` 那边 `UiState::scroll` 的内容灌进来。
+    pub scroll: ScrollView,
+}
+
+/// 绘制时读的滚动状态（偏移 + 每个容器的上限）。
+///
+/// 真相源是 `deer-gui::interaction::ScrollState`（`handle` 在**唯一入口**里改它）；
+/// 这里只是绘制期的一份副本 —— `deer-gpu` 不能反向依赖 `deer-gui`，所以用一个同形的小结构搬运。
+/// 字段直接复用 `deer-layout` 的两个类型，**不另造一套**（否则偏移的夹取语义会有两份）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScrollView {
+    pub offsets: deer_layout::layout::ScrollOffsets,
+    pub metrics: deer_layout::layout::ScrollMetrics,
 }
 
 impl InteractState {
@@ -418,7 +434,44 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
 
         if clip {
             list.push(DrawCmd::PopClip);
+            // 滚动条画在**裁剪之外**（`PopClip` 之后）：它盖在内容上，且不该被自己的视口裁掉。
+            // 几何来自 `deer_layout::scrollbar_geom` —— 与**命中侧同一份实现**
+            //（各写一份的话，「看得见的滚动条」与「点得到的滚动条」迟早错开）。
+            self.emit_scrollbar(n, r, ry, rw, rh, list);
         }
+    }
+
+    /// 给一个可滚动容器补上「轨道 + 滑块」两条命令（内容没超出 ⇒ 什么都不发）。
+    ///
+    /// ## 颜色为什么复用 `border` / `text_dim`（而不是新增主题字段）
+    ///
+    /// 给 `Theme` 加字段是一次**公开 API 变更**（要走设计登记），而滚动条只是几何上的
+    /// 「低调轨道 + 可见滑块」—— `border` 与 `text_dim` 在现有几套主题里正好是这个关系。
+    /// **登记为已知取舍**：等真有「主题化滚动条」的需求，再按 §6 走一遍登记加字段，
+    /// 那时把这两行换掉即可（几何不涉及颜色，改动面很小）。
+    fn emit_scrollbar(&self, n: &Node, x: i32, y: i32, w: i32, h: i32, list: &mut DrawList) {
+        let viewport = deer_layout::Rect {
+            x: x as f32,
+            y: y as f32,
+            w: w as f32,
+            h: h as f32,
+        };
+        let offset = self.state.scroll.offsets.get(&n.id);
+        let max_scroll = self.state.scroll.metrics.max_of(&n.id);
+        let Some(g) = deer_layout::scrollbar_geom(viewport, offset, max_scroll) else {
+            return;
+        };
+        let radius = (deer_layout::SCROLLBAR_W / 2.0) as i32;
+        list.push(DrawCmd::FillRoundRect {
+            rect: to_rect_i(g.track),
+            radius,
+            color: self.theme.border,
+        });
+        list.push(DrawCmd::FillRoundRect {
+            rect: to_rect_i(g.thumb),
+            radius,
+            color: self.theme.text_dim,
+        });
     }
 
     fn text_style(&self) -> deer_layout::TextStyle {
@@ -460,6 +513,14 @@ fn tint(base: Color, visual: Visual) -> Color {
         Visual::Hover => base.lighten(HOVER_LIGHTEN),
         Visual::Pressed => base.darken(PRESSED_DARKEN),
     }
+}
+
+/// 浮点矩形 → 整数矩形（**取整只在这一处发生**）。
+///
+/// `scrollbar_geom` 刻意返回浮点（命中侧要用浮点判包含）；绘制侧在这里一次收口，
+/// 于是「画出来的位置」与「算出来的位置」不会各自取整而差 1 像素。
+fn to_rect_i(r: deer_layout::Rect) -> RectI {
+    RectI::new(r.x.round() as i32, r.y.round() as i32, r.w.round() as i32, r.h.round() as i32)
 }
 
 /// 向内缩 `n` 像素（宽高至少留 1；缩没了就退化成 1×1 —— 文本命令不接受空矩形）。
@@ -1607,5 +1668,136 @@ mod tests {
         println!("节点 {node_p:?}｜不换行 ⇒ {texts_p:?}");
         assert_eq!(texts_p.len(), 1);
         assert_eq!(texts_p[0], (node_p, "alpha beta gamma delta".to_string()));
+    }
+
+    // ---- T3.2：可视滚动条 ---------------------------------------------------
+
+    /// 造「一个可滚动 Column + 一个高出视口的子节点」，返回 (树, 几何, 上限)。
+    fn scroller_fixture() -> (Node, Geometry, deer_layout::layout::ScrollMetrics) {
+        let mut col = Node::new(Kind::Column, "scroller");
+        col.layout.scroll = true;
+        // 视口高度**显式给**：滚动容器的语义是「内容超出**自己的**高度」，
+        // 而不是超出父给的盒子（盒子给大一点，容器自己矮）
+        col.layout.height = Some(deer_layout::node::Size::Px(50.0));
+        // 五个高 40 的子节点 ⇒ 内容高 200 ≫ 视口高 50（用多个小的比一个大 200 的更稳：
+        // 过不了「子节点主轴不被视口夹取」那条规则的实现差异）
+        for i in 0..5 {
+            let mut child = Node::new(Kind::Button, format!("b{i}"));
+            child.props.label = Some("x".into());
+            child.layout.height = Some(deer_layout::node::Size::Px(40.0));
+            col.children.push(child);
+        }
+
+        let box_ = Rect { x: 10.0, y: 20.0, w: 100.0, h: 200.0 };
+        let style = deer_layout::TextStyle { font_size: 14.0, line_height: 18.0 };
+        let (geo, metrics) = deer_layout::layout::layout_with_scroll(
+            &col,
+            box_,
+            style,
+            &ApproxMeasure,
+            &deer_layout::layout::ScrollOffsets::new(),
+        );
+        assert!(
+            metrics.max_of("scroller") > 0,
+            "测试前置：内容必须真的超出视口，否则下面的判据全都在测空气（实测 max_scroll={}）",
+            metrics.max_of("scroller")
+        );
+        (col, geo, metrics)
+    }
+
+    /// ① **默认状态一个滚动条都不画** —— 这条钉的是「既有语料逐字节不变」。
+    #[test]
+    fn default_scroll_state_draws_no_scrollbar() {
+        let (tree, geo, _m) = scroller_fixture();
+        let list = InteractiveRenderer::new(Theme::default(), &ApproxMeasure, &InteractState::default())
+            .build(&tree, &geo);
+        let f = geo.get("scroller").expect("容器有几何");
+        let vp = deer_layout::Rect { x: f.x, y: f.y, w: f.w, h: f.h };
+        // 前置：**假如**喂了状态就一定会画（否则本条断言可能只是因为几何算不出滚动条）
+        let _ = deer_layout::scrollbar_geom(vp, 0, 1).expect("喂了状态时该画得出来");
+        let in_scrollbar = list.cmds.iter().any(|c| {
+            matches!(c, DrawCmd::FillRoundRect { rect, .. }
+                if rect.x >= vp.x as i32 + vp.w as i32 - deer_layout::SCROLLBAR_W as i32 - 1)
+        });
+        assert!(
+            !in_scrollbar,
+            "默认状态（没喂滚动快照）不该在视口右边缘画任何东西"
+        );
+    }
+
+    /// ② 喂了状态 ⇒ **恰好**多出「轨道 + 滑块」两条，且几何与 `scrollbar_geom` 逐字节一致
+    ///   （绘制侧与命中侧共用同一份实现，这条就是它的判据）。
+    #[test]
+    fn feeding_scroll_state_adds_exactly_the_track_and_thumb() {
+        let (tree, geo, metrics) = scroller_fixture();
+        let base = InteractiveRenderer::new(Theme::default(), &ApproxMeasure, &InteractState::default())
+            .build(&tree, &geo);
+
+        let state = InteractState {
+            scroll: ScrollView {
+                offsets: deer_layout::layout::ScrollOffsets::new(),
+                metrics: metrics.clone(),
+            },
+            ..Default::default()
+        };
+        let fed =
+            InteractiveRenderer::new(Theme::default(), &ApproxMeasure, &state).build(&tree, &geo);
+
+        assert_eq!(
+            fed.len(),
+            base.len() + 2,
+            "喂了滚动状态之后应**恰好**多出「轨道 + 滑块」两条命令"
+        );
+
+        let f = geo.get("scroller").expect("容器有几何");
+        let vp = deer_layout::Rect { x: f.x, y: f.y, w: f.w, h: f.h };
+        let g = deer_layout::scrollbar_geom(vp, 0, metrics.max_of("scroller")).expect("该画");
+        let want_track = to_rect_i(g.track);
+        let want_thumb = to_rect_i(g.thumb);
+        let tail: Vec<&DrawCmd> = fed.cmds.iter().skip(base.len()).collect();
+        assert!(
+            matches!(tail[0], DrawCmd::FillRoundRect { rect, .. } if *rect == want_track),
+            "第一条应是轨道 {want_track:?}，实际 {:?}",
+            tail[0]
+        );
+        assert!(
+            matches!(tail[1], DrawCmd::FillRoundRect { rect, .. } if *rect == want_thumb),
+            "第二条应是滑块 {want_thumb:?}，实际 {:?}",
+            tail[1]
+        );
+    }
+
+    /// ③ 内容**没超出**视口 ⇒ 上限为 0 ⇒ 即使喂了状态也不画（满格滑块是噪音）。
+    #[test]
+    fn no_scrollbar_when_content_fits_even_with_state() {
+        let mut col = Node::new(Kind::Column, "tight");
+        col.layout.scroll = true;
+        let mut child = Node::new(Kind::Button, "b");
+        child.props.label = Some("x".into());
+        child.layout.height = Some(deer_layout::node::Size::Px(10.0));
+        col.children.push(child);
+
+        let box_ = Rect { x: 0.0, y: 0.0, w: 100.0, h: 200.0 };
+        let style = deer_layout::TextStyle { font_size: 14.0, line_height: 18.0 };
+        let (geo, metrics) = deer_layout::layout::layout_with_scroll(
+            &col,
+            box_,
+            style,
+            &ApproxMeasure,
+            &deer_layout::layout::ScrollOffsets::new(),
+        );
+        assert_eq!(metrics.max_of("tight"), 0, "测试前置：内容不该超出");
+
+        let state = InteractState {
+            scroll: ScrollView {
+                offsets: deer_layout::layout::ScrollOffsets::new(),
+                metrics,
+            },
+            ..Default::default()
+        };
+        let fed = InteractiveRenderer::new(Theme::default(), &ApproxMeasure, &state).build(&col, &geo);
+        let base = InteractiveRenderer::new(Theme::default(), &ApproxMeasure, &InteractState::default())
+            .build(&col, &geo);
+        assert_eq!(fed.len(), base.len(), "上限为 0 时不该画滚动条");
     }
 }

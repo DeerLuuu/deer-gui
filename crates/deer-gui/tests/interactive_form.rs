@@ -84,6 +84,7 @@ fn frame_with(tree: &Node, theme: &Theme, geo: &Geometry, state: &UiState) -> Fr
         hover: state.hover.clone(),
         focus: state.focus.clone(),
         pressed: state.pressed.clone(),
+        scroll: Default::default(),
     };
     let list = InteractiveRenderer::with_texts(
         theme.clone(),
