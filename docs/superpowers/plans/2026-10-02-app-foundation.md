@@ -2,6 +2,7 @@
 
 > **定位**：回答「要做出一个完整 App，还缺哪些**基础底层**」。按 `AGENTS.md` §7 四阶段工作流的 **P1 策划**格式输出（DoD-1：每条有验收标准与依赖、顺序满足依赖、公开 API 变更已列设计登记待确认）。
 > **修订**：v2（2026-10-02）—— 应用户「可视化编辑器」意向，并入 **E 线（编辑器地基）**与 **L 线（布局表达力）**，A 线追加 T3.7 指针捕获。
+> **修订 v3**（2026-10-02）：**分层落地** —— `docs/ARCHITECTURE.md` §2.3 登记 Godot 式 L0–L3 归属规则；`deer-gpu` 新增 `core_layer`/`text_layer`/`backend_layer` 门面模块（逻辑分层、零行为改动、零路径破坏）。本计划任务改动面映射到分层：A 线（`interaction.rs` = L2 framework）｜B 线（`deer-gpu::image` 待定属 core_layer 或 text_layer）｜C 线（deer-window 新面 = L1 DisplayServer / L3 host）｜L 线（`deer-layout` = L0 core）｜E 线（`deer-layout` + `.dui` = L0 core）。**物理拆 crate 待「Server 命名 + 时机」裁断**，本计划仍按既有 crate 推进。
 > **现状基线**（master `f0dd31d`，静态审阅 + 引用各 PR 自带验证记录，未重跑测试）：Phase 0 ✅、Phase 1（HAL 收敛）✅ —— T1.1/T1.2/T1.3 ✅、GPU HAL 已转 ✅（PR #16）；T3.5 输入框光标 ✅（PR #13）；文档反述已修净（PR #19）。
 > 状态真相源：`FEATURES.md`；里程碑：`ROADMAP.md`；本计划不重复登记。
 

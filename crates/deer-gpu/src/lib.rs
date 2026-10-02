@@ -49,6 +49,42 @@ pub use raster::Rasterizer;
 pub use render::{DefaultRenderer, NullRenderer, build_draw_list};
 pub use text::{GlyphPlacement, TextEngine};
 
+// ── 分层归属（2026-10-02 v2，Godot 式 L0–L3；详见 docs/ARCHITECTURE.md §2.3）────────
+//
+// 本 crate 历史地混装了三层的代码；以下门面模块是**逻辑分层**的入口，让下游可以按层引用
+// （如 `deer_gpu::core_layer::DrawList`），为将来物理拆 crate（→ `deer-core` / `deer-text` 等）铺路。
+// **不移动文件、不改既有 crate 根 `pub use` 路径**——零行为改动、零破坏。
+// 物理拆分的触发条件与"Server"命名待维护者裁断（见 ARCHITECTURE.md §2.3 末两点）。
+
+/// **L0 core**：与后端无关的契约 + 平台无关数据（`DrawCmd` 无设备 ⇒ core）。
+/// 将来随 `deer-layout` 并入 `deer-core`；HAL trait（`Backend`/`Device`/`Frame`…）定义在本
+/// crate 根，也属 L0 契约（实现它们才进 L1）。
+pub mod core_layer {
+    pub use crate::draw::{Color, DrawCmd, DrawList, RectI, TextureId};
+    pub use crate::error::{GpuError, GpuResult};
+    pub use crate::measure::FontMeasure;
+}
+
+/// **L1 TextServer**：字体解析 / 字形光栅化 / 图集 / 换行（有缓存与字体文件 ⇒ 服务级）。
+pub mod text_layer {
+    pub use crate::font::{Contour, Font, Glyph, Point, Segment};
+    pub use crate::glyph::{AtlasSlot, GlyphImage, GlyphKey};
+    pub use crate::raster::Rasterizer;
+    pub use crate::atlas::GlyphAtlas;
+    pub use crate::text::{GlyphPlacement, TextEngine};
+}
+
+/// **L1 RenderServer（CPU 参考后端）**：软件光栅化实现，作 parity 基准。
+/// Vulkan 后端在独立 crate `deer-vk`（也属 L1 RenderServer）。
+pub mod backend_layer {
+    pub use crate::null::CpuRenderer;
+    pub use crate::render::{DefaultRenderer, NullRenderer, build_draw_list};
+    pub use crate::interact::{
+        FieldText, InteractState, InteractiveRenderer, ScrollView, build_interactive_draw_list,
+        build_interactive_draw_list_with_texts,
+    };
+}
+
 use deer_layout::Geometry;
 use deer_layout::node::Node;
 
