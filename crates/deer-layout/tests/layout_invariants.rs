@@ -271,7 +271,10 @@ fn t10_scene_roundtrip() {
 fn t11_scene_errors_carry_line_numbers() {
     let cases: &[(&str, &str)] = &[
         ("未知类型", "[bogus name=x]\n"),
-        ("未知属性", "[text label=x nope=1]\n"),
+        // ⚠️ 这里原本是 `("未知属性", "[text label=x nope=1]")` —— **D8 起不再是错误**：
+        // 未知属性改成「警告 + 结构化保留」（见 `e2_unknown_attrs_tests`）。
+        // 换成**已知**属性的错误写法，覆盖同一个「带行号」的诉求，且不放松判据。
+        ("开关属性带值", "[text label=x disabled=1]\n"),
         ("叶子有子节点", "[text label=x]\n  [text label=y]\n"),
         ("缩进非 2 倍数", "[column name=a]\n   [text label=x]\n"),
         ("尺寸非法", "[text name=t w=abc]\n"),
@@ -350,5 +353,31 @@ fn t14_container_cross_axis_is_max_not_sum() {
         measure_tree(&c, STYLE, &ApproxMeasure)["col"].0,
         36.0,
         "Column 的交叉轴固有宽 = max(子宽) = 36，不是 72"
+    );
+}
+
+/// **D8 的新契约**：未知属性**不报错**，而是「警告 + 保留 + 写回」。
+///
+/// 与上一条（错误必须带行号）成对存在 —— 改契约时两条一起改，避免「放宽了但没人知道」。
+#[test]
+fn t11b_unknown_attrs_are_warned_not_rejected() {
+    let src = "[text label=x nope=1]\n";
+    let (tree, warnings) =
+        deer_layout::scene::parse_scene_collect(src, "ok.dui").expect("未知属性不该让解析失败");
+    assert_eq!(warnings.len(), 1, "应当有一条警告：{warnings:?}");
+    assert!(
+        warnings[0].contains("nope"),
+        "警告里要点名是哪个属性：{warnings:?}"
+    );
+    assert_eq!(
+        tree.props.extra.get("nope"),
+        Some(&Some("1".to_string())),
+        "未知属性必须被**结构化保留**"
+    );
+    // 而且**写得回去**（保留的意义就在这 —— 否则编辑器存一次就丢了）
+    assert!(
+        encode_scene(&tree).contains("nope=1"),
+        "未知属性必须被写回：{}",
+        encode_scene(&tree)
     );
 }

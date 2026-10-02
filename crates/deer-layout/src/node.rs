@@ -130,6 +130,17 @@ pub struct LayoutProps {
 pub struct NodeProps {
     pub label: Option<String>,
     pub disabled: bool,
+    /// **未知属性的原样保留**（D8 / E2 / Q6）：`.dui` 载入时遇到当前版本**不认识**的属性，
+    /// 不丢弃、也不硬报错，而是原样存这里、存盘时再写回去。
+    ///
+    /// 为什么要有它：编辑器往返**不能默默吃掉**用户文件里的未来字段 ——
+    /// 用户在新版里写的东西被旧版存一次就没了，那是**数据丢失**（而受害者往往过很久才发现）。
+    ///
+    /// - **值是 `Option<String>`**：`Some(v)` = `k=v`；`None` = **裸属性 `k`**。
+    ///   两者**不是同一件事**（`foo` vs `foo=""`）⇒ 合成一个 `String` 就再也分不出来，
+    ///   往返会**改掉文件内容**；
+    /// - **`BTreeMap` 而非 `HashMap`**：键序确定 ⇒ 编码逐字节可复现（round-trip² 的前提）。
+    pub extra: std::collections::BTreeMap<String, Option<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

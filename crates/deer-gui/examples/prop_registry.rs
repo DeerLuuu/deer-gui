@@ -105,6 +105,7 @@ fn type_name(t: registry::PropType) -> &'static str {
         registry::PropType::Size => "size",
         registry::PropType::Align => "align",
         registry::PropType::Text => "text",
+        registry::PropType::Opaque => "opaque",
     }
 }
 

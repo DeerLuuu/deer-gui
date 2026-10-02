@@ -43,6 +43,12 @@ pub enum PropType {
     Align,
     /// 文本（`label`）。
     Text,
+    /// **不透明**：往返保真的载体 —— **编辑器不该直接编辑它**（D8 的 `extra`）。
+    ///
+    /// 单列一类而不是塞进 `Text`：它的语义不是「一段文字」，而是
+    /// 「本库不认识的属性的原样保留」。把它伪装成可编辑文本会诱导编辑器去改它，
+    /// 而改它等于替用户编造未来版本的语义。
+    Opaque,
 }
 
 /// 一条属性登记。
@@ -146,6 +152,13 @@ pub const SPECS: &[PropSpec] = &[
         kinds: &TEXTUAL,
     },
     PropSpec {
+        name: "extra",
+        ty: PropType::Opaque,
+        domain: "未知属性的原样保留（**不要编辑**；它只为往返保真）",
+        default: "none",
+        kinds: &ANY,
+    },
+    PropSpec {
         name: "disabled",
         ty: PropType::Bool,
         domain: "true | false（**整棵子树**都不响应输入）",
@@ -194,12 +207,16 @@ mod tests {
             scroll,
             wrap,
         } = LayoutProps::default();
-        let NodeProps { label, disabled } = NodeProps::default();
+        let NodeProps {
+            label,
+            disabled,
+            extra,
+        } = NodeProps::default();
 
         // ② 触碰每个绑定（否则编译器会警告 unused，后来者容易一把删掉）
         let _probe = (
             &width, &height, &padding, &gap, &main_axis, &cross_axis, &grow, &scroll, &wrap, &label,
-            &disabled,
+            &disabled, &extra,
         );
 
         // ③ 名字集合必须相等（两边都排序后比较，避免顺序敏感）
@@ -215,6 +232,7 @@ mod tests {
             "wrap",
             "label",
             "disabled",
+            "extra",
         ];
         let mut from_registry: Vec<&str> = SPECS.iter().map(|s| s.name).collect();
         from_struct.sort_unstable();
@@ -247,6 +265,7 @@ mod tests {
                 "wrap" => l.wrap.to_string(),
                 "label" => format!("{:?}", n.label).to_lowercase(),
                 "disabled" => n.disabled.to_string(),
+                "extra" => "none".to_string(), // 空表 ⇒ 登记里写 none
                 other => panic!("登记表里有 `{other}`，但本测试不知道它该映到哪个字段 —— 请补上"),
             }
         };

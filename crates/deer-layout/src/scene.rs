@@ -256,7 +256,7 @@ fn declared_version(src: &str) -> Option<Result<u32, String>> {
     )
 }
 
-pub fn parse_scene(src: &str, source: &str) -> Result<Node, SceneError> {
+pub fn parse_scene_collect(src: &str, source: &str) -> Result<(Node, Vec<String>), SceneError> {
     // **版本头必须先读**：`preprocess` 会把 `#` 行当注释剥掉，之后就再也看不见它了。
     match declared_version(src) {
         Some(Ok(v)) if v > SCENE_FORMAT_VERSION => {
@@ -287,6 +287,8 @@ pub fn parse_scene(src: &str, source: &str) -> Result<Node, SceneError> {
     }
 
     let mut ids = IdGen::new();
+    // 载入过程中的**非致命**提示（未知属性等）—— 由 `parse_scene_collect` 交出去。
+    let mut warnings: Vec<String> = Vec::new();
     let mut open: Vec<Open> = Vec::new();
     let mut root: Option<Node> = None;
 
@@ -308,13 +310,29 @@ pub fn parse_scene(src: &str, source: &str) -> Result<Node, SceneError> {
             .ok_or_else(|| err(format!("未知节点类型 \"{type_name}\""), line, source))?;
         let attrs = parse_attrs(attrs_str, line, source)?;
 
-        for (k, _) in &attrs {
+        // **未知属性 = 警告 + 结构化保留**（D8 / Q6）。
+        //
+        // 为什么不再是硬报错：`.dui` 是**用户会手写、编辑器会存回**的文件。
+        // 用户在新版里写的属性被旧版读一次就丢掉，那是**数据丢失** ——
+        // 而且往往过很久才发现（「我那个设置怎么没了」）。
+        // 所以：**保留**（进 `extra`、存盘原样写回）+ **警告**（让人知道本版不认识它）。
+        //
+        // ⚠️ 只对**未知**属性放宽：**已知**属性写错**仍然硬报错** ——
+        // 那类错是「写错了但不生效」，最难查（见 `as_flag` 的说明），必须继续拦。
+        let mut extra: std::collections::BTreeMap<String, Option<String>> =
+            std::collections::BTreeMap::new();
+        for (k, v) in &attrs {
             if !KNOWN_ATTRS.contains(&k.as_str()) {
-                return Err(err(
-                    format!("未知属性 \"{k}\"（可用：{}）", KNOWN_ATTRS.join("/")),
-                    line,
-                    source,
+                // `AttrVal::Str(s)` ⇒ `k=s`；裸属性 ⇒ 只写 key（`None`）。
+                // 两者必须分开存：`foo` 与 `foo=""` 不是同一件事（见 `NodeProps::extra`）。
+                let val = match v {
+                    AttrVal::Str(s) => Some(s.clone()),
+                    AttrVal::Bare => None,
+                };
+                warnings.push(format!(
+                    "第 {line} 行：属性 `{k}` 本版不认识 —— 已原样保留并写回，但不会生效"
                 ));
+                extra.insert(k.clone(), val);
             }
         }
         let get = |k: &str| attrs.iter().find(|(a, _)| a == k).map(|(_, v)| v);
@@ -376,6 +394,7 @@ pub fn parse_scene(src: &str, source: &str) -> Result<Node, SceneError> {
             nprops.label = Some(s.clone());
         }
         nprops.disabled = as_flag(get("disabled"), "disabled", line, source)?;
+        nprops.extra = extra;
 
         let node = Node::new(kind, id).with_layout(layout).with_props(nprops);
 
@@ -428,7 +447,15 @@ pub fn parse_scene(src: &str, source: &str) -> Result<Node, SceneError> {
         }
     }
 
-    root.ok_or_else(|| err("场景为空", 1, source))
+    root.map(|r| (r, warnings))
+        .ok_or_else(|| err("场景为空", 1, source))
+}
+
+/// 解析 `.dui` 场景（**签名与行为不变**，警告丢弃）。
+///
+/// 要拿警告（例如编辑器提示「本版不认识某个属性」）就用 [`parse_scene_collect`]。
+pub fn parse_scene(src: &str, source: &str) -> Result<Node, SceneError> {
+    parse_scene_collect(src, source).map(|(node, _warnings)| node)
 }
 
 /// 编码回 `.dui` 文本。`parse_scene(encode_scene(t))` 必须与 `t` 结构相等。
@@ -475,6 +502,15 @@ pub fn encode_scene(root: &Node) -> String {
         }
         if n.props.disabled {
             attrs.push("disabled".to_string());
+        }
+        // **未知属性原样写回**（D8）：写在已知属性**之后**，顺序 = `BTreeMap` 键序
+        // ⇒ 同一棵树编码结果逐字节相同（round-trip² 的前提）。
+        // `None` = 原本就是**裸属性**，写回去也还是裸的（`foo` 不会变成 `foo=""`）。
+        for (k, v) in &n.props.extra {
+            match v {
+                Some(val) => attrs.push(format!("{k}={}", quote(val))),
+                None => attrs.push(k.clone()),
+            }
         }
         out.push_str(&format!("{pad}[{} {}]\n", n.kind.as_str(), attrs.join(" ")));
         for c in &n.children {
@@ -631,5 +667,80 @@ mod e2_id_uniqueness_tests {
         let src = "[column name=app]\n  [button name=a]\n  [button name=b]\n";
         let t = parse_scene(src, "ok.dui").expect("唯一命名应当能读");
         assert_eq!(t.children.len(), 2);
+    }
+}
+
+#[cfg(test)]
+mod e2_unknown_attrs_tests {
+    use super::*;
+
+    /// ① **未知属性：保留 + 警告 + 写回**（这是 D8 的核心三件事，缺一不算）
+    #[test]
+    fn unknown_attrs_are_warned_kept_and_written_back() {
+        let src = "[column name=app future=on]\n";
+        let (t, warn) = parse_scene_collect(src, "f.dui").expect("未知属性不该让解析失败");
+        assert_eq!(t.props.extra.get("future"), Some(&Some("on".to_string())));
+        assert_eq!(warn.len(), 1, "应当有**恰好一条**警告：{warn:?}");
+        assert!(warn[0].contains("future") && warn[0].contains("保留"), "{warn:?}");
+
+        let out = encode_scene(&t);
+        assert!(out.contains("future=on"), "未知属性必须被**写回**（否则就是数据丢失）：{out}");
+    }
+
+    /// ② **裸属性 `foo` 与 `foo=""` 必须区分**（它们在 `AttrVal` 里本来就是两种东西；
+    /// 合成一个类型就会在往返里改掉文件内容）
+    #[test]
+    fn bare_and_empty_valued_attrs_stay_distinct_through_round_trip() {
+        let src = "[column name=app flag bareval=\"\"]\n";
+        let t = parse_scene(src, "f.dui").expect("能读");
+        assert_eq!(t.props.extra.get("flag"), Some(&None), "裸属性应当存成 None");
+        assert_eq!(
+            t.props.extra.get("bareval"),
+            Some(&Some(String::new())),
+            "带空值的属性应当存成 Some(\"\")"
+        );
+        let out = encode_scene(&t);
+        let again = parse_scene(&out, "f.dui").expect("再读一次");
+        assert_eq!(
+            again.props.extra, t.props.extra,
+            "往返之后两种形态必须还是两种（否则「存一次就改内容」）：{out}"
+        );
+    }
+
+    /// ③ **已知属性写错仍然硬报错** —— 只对**未知**属性放宽，别把校验一起放松了。
+    #[test]
+    fn known_attr_with_a_bad_value_still_errors() {
+        // `scroll` 是开关属性：带值就是错（既有哲学）
+        let e = parse_scene("[column name=app scroll=1]\n", "bad.dui")
+            .expect_err("已知属性的错误写法必须继续报错");
+        assert!(format!("{e}").contains("scroll"), "{e}");
+        // 未知属性则不报错（同一次对照，证明放宽只针对未知）
+        assert!(parse_scene("[column name=app scrollx=1]\n", "ok.dui").is_ok());
+    }
+
+    /// ④ 带未知属性的文件**往返两次逐字节相同**（round-trip² 在有 extra 时也成立）
+    #[test]
+    fn round_trip_is_stable_with_unknown_attrs() {
+        let once = encode_scene(&parse_scene("[column name=app z=1 a=2 bare]\n", "f.dui").unwrap());
+        let twice = encode_scene(&parse_scene(&once, "f.dui").unwrap());
+        assert_eq!(once, twice, "带未知属性时也必须往返稳定：\n{once}\n---\n{twice}");
+    }
+
+    /// ⑤ **没有未知属性 ⇒ 逐字节不变**（既有语料的编码不许因为 D8 而变）
+    #[test]
+    fn no_unknown_attrs_means_byte_identical_output() {
+        let out = encode_scene(&parse_scene("[column name=app]\n  [button name=ok]\n", "f.dui").unwrap());
+        assert!(
+            !out.contains("extra") && !out.contains("None"),
+            "不该多写任何东西：{out}"
+        );
+        assert_eq!(out.lines().count(), 3, "头 + 两行节点：{out}");
+    }
+
+    /// ⑥ 老入口 `parse_scene` **签名与行为不变**（警告被丢掉）
+    #[test]
+    fn old_entry_point_still_works() {
+        let t = parse_scene("[column name=app future=on]\n", "f.dui").expect("老入口照常能读");
+        assert_eq!(t.id, "app");
     }
 }

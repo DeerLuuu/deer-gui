@@ -289,5 +289,6 @@ pub fn props(label: Option<&str>, disabled: bool) -> NodeProps {
     NodeProps {
         label: label.map(|s| s.to_string()),
         disabled,
+            extra: Default::default(),
     }
 }
