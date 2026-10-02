@@ -43,10 +43,11 @@ fn map_key_named_table() {
         (NamedKey::F35, Key::Other),
         (NamedKey::Delete, Key::Other),
         (NamedKey::Insert, Key::Other),
-        (NamedKey::Home, Key::Other),
-        (NamedKey::End, Key::Other),
-        (NamedKey::PageUp, Key::Other),
-        (NamedKey::PageDown, Key::Other),
+        // T3.2 按键滚动：四个滚动键首次有了自己的变体（此前落进 Other）
+        (NamedKey::Home, Key::Home),
+        (NamedKey::End, Key::End),
+        (NamedKey::PageUp, Key::PageUp),
+        (NamedKey::PageDown, Key::PageDown),
         (NamedKey::ContextMenu, Key::Other),
         (NamedKey::Pause, Key::Other),
         (NamedKey::PrintScreen, Key::Other),
@@ -238,11 +239,11 @@ fn input_event_is_comparable_and_cloneable() {
     let copy = text.clone();
     assert_eq!(copy, text);
 
-    let key = InputEvent::KeyDown { key: Key::Char('中'), mods: Mods { ctrl: true, ..Mods::default() } };
+    let key = InputEvent::KeyDown { key: Key::Char('中'), mods: Mods { ctrl: true, ..Mods::default() }, repeat: false };
     assert_eq!(key.clone(), key);
     assert_ne!(
         key,
-        InputEvent::KeyDown { key: Key::Char('中'), mods: Mods::default() },
+        InputEvent::KeyDown { key: Key::Char('中'), mods: Mods::default(), repeat: false },
         "mods 参与相等判定（Ctrl+中 与 中 不是同一个事件）"
     );
     assert_ne!(key, InputEvent::KeyUp { key: Key::Char('中'), mods: Mods { ctrl: true, ..Mods::default() } });
@@ -294,7 +295,7 @@ fn app_input_default_is_side_effect_free() {
         InputEvent::PointerDown { button: PointerButton::Left, x: 1.0, y: 2.0 },
         InputEvent::PointerUp { button: PointerButton::Right, x: 1.0, y: 2.0 },
         InputEvent::Wheel { dx: 1.0, dy: -1.0 },
-        InputEvent::KeyDown { key: Key::Tab, mods: Mods::default() },
+        InputEvent::KeyDown { key: Key::Tab, mods: Mods::default(), repeat: false },
         InputEvent::KeyUp { key: Key::Char('x'), mods: Mods { shift: true, ..Mods::default() } },
         InputEvent::TextInput { text: "hi".to_string() },
         InputEvent::FocusChanged { focused: false },

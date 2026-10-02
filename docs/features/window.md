@@ -470,8 +470,10 @@ set "DEER_WINDOW_REDRAW=continuous" && cargo run -q -p deer-window --example <�
   - **只有 Windows 的句柄映射**：winit 在别的平台也能开窗，但「原生句柄 → HAL 句柄」未实现 ⇒ `run()` 明确返回 `Err`（不静默填 0）。
   - **输入事件**：**已支持**（M5-1..M5-4：`InputEvent` + winit 映射 + `App::input` → 命中/状态机 → 重绘；
     见 [`input.md`](input.md)）。**M5b 起重绘也改成事件驱动**（默认省电，见第 6 节）；
-    **仍未做**：方向键**上下**导航 / 右键中键 / **按键滚动**（`PageUp` / `Home` / `End`）/ **按键重复**。
-    （**左右**方向键已做：输入框光标，T3.5；画面上的那根竖线是 T3.8。）
+    **均已落地**（详见 [`input.md`](input.md)）：方向键**上下**导航（T3.1）、
+    **按键滚动** `PageUp`/`PageDown`/`Home`/`End`、**右键透传** `PointerRight`（T3.3）、
+    **按键重复** `KeyDown.repeat`（T3.6）。**仍未做**的输入面只剩：**上下文菜单本体**（M6 控件）、
+    中键语义（只同步 hover）、触摸/拖放/物理键码。
     **滚动那一支已落地**：`MouseWheel` → `InputEvent::Wheel` → 滚动偏移 → 几何/绘制/命中，
     见 [`scroll-and-multiline.md`](scroll-and-multiline.md)；**可视滚动条**（拖滑块改偏移 +
     **点轨道跳转**）与**惯性驱动**（App 在 `redraw`/`next_deadline` 里接

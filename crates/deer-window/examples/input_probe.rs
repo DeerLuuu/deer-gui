@@ -85,7 +85,7 @@ impl Probe {
                 println!("{head} up        {} ({x:.1}, {y:.1})", button_name(*button));
             }
             InputEvent::Wheel { dx, dy } => println!("{head} wheel     dx={dx:.2} dy={dy:.2}"),
-            InputEvent::KeyDown { key, mods } => {
+            InputEvent::KeyDown { key, mods, .. } => {
                 println!("{head} key down  {key:?} mods={}", mods_name(*mods));
             }
             InputEvent::KeyUp { key, mods } => {

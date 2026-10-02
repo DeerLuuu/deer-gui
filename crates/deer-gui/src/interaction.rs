@@ -82,6 +82,11 @@ mod mirror {
         Right,
         Up,
         Down,
+        /// 滚动键（T3.2 剩余）：`PageUp` / `PageDown` 翻页，`Home` / `End` 到顶/到底。
+        PageUp,
+        PageDown,
+        Home,
+        End,
         /// 可打印字符键（逻辑字符，`Shift+a` ⇒ `Char('A')`）。
         Char(char),
         /// 其它一切（修饰键、功能键、死键、无法识别的键）。
@@ -112,6 +117,9 @@ mod mirror {
         KeyDown {
             key: Key,
             mods: Mods,
+            /// **系统按键重复**（长按不松时 OS 补发的 KeyDown）：`true` = 重复，`false` = 真按下。
+            /// 交互层默认不区分（照常消费）；建模的意义是「能区分」（T3.6，与 `deer-window` 逐字同步）。
+            repeat: bool,
         },
         KeyUp {
             key: Key,
@@ -389,6 +397,12 @@ pub enum UiEvent {
     /// 只有**真的变了**才发（到顶/到底再滚、或 `max_scroll == 0` 都是「没变」⇒ 不发），
     /// 于是窗口层的 dirty 约定照旧：有事件 = 需要重绘。
     Scrolled { id: String, offset: i32 },
+    /// **右键**按在某个节点上（T3.3，Q1 裁断：**纯透传** —— 上下文菜单属 M6 控件，
+    /// 地基只保证「事件能到上层」）。
+    ///
+    /// 语义与 `Clicked` 对称：**按下处 == 抬起处**才发（右键拖走再抬起不算）；
+    /// 但**不参与焦点/pressed**（右键不是「激活」）。禁用子树/被裁剪 ⇒ 不发。
+    PointerRight { id: String },
 }
 
 /// 滚轮的**每「一格」对应的像素数**（`InputEvent::Wheel::dy` 的单位由窗口层决定：
@@ -710,6 +724,14 @@ fn node_id_at(root: &Node, geo: &Geometry, clip: ClipSnapshot, x: f32, y: f32) -
     hit(root, geo, clip, x, y).map(|n| n.id.clone())
 }
 
+/// 从事件里取指针坐标（右/中键的通配分支用）。
+fn pointer_pos(ev: &InputEvent) -> (f32, f32) {
+    match ev {
+        InputEvent::PointerDown { x, y, .. } | InputEvent::PointerUp { x, y, .. } => (*x, *y),
+        _ => (0.0, 0.0),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 四b、滚轮 → 滚动偏移（剩余工作第 1 项）
 // ---------------------------------------------------------------------------
@@ -803,6 +825,75 @@ fn next_focus(ids: &[String], current: Option<&str>, back: bool) -> Option<Strin
 }
 
 // ---------------------------------------------------------------------------
+// 五b、方向键焦点（T3.1，D2：几何邻近）
+// ---------------------------------------------------------------------------
+
+/// 方向键的搜索方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Up,
+    Down,
+}
+
+/// **几何邻近**的下一个可聚焦控件（T3.1 / D2 裁断：不复用 `Tab` 的构建序 ——
+/// `Tab` 是构建序、方向键是空间语义，两者本就不同）。
+///
+/// 规则（一眼版）：在「与当前焦点**不同**、且**严格**在按键方向上（Up ⇒ 中心在上方
+/// `Δy < 0`；Down ⇒ 中心在下方 `Δy > 0`）」的可聚焦控件里选最近者：
+///
+/// - **主判据（垂直距离）**：`|Δy|` ——「上下移动」的第一直觉；
+/// - **平手判据（水平偏移）**：`|Δx|` —— 同一垂距的两个候选选水平更近的；
+/// - **再平手**：树序在前者（`focusables` 的迭代序）—— 同一输入永远同一输出
+///   （与布局不变式 I-1/I-2 的确定性纪律同源）。
+///
+/// ⚠️ **`Δy == 0`（同一行）不算任何方向**：「向下」把焦点挪到同行右边是反直觉的
+/// （且会让 Up/Down 在同一行按钮间来回横跳）—— 这条是测试逼出来的规则
+/// （第一版把 dy=0 放进 Down 方向 ⇒ btn_ok 按 Down 跑到了同行的 name 上）。
+///
+/// 两种 `None`：集合为空；无当前焦点时也 `None`（方向键没有「当前位置」就没有
+/// 「方向」可言 —— 与 `Tab` 的「无焦点取第一个」不同，这是刻意的：Tab 是序、
+/// 方向键是几何，无焦点的「第一个」在几何上没有定义）。
+fn nearest_focusable(
+    root: &Node,
+    geo: &Geometry,
+    current: Option<&str>,
+    dir: Direction,
+) -> Option<String> {
+    let cur_id = current?;
+    let ids = focusables(root);
+    let center = |id: &str| -> Option<(f32, f32)> {
+        geo.get(id).map(|f| (f.x + f.w / 2.0, f.y + f.h / 2.0))
+    };
+    let cur = center(cur_id)?;
+    let want_above = dir == Direction::Up;
+    let mut best: Option<(f32, f32, String)> = None; // (|Δy|, |Δx|, id)
+    for id in &ids {
+        if id == cur_id {
+            continue;
+        }
+        let Some(c) = center(id) else {
+            continue; // 零尺寸/无几何 ⇒ 方向键够不着（与 Tab 序的注释同源）
+        };
+        let (dy, dx) = (c.1 - cur.1, c.0 - cur.0);
+        // 严格方向：Δy 必须与方向同号；Δy == 0（同行）两个方向都不算。
+        if dy == 0.0 || (dy < 0.0) != want_above {
+            continue;
+        }
+        let key = (dy.abs(), dx.abs());
+        let better = match &best {
+            // 严格更近，或「垂距相等且水平更近」；全等 ⇒ 树序在前者胜（迭代序即树序，
+            // 先到的同距候选不被替换 ⇒ 用严格小于）。
+            None => true,
+            Some((by, bx, _)) => key.0 < *by || (key.0 == *by && key.1 < *bx),
+        };
+        if better {
+            best = Some((key.0, key.1, id.clone()));
+        }
+    }
+    best.map(|(_, _, id)| id)
+}
+
+// ---------------------------------------------------------------------------
 // 六、状态机（M5-2）
 // ---------------------------------------------------------------------------
 
@@ -819,8 +910,12 @@ fn next_focus(ids: &[String], current: Option<&str>, back: bool) -> Option<Strin
 /// | `KeyDown { Backspace }` | 焦点是启用的输入框 ⇒ 删**一个字符**（Unicode 字符，不是字节）⇒ `TextChanged` |
 /// | `TextInput` | 焦点是启用的输入框 ⇒ 追加 ⇒ `TextChanged` |
 /// | `FocusChanged { focused: false }` | 窗口失焦：清 `hover`/`pressed`（`focus`/`texts` 不动）|
-/// | `Wheel { dy }` | **滚动**：`hover` 最近的可滚动祖先（含自身）偏移 `-dy ×` [`WHEEL_STEP_PX`]，夹在 `[0, max_scroll]`；变了才发 `Scrolled` |
-/// | 其余（`KeyUp`、右/中键、方向键、`Key::Char`/`Other`、`focused: true`） | 本里程碑不消费（见「已知边界」） |
+/// | `Wheel { dy }` | **滚动**：`hover` 最近的可滚动祖先（含自身）偏移 `-dy ×` [`WHEEL_STEP_PX`]`，夹在 `[0, max_scroll]`；变了才发 `Scrolled` |
+/// | `KeyDown { Up/Down }`（T3.1，焦点**不是**输入框时） | **几何邻近**焦点移动（严格方向；无焦点 ⇒ 不定义；到边停） |
+/// | `KeyDown { PageUp/PageDown/Home/End }`（T3.2，焦点**不是**输入框时） | **按键滚动**：焦点容器优先、退 `hover`；翻页 = 视口高；Home/End 到边 |
+/// | `PointerDown { Right }`（T3.3，Q1） | **按下即发** `PointerRight`（纯透传；不 pressed/不焦点；禁用子树不发） |
+/// | `KeyDown { repeat: true }`（T3.6） | 与 `false` 同语义（**能区分**；要不要忽略重复由调用方决定） |
+/// | 其余（`KeyUp`、中键、`Key::Char`/`Other`、`focused: true`） | 不消费（见「已知边界」） |
 ///
 /// 只有**状态真的变了**才产出事件（`M5-4` 的 dirty 约定依赖这一点）。
 ///
@@ -938,8 +1033,28 @@ pub fn handle(
             state.pressed = id;
             }
         }
-        // 右/中键不参与按下与点击（右键菜单/中键滚动是 M6+ 的事）。
-        InputEvent::PointerDown { .. } => {}
+        // 右/中键：**不参与左键的按下/点击语义**（pressed/Clicked 独占属左键）。
+        // 右键 ⇒ **按下即发** `PointerRight`（Q1：纯透传 —— 为什么不做「按下处==抬起处」
+        // 的 Clicked 式配对：那需要记「右键按下处」，要么给 `UiState` 加公开字段（改契约），
+        // 要么拿 hover 近似（按下后拖走再回来会误判）。透传的语义就是「事件到了」，
+        // 菜单的打开/关闭属 M6 控件层，到那时再决定要不要配对语义）。
+        InputEvent::PointerDown {
+            button: PointerButton::Right,
+            x,
+            y,
+        } => {
+            let id = node_id_at(root, geo, clip, *x, *y);
+            sync_hover(state, &mut out, id.clone());
+            if let Some(id) = id {
+                out.push(UiEvent::PointerRight { id });
+            }
+        }
+        // 中键：同步 hover（指针事件统一规则），无额外语义。
+        InputEvent::PointerDown { .. } => {
+            let (x, y) = pointer_pos(ev);
+            let id = node_id_at(root, geo, clip, x, y);
+            sync_hover(state, &mut out, id);
+        }
         InputEvent::PointerUp {
             button: PointerButton::Left,
             x,
@@ -958,7 +1073,13 @@ pub fn handle(
                 }
             }
         }
-        InputEvent::PointerUp { .. } => {}
+        // 右/中键的**抬起**：只同步 hover（按下语义已在 Down 分支完成 —— `PointerRight`
+        // 是按下即发，没有抬起配对）。
+        InputEvent::PointerUp { .. } => {
+            let (x, y) = pointer_pos(ev);
+            let id = node_id_at(root, geo, clip, x, y);
+            sync_hover(state, &mut out, id);
+        }
         InputEvent::Wheel { dy, .. } => {
             // 滚轮滚「`hover` 最近的可滚动祖先（含自身）」，一个步长见 [`WHEEL_STEP_PX`]。
             // `dx`（水平）**本期忽略**：只做垂直滚动（`Row` 上的 `scroll` 也被忽略）。
@@ -978,6 +1099,7 @@ pub fn handle(
         InputEvent::KeyDown {
             key: Key::Tab,
             mods,
+            ..
         } => {
             let ids = focusables(root);
             if let Some(next) = next_focus(&ids, state.focus.as_deref(), mods.shift) {
@@ -1037,6 +1159,75 @@ pub fn handle(
             if let Some(id) = focused_field_id(root, state) {
                 let caret = caret_of(state, &id);
                 set_caret(state, &id, caret + 1); // `set_caret` 自己会夹到字符数
+            }
+        }
+        // T3.1（D2 裁断：几何邻近，不复用 Tab 的构建序）：方向键**上下**把焦点移到
+        // 「几何上最近」的可聚焦控件。前置：焦点在**输入框**上 ⇒ 不消费 —— 上下留给
+        // 多行文本的光标移动（与 Left/Right 被 `Field` 光标独占是同一条边界规则）。
+        InputEvent::KeyDown { key: Key::Up, .. } => {
+            if focused_field_id(root, state).is_none() {
+                if let Some(next) =
+                    nearest_focusable(root, geo, state.focus.as_deref(), Direction::Up)
+                {
+                    if state.focus.as_deref() != Some(next.as_str()) {
+                        state.focus = Some(next.clone());
+                        out.push(UiEvent::FocusChanged(Some(next)));
+                    }
+                }
+            }
+        }
+        InputEvent::KeyDown { key: Key::Down, .. } => {
+            if focused_field_id(root, state).is_none() {
+                if let Some(next) =
+                    nearest_focusable(root, geo, state.focus.as_deref(), Direction::Down)
+                {
+                    if state.focus.as_deref() != Some(next.as_str()) {
+                        state.focus = Some(next.clone());
+                        out.push(UiEvent::FocusChanged(Some(next)));
+                    }
+                }
+            }
+        }
+        // 按键滚动（T3.2 剩余）：`PageUp`/`PageDown` 翻一页（= 视口高）、`Home`/`End`
+        // 到顶/到底。目标规则与滚轮同一来源：**焦点所在容器优先**（键盘用户没有指针），
+        // 无焦点 ⇒ 退 `hover`（滚轮的目标规则），再没有 ⇒ 不滚（fail-closed）。
+        // 前置：焦点在输入框上 ⇒ 不消费（PageUp 等在输入语境是编辑键 —— 与方向键同边界）。
+        InputEvent::KeyDown {
+            key: key @ (Key::PageUp | Key::PageDown | Key::Home | Key::End),
+            ..
+        } => {
+            if focused_field_id(root, state).is_none() {
+                // 翻页步长 = 目标容器视口高（几何里有；没有几何 ⇒ 退 WHEEL_STEP_PX）
+                let anchor = state
+                    .focus
+                    .clone()
+                    .or_else(|| state.hover.clone());
+                let Some(anchor) = anchor else { return out };
+                let Some(node) = node_by_id(root, &anchor) else { return out };
+                if path_is_dead(root, node) {
+                    return out;
+                }
+                let Some(target) = nearest_scroll_container(root, &anchor, None) else {
+                    return out;
+                };
+                let viewport_h = geo
+                    .get(&target.id)
+                    .map(|f| f.h.max(1.0) as i32)
+                    .unwrap_or(WHEEL_STEP_PX);
+                let cur = state.scroll.offset_of(&target.id);
+                let want = match key {
+                    Key::PageUp => cur - viewport_h,
+                    Key::PageDown => cur + viewport_h,
+                    Key::Home => 0,
+                    Key::End => state.scroll.max_of(&target.id),
+                    _ => cur,
+                };
+                if let Some(offset) = state.scroll.scroll_to(&target.id, want) {
+                    out.push(UiEvent::Scrolled {
+                        id: target.id.clone(),
+                        offset,
+                    });
+                }
             }
         }
         // `Key::Up` / `Key::Down` / `Key::Char` / `Key::Other`：不消费 —— 上下没有对应的
@@ -1299,6 +1490,7 @@ mod tests {
                 shift,
                 ..Default::default()
             },
+            repeat: false,
         }
     }
 
@@ -2362,10 +2554,11 @@ mod tests {
             "测试前置：这棵树里不该有可滚动容器，实际 {scrollers:?}"
         );
         let before = s.clone();
+        // 注：T3.3 起**右键按下**不在这张表里 —— 它现在**有意**发 `PointerRight`
+        // （Q1 纯透传）。它的正判据在 t33 那组；这里只保留「中键」与「右键抬起」。
         let events = [
             InputEvent::Wheel { dx: 0.0, dy: 3.0 },
             InputEvent::KeyUp { key: Key::Tab, mods: Mods::default() },
-            InputEvent::PointerDown { button: PointerButton::Right, x, y },
             InputEvent::PointerUp { button: PointerButton::Middle, x, y },
             // 注：`Key::Left` / `Key::Right` **不在**这张表里了 —— T3.5 起它们有自己的分支
             // （挪输入框光标），被 `handle` **消费** ⇒ 会改状态。它们的用例挪到
@@ -2544,6 +2737,173 @@ mod tests {
         assert!(st.scroll.drag.is_none(), "没按在滑块上就不该开始拖动");
         assert_eq!(st.pressed.as_deref(), Some("b0"), "内容上的按下照旧记 pressed");
         assert!(!out.iter().any(|e| matches!(e, UiEvent::Scrolled { .. })), "不该发 Scrolled：{out:?}");
+    }
+
+    // ---- T3.1：方向键上下焦点（几何邻近，D2 裁断） -----------------------------
+
+    /// ① 向下 ⇒ 移到**垂直最近**的可聚焦控件（btn_ok → btn_last：中间的 btn_no 禁用，
+    ///    同行的 name 因 `Δy == 0` **不算向下** —— 这条规则是测试逼出来的）
+    #[test]
+    fn arrow_down_moves_to_the_nearest_below() {
+        let (t, g) = fixture();
+        let mut s = UiState { focus: Some("btn_ok".into()), ..Default::default() };
+        let out = handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::KeyDown { key: Key::Down, mods: Default::default(), repeat: false });
+        assert!(s.focus.as_deref() == Some("btn_last"),
+            "向下应当：跳过禁用的 btn_no、排除同行的 name（Δy=0）⇒ btn_last，实际 {:?}",
+            s.focus);
+        assert!(out.iter().any(|e| matches!(e, UiEvent::FocusChanged(Some(id)) if id == "btn_last")));
+    }
+
+    /// ② 向上 ⇒ 反向同理（btn_last → btn_ok：跳过禁用按钮；btn_ok 与 name 同垂距，
+    ///    btn_ok 水平 |Δx|=0 更近 ⇒ 平手判据生效）
+    #[test]
+    fn arrow_up_moves_to_the_nearest_above() {
+        let (t, g) = fixture();
+        let mut s = UiState { focus: Some("btn_last".into()), ..Default::default() };
+        handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::KeyDown { key: Key::Up, mods: Default::default(), repeat: false });
+        assert!(s.focus.as_deref() == Some("btn_ok"),
+            "向上应在严格上方的可聚焦控件里选最近（btn_ok 与 name 同垂距 50，btn_ok 水平更近），实际 {:?}",
+            s.focus);
+    }
+
+    /// ③ 焦点在**输入框**上 ⇒ 上下不消费（留给多行文本光标；与 Left/Right 被 Field 独占同一条边界）
+    #[test]
+    fn arrows_do_not_move_focus_off_a_field() {
+        let (t, g) = fixture();
+        let mut s = UiState { focus: Some("name".into()), ..Default::default() };
+        let before = s.clone();
+        let out = handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::KeyDown { key: Key::Down, mods: Default::default(), repeat: false });
+        assert_eq!(s, before, "焦点在输入框上时按上下不得改任何状态");
+        assert!(out.is_empty(), "也不发事件：{out:?}");
+    }
+
+    /// ④ 无焦点 ⇒ 方向键**不定义**语义（几何上没有「当前位置」就没有「方向」），
+    ///    与 `Tab` 的「无焦点取第一个」刻意不同（Tab 是序、方向键是几何）。
+    #[test]
+    fn arrows_from_no_focus_do_nothing() {
+        let (t, g) = fixture();
+        let mut s = UiState::default();
+        let before = s.clone();
+        for key in [Key::Up, Key::Down] {
+            let out = handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+                &InputEvent::KeyDown { key, mods: Default::default(), repeat: false });
+            assert!(out.is_empty(), "{key:?} 无焦点时不该发事件：{out:?}");
+        }
+        assert_eq!(s, before, "无焦点时方向键不得改任何状态");
+    }
+
+    /// ⑤ 方向上没有候选（已在最底/最顶）⇒ 停在原地、不发事件（不环绕 —— 环绕是 Tab 的语义）
+    #[test]
+    fn arrows_at_the_edge_stay_put() {
+        let (t, g) = fixture();
+        let mut s = UiState { focus: Some("btn_last".into()), ..Default::default() };
+        let out = handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::KeyDown { key: Key::Down, mods: Default::default(), repeat: false });
+        assert!(s.focus.as_deref() == Some("btn_last"), "最底再按 Down ⇒ 停在原地");
+        assert!(out.is_empty(), "停在原地不发事件：{out:?}");
+    }
+
+    // ---- T3.3：右/中键（Q1 纯透传） -------------------------------------------
+
+    /// ① 右键按在节点上 ⇒ **按下即发** `PointerRight`；不置 pressed、不改焦点
+    #[test]
+    fn right_press_fires_pointer_right_without_pressing() {
+        let (t, g) = fixture();
+        let mut s = UiState::default();
+        let (x, y) = ev_at("btn_ok", &g);
+        let out = handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Right, x, y });
+        assert!(matches!(out.iter().find(|e| matches!(e, UiEvent::PointerRight { .. })),
+            Some(UiEvent::PointerRight { id }) if id == "btn_ok"),
+            "右键按下应发 PointerRight(btn_ok)：{out:?}");
+        assert!(s.pressed.is_none(), "右键不置 pressed（左键独占）：{:?}", s.pressed);
+        assert!(s.focus.is_none(), "右键不改焦点：{:?}", s.focus);
+    }
+
+    /// ② 右键按在**禁用子树**上 ⇒ 不发（禁用不响应输入的同一条规则）
+    #[test]
+    fn right_press_on_dead_subtree_fires_nothing() {
+        let (t, g) = fixture();
+        let mut s = UiState::default();
+        let (x, y) = ev_at("btn_no", &g);
+        let out = handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Right, x, y });
+        assert!(!out.iter().any(|e| matches!(e, UiEvent::PointerRight { .. })),
+            "禁用子树上的右键不该透传：{out:?}");
+    }
+
+    /// ③ 中键 ⇒ 只同步 hover，无任何额外语义（不 pressed、不事件）
+    #[test]
+    fn middle_press_only_syncs_hover() {
+        let (t, g) = fixture();
+        let mut s = UiState::default();
+        let (x, y) = ev_at("btn_ok", &g);
+        let out = handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Middle, x, y });
+        assert_eq!(s.hover.as_deref(), Some("btn_ok"), "中键也同步 hover（指针事件统一规则）");
+        assert!(s.pressed.is_none());
+        assert!(out.iter().all(|e| matches!(e, UiEvent::HoverChanged(_))),
+            "中键只该有 HoverChanged：{out:?}");
+    }
+
+    // ---- 按键滚动（T3.2 剩余：PageUp/PageDown/Home/End） -----------------------
+
+    /// ① PageDown ⇒ 焦点所在容器翻一页（= 视口高）；PageUp ⇒ 反向；到边界夹取
+    #[test]
+    fn page_keys_scroll_the_focused_container_by_a_viewport() {
+        let (tree, geo, mut st) = scroller_fixture();
+        // 焦点放进滚动容器内的一个按钮（视口高 50）
+        st.focus = Some("b0".into());
+        let vp_h = geo.get("box").map(|f| f.h as i32).unwrap();
+        let e = handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::KeyDown { key: Key::PageDown, mods: Default::default(), repeat: false });
+        assert!(e.iter().any(|x| matches!(x, UiEvent::Scrolled { .. })), "PageDown 该发 Scrolled：{e:?}");
+        assert_eq!(st.scroll.offset_of("box"), vp_h.min(st.scroll.max_of("box")),
+            "翻一页 = 视口高（{}），到边界夹取", vp_h);
+        // PageUp 回到顶
+        handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::KeyDown { key: Key::PageUp, mods: Default::default(), repeat: false });
+        assert_eq!(st.scroll.offset_of("box"), 0, "PageUp 翻回一页（到顶夹在 0）");
+    }
+
+    /// ② Home/End ⇒ 到顶/到底
+    #[test]
+    fn home_end_jump_to_the_edges() {
+        let (tree, geo, mut st) = scroller_fixture();
+        st.focus = Some("b0".into());
+        let max = st.scroll.max_of("box");
+        handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::KeyDown { key: Key::End, mods: Default::default(), repeat: false });
+        assert_eq!(st.scroll.offset_of("box"), max, "End ⇒ 到底");
+        handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::KeyDown { key: Key::Home, mods: Default::default(), repeat: false });
+        assert_eq!(st.scroll.offset_of("box"), 0, "Home ⇒ 到顶");
+    }
+
+    /// ③ 无焦点无悬停 ⇒ 不滚（fail-closed，与滚轮同规则）
+    #[test]
+    fn scroll_keys_without_anchor_do_nothing() {
+        let (tree, geo, mut st) = scroller_fixture();
+        let before = st.clone();
+        let out = handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::KeyDown { key: Key::PageDown, mods: Default::default(), repeat: false });
+        assert_eq!(st, before, "无锚点时按键滚动不得改状态");
+        assert!(out.is_empty(), "也不发事件：{out:?}");
+    }
+
+    /// ④ 焦点在**输入框**上 ⇒ 不消费（输入语境的编辑键 —— 与方向键同边界）
+    #[test]
+    fn scroll_keys_are_not_consumed_inside_a_field() {
+        let (t, g) = fixture();
+        let mut s = UiState { focus: Some("name".into()), ..Default::default() };
+        let before = s.clone();
+        let out = handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::KeyDown { key: Key::PageDown, mods: Default::default(), repeat: false });
+        assert_eq!(s, before, "输入框聚焦时 PageDown 不改状态");
+        assert!(out.is_empty(), "也不发事件：{out:?}");
     }
 
     // ---- T3.2b：点轨道跳转 ---------------------------------------------------

@@ -85,7 +85,7 @@
 | **字距与连字**（`kern` / `GSUB` / `GPOS`） | M4 残余 | 不做整形，`advance` 就是 `hmtx` 的原始值 |
 | **CFF / OpenType-CFF 字体**（`OTTO`） | M4 残余 | 解析层直接报错，不静默给空轮廓；只支持 `glyf` 轮廓 |
 | **竖排 / RTL / 复杂脚本整形** | M4 残余 | 完全没有；不读 `GSUB`/`GPOS` |
-| **输入与焦点的剩余部分**（停靠 / 多窗口、方向键**上下**导航、右键 / 中键、**按键滚动**（`PageUp` / `Home` / `End`）、**按键重复**） | M5/M6 | 输入通路、命中/状态机、Tab/Escape 焦点、文本输入、脚本重放、**事件驱动重绘（默认省电）**、**滚轮驱动的垂直滚动**、**可视滚动条（拖滑块 + 点轨道跳转）**、**惯性驱动收口（`advance_inertia`/`inertia_deadline` + `scroll_inertia_window` 参考实现，T3.2b）**、**输入框光标（左右方向键 + 在光标处编辑 + T3.8 起画面上有竖线）**、**IME 预编辑**都已落地（见第三节与 [`scroll-and-multiline.md`](docs/features/scroll-and-multiline.md)、[`scrollbar.md`](docs/features/scrollbar.md)、[`ime.md`](docs/features/ime.md)）；剩下的见 [`input.md`](docs/features/input.md) 第 6 节「仍未做」（含**真机输入法**只能人肉验证） |
+| **输入与焦点的剩余部分**（仅剩：停靠 / 多窗口） | M5/M6 | **输入地基全部落地**：事件通路、命中/状态机、Tab/Escape 焦点、文本输入、脚本重放、事件驱动重绘、滚轮垂直滚动、可视滚动条（拖滑块 + 点轨道跳转）、惯性收口（T3.2b）、输入框光标（T3.5/T3.8）、IME 预编辑（T3.4）、**方向键上下导航（T3.1 几何邻近）**、**按键滚动（`PageUp`/`PageDown`/`Home`/`End`）**、**右键透传 `PointerRight`（T3.3）**、**按键重复 `repeat: bool`（T3.6）**（见 [`input.md`](docs/features/input.md) 第 6 节）；**真机输入法**只能人肉验证 |
 | **可停靠面板 dock**（拖动改位置 / 边缘折叠） | M6 | 完全没有 |
 | **控件族**（12 个 `deer-ui` 控件的语义） | M6 | 现在只有 5 种节点：`column`/`row`/`text`/`button`/`field` |
 | **DX12 / Metal 后端** | M7 | 完全没有 |
