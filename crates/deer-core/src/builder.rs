@@ -216,7 +216,8 @@ pub struct L {
     pub grow: Option<f32>,
     pub scroll: Option<bool>,
     pub wrap: Option<bool>,
-    /// 流外定位（L1）：`Some(Pos::Offset { .. })` ⇒ 脱离流内布局。
+    /// 流外定位（L1 偏移 / L4 锚定）：`Some(Pos::Offset { .. })` 或
+    /// `Some(Pos::Anchors { .. })` ⇒ 脱离流内布局。
     pub position: Option<Pos>,
     /// **每子节点交叉轴对齐**（L2）：`Some` ⇒ 覆盖父容器的 `cross_axis`（仅该子节点）。
     pub cross_self: Option<Align>,
@@ -282,6 +283,29 @@ impl L {
     /// 设了它，该节点脱离流内布局（不参与主轴分配、不占流内空间、不计入父固有尺寸）。
     pub fn pos(mut self, x: i32, y: i32) -> L {
         self.position = Some(Pos::Offset { x, y });
+        self
+    }
+    /// **流外锚定**（L4）：四边锚点比例 + 像素修正，同为流外（与 [`L::pos`] 共用
+    /// `position` 字段 —— Q5：一个机制，不另起第二套定位）。
+    ///
+    /// - `l/t/r/b`：父内容盒的**锚点比例**（0.0 = 左/上边、1.0 = 右/下边，可超 `[0,1]`；
+    ///   `None` = 该边没有锚）；
+    /// - `ox/oy`：**像素**修正，内缩式 —— 起点边（l/t）加、终点边（r/b）减
+    ///   （正 = 向内容盒内缩，负 = 向外）；
+    /// - 一轴两侧都有锚 ⇒ 该轴尺寸由锚点对导出（显式 w/h 不参与）；只锚一边 ⇒
+    ///   显式/固有尺寸；min/max 照常夹取；**父盒子 resize 时锚定边跟随**。
+    ///
+    /// 语义与数值例子见 `docs/features/anchors.md`。
+    pub fn anchors(
+        mut self,
+        l: Option<f32>,
+        t: Option<f32>,
+        r: Option<f32>,
+        b: Option<f32>,
+        ox: i32,
+        oy: i32,
+    ) -> L {
+        self.position = Some(Pos::Anchors { l, t, r, b, ox, oy });
         self
     }
     /// **每子节点交叉轴对齐**（L2）：覆盖父容器的 `cross`，只对这一个子节点生效

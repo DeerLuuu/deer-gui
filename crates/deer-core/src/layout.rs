@@ -584,6 +584,19 @@ impl PlaceCtx<'_> {
             .max(0.0)
             .round();
 
+        self.place_sized(n, rect, w, h);
+    }
+
+    /// **尺寸已定**的落位：跳过 [`Self::place`] 的来源推导，直接把 `w`/`h` 写进几何表
+    /// 并递归排子节点（推导逻辑只有 [`Self::place`] 一处）。
+    ///
+    /// 为什么流外子节点要走这条通道（L4 实测踩过）：[`Self::place`] 的 I-7 会再读一次
+    /// 节点自己的显式 `w`/`h`。对 L1 偏移这是**恒等**（调用方算的 w 就是同一个表达式的值）；
+    /// 对 L4 双锚轴**不是** —— 锚点对导出的尺寸 ≠ 显式 `w`（角标：锚点距撑出 16px、
+    /// 显式 99px，D10 定死「显式被忽略」）。若再走一次推导，显式 99 会把锚定 16 静默
+    /// 赢回去 —— 「同一尺寸两种设法」的死灰复燃。所以最终尺寸在流外落位段算一次、
+    /// 算完直接落表；流内子节点照旧走 [`Self::place`]（推导只发生一次）。
+    fn place_sized(&mut self, n: &Node, rect: Rect, w: f32, h: f32) {
     self.geo.insert(
         n.id.clone(),
         Rect::new(rect.x.round(), rect.y.round(), w, h),
@@ -784,18 +797,15 @@ impl PlaceCtx<'_> {
         cursor += main_size + gap;
     }
 
-    // **L1：流外子节点落位** —— 不占流内空间、不推进 `cursor`、不参与主轴分配与
-    // 交叉轴 stretch（那两个都是流内概念）。位置 = **父内容盒原点 + 偏移**（D10 定死
-    // 参照矩形 = 父内容盒，与百分比解析基准一致）；滚动容器的**内容平移同样作用于它**
-    // （它是内容的一部分），但 `max_scroll` **不含**它（流外 ⇒ 不计入内容主轴尺寸）。
+    // **L1/L4：流外子节点落位** —— 不占流内空间、不推进 `cursor`、不参与主轴分配与
+    // 交叉轴 stretch（那两个都是流内概念）。参照矩形 = **父内容盒**（D10 定死，
+    // 与百分比解析基准一致）；滚动容器的**内容平移同样作用于它**（它是内容的一部分），
+    // 但 `max_scroll` **不含**它（流外 ⇒ 不计入内容主轴尺寸）。
     //
     // 这里在流内循环**之后**算只是行文次序：几何是按 id 查的表（`Geometry`），
     // 插入次序不影响任何结果；绘制与命中的层叠序由**声明序**决定（渲染器按树序发命令、
     // `hit_test` 按声明序遍历）—— 见 `hit_test` 的层叠序说明。
     for c in n.children.iter().filter(|c| c.is_positioned()) {
-        let Some(Pos::Offset { x, y }) = c.layout.position else {
-            continue; // `is_positioned()` 已保证是 `Some`；穷尽匹配为将来变体（L4 anchors）留位
-        };
         let ownc = self.intrinsic.get(&c.id).copied().unwrap_or((0.0, 0.0));
         // 尺寸：显式 > 固有（I-7 同一套）；**不被父内容盒夹取** —— 流外节点本来就允许
         // 伸出父盒子（负偏移同理），而且它不计入父固有尺寸 ⇒ 内容盒可能收缩到 0，
@@ -808,23 +818,75 @@ impl PlaceCtx<'_> {
         let ex_h = resolve(c.layout.height, inner_h);
         let (wlo, whi) = mm_bounds(c.layout.min_w, c.layout.max_w, inner_w);
         let (hlo, hhi) = mm_bounds(c.layout.min_h, c.layout.max_h, inner_h);
-        let w = clamp_between(ex_w.unwrap_or(ownc.0).max(0.0), wlo, whi).round();
-        let h = clamp_between(ex_h.unwrap_or(ownc.1).max(0.0), hlo, hhi).round();
-        // 偏移本身**不夹取**（可为负 ⇒ 允许伸出到父盒子之外；绘制/命中边界见指南）。
-        let (cx, cy) = if horizontal {
-            (rect.x + pad + x as f32 - offset, rect.y + pad + y as f32)
-        } else {
-            (rect.x + pad + x as f32, rect.y + pad + y as f32 - offset)
+
+        // 偏移的代数（L4 落地时定死，与 D10 草图「两边同 +ox」不同，理由）：
+        // 草图的 `offset: [Size; 4]`（每边一个偏移）在 L4 落地时收敛成**一对** `ox/oy`
+        // （任务登记的形状）。一对偏移要同时满足两个验收场景，只有「内缩式」这一种代数：
+        // **起点边 +ox、终点边 −ox** ——
+        // - 撑满 `l=0,r=1, ox=8` ⇒ 左缘 +8、右缘 −8 = 内容盒内缩 8px（两边同 +ox 会
+        //   整体右移 8px、右缘伸出盒子，那不是「内缩」）；
+        // - 角标 `l=r=1, ox=-8` ⇒ 两缘在角点两侧各 8px = 徽标**跨越角点**居中
+        //   （两边同 +ox 会把两缘叠在同一点上，宽恒为 0）。
+        // 「正 = 向内、负 = 向外」也与 CSS `inset: 8px` 的直觉一致。
+        let (cx, cy, w, h) = match c.layout.position {
+            Some(Pos::Offset { x, y }) => {
+                let w = clamp_between(ex_w.unwrap_or(ownc.0).max(0.0), wlo, whi).round();
+                let h = clamp_between(ex_h.unwrap_or(ownc.1).max(0.0), hlo, hhi).round();
+                // 偏移本身**不夹取**（可为负 ⇒ 允许伸出到父盒子之外；绘制/命中边界见指南）。
+                let (cx, cy) = if horizontal {
+                    (rect.x + pad + x as f32 - offset, rect.y + pad + y as f32)
+                } else {
+                    (rect.x + pad + x as f32, rect.y + pad + y as f32 - offset)
+                };
+                (cx, cy, w, h)
+            }
+            Some(Pos::Anchors { l, t, r, b, ox, oy }) => {
+                // 尺寸先行：一轴**两侧都有锚** ⇒ 尺寸 = 锚点对导出（显式 w/h 不参与，
+                // D10：「忽略、不是报错」），`min/max`（L3）照常夹取**最终尺寸** ——
+                // min/max 是「修复」不是「来源」，锚点给了初值之后它们仍然说了算；
+                // 只锚一边（或都不锚）⇒ 显式/固有尺寸（与 Offset 同一套来源规则）。
+                let w = match (l, r) {
+                    (Some(lv), Some(rv)) => {
+                        clamp_between(((rv - lv) * inner_w - 2.0 * ox as f32).max(0.0), wlo, whi)
+                            .round()
+                    }
+                    _ => clamp_between(ex_w.unwrap_or(ownc.0).max(0.0), wlo, whi).round(),
+                };
+                let h = match (t, b) {
+                    (Some(tv), Some(bv)) => {
+                        clamp_between(((bv - tv) * inner_h - 2.0 * oy as f32).max(0.0), hlo, hhi)
+                            .round()
+                    }
+                    _ => clamp_between(ex_h.unwrap_or(ownc.1).max(0.0), hlo, hhi).round(),
+                };
+                // 起点坐标：有起点锚按起点锚（内缩式 +ox）；只有终点锚 ⇒ 终点边落在锚上、
+                // 向左/上退自身尺寸；两边都没锚 ⇒ 与 Offset 同款（内容盒原点 + 偏移）。
+                // 被夹取时（上面的 w/h 不再等于锚点距）**起点锚保持、终点边让步** ——
+                // 与「只锚一边」的情形自然统一，规则只有一条。
+                let x0 = match (l, r) {
+                    (Some(lv), _) => rect.x + pad + lv * inner_w + ox as f32,
+                    (None, Some(rv)) => rect.x + pad + rv * inner_w - ox as f32 - w,
+                    (None, None) => rect.x + pad + ox as f32,
+                };
+                let y0 = match (t, b) {
+                    (Some(tv), _) => rect.y + pad + tv * inner_h + oy as f32,
+                    (None, Some(bv)) => rect.y + pad + bv * inner_h - oy as f32 - h,
+                    (None, None) => rect.y + pad + oy as f32,
+                };
+                // 滚动平移与 Offset 完全同一套：主轴方向整体位移 `-offset`。
+                let (cx, cy) = if horizontal {
+                    (x0 - offset, y0)
+                } else {
+                    (x0, y0 - offset)
+                };
+                (cx, cy, w, h)
+            }
+            // `is_positioned()` 已保证是 `Some`；穷尽匹配兜住未来变体
+            None => continue,
         };
-        self.place(
-            c,
-            Rect::new(cx, cy, w, h),
-            (w, h),
-            (inner_w, inner_h),
-            // bound 给无穷：流外节点的尺寸**不夹取**（见上），上面的 w/h 就是最终值；
-            // 传内容盒会让 `place` 里的 I-6 夹取把它夹回内容盒（内容盒可能已收缩到 0）。
-            (f32::INFINITY, f32::INFINITY),
-        );
+        // 尺寸与位置都已在上面算成最终值（锚点对 / min-max / 取整）⇒ 走 `place_sized`
+        // 直接落表，不让 I-7 的来源推导把显式 w/h 再赢一遍（理由见 `place_sized` 的文档）。
+        self.place_sized(c, Rect::new(cx, cy, w, h), w, h);
     }
 }
 }

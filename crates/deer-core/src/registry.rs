@@ -41,7 +41,7 @@ pub enum PropType {
     Size,
     /// 对齐方式（`main_axis` / `cross_axis`）。
     Align,
-    /// **流外定位**（L1 的 `position`）：`x,y` 像素偏移。
+    /// **流外定位**（L1 的 `position`；L4 起 `Pos` 含 `Anchors` 变体）：偏移或锚点。
     Pos,
     /// 文本（`label`）。
     Text,
@@ -184,7 +184,8 @@ pub const SPECS: &[PropSpec] = &[
     PropSpec {
         name: "position",
         ty: PropType::Pos,
-        domain: "x,y（整数像素，可为负；设了即脱离流内，位置 = 父内容盒原点 + 偏移）",
+        domain: "Offset：x,y（整数像素，可为负）｜Anchors：anchor-l/t/r/b=比例（可缺省）+ \
+                 anchor-ox/oy=整数像素（正=向内）；任一形式 ⇒ 脱离流内",
         default: "none",
         kinds: &ANY,
     },

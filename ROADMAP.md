@@ -316,6 +316,12 @@ pub enum Pos {
     Anchors { l: f32, t: f32, r: f32, b: f32, offset: [Size; 4] },
 }
 ```
+**落地状态（L4 收官时更新）**：`Offset`（L1）与 `Anchors`（L4）**已落地**；`At` 形状未做。
+落地形与本草图有两处出入（均已写进测试与指南）：`Offset { x: i32, y: i32 }`（整数像素，
+非 `At { x: Size, y: Size }`）；`Anchors { l/t/r/b: Option<f32>, ox/oy: i32 }` ——
+逐边可缺省（一轴两侧各自可选「有没有锚」，`f32` 表达不了「缺」），偏移是**一对**
+内缩式像素修正（起点边 +、终点边 −；草图 `[Size; 4]` 每边一个的方案未采用）。
+语义与数值口径见 `docs/features/anchors.md`。
 
 **两条遗留决定（D6 说「到 L1 的 PR 必须定死」，这里定死）**
 
