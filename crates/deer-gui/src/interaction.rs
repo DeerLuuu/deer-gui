@@ -120,6 +120,15 @@ mod mirror {
         TextInput {
             text: String,
         },
+        /// **IME 预编辑**（中文/日文输入法正在拼、还没上屏的那一段）。
+        ///
+        /// 与 [`InputEvent::TextInput`] 的分工是硬的：预编辑**只进 [`UiState::preedit`]
+        /// 缓冲、不进 `texts`**；提交走 `TextInput` 进 `texts` 并**同时清缓冲**。
+        /// 这条分工就是「**无双写**」—— 那段文字只以一条路径上屏。
+        /// 空 `text` = 预编辑被取消。
+        ImePreedit {
+            text: String,
+        },
         /// 窗口焦点（**不是** UI 里的控件焦点）。
         FocusChanged {
             focused: bool,
@@ -139,6 +148,8 @@ mod mirror {
 /// 交互状态：**唯一真相**（窗口层渲染的树由它派生）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct UiState {
+    /// **IME 预编辑缓冲**（还没上屏的那一段）。默认 `None` ⇒ 既有行为不变。
+    pub preedit: Option<Preedit>,
     /// 指针当前压在哪个节点上（含容器；`None` = 没压在任何节点上）。
     pub hover: Option<String>,
     /// 键盘焦点（`Tab`/`Shift+Tab` 改它，`Escape` 清它）。
@@ -182,6 +193,18 @@ pub struct UiState {
 /// `grab_dy` 是**按下时**指针距滑块顶的像素数：拖动时用它保持手感不变 ——
 /// 没有它的话，滑块会瞬间「跳」到指针正下方（手指按在滑块底部时会明显跳一下）。
 /// 用 `i32` 而不是 `f32` 是为了让 [`ScrollState`] 保住 `Eq`（`f32` 会把它弄没）。
+/// **正在进行中的 IME 预编辑**（还没上屏的一段拼写，挂在某个输入框上）。
+///
+/// 它**不属于** `texts`：`texts` 是「已经上屏的内容」。预编辑每改一次都要重画，
+/// 但一次都不该污染文本本身 —— 分开存才有一处能回答「现在有没有未上屏的内容」。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Preedit {
+    /// 挂在哪个输入框上（= 当时聚焦的 `Field`）。
+    pub id: String,
+    /// 正在拼的那一段（空串视为没有预编辑）。
+    pub text: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScrollDrag {
     /// 被拖的容器 id。
@@ -956,7 +979,26 @@ pub fn handle(
         // ⇒ 「无光标移动」再被 T3.5 的 `Left`/`Right` 推翻（它们现在有自己的分支）。
         InputEvent::KeyDown { .. } => {}
         InputEvent::KeyUp { .. } => {}
+        InputEvent::ImePreedit { text } => {
+            // 预编辑挂在**当前聚焦的输入框**上；没有聚焦输入框 ⇒ 无处可挂，忽略。
+            // 空串 = 输入法清掉了拼写（取消/切走）⇒ 清缓冲。
+            let target = state
+                .focus
+                .as_deref()
+                .filter(|id| node_is_focusable(root, id))
+                .map(str::to_string);
+            if let Some(id) = target {
+                state.preedit = if text.is_empty() {
+                    None
+                } else {
+                    Some(Preedit { id, text: text.clone() })
+                };
+            }
+        }
         InputEvent::TextInput { text } => {
+            // **提交即清预编辑缓冲**：那段文字从现在起由 `texts` 负责显示。
+            // 不清就是双写（缓冲里一份、`texts` 里一份 ⇒ 画两遍）。
+            state.preedit = None;
             // 空串不算变化（否则会白白置一次 dirty）。
             if !text.is_empty() {
                 // 插在**光标处**（不再是无脑追加）：新输入进去之后，光标跟着往后移，
@@ -2221,6 +2263,7 @@ mod tests {
             texts: BTreeMap::from([("name".to_string(), "hi".to_string())]),
             carets: Default::default(),
             scroll: Default::default(),
+            preedit: None,
         };
         // 前置：这份语料确实一个可滚动容器都没有（否则下面的 `Wheel` 断言在测空气）。
         let mut scrollers = Vec::new();
@@ -2525,6 +2568,71 @@ mod tests {
             "开始拖动之后惯性必须停 —— 否则拖动与惯性会同时改偏移"
         );
         assert!(st.scroll.inertia_step().is_none());
+    }
+
+    // ---- T3.4：IME 预编辑（无双写） ------------------------------------------
+
+    /// **预编辑只进缓冲、不进 `texts`；提交才进 `texts` 且清缓冲** —— 这条就是「无双写」。
+    #[test]
+    fn ime_preedit_goes_to_buffer_then_commit_replaces_it() {
+        let (t, g) = fixture();
+        let mut s = UiState {
+            focus: Some("name".into()),
+            ..Default::default()
+        };
+
+        // ① 预编辑「zhong」⇒ 只进缓冲
+        handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::ImePreedit { text: "zhong".into() });
+        assert_eq!(
+            s.preedit.as_ref().map(|p| (p.id.as_str(), p.text.as_str())),
+            Some(("name", "zhong")),
+            "预编辑应当挂在聚焦的输入框上"
+        );
+        assert!(
+            s.texts.get("name").is_none_or(|t| !t.contains("zhong")),
+            "**预编辑不许进 `texts`**（还没上屏）：{:?}",
+            s.texts.get("name")
+        );
+
+        // ② 预编辑变了 ⇒ 缓冲跟着变（不是叠加）
+        handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::ImePreedit { text: "zhongg".into() });
+        assert_eq!(s.preedit.as_ref().map(|p| p.text.as_str()), Some("zhongg"));
+
+        // ③ 提交「中」⇒ 进 texts，**并且缓冲清空**
+        handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::TextInput { text: "中".into() });
+        assert_eq!(s.texts.get("name").map(String::as_str), Some("中"));
+        assert!(
+            s.preedit.is_none(),
+            "提交之后缓冲必须清空 —— 否则那段字会「缓冲一份 + texts 一份」画两遍（双写）"
+        );
+    }
+
+    /// 空预编辑 = 取消 ⇒ 清缓冲，且**不**改 `texts`。
+    #[test]
+    fn empty_preedit_cancels_without_touching_texts() {
+        let (t, g) = fixture();
+        let mut s = UiState { focus: Some("name".into()), ..Default::default() };
+        handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::ImePreedit { text: "abc".into() });
+        assert!(s.preedit.is_some(), "前置：先要有预编辑");
+        handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::ImePreedit { text: String::new() });
+        assert!(s.preedit.is_none(), "空预编辑应当清掉缓冲");
+        assert!(s.texts.get("name").is_none_or(|t| t.is_empty()), "取消不该改 texts");
+    }
+
+    /// 没有聚焦输入框 ⇒ 预编辑无处可挂 ⇒ 忽略（不 panic、不留痕）。
+    #[test]
+    fn preedit_without_a_focused_field_is_ignored() {
+        let (t, g) = fixture();
+        let mut s = UiState::default();
+        assert!(s.focus.is_none(), "前置：没有焦点");
+        handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::ImePreedit { text: "zhong".into() });
+        assert!(s.preedit.is_none(), "没有聚焦输入框时不该留下预编辑");
     }
 
     // ---- T3.2：UiState → InteractState 的唯一转换 ---------------------------

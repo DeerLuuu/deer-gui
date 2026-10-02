@@ -651,6 +651,13 @@ pub enum InputEvent {
     TextInput {
         text: String,
     },
+    /// **IME 预编辑**（还没上屏的那一段）。
+    ///
+    /// ⚠️ 本枚举与 `deer_gui::interaction::InputEvent` 是**两份定义、必须逐字同步**
+    /// （mirror 纪律）：变体名、字段名、语义都要对得上。
+    ImePreedit {
+        text: String,
+    },
     FocusChanged {
         focused: bool,
     },
@@ -1509,9 +1516,12 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
                     }
                 }
                 Ime::Preedit(text, _) => {
-                    // 预编辑文本**不派发**（M5 不建模预编辑）：这里只用它抑制按键文本，
-                    // 避免「预编辑中按键的 text」与「Commit」双重上屏。
+                    // ① 仍用它抑制按键文本（避免「预编辑中按键的 text」与「Commit」双写）；
+                    // ② **并且真的派发**（T3.4 起预编辑被建模了 —— UI 层要拿它画下划线）。
+                    // `Gate::Always`：预编辑是**视觉**状态（与焦点同类），一变就该重画；
+                    // 若走 `AppDecides`，中文输入时那一段拼写就不会显示出来。
                     self.ime_composing = !text.is_empty();
+                    self.dispatch(event_loop, &InputEvent::ImePreedit { text }, Gate::Always);
                 }
                 Ime::Enabled | Ime::Disabled => self.ime_composing = false,
             },
