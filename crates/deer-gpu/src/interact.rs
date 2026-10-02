@@ -114,6 +114,11 @@ pub struct InteractState {
     /// 默认空 ⇒ **一个滚动条都不画**（既有语料逐字节不变）。这是刻意的 opt-in：
     /// 想看到滚动条，就把 `deer-gui` 那边 `UiState::scroll` 的内容灌进来。
     pub scroll: ScrollView,
+    /// **输入框的光标位置**（`Field` id → 字符位，**不是字节位**）。
+    ///
+    /// 默认空 ⇒ **一根光标都不画**（既有语料逐字节不变，opt-in —— 与 `scroll` 同一条纪律）。
+    /// 想看到光标，就把 `UiState::carets` 灌进来。
+    pub carets: std::collections::BTreeMap<String, usize>,
 }
 
 /// 绘制时读的滚动状态（偏移 + 每个容器的上限）。
@@ -179,7 +184,10 @@ pub const FILL_ROUND_RADIUS: i32 = 4;
 /// 而不动这个内缩，测试会红，而不是悄悄又出现方角补块。
 pub const FOCUS_RING_INSET: i32 = 2;
 /// 文本相对控件矩形的内缩（像素）：让文字与描边不重叠 —— 于是「文本变化」只发生在框内。
-pub const TEXT_INSET: i32 = 2;
+const TEXT_INSET: i32 = 2;
+
+/// **光标竖线**的宽度（像素）。1px 足够看得见，且不会盖住相邻字形。
+pub const CARET_W: i32 = 1;
 
 /// 一个节点的**状态视觉等级**。
 ///
@@ -406,13 +414,45 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
                         });
                     }
                     // 文本**内缩**：文字与描边不重叠 ⇒「文本变化」只发生在框内（判据更强）。
+                    let text_rect = inset(rect, TEXT_INSET);
+                    let label = self.field_label(n);
                     list.push(DrawCmd::Text {
-                        rect: inset(rect, TEXT_INSET),
-                        text: self.field_label(n),
+                        rect: text_rect,
+                        text: label.clone(),
                         color: self.theme.text,
                         size: self.theme.font_size,
                         align: 0,
                     });
+                    // **光标**（T3.8）：只在焦点框里画，位置 = 文本起点 + 「光标前那一段」的宽度。
+                    //
+                    // 为什么要 `measure`：光标位置是**字符位**（T3.5 的模型），
+                    // 而画出来是**像素** —— 两者之间必须过一次真实度量，
+                    // 且**与文本布局用同一个度量**（这是 Q-3 定下的纪律：
+                    // 布局、绘制、光栅化不许各算各的字宽）。
+                    //
+                    // 默认 `carets` 为空 ⇒ 这条不触发 ⇒ 既有语料逐字节不变。
+                    if focused {
+                        if let Some(&caret_chars) = self.state.carets.get(&n.id) {
+                            let total = label.chars().count();
+                            let keep = caret_chars.min(total);
+                            let prefix: String = label.chars().take(keep).collect();
+                            let dx = self
+                                .measure
+                                .width(&prefix, self.text_style())
+                                .round() as i32;
+                            list.push(DrawCmd::FillRoundRect {
+                                // 半径 0 = 纯矩形：光标要一条实心竖线，不需要圆角
+                                rect: RectI::new(
+                                    text_rect.x + dx,
+                                    text_rect.y,
+                                    CARET_W,
+                                    text_rect.h,
+                                ),
+                                radius: 0,
+                                color: self.theme.text,
+                            });
+                        }
+                    }
                 }
             }
         }
@@ -1690,6 +1730,110 @@ mod tests {
         println!("节点 {node_p:?}｜不换行 ⇒ {texts_p:?}");
         assert_eq!(texts_p.len(), 1);
         assert_eq!(texts_p[0], (node_p, "alpha beta gamma delta".to_string()));
+    }
+
+    // ---- T3.8：光标渲染 ------------------------------------------------------
+
+    /// 一个聚焦的 `Field`（标签 `abcd`）+ 指定的光标位置 ⇒ 绘制列表。
+    fn field_with_caret(caret: Option<usize>) -> crate::DrawList {
+        let mut f = Node::new(Kind::Field, "f");
+        f.props.label = Some("abcd".into());
+        let mut root = Node::new(Kind::Column, "root");
+        root.children.push(f);
+        let geo = layout(
+            &root,
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 60.0 },
+            deer_layout::TextStyle { font_size: 14.0, line_height: 18.0 },
+            &ApproxMeasure,
+        );
+        let mut carets = std::collections::BTreeMap::new();
+        if let Some(c) = caret {
+            carets.insert("f".to_string(), c);
+        }
+        let state = InteractState {
+            focus: Some("f".into()),
+            carets,
+            ..Default::default()
+        };
+        InteractiveRenderer::new(Theme::default(), &ApproxMeasure, &state).build(&root, &geo)
+    }
+
+    /// 光标那一条：**宽 `CARET_W`、半径 0**的填充矩形（用它把光标从别的矩形里挑出来）。
+    fn caret_x(list: &crate::DrawList) -> Vec<i32> {
+        list.cmds
+            .iter()
+            .filter_map(|c| match c {
+                DrawCmd::FillRoundRect { rect, radius, .. }
+                    if *radius == 0 && rect.w == CARET_W =>
+                {
+                    Some(rect.x)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// ① **默认（没有 caret 表）一根都不画** —— 既有语料逐字节不变。
+    #[test]
+    fn no_caret_without_a_caret_entry() {
+        let list = field_with_caret(None);
+        assert!(
+            caret_x(&list).is_empty(),
+            "没喂光标表时不该画光标（opt-in）：{:?}",
+            caret_x(&list)
+        );
+    }
+
+    /// ② 有光标就**恰好一根**，而且**位置随字符位右移**（这是「可见」的正向判据）。
+    #[test]
+    fn caret_moves_right_with_the_char_index() {
+        let xs: Vec<i32> = [0usize, 1, 2, 3, 4]
+            .iter()
+            .map(|c| {
+                let v = caret_x(&field_with_caret(Some(*c)));
+                assert_eq!(v.len(), 1, "字符位 {c} 时应当恰好一根光标：{v:?}");
+                v[0]
+            })
+            .collect();
+        for w in xs.windows(2) {
+            assert!(
+                w[1] > w[0],
+                "光标应当随字符位右移，实际 {xs:?}（这一条是「看得见光标在动」的判据）"
+            );
+        }
+    }
+
+    /// ③ 光标越界（字符位 > 文本长度）⇒ **夹到末尾**，不越出文本框、也不 panic。
+    #[test]
+    fn caret_past_the_end_clamps_to_the_last_position() {
+        let at_end = caret_x(&field_with_caret(Some(4)));
+        let past_end = caret_x(&field_with_caret(Some(999)));
+        assert_eq!(at_end.len(), 1);
+        assert_eq!(
+            past_end, at_end,
+            "越过末尾的光标应当夹到末尾位置（而不是画到框外或崩）"
+        );
+    }
+
+    /// ④ **失焦不画**（光标是焦点态的一部分）。
+    #[test]
+    fn no_caret_when_the_field_is_not_focused() {
+        let mut f = Node::new(Kind::Field, "f");
+        f.props.label = Some("abcd".into());
+        let mut root = Node::new(Kind::Column, "root");
+        root.children.push(f);
+        let geo = layout(
+            &root,
+            Rect { x: 0.0, y: 0.0, w: 200.0, h: 60.0 },
+            deer_layout::TextStyle { font_size: 14.0, line_height: 18.0 },
+            &ApproxMeasure,
+        );
+        let mut carets = std::collections::BTreeMap::new();
+        carets.insert("f".to_string(), 2usize);
+        // 焦点在别处（且这个 id 不存在）
+        let state = InteractState { focus: Some("other".into()), carets, ..Default::default() };
+        let list = InteractiveRenderer::new(Theme::default(), &ApproxMeasure, &state).build(&root, &geo);
+        assert!(caret_x(&list).is_empty(), "失焦的输入框不该画光标");
     }
 
     // ---- T3.2：可视滚动条 ---------------------------------------------------
