@@ -7,7 +7,7 @@
 ## 1. 这是什么 / 什么时候用它
 
 **内容超出视口的容器会自己长出滚动条** —— 一条轨道 + 一个滑块，滑块的位置与高度反映
-「当前看到的是内容的哪一段」。**滑块可以直接拖**（拖动改偏移、抬起结束）。
+「当前看到的是内容的哪一段」。**滑块可以直接拖**（拖动改偏移、抬起结束）；滚轮之后还会**惯性滑一段**再自己停。
 
 什么时候你会看到它：
 
@@ -55,8 +55,22 @@ pub const SCROLLBAR_MIN_THUMB: f32 = 24.0; // 滑块下限（内容极长时仍�
 pub struct ScrollbarGeom { pub track: Rect, pub thumb: Rect }
 pub fn scrollbar_geom(viewport: Rect, offset: i32, max_scroll: i32) -> Option<ScrollbarGeom>
 
-// 反解（拖动/命中用）：指针在这儿 ⇒ 偏移该是多少。与上一个函数是同一套映射的两个方向。
+// 反解（拖动/命中用）：指针在这儿 ⇒ 偏移该是多少。与上一个函数是同一个映射的两个方向。
 pub fn scrollbar_offset_for_pointer(viewport: Rect, max_scroll: i32, pointer_y: f32, grab_dy: f32) -> i32
+```
+
+惯性滚动（滚轮之后继续滑）在 `ScrollState` 上：
+
+```rust
+pub const INERTIA_TICK_MS: u64 = 16;      // 每步 16ms（窗口层按它 wake_after）
+pub const INERTIA_DECAY_NUM: i32 = 85;    // 每步 v = v * 85 / 100（**整数** ⇒ 逐位可复现）
+pub const INERTIA_MIN_V: i32 = 2;         // |v| 小于它就停
+
+impl ScrollState {
+    pub fn inertia_active(&self) -> bool;                       // 还要不要再排一次唤醒
+    pub fn inertia_step(&mut self) -> Option<(String, i32)>;    // 推进一步（None = 停了）
+    pub fn stop_inertia(&mut self);                             // 拖动/新的输入时手动停
+}
 ```
 
 绘制侧的接口是 `InteractState` 上的一个字段：
@@ -98,7 +112,11 @@ pub struct ScrollView { pub offsets: ScrollOffsets, pub metrics: ScrollMetrics }
 ### 做不到什么
 
 - **点轨道跳转**（点轨道空白处应当跳到那一页）**还没做** —— 只能**拖滑块**或滚轮；
-- **惯性滚动**（滚轮/拖动松手后的衰减）**还没做**；
+- **窗口层的惯性自驱接线还没做**：`inertia_step` 是纯逻辑、判据齐全，但**没有人每
+  `INERTIA_TICK_MS` 调它** —— 应用需要自己在唤醒回调里调（`Waker::wake_after` +
+  `inertia_active()` 决定还要不要排下一次）。⇒ **真实窗口里现在看不到惯性**，
+  尽管逻辑已经就位；
+- **点轨道跳转**（点轨道空白处跳到那一页）**还没做**；
 - **横向滚动**：滚动条只有垂直方向（与「滚动容器本期只做垂直」一致）；
 - **不能配颜色/宽度**：三个常量是编译期固定的；主题化需要先给 `Theme` 加字段（公开 API 变更，未登记）；
 - **不会自动隐藏**（没有「静止时淡出」这类行为）。

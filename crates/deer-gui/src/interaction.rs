@@ -190,12 +190,38 @@ pub struct ScrollDrag {
     pub grab_dy: i32,
 }
 
+/// 惯性**每步**衰减的分子/分母（`v = v * 85 / 100`）。
+///
+/// **整数衰减是刻意的**：它让「滚一次之后停下来要几步、停在哪」**逐位可复现**
+/// （浮点会因平台/优化而漂，那会让判据变得不可靠 —— 与布局的确定性纪律同源）。
+pub const INERTIA_DECAY_NUM: i32 = 85;
+/// 见 [`INERTIA_DECAY_NUM`]。
+pub const INERTIA_DECAY_DEN: i32 = 100;
+/// 速度绝对值小于它就**停**（像素/步）。太小的话会「永远差一点」地抖下去。
+pub const INERTIA_MIN_V: i32 = 2;
+/// 惯性推进一步的时间（毫秒）。窗口层按它 `wake_after`。
+pub const INERTIA_TICK_MS: u64 = 16;
+
+/// **正在惯性滚动**（滚轮/拖动松手之后继续滑）。`None` = 停了。
+///
+/// 速度单位是**像素/步**（不是像素/秒）：步进由 [`INERTIA_TICK_MS`] 决定，
+/// 存整数既保住 [`ScrollState`] 的 `Eq`，也让衰减过程可复现。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScrollInertia {
+    /// 被滚的容器 id。
+    pub id: String,
+    /// 每步位移（带符号：正 = 内容上移 = 偏移增大）。
+    pub velocity: i32,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScrollState {
     /// 当前偏移（整数像素）。
     pub offsets: ScrollOffsets,
     /// **正在拖动的滚动条**（T3.2）。默认 `None` ⇒ 既有行为逐字节不变。
     pub drag: Option<ScrollDrag>,
+    /// **正在惯性滚动**（T3.2）。默认 `None` ⇒ 既有行为逐字节不变。
+    pub inertia: Option<ScrollInertia>,
     /// 本帧的滚动上限（来自 [`deer_layout::layout::layout_with_scroll`]）。
     pub metrics: ScrollMetrics,
 }
@@ -240,6 +266,50 @@ impl ScrollState {
     }
 
     /// 相对滚动：`delta_px > 0` = 内容上移（偏移增大）。
+    /// **是否还在惯性滚动** —— 窗口层据此决定「还要不要再排一次唤醒」。
+    ///
+    /// 这一条就是「唤醒账本无空转」的判据面：**停了之后它必须为 `false`**，
+    /// 于是 `next_deadline` 回到 `None`，事件循环不再被唤醒（省电的那条纪律）。
+    pub fn inertia_active(&self) -> bool {
+        self.inertia.is_some()
+    }
+
+    /// 让惯性**停下**（拖动/新的滚轮/失焦时调用）—— 幂等。
+    pub fn stop_inertia(&mut self) {
+        self.inertia = None;
+    }
+
+    /// **推进一步惯性**：偏移 += 速度，速度按 [`INERTIA_DECAY_NUM`] 衰减。
+    ///
+    /// 返回 `Some((id, 新偏移))` 表示这一步**真的移动了**；返回 `None` 表示
+    /// **已经停下**（到边界 / 速度太小），并且此时 [`Self::inertia_active`] 必须是 `false`
+    /// —— 调用方据此**不再排下一次唤醒**。
+    ///
+    /// 「到边界就停」是刻意的：不夹取的话，惯性会一直「撞墙」空转 ——
+    /// 画面没动，却每 16ms 唤醒一次，正是要避免的空转。
+    pub fn inertia_step(&mut self) -> Option<(String, i32)> {
+        let cur = self.inertia.clone()?;
+        let before = self.offset_of(&cur.id);
+        let want = before.saturating_add(cur.velocity);
+        let next = self.metrics.clamp(&cur.id, want);
+        if next == before {
+            // 撞到边界（或速度为 0）⇒ 停，不留下「还在动」的假象
+            self.inertia = None;
+            return None;
+        }
+        self.offsets.set(cur.id.clone(), next);
+        let decayed = cur.velocity * INERTIA_DECAY_NUM / INERTIA_DECAY_DEN;
+        if decayed.abs() < INERTIA_MIN_V {
+            self.inertia = None;
+        } else {
+            self.inertia = Some(ScrollInertia {
+                id: cur.id.clone(),
+                velocity: decayed,
+            });
+        }
+        Some((cur.id, next))
+    }
+
     pub fn scroll_by(&mut self, id: &str, delta_px: i32) -> Option<i32> {
         let cur = self.offsets.get(id);
         self.scroll_to(id, cur.saturating_add(delta_px))
@@ -750,6 +820,8 @@ pub fn handle(
                 // 更不该在抬起时发 `Clicked`）。
                 //
                 // 默认状态下没有任何滚动条 ⇒ 这条永远不触发 ⇒ 既有行为逐字节不变。
+                // 开始拖动 ⇒ **惯性立刻停**（否则两种位移会打架）
+                state.scroll.stop_inertia();
                 state.scroll.drag = Some(drag);
                 let id = node_id_at(root, geo, clip, *x, *y);
                 sync_hover(state, &mut out, id);
@@ -800,6 +872,14 @@ pub fn handle(
             // `dx`（水平）**本期忽略**：只做垂直滚动（`Row` 上的 `scroll` 也被忽略）。
             // 边界与「没变」都由 `ScrollState::scroll_by` 负责（夹取 + 变了才回 `Some`）。
             if let Some((id, offset)) = wheel_scroll(state, root, *dy) {
+                // 滚轮**立刻走一步**（既有行为，逐字节不变）；同时**播种惯性**，
+                // 于是松手之后还会继续滑一段并自己衰减停下。
+                // 播种速度就是这一步的位移 ⇒ 「滚多远」与「滑多远」成比例，手感一致。
+                let step = -(WHEEL_STEP_PX as f32 * dy).round() as i32;
+                state.scroll.inertia = Some(ScrollInertia {
+                    id: id.clone(),
+                    velocity: step,
+                });
                 out.push(UiEvent::Scrolled { id, offset });
             }
         }
@@ -2199,6 +2279,35 @@ mod tests {
         (col, geo, st)
     }
 
+    /// **深容器**夹具：视口同样 50 高，但内容高 8000 ⇒ `max_scroll` 很大。
+    ///
+    /// 专门给「惯性衰减」的判据用：在浅容器里惯性会**撞墙**停，于是「不衰减」的实现
+    /// 也能通过（实测：这是本条判据第一版的失效原因）。要测衰减，就必须让容器
+    /// **深到撞不到墙**。
+    fn deep_scroller_fixture() -> (Node, Geometry, UiState) {
+        let mut col = Node::new(Kind::Column, "box");
+        col.layout.scroll = true;
+        col.layout.height = Some(Size::Px(50.0));
+        col.layout.width = Some(Size::Px(100.0));
+        for i in 0..200 {
+            let mut c = Node::new(Kind::Button, format!("d{i}"));
+            c.props.label = Some("x".into());
+            c.layout.height = Some(Size::Px(40.0));
+            col.children.push(c);
+        }
+        let (geo, metrics) = deer_layout::layout::layout_with_scroll(
+            &col,
+            Rect { x: 0.0, y: 0.0, w: 100.0, h: 50.0 },
+            deer_layout::TextStyle { font_size: 14.0, line_height: 18.0 },
+            &deer_layout::layout::ApproxMeasure,
+            &deer_layout::layout::ScrollOffsets::new(),
+        );
+        let mut st = UiState::default();
+        st.scroll.set_metrics(&metrics);
+        assert!(st.scroll.max_of("box") > 1000, "前置：容器必须**深**到撞不到墙");
+        (col, geo, st)
+    }
+
     /// 滑块上的一点（抓它）与该容器的视口矩形。
     fn thumb_point(geo: &Geometry, st: &UiState) -> (f32, f32, deer_layout::Rect, i32) {
         let f = geo.get("box").expect("容器有几何");
@@ -2307,6 +2416,115 @@ mod tests {
         assert!(st.scroll.drag.is_none(), "没按在滑块上就不该开始拖动");
         assert_eq!(st.pressed.as_deref(), Some("b0"), "内容上的按下照旧记 pressed");
         assert!(!out.iter().any(|e| matches!(e, UiEvent::Scrolled { .. })), "不该发 Scrolled：{out:?}");
+    }
+
+    // ---- T3.2：惯性滚动 ------------------------------------------------------
+
+    /// 滚一次轮 ⇒ 立即走一步（既有行为）**并且**进入惯性。
+    #[test]
+    fn wheel_seeds_inertia_and_keeps_the_immediate_step() {
+        let (tree, geo, mut st) = scroller_fixture();
+        // 滚轮事件**没有坐标** ⇒ 它滚的是 `hover` 最近的可滚动祖先（既有语义）
+        st.hover = Some("b0".into());
+        let e = handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::Wheel { dx: 0.0, dy: -1.0 });
+        assert!(e.iter().any(|x| matches!(x, UiEvent::Scrolled { .. })), "滚轮仍要立刻发 Scrolled：{e:?}");
+        assert_eq!(
+            st.scroll.offset_of("box"),
+            WHEEL_STEP_PX,
+            "**立即走一步**的既有行为不许回退（= 一个 WHEEL_STEP_PX）"
+        );
+        assert!(st.scroll.inertia_active(), "滚轮之后应当进入惯性（松手还会滑一段）");
+    }
+
+    /// **惯性会衰减并自己停下**；停下之后不许再「还在动」（否则就是空转）。
+    #[test]
+    fn inertia_decays_and_stops_without_spinning() {
+        // ⚠️ 必须用**深容器**：浅容器里惯性会撞墙停，那样「不衰减」的实现也能过
+        //    —— 本判据第一版就是这么失效的（实测）。
+        let (tree, geo, mut st) = deep_scroller_fixture();
+        // 滚轮事件**没有坐标** ⇒ 它滚的是 `hover` 最近的可滚动祖先（既有语义）
+        st.hover = Some("d0".into());
+        handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::Wheel { dx: 0.0, dy: -1.0 });
+
+        let max = st.scroll.max_of("box");
+        let mut prev = st.scroll.offset_of("box");
+        let mut steps = 0;
+        let mut moved = 0;
+        // 上限只是防死循环：真出问题时应由「步数异常大」暴露，而不是把测试挂住
+        while let Some((id, off)) = st.scroll.inertia_step() {
+            steps += 1;
+            assert_eq!(id, "box");
+            assert!(off > prev, "向下滚时每步都该前进：{prev} → {off}");
+            prev = off;
+            moved += 1;
+            assert!(steps < 500, "惯性跑了 {steps} 步还没停 —— 衰减没生效（空转？）");
+        }
+        assert!(moved > 1, "只走了一步就没惯性了 —— 等于没做（实际 {moved} 步）");
+        // ★ **判别性断言**：它是**衰减**停的，不是**撞墙**停的。
+        //   去掉衰减时速度恒定 ⇒ 会一路滑到 `max` 才停 ⇒ 这条必红。
+        assert!(
+            prev < max / 2,
+            "停在了 {prev}（max={max}）—— 像是撞墙停的，不是衰减停的 ⇒ 衰减没生效"
+        );
+        assert!(
+            !st.scroll.inertia_active(),
+            "停下之后 `inertia_active()` 必须是 false —— 窗口层据此不再排唤醒             （否则每 16ms 醒一次却什么都不做 = 空转）"
+        );
+        // 再推一次：什么都不该发生
+        assert!(st.scroll.inertia_step().is_none(), "停下之后不该还能推进");
+    }
+
+    /// **撞到边界就停**，且偏移不越界（不越界 + 不空转两条一起钉）。
+    #[test]
+    fn inertia_stops_at_the_bound_and_never_escapes() {
+        let (tree, geo, mut st) = scroller_fixture();
+        // 滚轮事件**没有坐标** ⇒ 它滚的是 `hover` 最近的可滚动祖先（既有语义）
+        st.hover = Some("b0".into());
+        let max = st.scroll.max_of("box");
+        // 猛滚几下，必然撞到底
+        for _ in 0..6 {
+            handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+                &InputEvent::Wheel { dx: 0.0, dy: -1.0 });
+        }
+        let mut prev = st.scroll.offset_of("box");
+        let mut steps = 0;
+        while let Some((_, off)) = st.scroll.inertia_step() {
+            assert!(off <= max, "偏移越界：{off} > {max}");
+            // ★ **每一步都必须真的移动** —— 这正是不空转的定义。
+            //   撞到边界之后若还返回 `Some`（只是偏移没变），那就是「假装在动」：
+            //   窗口层会照它每 16ms 唤醒一次却什么都不做。去掉「撞墙就停」的实现必红。
+            assert!(
+                off > prev,
+                "第 {steps} 步返回 `Some` 但偏移没变（{prev} → {off}）⇒ 撞墙后仍在空转"
+            );
+            prev = off;
+            steps += 1;
+            assert!(steps < 10_000);
+        }
+        assert_eq!(st.scroll.offset_of("box"), max, "撞底之后应当停在 max");
+        assert!(!st.scroll.inertia_active(), "撞边界就该停，不该继续空转");
+    }
+
+    /// **开始拖滚动条 ⇒ 惯性立刻停**（两种位移不许打架）。
+    #[test]
+    fn dragging_cancels_inertia() {
+        let (tree, geo, mut st) = scroller_fixture();
+        // 滚轮事件**没有坐标** ⇒ 它滚的是 `hover` 最近的可滚动祖先（既有语义）
+        st.hover = Some("b0".into());
+        handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::Wheel { dx: 0.0, dy: -1.0 });
+        assert!(st.scroll.inertia_active(), "前置：滚轮之后应当在滑");
+
+        let (px, py, _, _) = thumb_point(&geo, &st);
+        handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Left, x: px, y: py });
+        assert!(
+            !st.scroll.inertia_active(),
+            "开始拖动之后惯性必须停 —— 否则拖动与惯性会同时改偏移"
+        );
+        assert!(st.scroll.inertia_step().is_none());
     }
 
     // ---- T3.2：UiState → InteractState 的唯一转换 ---------------------------
