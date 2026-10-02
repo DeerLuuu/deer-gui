@@ -137,6 +137,7 @@ fn scripted_replay_is_deterministic_and_matches_expected_state() {
         // 的另一半：一旦动过文本，`carets` 就会被显式写上，但它的值仍是「追加」该有的值。
         carets: std::collections::BTreeMap::from([("field_1".to_string(), 3usize)]),
         scroll: Default::default(),
+        preedit: None,
     };
     assert_eq!(state1, expect_state, "最终状态必须逐字段相等");
 

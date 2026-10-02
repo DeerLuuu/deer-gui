@@ -73,6 +73,10 @@ impl Probe {
             info.extent.width, info.extent.height
         );
         match ev {
+            // T3.4 起 `InputEvent` 多了 `ImePreedit`（预编辑）。本探针只打印事件，
+            // 预编辑留给 UI 层用 —— 但**穷尽性由编译期强制**：不加这一臂就编不过，
+            // 这样「新增事件变体、下游忘了处理」不可能悄悄发生。
+            InputEvent::ImePreedit { text } => println!("ImePreedit({text:?})"),
             InputEvent::PointerMoved { x, y } => println!("{head} move      ({x:.1}, {y:.1})"),
             InputEvent::PointerDown { button, x, y } => {
                 println!("{head} down      {} ({x:.1}, {y:.1})", button_name(*button));
