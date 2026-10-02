@@ -1,7 +1,10 @@
 //! **M5-4 的闭环**：输入 → 命中 → 状态 → 重绘，而且**只在状态真的变了时才重绘**。
 //!
 //! ```sh
-//! # 真实窗口（自己点、按 Tab/Esc；Esc 退出）
+//! # 纯手工把玩（不自动跑脚本、不断言；自己点、按 Tab/Esc；Esc 退出）
+//! DEER_FORM_MANUAL=1 cargo run -q -p deer-gui --features window --example interactive_form
+//!
+//! # 自检（自动重放内置脚本 + 终态断言，读完自己退出，退出码 0 = 断言全过）
 //! cargo run -q -p deer-gui --features window --example interactive_form
 //!
 //! # 脚本化重放（确定性，读完脚本自己退出，退出码 0 = 断言全过）
@@ -296,6 +299,8 @@ struct Form {
     renderer: Option<WindowedRenderer>,
     /// 环境变量给的自定义脚本模板（`None` ⇒ 用内置脚本，那个有期望终态）。
     script_src: Option<String>,
+    /// **纯交互模式**（`DEER_FORM_MANUAL=1`）：不重放任何脚本、不断言终态，人工把玩、Esc 退出。
+    manual: bool,
     done: bool,
     /// **M5c 省电重放档**：声明 `OnDemand` 并用 [`Waker`]（deadline）推进脚本。
     ondemand: bool,
@@ -418,6 +423,11 @@ impl Form {
     /// **M5b-A2**：事件不再直接调 `feed`，而是走 [`Form::handle_input`] —— 与真实窗口事件
     /// **同一个入口**。脚本推进因此是「输入路径」的一环，而不是「`redraw` 顺手改了状态」。
     fn step_script(&mut self) -> Result<Option<Flow>, String> {
+        // **纯交互模式**（manual）：队列天生为空 —— 「队列空 ⇒ 收尾退出」那条语义是
+        // 脚本模式的（脚本播完就该退）；手工把玩恰恰要窗口一直开着，Esc 才退。
+        if self.manual {
+            return Ok(Some(Flow::Continue));
+        }
         let Some(ev) = self.queue.pop_front() else {
             return Ok(None);
         };
@@ -783,15 +793,20 @@ impl App for Form {
         );
 
         // 脚本：内置脚本有期望终态（是判据）；自定义脚本只保证「解析 + 重放 + 退出」。
-        let custom = self.script_src.is_some();
-        let tpl = self.script_src.clone().unwrap_or_else(|| BUILTIN_SCRIPT.to_string());
-        let src = resolve_script(&tpl, &f)?;
-        println!("[interactive_form] 脚本（{}）：{src}", if custom { "自定义" } else { "内置" });
-        let evs = input_script::parse_script(&src)?;
-        println!("[interactive_form] 解析出 {} 条输入事件", evs.len());
-        self.queue = evs.into_iter().collect();
-        if !custom {
-            self.expected = Some(expected_state());
+        // 纯交互模式（manual）：两者都不做 —— 队列保持空，窗口事件直接进状态机，Esc 退出。
+        if self.manual {
+            println!("[interactive_form] 纯交互模式：不重放脚本、不断言终态");
+        } else {
+            let custom = self.script_src.is_some();
+            let tpl = self.script_src.clone().unwrap_or_else(|| BUILTIN_SCRIPT.to_string());
+            let src = resolve_script(&tpl, &f)?;
+            println!("[interactive_form] 脚本（{}）：{src}", if custom { "自定义" } else { "内置" });
+            let evs = input_script::parse_script(&src)?;
+            println!("[interactive_form] 解析出 {} 条输入事件", evs.len());
+            self.queue = evs.into_iter().collect();
+            if !custom {
+                self.expected = Some(expected_state());
+            }
         }
 
         // 首帧必然要画（窗口刚建好）。
@@ -1103,13 +1118,18 @@ fn pixel_numbers(theme: &Theme, extent: Extent) -> Result<(), String> {
 fn main() -> ExitCode {
     let theme = Theme::default();
     let script_src = std::env::var(ENV_VAR).ok().filter(|s| !s.trim().is_empty());
+    // **纯交互模式**（人工把玩）：不重放任何脚本、不断言终态 —— Esc 退出。
+    let manual = deer_gui::env_gate::flag("DEER_FORM_MANUAL");
     // M5c 省电重放档：**先 `trim()` 再比**（`cmd` 的 `set X=1 && …` 会把空格算进值里）。
     let ondemand = deer_gui::env_gate::flag(ONDEMAND_ENV);
-    match &script_src {
-        Some(_) => println!("[{ENV_VAR}] 已给出 ⇒ 脚本化重放（重放期间忽略窗口事件）"),
-        None => {
-            println!("没有设 {ENV_VAR} ⇒ 交互模式：自己点、按 Tab 移焦点、打字、Esc 退出");
-            println!("             内置脚本（会自动重放）：{BUILTIN_SCRIPT}");
+    if manual {
+        println!("[interactive_form] 纯交互模式（DEER_FORM_MANUAL=1）：不重放脚本、不断言终态，自己点、Esc 退出");
+    } else {
+        match &script_src {
+            Some(_) => println!("[{ENV_VAR}] 已给出 ⇒ 脚本化重放（重放期间忽略窗口事件）"),
+            None => println!(
+                "[interactive_form] 自检模式：自动重放内置脚本并断言终态（要人工把玩请设 DEER_FORM_MANUAL=1）"
+            ),
         }
     }
     if ondemand {
@@ -1118,7 +1138,7 @@ fn main() -> ExitCode {
              （M5b 时这条在接口上做不到：那时窗口层没有「自己唤醒事件循环」的手段）"
         );
     }
-    if !window_tests_enabled() {
+    if !window_tests_enabled() && !manual {
         // 与既有窗口类 example 同一约定：**退出码 0 但明确写着「这不是通过」**。
         println!("⚠️ **这不是通过，是被跳过**：没有设 DEER_VK_WINDOW_TESTS=1（本示例要真窗口）");
     }
@@ -1141,6 +1161,7 @@ fn main() -> ExitCode {
         engine: None,
         renderer: None,
         script_src,
+        manual,
         done: false,
         ondemand,
         waker: None,
