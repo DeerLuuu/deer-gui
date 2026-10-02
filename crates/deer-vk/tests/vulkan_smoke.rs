@@ -100,7 +100,7 @@ fn vk_backend_opens_a_real_device_and_reports_m2b_boundaries() {
     assert!(
         device
             .upload_texture(
-                deer_gpu::TextureId(999),
+                deer_core::TextureId(999),
                 &[0u8; 4],
                 deer_gpu::TextureRegion {
                     x: 0,

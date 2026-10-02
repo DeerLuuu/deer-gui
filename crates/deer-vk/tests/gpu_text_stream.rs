@@ -24,10 +24,10 @@
 //! 字体来源：系统字体（`consola` → `arial` → `segoeui`）；**拿不到就明确跳过并打印原因**，
 //! 不伪装通过。断言针对的是「任意正常字体都成立的性质」，不是某个字体的位图指纹。
 
-use deer_gpu::draw::{Color, DrawCmd, DrawList, RectI};
+use deer_core::draw::{Color, DrawCmd, DrawList, RectI};
 use deer_gpu::null::CpuRenderer;
 use deer_gpu::text::{GlyphPlacement, TextEngine};
-use deer_gpu::{AtlasSlot, Extent};
+use deer_gpu::{ AtlasSlot, Extent };
 use deer_vk::gpu_text::{self, TextVertex};
 
 /// 前景 / 背景：用**不透明**色，让「CPU 有没有写这个像素」变成「是否等于背景色」。

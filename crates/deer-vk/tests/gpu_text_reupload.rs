@@ -35,9 +35,10 @@
 //! 以**返回值**赋值）⇒ 「跳过改指」必然让这里的读数停在 `(1,1)` 并变红。
 //! 这是本项目「**读数与真实调用同处**」规矩的一次直接应用。
 
-use deer_gpu::draw::{Color, DrawCmd, DrawList};
+use deer_core::draw::{Color, DrawCmd, DrawList};
 use deer_gpu::text::TextEngine;
-use deer_gpu::{Extent, RectI};
+use deer_core::{ RectI };
+use deer_gpu::{ Extent };
 use deer_vk::GpuGeometryRenderer;
 
 fn engine(size: f32) -> Option<TextEngine> {

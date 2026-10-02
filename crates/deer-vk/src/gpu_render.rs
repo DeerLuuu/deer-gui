@@ -110,7 +110,8 @@
 
 use std::ffi::c_void;
 
-use deer_gpu::{Color, DrawCmd, DrawList, Extent, GpuError, GpuResult, RectI, TextEngine};
+use deer_core::{ Color, DrawCmd, DrawList, GpuError, GpuResult, RectI };
+use deer_gpu::{ Extent, TextEngine };
 
 use crate::device::{
     vk_result_name, DescriptorPool, DescriptorSet, DeviceFns, DrawIndexedIndirectCommand, RenderPass,

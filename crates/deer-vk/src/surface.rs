@@ -20,7 +20,8 @@
 use std::ffi::c_void;
 use std::ptr;
 
-use deer_gpu::{GpuError, GpuResult, Platform, RawWindowHandle};
+use deer_core::{ GpuError, GpuResult };
+use deer_gpu::{ Platform, RawWindowHandle };
 
 use crate::ffi;
 use crate::ffi_dev as vk;

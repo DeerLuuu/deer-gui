@@ -121,7 +121,7 @@ fn main() -> Result<(), String> {
 }
 
 /// 背景色之外的像素数（「被画过」的像素）。
-fn count_ink(fb: &gpu::null::Framebuffer, bg: gpu::Color) -> usize {
+fn count_ink(fb: &gpu::null::Framebuffer, bg: deer_core::Color) -> usize {
     fb.pixels
         .chunks_exact(4)
         .filter(|p| !(p[0] == bg.r && p[1] == bg.g && p[2] == bg.b))

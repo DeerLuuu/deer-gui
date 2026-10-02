@@ -97,10 +97,10 @@
 //! 提示一律走 `DrawCmd::node_hint`（唯一算校验和的地方），本模块不手写字面量。
 //! 零面积节点只画描边（与 `DefaultRenderer` 的早退不同），并在模块测试里钉住这条差异。
 
-use deer_layout::layout::{Geometry, Measure};
-use deer_layout::node::{Kind, Node};
+use deer_core::layout::{Geometry, Measure};
+use deer_core::node::{Kind, Node};
 
-use crate::draw::{Color, DrawCmd, DrawList, RectI};
+use deer_core::draw::{Color, DrawCmd, DrawList, RectI};
 use crate::Theme;
 
 /// 交互状态的视觉输入（`UiState` 的**只读子集**，避免 `deer-gpu` 反向依赖 `deer-gui`）。
@@ -145,8 +145,8 @@ pub struct PreeditView {
 /// 字段直接复用 `deer-layout` 的两个类型，**不另造一套**（否则偏移的夹取语义会有两份）。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScrollView {
-    pub offsets: deer_layout::layout::ScrollOffsets,
-    pub metrics: deer_layout::layout::ScrollMetrics,
+    pub offsets: deer_core::layout::ScrollOffsets,
+    pub metrics: deer_core::layout::ScrollMetrics,
 }
 
 impl InteractState {
@@ -535,7 +535,7 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
         if clip {
             list.push(DrawCmd::PopClip);
             // 滚动条画在**裁剪之外**（`PopClip` 之后）：它盖在内容上，且不该被自己的视口裁掉。
-            // 几何来自 `deer_layout::scrollbar_geom` —— 与**命中侧同一份实现**
+            // 几何来自 `deer_core::scrollbar_geom` —— 与**命中侧同一份实现**
             //（各写一份的话，「看得见的滚动条」与「点得到的滚动条」迟早错开）。
             self.emit_scrollbar(n, r, ry, rw, rh, list);
         }
@@ -550,7 +550,7 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
     /// **登记为已知取舍**：等真有「主题化滚动条」的需求，再按 §6 走一遍登记加字段，
     /// 那时把这两行换掉即可（几何不涉及颜色，改动面很小）。
     fn emit_scrollbar(&self, n: &Node, x: i32, y: i32, w: i32, h: i32, list: &mut DrawList) {
-        let viewport = deer_layout::Rect {
+        let viewport = deer_core::Rect {
             x: x as f32,
             y: y as f32,
             w: w as f32,
@@ -558,7 +558,7 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
         };
         let offset = self.state.scroll.offsets.get(&n.id);
         let max_scroll = self.state.scroll.metrics.max_of(&n.id);
-        let Some(g) = deer_layout::scrollbar_geom(viewport, offset, max_scroll) else {
+        let Some(g) = deer_core::scrollbar_geom(viewport, offset, max_scroll) else {
             // ⚠️ 这里是最容易「静默失败」的地方：可滚动容器一条滚动条都没画出来，
             // 而画面看起来只是「滚动条没出现」—— 分不清是「内容装得下」（正常）
             // 还是「调用方忘了 `set_metrics`」（bug）。日志把这两种情况分开。
@@ -583,7 +583,7 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
             }
             return;
         };
-        let radius = (deer_layout::SCROLLBAR_W / 2.0) as i32;
+        let radius = (deer_core::SCROLLBAR_W / 2.0) as i32;
         list.push(DrawCmd::FillRoundRect {
             rect: to_rect_i(g.track),
             radius,
@@ -596,8 +596,8 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
         });
     }
 
-    fn text_style(&self) -> deer_layout::TextStyle {
-        deer_layout::TextStyle {
+    fn text_style(&self) -> deer_core::TextStyle {
+        deer_core::TextStyle {
             font_size: self.theme.font_size,
             line_height: self.theme.line_height,
         }
@@ -641,7 +641,7 @@ fn tint(base: Color, visual: Visual) -> Color {
 ///
 /// `scrollbar_geom` 刻意返回浮点（命中侧要用浮点判包含）；绘制侧在这里一次收口，
 /// 于是「画出来的位置」与「算出来的位置」不会各自取整而差 1 像素。
-fn to_rect_i(r: deer_layout::Rect) -> RectI {
+fn to_rect_i(r: deer_core::Rect) -> RectI {
     RectI::new(r.x.round() as i32, r.y.round() as i32, r.w.round() as i32, r.h.round() as i32)
 }
 
@@ -669,15 +669,16 @@ fn focus_ring_rect(r: RectI) -> RectI {
 
 #[cfg(test)]
 mod tests {
+    use deer_core::{ Color, DrawCmd, DrawList, RectI };
     use super::*;
     use crate::null::CpuRenderer;
     use crate::render::{DefaultRenderer, NullRenderer, build_draw_list};
-    use crate::{Extent, Theme};
-    use deer_layout::layout::{ApproxMeasure, layout};
-    use deer_layout::node::Rect;
+    use crate::{ Extent, Theme };
+    use deer_core::layout::{ApproxMeasure, layout};
+    use deer_core::node::Rect;
 
     fn tree() -> Node {
-        let mut b = deer_layout::builder::Builder::new(Kind::Column, "app")
+        let mut b = deer_core::builder::Builder::new(Kind::Column, "app")
             .padding(0.0)
             .gap(0.0);
         b.button("OK");
@@ -689,7 +690,7 @@ mod tests {
         layout(
             &tree(),
             Rect::new(0.0, 0.0, 200.0, 120.0),
-            deer_layout::TextStyle::default(),
+            deer_core::TextStyle::default(),
             &ApproxMeasure,
         )
     }
@@ -1641,11 +1642,11 @@ mod tests {
         let theme = Theme::default();
         let s = InteractState::default();
         let build = |scroll: bool| {
-            let mut b = deer_layout::builder::Builder::new(Kind::Column, "app");
+            let mut b = deer_core::builder::Builder::new(Kind::Column, "app");
             b.container_opts(
                 Kind::Column,
                 "outer",
-                deer_layout::builder::L::new()
+                deer_core::builder::L::new()
                     .w(200.0)
                     .h(100.0)
                     .scroll(scroll)
@@ -1657,10 +1658,10 @@ mod tests {
                 },
             );
             let tree = b.build();
-            let geo = deer_layout::layout::layout(
+            let geo = deer_core::layout::layout(
                 &tree,
                 Rect::new(0.0, 0.0, 200.0, 100.0),
-                deer_layout::TextStyle::default(),
+                deer_core::TextStyle::default(),
                 &ApproxMeasure,
             );
             let list = InteractiveRenderer::new(theme.clone(), &ApproxMeasure, &s).build(&tree, &geo);
@@ -1729,16 +1730,16 @@ mod tests {
         let theme = Theme::default();
         let s = InteractState::default();
         let build = |wrap: bool| {
-            let mut b = deer_layout::builder::Builder::new(Kind::Column, "app");
+            let mut b = deer_core::builder::Builder::new(Kind::Column, "app");
             b.text_opts("alpha beta gamma delta", |n| {
-                n.layout.width = Some(deer_layout::node::Size::Px(60.0));
+                n.layout.width = Some(deer_core::node::Size::Px(60.0));
                 n.layout.wrap = wrap;
             });
             let tree = b.build();
-            let geo = deer_layout::layout::layout(
+            let geo = deer_core::layout::layout(
                 &tree,
                 Rect::new(0.0, 0.0, 200.0, 260.0),
-                deer_layout::TextStyle::default(),
+                deer_core::TextStyle::default(),
                 &ApproxMeasure,
             );
             let list = InteractiveRenderer::new(theme.clone(), &ApproxMeasure, &s).build(&tree, &geo);
@@ -1795,7 +1796,7 @@ mod tests {
     // ---- T3.4：预编辑渲染 ----------------------------------------------------
 
     /// 聚焦的 `Field`（标签 `abcd`）+ 光标位 + 预编辑 ⇒ 绘制列表。
-    fn field_frame(caret: Option<usize>, preedit: Option<(&str, &str)>) -> crate::DrawList {
+    fn field_frame(caret: Option<usize>, preedit: Option<(&str, &str)>) -> deer_core::DrawList {
         let mut f = Node::new(Kind::Field, "f");
         f.props.label = Some("abcd".into());
         let mut root = Node::new(Kind::Column, "root");
@@ -1803,7 +1804,7 @@ mod tests {
         let geo = layout(
             &root,
             Rect { x: 0.0, y: 0.0, w: 200.0, h: 60.0 },
-            deer_layout::TextStyle { font_size: 14.0, line_height: 18.0 },
+            deer_core::TextStyle { font_size: 14.0, line_height: 18.0 },
             &ApproxMeasure,
         );
         let mut carets = std::collections::BTreeMap::new();
@@ -1823,7 +1824,7 @@ mod tests {
     }
 
     /// 列表里**文字等于 `want`** 的那条 `Text` 命令的 x（没有则 `None`）。
-    fn text_x(list: &crate::DrawList, want: &str) -> Option<i32> {
+    fn text_x(list: &deer_core::DrawList, want: &str) -> Option<i32> {
         list.cmds.iter().find_map(|c| match c {
             DrawCmd::Text { rect, text, .. } if text == want => Some(rect.x),
             _ => None,
@@ -1831,7 +1832,7 @@ mod tests {
     }
 
     /// 下划线（高 `PREEDIT_UNDERLINE_H`、半径 0 的填充矩形）的 (x, w)。
-    fn underline(list: &crate::DrawList) -> Option<(i32, i32)> {
+    fn underline(list: &deer_core::DrawList) -> Option<(i32, i32)> {
         list.cmds.iter().find_map(|c| match c {
             DrawCmd::FillRoundRect { rect, radius, .. }
                 if *radius == 0 && rect.h == PREEDIT_UNDERLINE_H =>
@@ -1895,7 +1896,7 @@ mod tests {
     // ---- T3.8：光标渲染 ------------------------------------------------------
 
     /// 一个聚焦的 `Field`（标签 `abcd`）+ 指定的光标位置 ⇒ 绘制列表。
-    fn field_with_caret(caret: Option<usize>) -> crate::DrawList {
+    fn field_with_caret(caret: Option<usize>) -> deer_core::DrawList {
         let mut f = Node::new(Kind::Field, "f");
         f.props.label = Some("abcd".into());
         let mut root = Node::new(Kind::Column, "root");
@@ -1903,7 +1904,7 @@ mod tests {
         let geo = layout(
             &root,
             Rect { x: 0.0, y: 0.0, w: 200.0, h: 60.0 },
-            deer_layout::TextStyle { font_size: 14.0, line_height: 18.0 },
+            deer_core::TextStyle { font_size: 14.0, line_height: 18.0 },
             &ApproxMeasure,
         );
         let mut carets = std::collections::BTreeMap::new();
@@ -1919,7 +1920,7 @@ mod tests {
     }
 
     /// 光标那一条：**宽 `CARET_W`、半径 0**的填充矩形（用它把光标从别的矩形里挑出来）。
-    fn caret_x(list: &crate::DrawList) -> Vec<i32> {
+    fn caret_x(list: &deer_core::DrawList) -> Vec<i32> {
         list.cmds
             .iter()
             .filter_map(|c| match c {
@@ -1985,7 +1986,7 @@ mod tests {
         let geo = layout(
             &root,
             Rect { x: 0.0, y: 0.0, w: 200.0, h: 60.0 },
-            deer_layout::TextStyle { font_size: 14.0, line_height: 18.0 },
+            deer_core::TextStyle { font_size: 14.0, line_height: 18.0 },
             &ApproxMeasure,
         );
         let mut carets = std::collections::BTreeMap::new();
@@ -1999,29 +2000,29 @@ mod tests {
     // ---- T3.2：可视滚动条 ---------------------------------------------------
 
     /// 造「一个可滚动 Column + 一个高出视口的子节点」，返回 (树, 几何, 上限)。
-    fn scroller_fixture() -> (Node, Geometry, deer_layout::layout::ScrollMetrics) {
+    fn scroller_fixture() -> (Node, Geometry, deer_core::layout::ScrollMetrics) {
         let mut col = Node::new(Kind::Column, "scroller");
         col.layout.scroll = true;
         // 视口高度**显式给**：滚动容器的语义是「内容超出**自己的**高度」，
         // 而不是超出父给的盒子（盒子给大一点，容器自己矮）
-        col.layout.height = Some(deer_layout::node::Size::Px(50.0));
+        col.layout.height = Some(deer_core::node::Size::Px(50.0));
         // 五个高 40 的子节点 ⇒ 内容高 200 ≫ 视口高 50（用多个小的比一个大 200 的更稳：
         // 过不了「子节点主轴不被视口夹取」那条规则的实现差异）
         for i in 0..5 {
             let mut child = Node::new(Kind::Button, format!("b{i}"));
             child.props.label = Some("x".into());
-            child.layout.height = Some(deer_layout::node::Size::Px(40.0));
+            child.layout.height = Some(deer_core::node::Size::Px(40.0));
             col.children.push(child);
         }
 
         let box_ = Rect { x: 10.0, y: 20.0, w: 100.0, h: 200.0 };
-        let style = deer_layout::TextStyle { font_size: 14.0, line_height: 18.0 };
-        let (geo, metrics) = deer_layout::layout::layout_with_scroll(
+        let style = deer_core::TextStyle { font_size: 14.0, line_height: 18.0 };
+        let (geo, metrics) = deer_core::layout::layout_with_scroll(
             &col,
             box_,
             style,
             &ApproxMeasure,
-            &deer_layout::layout::ScrollOffsets::new(),
+            &deer_core::layout::ScrollOffsets::new(),
         );
         assert!(
             metrics.max_of("scroller") > 0,
@@ -2038,12 +2039,12 @@ mod tests {
         let list = InteractiveRenderer::new(Theme::default(), &ApproxMeasure, &InteractState::default())
             .build(&tree, &geo);
         let f = geo.get("scroller").expect("容器有几何");
-        let vp = deer_layout::Rect { x: f.x, y: f.y, w: f.w, h: f.h };
+        let vp = deer_core::Rect { x: f.x, y: f.y, w: f.w, h: f.h };
         // 前置：**假如**喂了状态就一定会画（否则本条断言可能只是因为几何算不出滚动条）
-        let _ = deer_layout::scrollbar_geom(vp, 0, 1).expect("喂了状态时该画得出来");
+        let _ = deer_core::scrollbar_geom(vp, 0, 1).expect("喂了状态时该画得出来");
         let in_scrollbar = list.cmds.iter().any(|c| {
             matches!(c, DrawCmd::FillRoundRect { rect, .. }
-                if rect.x >= vp.x as i32 + vp.w as i32 - deer_layout::SCROLLBAR_W as i32 - 1)
+                if rect.x >= vp.x as i32 + vp.w as i32 - deer_core::SCROLLBAR_W as i32 - 1)
         });
         assert!(
             !in_scrollbar,
@@ -2061,7 +2062,7 @@ mod tests {
 
         let state = InteractState {
             scroll: ScrollView {
-                offsets: deer_layout::layout::ScrollOffsets::new(),
+                offsets: deer_core::layout::ScrollOffsets::new(),
                 metrics: metrics.clone(),
             },
             ..Default::default()
@@ -2076,8 +2077,8 @@ mod tests {
         );
 
         let f = geo.get("scroller").expect("容器有几何");
-        let vp = deer_layout::Rect { x: f.x, y: f.y, w: f.w, h: f.h };
-        let g = deer_layout::scrollbar_geom(vp, 0, metrics.max_of("scroller")).expect("该画");
+        let vp = deer_core::Rect { x: f.x, y: f.y, w: f.w, h: f.h };
+        let g = deer_core::scrollbar_geom(vp, 0, metrics.max_of("scroller")).expect("该画");
         let want_track = to_rect_i(g.track);
         let want_thumb = to_rect_i(g.thumb);
         let tail: Vec<&DrawCmd> = fed.cmds.iter().skip(base.len()).collect();
@@ -2100,23 +2101,23 @@ mod tests {
         col.layout.scroll = true;
         let mut child = Node::new(Kind::Button, "b");
         child.props.label = Some("x".into());
-        child.layout.height = Some(deer_layout::node::Size::Px(10.0));
+        child.layout.height = Some(deer_core::node::Size::Px(10.0));
         col.children.push(child);
 
         let box_ = Rect { x: 0.0, y: 0.0, w: 100.0, h: 200.0 };
-        let style = deer_layout::TextStyle { font_size: 14.0, line_height: 18.0 };
-        let (geo, metrics) = deer_layout::layout::layout_with_scroll(
+        let style = deer_core::TextStyle { font_size: 14.0, line_height: 18.0 };
+        let (geo, metrics) = deer_core::layout::layout_with_scroll(
             &col,
             box_,
             style,
             &ApproxMeasure,
-            &deer_layout::layout::ScrollOffsets::new(),
+            &deer_core::layout::ScrollOffsets::new(),
         );
         assert_eq!(metrics.max_of("tight"), 0, "测试前置：内容不该超出");
 
         let state = InteractState {
             scroll: ScrollView {
-                offsets: deer_layout::layout::ScrollOffsets::new(),
+                offsets: deer_core::layout::ScrollOffsets::new(),
                 metrics,
             },
             ..Default::default()

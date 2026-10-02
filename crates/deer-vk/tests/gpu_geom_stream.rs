@@ -6,7 +6,8 @@
 //!    必须**分开** —— `pos` 用裁剪后的矩形，`rect` 保持原始矩形（见 ledger Ruling 5）；
 //! 3. **文本不静默丢弃**：`DrawCmd::Text` 记入 `unsupported`，让调用方看得见。
 
-use deer_gpu::{Color, DrawCmd, DrawList, Extent, RectI};
+use deer_core::{ Color, DrawCmd, DrawList, RectI };
+use deer_gpu::{ Extent };
 use deer_vk::gpu_geom;
 
 /// 浮点近似比较（NDC 是算出来的，不能指望逐位相等）。

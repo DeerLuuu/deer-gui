@@ -28,7 +28,8 @@ use deer_gpu::interact::{
     InteractiveRenderer,
 };
 use deer_gui::gpu::null::CpuRenderer;
-use deer_gui::gpu::{Color, DrawList, Extent, TextEngine, Theme};
+use deer_core::{Color, DrawList};
+use deer_gpu::{Extent, TextEngine, Theme};
 use deer_gui::input_script;
 use deer_gui::interaction::{ClipSnapshot, UiEvent, UiState, focusables};
 use deer_gui::layout::builder::{Builder, L};

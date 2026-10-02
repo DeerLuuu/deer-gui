@@ -96,7 +96,7 @@ fn main() {
     let tree = app.build();
 
     let mut state = UiState::default();
-    let (geo, metrics) = deer_layout::layout::layout_with_scroll(
+    let (geo, metrics) = deer_core::layout::layout_with_scroll(
         &tree,
         Rect::new(0.0, 0.0, W as f32, H as f32),
         style,
@@ -115,7 +115,7 @@ fn main() {
     );
 
     let frame = |tree: &Node, state: &UiState| {
-        let (geo, metrics) = deer_layout::layout::layout_with_scroll(
+        let (geo, metrics) = deer_core::layout::layout_with_scroll(
             tree,
             Rect::new(0.0, 0.0, W as f32, H as f32),
             style,

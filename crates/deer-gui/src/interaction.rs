@@ -30,9 +30,9 @@
 
 use std::collections::BTreeMap;
 
-use deer_gpu::{DrawCmd, DrawList, RectI};
-use deer_layout::layout::{Geometry, ScrollMetrics, ScrollOffsets};
-use deer_layout::node::{Kind, Node};
+use deer_core::{ DrawCmd, DrawList, RectI };
+use deer_core::layout::{Geometry, ScrollMetrics, ScrollOffsets};
+use deer_core::node::{Kind, Node};
 
 // ---------------------------------------------------------------------------
 // 一、输入事件模型 —— M5-1 冻结定义的**本地镜像**
@@ -253,7 +253,7 @@ pub struct ScrollState {
     pub drag: Option<ScrollDrag>,
     /// **正在惯性滚动**（T3.2）。默认 `None` ⇒ 既有行为逐字节不变。
     pub inertia: Option<ScrollInertia>,
-    /// 本帧的滚动上限（来自 [`deer_layout::layout::layout_with_scroll`]）。
+    /// 本帧的滚动上限（来自 [`deer_core::layout::layout_with_scroll`]）。
     pub metrics: ScrollMetrics,
 }
 
@@ -585,7 +585,7 @@ impl ClipSnapshot {
                     //    （改前实测：不 panic，且命中节点的裁剪张冠李戴）。
                     assert_eq!(
                         *node_id_fp,
-                        deer_gpu::draw::node_id_fp(&n.id),
+                        deer_core::draw::node_id_fp(&n.id),
                         "NodeHint 的 **id 指纹** 与节点 `{}` 对不上：绘制列表与这棵树不是同一份\
                          （长度校验和看不见这类错位 —— 等长 id 互换就是典型）。",
                         n.id
@@ -635,14 +635,14 @@ fn point_in_rect(r: &RectI, x: f32, y: f32) -> bool {
 // 四、命中测试（M5-2）
 // ---------------------------------------------------------------------------
 
-/// 命中测试：**复用 `deer_layout::hit_test`** 取最深命中者，再叠加两条本层的规则：
+/// 命中测试：**复用 `deer_core::hit_test`** 取最深命中者，再叠加两条本层的规则：
 ///
 /// 1. **禁用**：命中节点自身或任一祖先 `props.disabled` ⇒ 整个点不命中（禁用子树不响应输入）；
 /// 2. **裁剪**：该点在命中节点的**有效裁剪**外（含从没有被登记的祖先继承来的裁剪）⇒ 不命中。
 ///
 /// **不回退到祖先**（理由见模块注释的结论 3）。
 pub fn hit<'a>(root: &'a Node, geo: &Geometry, clip: ClipSnapshot, x: f32, y: f32) -> Option<&'a Node> {
-    let deepest = deer_layout::hit_test(root, geo, x, y)?;
+    let deepest = deer_core::hit_test(root, geo, x, y)?;
     let verdict = probe_input_path(root, deepest as *const Node, false, None, &clip).expect(
         "内部不变式：`hit_test` 的返回值必定取自这棵树 —— 走到这里说明路径遍历写错了",
     );
@@ -941,7 +941,7 @@ pub fn handle(
     match ev {
         InputEvent::PointerMoved { x, y } => {
             // ★ 拖动滚动条期间：把指针位置**反解**成偏移。
-            // 反解在 `deer_layout::scrollbar_offset_for_pointer` —— 与 `scrollbar_geom`
+            // 反解在 `deer_core::scrollbar_offset_for_pointer` —— 与 `scrollbar_geom`
             // 是同一套映射的两个方向，所以「拖到哪儿对应哪个偏移」不会两边各写一份。
             if let Some(drag) = state.scroll.drag.clone() {
                 if let Some(f) = geo.get(&drag.id) {
@@ -1296,7 +1296,7 @@ pub fn handle(
 /// 找到「指针落在其**滑块**上」的可滚动容器 ⇒ 返回这次拖动的抓取信息。
 ///
 /// **最深的优先**：内层滚动条画在外层之上，所以指针压在同一条竖带时应当抓内层。
-/// 命中判据直接调 `deer_layout::scrollbar_geom` —— 与**绘制侧同一份实现**
+/// 命中判据直接调 `deer_core::scrollbar_geom` —— 与**绘制侧同一份实现**
 /// （各写一份的话，「看得见的滑块」与「抓得到的滑块」迟早错开）。
 ///
 /// T3.2b 起语义扩成**两档**：按在滑块上 ⇒ 普通拖动（`grab_dy` = 指针距滑块顶）；
@@ -1402,8 +1402,8 @@ fn byte_index_of(s: &str, caret: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use deer_layout::node::Rect;
-    use deer_layout::node::Size;
+    use deer_core::node::Rect;
+    use deer_core::node::Size;
 
     /// 手写几何（**不经过布局**）：断言依赖的矩形必须一眼能读出来。
     ///
@@ -1418,7 +1418,7 @@ mod tests {
     /// ```
     fn tree() -> Node {
         Node::new(Kind::Column, "app")
-            .with_layout(deer_layout::node::LayoutProps {
+            .with_layout(deer_core::node::LayoutProps {
                 width: Some(Size::Px(200.0)),
                 height: Some(Size::Px(120.0)),
                 ..Default::default()
@@ -1465,7 +1465,7 @@ mod tests {
         );
         // 前置②：这条几何确实会被 `hit_test` 判为命中（否则裁剪/禁用测试没有判别力）。
         assert!(
-            deer_layout::hit_test(&t, &g, 30.0, 20.0).is_some_and(|n| n.id == "btn_ok"),
+            deer_core::hit_test(&t, &g, 30.0, 20.0).is_some_and(|n| n.id == "btn_ok"),
             "测试前置：`)` 点 (30,20) 应当落在 btn_ok 上"
         );
         (t, g)
@@ -1862,7 +1862,7 @@ mod tests {
         //    前置：这个点确实落在 app 上、且不在两个按钮/输入框上。
         let container_pt = (110.0f32, 90.0f32);
         assert_eq!(
-            deer_layout::hit_test(&t, &g, container_pt.0, container_pt.1).map(|n| n.id.as_str()),
+            deer_core::hit_test(&t, &g, container_pt.0, container_pt.1).map(|n| n.id.as_str()),
             Some("app"),
             "测试前置：这个点必须命中容器 app"
         );
@@ -1923,7 +1923,7 @@ mod tests {
         // 反向：禁用按钮点不出焦点。
         let (nx, ny) = (45.0f32, 50.0f32);
         assert_eq!(
-            deer_layout::hit_test(&t, &g, nx, ny).map(|n| n.id.as_str()),
+            deer_core::hit_test(&t, &g, nx, ny).map(|n| n.id.as_str()),
             Some("btn_no"),
             "测试前置：这个点命中禁用按钮 btn_no"
         );
@@ -1958,7 +1958,7 @@ mod tests {
         );
 
         // 前置：`hit_test` **会**命中禁用节点（否则这个测试在测空气）。
-        let raw = deer_layout::hit_test(&t, &g, dx, dy).map(|n| n.id.clone());
+        let raw = deer_core::hit_test(&t, &g, dx, dy).map(|n| n.id.clone());
         println!("hit_test 原始结果（不看禁用）：{raw:?} / hit() 结果：{:?}", hit(&t, &g, ClipSnapshot::unclipped(), dx, dy).map(|n| n.id.as_str()));
         assert_eq!(raw.as_deref(), Some("btn_no"), "测试前置：hit_test 必须命中 btn_no");
 
@@ -1994,7 +1994,7 @@ mod tests {
 
         // 禁用节点**子树里的叶子**同样不响应（几何上它在 btn_no 内）。
         let (lx, ly) = ev_at("btn_no_label", &g);
-        let raw2 = deer_layout::hit_test(&t, &g, lx, ly).map(|n| n.id.clone());
+        let raw2 = deer_core::hit_test(&t, &g, lx, ly).map(|n| n.id.clone());
         let h2 = hit(&t, &g, ClipSnapshot::unclipped(), lx, ly).map(|n| n.id.clone());
         println!("禁用子树：hit_test={raw2:?} / hit={h2:?}");
         assert_eq!(raw2.as_deref(), Some("btn_no_label"), "测试前置：hit_test 命中子树叶子");
@@ -2020,7 +2020,7 @@ mod tests {
 
         // 前置：几何上两点都在 btn_ok 里（所以拒绝只能来自裁剪，不可能是几何）。
         for (x, y) in [inside, outside_clip] {
-            let raw = deer_layout::hit_test(&t, &g, x, y).map(|n| n.id.clone());
+            let raw = deer_core::hit_test(&t, &g, x, y).map(|n| n.id.clone());
             println!("({x},{y}) hit_test={raw:?} clip_of={:?}", snap.clip_of("btn_ok"));
             assert_eq!(raw.as_deref(), Some("btn_ok"), "测试前置：几何命中 btn_ok");
         }
@@ -2232,7 +2232,7 @@ mod tests {
             (9.999, 20.0, false), // 左外侧
             (30.0, 9.999, false), // 上外侧
         ] {
-            let via_layout = deer_layout::hit_test(&t, &g, x, y).map(|n| n.id.clone());
+            let via_layout = deer_core::hit_test(&t, &g, x, y).map(|n| n.id.clone());
             let via_hit = hit(&t, &g, ClipSnapshot::unclipped(), x, y).map(|n| n.id.clone());
             println!("({x},{y}) hit_test={via_layout:?} hit={via_hit:?}");
             // 不裁剪、不禁用时，本层的 `hit` 必须与 `hit_test` 逐点一致。
@@ -2296,7 +2296,7 @@ mod tests {
         assert_eq!(s.hover.as_deref(), Some("name"));
         // 前置：几何上 (157,20) 确实落在 name 上（矩形 x∈[60,160)）。
         assert_eq!(
-            deer_layout::hit_test(&t, &g, 157.0, 20.0).map(|n| n.id.as_str()),
+            deer_core::hit_test(&t, &g, 157.0, 20.0).map(|n| n.id.as_str()),
             Some("name"),
             "测试前置：几何命中 name"
         );
@@ -2427,12 +2427,12 @@ mod tests {
     fn r14_clip_snapshot_from_real_layout_and_null_renderer() {
         // 真实布局 + `NullRenderer`（它给每个有几何的节点发一条 NodeHint）。
         let t = tree();
-        let style = deer_layout::layout::TextStyle::default();
-        let g = deer_layout::layout::layout(
+        let style = deer_core::layout::TextStyle::default();
+        let g = deer_core::layout::layout(
             &t,
             Rect::new(0.0, 0.0, 200.0, 120.0),
             style,
-            &deer_layout::layout::ApproxMeasure,
+            &deer_core::layout::ApproxMeasure,
         );
         let list = deer_gpu::NullRenderer::build(&t, &g);
         let counts = list.counts();
@@ -2587,12 +2587,12 @@ mod tests {
             c.layout.height = Some(Size::Px(40.0));
             col.children.push(c);
         }
-        let (geo, metrics) = deer_layout::layout::layout_with_scroll(
+        let (geo, metrics) = deer_core::layout::layout_with_scroll(
             &col,
             Rect { x: 0.0, y: 0.0, w: 100.0, h: 50.0 },
-            deer_layout::TextStyle { font_size: 14.0, line_height: 18.0 },
-            &deer_layout::layout::ApproxMeasure,
-            &deer_layout::layout::ScrollOffsets::new(),
+            deer_core::TextStyle { font_size: 14.0, line_height: 18.0 },
+            &deer_core::layout::ApproxMeasure,
+            &deer_core::layout::ScrollOffsets::new(),
         );
         let mut st = UiState::default();
         st.scroll.set_metrics(&metrics);
@@ -2616,12 +2616,12 @@ mod tests {
             c.layout.height = Some(Size::Px(40.0));
             col.children.push(c);
         }
-        let (geo, metrics) = deer_layout::layout::layout_with_scroll(
+        let (geo, metrics) = deer_core::layout::layout_with_scroll(
             &col,
             Rect { x: 0.0, y: 0.0, w: 100.0, h: 50.0 },
-            deer_layout::TextStyle { font_size: 14.0, line_height: 18.0 },
-            &deer_layout::layout::ApproxMeasure,
-            &deer_layout::layout::ScrollOffsets::new(),
+            deer_core::TextStyle { font_size: 14.0, line_height: 18.0 },
+            &deer_core::layout::ApproxMeasure,
+            &deer_core::layout::ScrollOffsets::new(),
         );
         let mut st = UiState::default();
         st.scroll.set_metrics(&metrics);
@@ -2630,9 +2630,9 @@ mod tests {
     }
 
     /// 滑块上的一点（抓它）与该容器的视口矩形。
-    fn thumb_point(geo: &Geometry, st: &UiState) -> (f32, f32, deer_layout::Rect, i32) {
+    fn thumb_point(geo: &Geometry, st: &UiState) -> (f32, f32, deer_core::Rect, i32) {
         let f = geo.get("box").expect("容器有几何");
-        let vp = deer_layout::Rect { x: f.x, y: f.y, w: f.w, h: f.h };
+        let vp = deer_core::Rect { x: f.x, y: f.y, w: f.w, h: f.h };
         let max = st.scroll.max_of("box");
         let g = crate::layout::scrollbar_geom(vp, st.scroll.offset_of("box"), max).expect("该有滚动条");
         (g.thumb.x + 2.0, g.thumb.y + 2.0, vp, max)
@@ -3215,12 +3215,12 @@ mod tests {
             c.layout.height = Some(Size::Px(40.0));
             col.children.push(c);
         }
-        let (_geo, metrics) = deer_layout::layout::layout_with_scroll(
+        let (_geo, metrics) = deer_core::layout::layout_with_scroll(
             &col,
             Rect { x: 0.0, y: 0.0, w: 100.0, h: 200.0 },
-            deer_layout::TextStyle { font_size: 14.0, line_height: 18.0 },
-            &deer_layout::layout::ApproxMeasure,
-            &deer_layout::layout::ScrollOffsets::new(),
+            deer_core::TextStyle { font_size: 14.0, line_height: 18.0 },
+            &deer_core::layout::ApproxMeasure,
+            &deer_core::layout::ScrollOffsets::new(),
         );
         assert!(
             metrics.max_of("box") > 0,
@@ -3450,7 +3450,7 @@ mod tests {
 
         // ③ `dy = 0`：即使上限非 0 也不是「变化」⇒ 不发事件（`ScrollState` 的判据）。
         let mut st = ScrollState::new();
-        st.set_metrics(&deer_layout::layout::ScrollMetrics::new());
+        st.set_metrics(&deer_core::layout::ScrollMetrics::new());
         assert_eq!(st.scroll_by("any", 0), None, "dy=0 时偏移没变 ⇒ None");
         assert_eq!(st.scroll_by("any", 40), None, "上限 0 ⇒ 夹取后仍是 0 ⇒ None（fail-closed）");
         assert_eq!(st.offset_of("any"), 0);

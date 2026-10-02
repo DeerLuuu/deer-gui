@@ -31,7 +31,8 @@
 //! 代价是冗余：6 个顶点各带一份同样的 `rect`/`radius_kind`/`color` —— 换来的是
 //! **一条静态管线画完所有非文本命令**，不需要按命令切换常量。
 
-use deer_gpu::{Color, DrawCmd, DrawList, Extent, RectI};
+use deer_core::{ Color, DrawCmd, DrawList, RectI };
+use deer_gpu::{ Extent };
 
 /// 普通填充：不做圆角。
 pub const RADIUS_FILL: f32 = 0.0;

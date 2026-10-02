@@ -46,7 +46,7 @@
 use std::collections::HashMap;
 
 use crate::atlas::GlyphAtlas;
-use crate::error::{GpuError, GpuResult};
+use deer_core::error::{GpuError, GpuResult};
 use crate::font::Font;
 use crate::glyph::{AtlasSlot, GlyphKey};
 use crate::measure::{FontMeasure, find_system_font};

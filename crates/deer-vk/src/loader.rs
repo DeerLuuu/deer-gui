@@ -12,7 +12,7 @@
 
 use std::ffi::{c_char, c_void};
 
-use deer_gpu::{GpuError, GpuResult};
+use deer_core::{ GpuError, GpuResult };
 
 pub type Module = *mut c_void;
 pub type FARPROC = *mut c_void;

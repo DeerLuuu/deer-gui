@@ -9,7 +9,8 @@
 //! 指南：[`docs/features/scrollbar.md`](../../../docs/features/scrollbar.md)
 
 use deer_gui::gpu::interact::{InteractiveRenderer, InteractState};
-use deer_gui::gpu::{DrawCmd, RectI, Theme};
+use deer_core::{DrawCmd, RectI};
+use deer_gui::gpu::Theme;
 use deer_gui::layout::TextStyle;
 use deer_gui::layout::layout::{ApproxMeasure, ScrollOffsets, layout_with_scroll};
 use deer_gui::layout::node::{Kind, Node, Rect, Size};

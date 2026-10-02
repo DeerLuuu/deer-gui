@@ -22,7 +22,7 @@ use std::ffi::{CStr, c_char, c_void};
 use std::ptr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use deer_gpu::{GpuError, GpuResult};
+use deer_core::{ GpuError, GpuResult };
 
 /// 设备级 FFI 的类型集合 —— 冻死 API 里把它们写作 `crate::ffi::vk::*`。
 ///

@@ -45,10 +45,8 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use deer_gpu::{
-    AdapterInfo, Device, DrawList, Extent, Frame, GpuError, GpuResult, PresentResult,
-    RawWindowHandle, Swapchain, TargetFormat, TextureDesc, TextureId, TextureRegion,
-};
+use deer_core::{ DrawList, GpuError, GpuResult, TextureId };
+use deer_gpu::{ AdapterInfo, Device, Extent, Frame, PresentResult, RawWindowHandle, Swapchain, TargetFormat, TextureDesc, TextureRegion };
 
 use crate::device::{Texture, TextureFormat, UploadRegion, VkDevice};
 use crate::windowed::{FrameOutcome, WindowedRenderer};
@@ -228,7 +226,7 @@ impl Device for VulkanDevice {
             self.adapter_index,
             window,
             extent,
-            deer_gpu::Color::rgb(0, 0, 0),
+            deer_core::Color::rgb(0, 0, 0),
         )?;
         let actual = renderer.extent();
         let format = target_format_of(renderer.format());
