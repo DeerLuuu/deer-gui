@@ -218,6 +218,14 @@ pub struct L {
     pub wrap: Option<bool>,
     /// 流外定位（L1）：`Some(Pos::Offset { .. })` ⇒ 脱离流内布局。
     pub position: Option<Pos>,
+    /// **每子节点交叉轴对齐**（L2）：`Some` ⇒ 覆盖父容器的 `cross_axis`（仅该子节点）。
+    pub cross_self: Option<Align>,
+    /// **最小/最大尺寸**（L3）。像素版便捷构造见 [`L::min_w`] 等；百分比用
+    /// `L { min_w: Some(Size::Pct(50.0)), .. }` 直设字段。
+    pub min_w: Option<Size>,
+    pub max_w: Option<Size>,
+    pub min_h: Option<Size>,
+    pub max_h: Option<Size>,
 }
 
 impl L {
@@ -276,6 +284,32 @@ impl L {
         self.position = Some(Pos::Offset { x, y });
         self
     }
+    /// **每子节点交叉轴对齐**（L2）：覆盖父容器的 `cross`，只对这一个子节点生效
+    /// （只对**流内**子节点有意义；流外节点不受它影响）。
+    pub fn cross_self(mut self, a: Align) -> L {
+        self.cross_self = Some(a);
+        self
+    }
+    /// **最小宽度**（L3，像素）：节点宽被托底到它（measure 与 place 两处都生效）。
+    pub fn min_w(mut self, v: f32) -> L {
+        self.min_w = Some(Size::Px(v));
+        self
+    }
+    /// **最大宽度**（L3，像素）：显式尺寸与 grow 分配结果都被封顶到它。
+    pub fn max_w(mut self, v: f32) -> L {
+        self.max_w = Some(Size::Px(v));
+        self
+    }
+    /// **最小高度**（L3，像素）。语义同 [`L::min_w`]，作用在高度上。
+    pub fn min_h(mut self, v: f32) -> L {
+        self.min_h = Some(Size::Px(v));
+        self
+    }
+    /// **最大高度**（L3，像素）。语义同 [`L::max_w`]，作用在高度上。
+    pub fn max_h(mut self, v: f32) -> L {
+        self.max_h = Some(Size::Px(v));
+        self
+    }
     /// 便捷构造 `LayoutProps`。
     pub fn to_props(self) -> LayoutProps {
         LayoutProps {
@@ -289,6 +323,11 @@ impl L {
             scroll: self.scroll.unwrap_or(false),
             wrap: self.wrap.unwrap_or(false),
             position: self.position,
+            cross_self: self.cross_self,
+            min_w: self.min_w,
+            max_w: self.max_w,
+            min_h: self.min_h,
+            max_h: self.max_h,
         }
     }
 }

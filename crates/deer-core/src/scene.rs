@@ -173,8 +173,8 @@ fn parse_attrs(s: &str, line: usize, source: &str) -> Result<Vec<(String, AttrVa
 }
 
 const KNOWN_ATTRS: &[&str] = &[
-    "name", "w", "h", "pad", "gap", "main", "cross", "grow", "scroll", "wrap", "pos", "label",
-    "disabled",
+    "name", "w", "h", "min-w", "max-w", "min-h", "max-h", "pad", "gap", "main", "cross",
+    "cross-self", "grow", "scroll", "wrap", "pos", "label", "disabled",
 ];
 
 /// 开关属性（裸属性 = 真；**带值就报错**）。
@@ -411,6 +411,20 @@ pub fn parse_scene_collect(src: &str, source: &str) -> Result<(Node, Vec<String>
         if let Some(v) = get("h") {
             layout.height = Some(as_size(v, "h", line, source)?);
         }
+        // 最小/最大尺寸（L3）：数字或百分比（相对父内容盒解析）。
+        // 语义：min 是下限、max 是上限，measure 与 place 两处都生效；min > max ⇒ min 赢。
+        if let Some(v) = get("min-w") {
+            layout.min_w = Some(as_size(v, "min-w", line, source)?);
+        }
+        if let Some(v) = get("max-w") {
+            layout.max_w = Some(as_size(v, "max-w", line, source)?);
+        }
+        if let Some(v) = get("min-h") {
+            layout.min_h = Some(as_size(v, "min-h", line, source)?);
+        }
+        if let Some(v) = get("max-h") {
+            layout.max_h = Some(as_size(v, "max-h", line, source)?);
+        }
         if let Some(v) = get("pad") {
             layout.padding = as_num(v, "pad", line, source)?;
         }
@@ -422,6 +436,10 @@ pub fn parse_scene_collect(src: &str, source: &str) -> Result<(Node, Vec<String>
         }
         if let Some(v) = get("cross") {
             layout.cross_axis = Some(as_align(v, "cross", line, source)?);
+        }
+        // 每子节点交叉轴对齐（L2）：覆盖容器级 `cross`，只对这一个流内子节点生效。
+        if let Some(v) = get("cross-self") {
+            layout.cross_self = Some(as_align(v, "cross-self", line, source)?);
         }
         if let Some(v) = get("grow") {
             layout.grow = as_num(v, "grow", line, source)?;
@@ -522,6 +540,28 @@ pub fn encode_scene(root: &Node) -> String {
             Some(Size::Pct(p)) => attrs.push(format!("h={}%", fmt_num(p))),
             None => {}
         }
+        // L3：最小/最大尺寸（`Some` 才写 ⇒ 未设时编码**不多写一个字节**，既有语料逐字节不变）。
+        // 值形如 `36` / `50%`（无空格 ⇒ 不需要引号；与 `as_size` 互逆 ⇒ 往返稳定）。
+        match l.min_w {
+            Some(Size::Px(v)) => attrs.push(format!("min-w={}", fmt_num(v))),
+            Some(Size::Pct(p)) => attrs.push(format!("min-w={}%", fmt_num(p))),
+            None => {}
+        }
+        match l.max_w {
+            Some(Size::Px(v)) => attrs.push(format!("max-w={}", fmt_num(v))),
+            Some(Size::Pct(p)) => attrs.push(format!("max-w={}%", fmt_num(p))),
+            None => {}
+        }
+        match l.min_h {
+            Some(Size::Px(v)) => attrs.push(format!("min-h={}", fmt_num(v))),
+            Some(Size::Pct(p)) => attrs.push(format!("min-h={}%", fmt_num(p))),
+            None => {}
+        }
+        match l.max_h {
+            Some(Size::Px(v)) => attrs.push(format!("max-h={}", fmt_num(v))),
+            Some(Size::Pct(p)) => attrs.push(format!("max-h={}%", fmt_num(p))),
+            None => {}
+        }
         if l.padding != 0.0 {
             attrs.push(format!("pad={}", fmt_num(l.padding)));
         }
@@ -533,6 +573,10 @@ pub fn encode_scene(root: &Node) -> String {
         }
         if let Some(a) = l.cross_axis {
             attrs.push(format!("cross={}", align_str(a)));
+        }
+        // L2：每子节点交叉轴对齐（`Some` 才写 ⇒ 未设时一个字节都不多）。
+        if let Some(a) = l.cross_self {
+            attrs.push(format!("cross-self={}", align_str(a)));
         }
         if l.grow != 0.0 {
             attrs.push(format!("grow={}", fmt_num(l.grow)));

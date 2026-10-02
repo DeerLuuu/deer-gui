@@ -62,7 +62,9 @@ for (id, r) in &geo {
 | 百分比尺寸 | `L { width: Some(Size::Pct(50.0)), .. }` | `w=50%` | 相对**父内容盒** |
 | 主轴分配权重 | `.grow(1.0)` | `grow=1` | 剩余空间按权重分 |
 | 主轴对齐 | `.main(Align::Center)` | `main=center` | `start`/`center`/`end`/`stretch` |
-| 交叉轴对齐 | `.cross(Align::Stretch)` | `cross=stretch` | 同上 |
+| 交叉轴对齐 | `.cross(Align::Stretch)` | `cross=stretch` | 同上（容器级，管全体子节点） |
+| **每子节点交叉轴对齐** | `.cross_self(Align::End)` | `cross-self=end` | **覆盖**容器级 `cross`，只对这一个流内子节点生效；流外不生效，见 [`align-self.md`](align-self.md) |
+| **最小/最大尺寸** | `.min_w(80.0)` / `.max_w(200.0)` / `.min_h(v)` / `.max_h(v)` | `min-w=80` / `max-w=200` / `min-h=` / `max-h=` | min 下限、max 上限，measure 与 place 两处都夹（固有聚合 / 显式 / grow/stretch 都过 `[min,max]`）；`min > max` ⇒ min 赢，见 [`min-max-sizes.md`](min-max-sizes.md) |
 | **垂直滚动容器** | `.scroll(true)` | `scroll`（裸属性） | 只对 `column` 有意义 ⇒ `max_scroll` + 视口裁剪，见 [`scroll-and-multiline.md`](scroll-and-multiline.md) |
 | **文本换行** | `n.layout.wrap = true` | `wrap`（裸属性） | 只对 `text` 有意义；换行宽度 = 节点自己的 `w=` |
 
