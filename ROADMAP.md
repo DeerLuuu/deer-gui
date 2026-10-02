@@ -275,6 +275,31 @@ M3 把界面**画上了窗口**（M3c），但那是走**专用快路** `Windowe
 > [`docs/superpowers/plans/2026-10-02-app-foundation.md`](docs/superpowers/plans/2026-10-02-app-foundation.md)
 > 的评审记录；本节只留**决定与理由摘要**。
 
+#### D8：`NodeProps` 增 `extra` —— 未知属性的「警告 + 结构化保留」（E2，Q6 已裁断）
+
+**决定（人已裁断，2026-10-02）**：`.dui` 载入遇到**当前版本不认识的属性**时，
+**警告 + 结构化保留**，不是丢弃、也不是硬报错。理由：编辑器往返**不能默默吃掉**用户文件
+里的未来字段 —— 用户在新版里写的东西，被旧版存一次就没了，那是数据丢失。
+
+**为什么这必须登记**：`NodeProps` 与 `LayoutProps` 同属**三契约的公共部分**
+（数据模型 / `.dui` 语法 / 两路结构相等断言）⇒ 加字段要同步改多处。
+
+##### 设计细节（都是必须定死、否则会漂的点）
+
+| # | 决定 | 理由 |
+|---|---|---|
+| 1 | 新字段 `NodeProps.extra: BTreeMap<String, Option<String>>` | `BTreeMap` 而非 `HashMap`：**顺序确定** ⇒ 往返逐字节稳定（round-trip² 的前提）。值是 `Option<String>` 而不是 `String`，因为 `AttrVal` 有两种：`Str(s)` 与**裸属性 `Bare`** —— `foo` 与 `foo=""` **不是同一件事**，合成一个类型就再也分不出来，往返会改文件内容 |
+| 2 | 已知属性写错**仍然硬报错**；只有**未知**属性进 `extra` | 与 `scene-file.md` 既有的「写错即报错」哲学并存。这是 Q6 明确登记的**例外**，不是放松 |
+| 3 | encode 时 `extra` 写在**已知属性之后**，顺序 = `BTreeMap` 的键序 | 顺序确定 ⇒ 同一棵树编码结果逐字节相同 |
+| 4 | `structurally_eq` **自动**把 `extra` 纳入比较 | 两棵只有 `extra` 不同的树，**本来就不是**结构相等的树。不改判定逻辑，靠 `NodeProps` 的派生相等自动覆盖 |
+| 5 | E1 属性注册表**必须加一条**（新 `PropType::Opaque`） | E1 的**穷尽解构**防漂移测试会**编译失败**，逼着登记 —— 这正是那条护栏的用途。`Opaque` 的语义是「往返保真的载体，**编辑器不该直接编辑它**」 |
+| 6 | 新 API：`parse_scene_collect(src, source) -> Result<(Node, Vec<String>), SceneError>` | 警告要有地方给。`parse_scene` **签名不变**、内部调用新函数并丢掉警告 ⇒ 既有调用点零改动 |
+| 7 | `.dui` 既有语料**逐字节不变** | `extra` 默认空 ⇒ 编码不多写任何东西 |
+
+**影响面（实现时逐一核对）**：`node.rs`（字段）/ `scene.rs`（解析 + 编码 + 警告）/
+`builder.rs::props`（构造要带上）/ `registry.rs`（加 `PropType::Opaque` 一条）/
+`scene-file.md`（语法表要说明「未知属性会被保留」）。
+
 ### M4 的细步与状态
 
 M4 原来写成一条「字体解析 + 光栅化 + 图集 + 度量 + 换行」。实际按「**先让字变成像素**、
