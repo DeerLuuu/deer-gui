@@ -948,8 +948,8 @@ fn render_is_refused_after_an_unconfirmed_submit() {
 // ===========================================================================
 
 /// 系统字体引擎（拿不到就跳过并打印原因）。
-fn text_engine(font_size: f32) -> Option<deer_gpu::text::TextEngine> {
-    match deer_gpu::text::TextEngine::from_system_font(font_size) {
+fn text_engine(font_size: f32) -> Option<deer_text::text::TextEngine> {
+    match deer_text::text::TextEngine::from_system_font(font_size) {
         Ok(e) => Some(e),
         Err(e) => {
             eprintln!("跳过：这台机器上拿不到系统字体（{e}）");

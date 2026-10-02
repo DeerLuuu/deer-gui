@@ -15,19 +15,21 @@
 use std::path::Path;
 
 use deer_gui::gpu::null::CpuRenderer;
-use deer_gui::gpu::text::TextEngine;
 use deer_gui::gpu::{self, Extent, Theme};
 use deer_gui::layout::builder::{Builder, L};
 use deer_gui::layout::layout;
 use deer_gui::layout::layout::TextStyle;
 use deer_gui::layout::node::{Kind, Rect};
+// LY2：文本栈来自 L1 crate `deer-text`。
+use deer_text::measure::find_system_font;
+use deer_text::text::TextEngine;
 
 const W: u32 = 460;
 const H: u32 = 190;
 
 fn main() -> Result<(), String> {
     // ① 拿字体。**找不到就明确失败** —— 示例是给人看的，不许伪装成功。
-    let font_path = deer_gui::gpu::measure::find_system_font()
+    let font_path = find_system_font()
         .ok_or_else(|| "找不到系统字体（consola.ttf / arial.ttf / segoeui.ttf），本示例需要真实字体".to_string())?;
     println!("字体：{}", font_path.display());
 

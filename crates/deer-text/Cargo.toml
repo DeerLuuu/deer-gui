@@ -1,0 +1,14 @@
+[package]
+name = "deer-text"
+description = "deer-gui 的 L1 TextServer：零依赖 TrueType 解析、字形光栅化、字形图集、文本引擎与真实字体度量"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "deer_text"
+path = "src/lib.rs"
+
+[dependencies]
+deer-core.workspace = true

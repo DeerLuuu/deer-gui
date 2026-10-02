@@ -26,8 +26,10 @@
 
 use deer_core::draw::{Color, DrawCmd, DrawList, RectI};
 use deer_gpu::null::CpuRenderer;
-use deer_gpu::text::{GlyphPlacement, TextEngine};
-use deer_gpu::{ AtlasSlot, Extent };
+use deer_gpu::{ Extent };
+// LY2：文本栈来自 L1 crate `deer-text`。
+use deer_text::text::{GlyphPlacement, TextEngine};
+use deer_text::{ AtlasSlot };
 use deer_vk::gpu_text::{self, TextVertex};
 
 /// 前景 / 背景：用**不透明**色，让「CPU 有没有写这个像素」变成「是否等于背景色」。

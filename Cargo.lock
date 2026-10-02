@@ -250,6 +250,7 @@ version = "0.0.0"
 dependencies = [
  "deer-core",
  "deer-log",
+ "deer-text",
 ]
 
 [[package]]
@@ -259,6 +260,7 @@ dependencies = [
  "deer-core",
  "deer-gpu",
  "deer-log",
+ "deer-text",
  "deer-vk",
  "deer-window",
 ]
@@ -268,11 +270,19 @@ name = "deer-log"
 version = "0.0.0"
 
 [[package]]
+name = "deer-text"
+version = "0.0.0"
+dependencies = [
+ "deer-core",
+]
+
+[[package]]
 name = "deer-vk"
 version = "0.0.0"
 dependencies = [
  "deer-core",
  "deer-gpu",
+ "deer-text",
 ]
 
 [[package]]

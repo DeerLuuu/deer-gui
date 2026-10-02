@@ -76,8 +76,11 @@
 //! 否则新字形会被静默跳过（那才是真的会画错）。以「与 CPU 逐字一致」为准 ⇒ 取 `&mut`。
 
 use deer_core::draw::{Color, DrawCmd, DrawList, RectI};
-use deer_gpu::text::GlyphPlacement;
-use deer_gpu::{ Extent, TextEngine };
+// LY2：文本栈（TextEngine / GlyphPlacement / AtlasSlot）来自 L1 crate `deer-text`。
+use deer_gpu::{ Extent };
+use deer_text::glyph::AtlasSlot;
+use deer_text::text::GlyphPlacement;
+use deer_text::TextEngine;
 
 /// 文本管线的一个顶点：位置（NDC）+ 图集 `uv` + 颜色（**不预乘**）。
 ///
@@ -224,7 +227,7 @@ fn emit_quad(
     vis: RectI,
     gx0: i32,
     gy0: i32,
-    slot: deer_gpu::glyph::AtlasSlot,
+    slot: AtlasSlot,
     atlas_w: u32,
     atlas_h: u32,
     color: Color,

@@ -64,12 +64,15 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use deer_gui::gpu::null::CpuRenderer;
-use deer_gui::gpu::text::TextEngine;
-use deer_gui::gpu::{self, Color, DrawCmd, DrawList, Extent, RectI, Theme};
+use deer_gui::gpu::{self, Extent, Theme};
 use deer_gui::layout::builder::{Builder, L};
 use deer_gui::layout::layout;
 use deer_gui::layout::layout::TextStyle;
 use deer_gui::layout::node::{Kind, Rect};
+// LY1/LY2：L0 类型来自 `deer-core`；文本栈来自 L1 crate `deer-text`。
+use deer_core::{Color, DrawCmd, DrawList, RectI};
+use deer_text::measure::find_system_font;
+use deer_text::TextEngine;
 use deer_gui::vk::pipelines::ViewportStrategy;
 use deer_gui::vk::windowed::{
     live_ui_resource_count, viewport_strategy_from_env, FrameOutcome, WindowedRenderer,
@@ -467,7 +470,7 @@ impl Parity {
 
 impl App for Parity {
     fn init(&mut self, info: &WindowInfo) -> Result<(), String> {
-        let font_path = gpu::measure::find_system_font().ok_or_else(|| {
+        let font_path = find_system_font().ok_or_else(|| {
             "找不到系统字体（consola.ttf / arial.ttf / segoeui.ttf）—— 本示例需要真实字形"
                 .to_string()
         })?;

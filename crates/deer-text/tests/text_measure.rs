@@ -20,8 +20,8 @@
 
 mod support;
 
-use deer_gpu::font::Font;
-use deer_gpu::measure::{find_system_font, FontMeasure};
+use deer_text::font::Font;
+use deer_text::measure::{find_system_font, FontMeasure};
 use deer_core::layout::{ApproxMeasure, Measure, TextStyle};
 
 /// 合成字体：`unitsPerEm = 1000`。

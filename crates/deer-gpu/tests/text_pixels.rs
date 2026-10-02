@@ -13,8 +13,10 @@
 
 use deer_core::draw::{Color, DrawCmd, DrawList, RectI};
 use deer_gpu::null::{CpuRenderer, Framebuffer};
-use deer_gpu::text::TextEngine;
 use deer_gpu::Extent;
+// LY2：文本栈在 L1 crate `deer-text`；本用例是**跨层集成测试**
+// （deer-gpu 的 CPU 后端 × deer-text 的文本引擎），所以留在 deer-gpu，只把 import 改到 `deer_text`。
+use deer_text::text::TextEngine;
 
 const BG: Color = Color::rgb(20, 22, 32);
 const FG: Color = Color::rgb(230, 232, 239);

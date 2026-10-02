@@ -386,7 +386,7 @@ impl Frame for VulkanFrame {
     fn record(
         &mut self,
         list: &DrawList,
-        text: Option<&mut deer_gpu::TextEngine>,
+        text: Option<&mut deer_text::TextEngine>,
     ) -> GpuResult<()> {
         // T1.1：把 `DrawList` 真的送上 GPU —— 复用窗口路径那条链
         // （[`crate::windowed::WindowedRenderer::prepare_ui`]，与 `draw_and_present`

@@ -26,7 +26,7 @@
 //!
 //! `glyf` 里的坐标是 **font units**（通常是 2048 或 1000 / em）。
 //! 本模块**不改坐标**，只把「每 em 多少单位」(`units_per_em`) 给出去 ——
-//! 缩放到像素是调用方的事（见 `deer-gpu::text`）。
+//! 缩放到像素是调用方的事（见本 crate 的 `crate::text` 模块）。
 //! 这样解析层保持纯粹，度量与缩放可以在别处单测。
 
 use deer_core::error::{GpuError, GpuResult};

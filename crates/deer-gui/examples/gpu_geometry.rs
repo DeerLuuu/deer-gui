@@ -111,7 +111,7 @@ fn run() -> Result<(), String> {
     let extent = Extent { width: W, height: H };
 
     // ② 字体：找不到就**明确失败**（示例是给人看的，不伪装成功）
-    let font_path = deer_gpu::measure::find_system_font()
+    let font_path = deer_text::measure::find_system_font()
         .ok_or_else(|| "找不到系统字体（consola.ttf / arial.ttf / segoeui.ttf）——本示例需要真实字体".to_string())?;
     println!("字体        : {}", font_path.display());
 

@@ -70,9 +70,12 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use deer_gui::gpu::interact::{FieldText, InteractiveRenderer};
-use deer_gui::gpu::measure::find_system_font;
 use deer_gui::gpu::null::CpuRenderer;
-use deer_gui::gpu::{Color, DrawCmd, DrawList, Extent, TextEngine, Theme};
+use deer_gui::gpu::{Extent, Theme};
+// LY1/LY2：L0 类型来自 `deer-core`；文本栈来自 L1 crate `deer-text`。
+use deer_core::{Color, DrawCmd, DrawList};
+use deer_text::measure::find_system_font;
+use deer_text::TextEngine;
 use deer_gui::input_script::{self, ENV_VAR};
 use deer_gui::interaction::{self, ClipSnapshot, InputEvent, Key, UiState};
 use deer_gui::layout::builder::{Builder, L};

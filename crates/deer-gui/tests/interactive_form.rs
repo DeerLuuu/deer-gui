@@ -29,7 +29,9 @@ use deer_gpu::interact::{
 };
 use deer_gui::gpu::null::CpuRenderer;
 use deer_core::{Color, DrawList};
-use deer_gpu::{Extent, TextEngine, Theme};
+use deer_gpu::{Extent, Theme};
+// LY2：文本栈来自 L1 crate `deer-text`。
+use deer_text::TextEngine;
 use deer_gui::input_script;
 use deer_gui::interaction::{ClipSnapshot, UiEvent, UiState, focusables};
 use deer_gui::layout::builder::{Builder, L};

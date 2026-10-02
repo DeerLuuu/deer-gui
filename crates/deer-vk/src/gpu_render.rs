@@ -111,7 +111,9 @@
 use std::ffi::c_void;
 
 use deer_core::{ Color, DrawCmd, DrawList, GpuError, GpuResult, RectI };
-use deer_gpu::{ Extent, TextEngine };
+use deer_gpu::{ Extent };
+// LY2：文本引擎来自 L1 crate `deer-text`。
+use deer_text::TextEngine;
 
 use crate::device::{
     vk_result_name, DescriptorPool, DescriptorSet, DeviceFns, DrawIndexedIndirectCommand, RenderPass,

@@ -55,8 +55,10 @@ use std::time::Duration;
 
 use deer_gui::env_gate;
 use deer_gui::gpu::interact::{FieldText, InteractiveRenderer};
-use deer_gui::gpu::measure::find_system_font;
 use deer_gui::gpu::null::CpuRenderer;
+// LY2：文本栈（find_system_font / TextEngine / FontMeasure）来自 L1 crate `deer-text`
+// （`deer_gui::prelude::*` 也已经导出它们）。
+use deer_text::measure::find_system_font;
 use deer_gui::interaction::{self, ClipSnapshot, InputEvent, Key, PointerButton, UiEvent, UiState};
 use deer_gui::layout::layout::{self, Geometry};
 use deer_gui::prelude::*;

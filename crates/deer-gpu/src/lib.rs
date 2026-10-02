@@ -23,60 +23,46 @@
 #![deny(clippy::all)]
 
 use deer_core::{Color, DrawList, GpuResult, TextureId};
+// LY2：文本引擎来自 L1 crate `deer-text`。HAL 的 `Frame::record` 契约要**按帧传入**它
+// —— 签名逐字不变（仍是 `Option<&mut TextEngine>`），变的是这个类型现在定义在 `deer-text`。
+use deer_text::TextEngine;
 
-pub mod atlas;
-pub mod font;
-pub mod glyph;
 pub mod interact;
-pub mod measure;
 pub mod null;
-pub mod png;
-pub mod raster;
 pub mod render;
-pub mod text;
 
-pub use atlas::GlyphAtlas;
-pub use font::{Contour, Font, Glyph, Point, Segment};
-pub use glyph::{AtlasSlot, GlyphImage, GlyphKey};
+// LY2（2026-10-XX）：文本栈（`font` / `glyph` / `raster` / `atlas` / `text` / `measure`）
+// 已物理迁到 L1 crate **`deer-text`**，本 crate 根**不再导出文本栈**（登记过的口径变化，
+// 见 `ROADMAP.md` 的 LY2 条目）。要文本能力请 `use deer_text::…`。
+//
+// `png` 是唯一例外：它本身与文本无关，但 `deer_text::TextEngine::atlas_png()` 需要它，
+// 而依赖方向是 `deer-gpu → deer-text`（不能反向）⇒ 编码器随迁到 `deer-text`，
+// 这里用**模块别名**保留 `deer_gpu::png` 这个既有路径（`deer_gpu::png::encode_rgba` 逐字不变）。
+// 长期归属（L0 公共工具）留给 LY4 对账。
+pub use deer_text::png;
+
 pub use interact::{
     FieldText, InteractState, InteractiveRenderer, ScrollView, build_interactive_draw_list,
     build_interactive_draw_list_with_texts,
 };
-pub use measure::FontMeasure;
-pub use raster::Rasterizer;
+// LY2：`backend_layer` 门面删除 —— 它的条目本就在根导出。其中 `render` / `interact`
+// 两组名字原样保留；`null::CpuRenderer` 原本**只**经门面可达，这里补一条根导出，
+// 保证「删门面不丢任何条目」。
+pub use null::CpuRenderer;
 pub use render::{DefaultRenderer, NullRenderer, build_draw_list};
-pub use text::{GlyphPlacement, TextEngine};
 
 // ── 分层归属（2026-10-02 v2，Godot 式 L0–L3；详见 docs/ARCHITECTURE.md §2.3）────────
-//
-// 本 crate 历史地混装了三层的代码；以下门面模块是**逻辑分层**的入口，让下游可以按层引用
-// （如 `deer_gpu::core_layer::DrawList`），为将来物理拆 crate（→ `deer-core` / `deer-text` 等）铺路。
-// **不移动文件、不改既有 crate 根 `pub use` 路径**——零行为改动、零破坏。
-// 物理拆分的触发条件与"Server"命名待维护者裁断（见 ARCHITECTURE.md §2.3 末两点）。
 //
 // LY1（2026-10-XX）：`core_layer` 门面已删除 —— 它的条目（`DrawList`/`DrawCmd`/`Color`/
 // `RectI`/`TextureId`/`GpuError`/`GpuResult`）已物理迁到 L0 crate **`deer-core`**，
 // 下沉后的路径就是 `deer_core::…`，再留一个同名门面只会造成双路径。
-
-/// **L1 TextServer**：字体解析 / 字形光栅化 / 图集 / 换行（有缓存与字体文件 ⇒ 服务级）。
-pub mod text_layer {
-    pub use crate::font::{Contour, Font, Glyph, Point, Segment};
-    pub use crate::glyph::{AtlasSlot, GlyphImage, GlyphKey};
-    pub use crate::raster::Rasterizer;
-    pub use crate::atlas::GlyphAtlas;
-    pub use crate::text::{GlyphPlacement, TextEngine};
-}
-
-/// **L1 RenderServer（CPU 参考后端）**：软件光栅化实现，作 parity 基准。
-/// Vulkan 后端在独立 crate `deer-vk`（也属 L1 RenderServer）。
-pub mod backend_layer {
-    pub use crate::null::CpuRenderer;
-    pub use crate::render::{DefaultRenderer, NullRenderer, build_draw_list};
-    pub use crate::interact::{
-        FieldText, InteractState, InteractiveRenderer, ScrollView, build_interactive_draw_list,
-        build_interactive_draw_list_with_texts,
-    };
-}
+//
+// LY2（2026-10-XX）：**物理拆分完成，门面全部删除**。
+//   - `text_layer` 的条目 → L1 crate `deer-text`（`deer_text::…`）；
+//   - `backend_layer` 的条目 → 就是本 crate 的根导出（见上方 `pub use`），
+//     不再需要一层同名转发（转发层只会造成「同一个类型两条路径」）。
+// 本 crate 现在的分层归属：**L1 RenderServer（CPU 参考后端）+ HAL traits**
+// （HAL traits 暂驻本 crate 是 ⑨ 登记的例外，本轮不迁）。
 
 use deer_core::{Geometry, node::Node};
 

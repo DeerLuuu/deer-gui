@@ -13,7 +13,7 @@
 //! 另外还有[合成字体测试](font_synthetic.rs)：测试自己构造一份最小 TTF，
 //! 让解析器在**任何机器上**都有确定性的对照组。
 
-use deer_gpu::font::{Font, Segment};
+use deer_text::font::{Font, Segment};
 
 /// 找一个可用的系统 TrueType 字体（非 CFF）。
 fn system_font() -> Option<(String, Vec<u8>)> {
