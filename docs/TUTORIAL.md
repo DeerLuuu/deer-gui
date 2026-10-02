@@ -267,6 +267,10 @@ assert_eq!(hit.map(|n| n.id.as_str()), Some("button_1"));
 注意 `layout_with_scroll` 给出的上限**每帧**都要 `set_metrics` 灌回状态，否则滚动条不出现
 （见 [`features/scrollbar.md`](features/scrollbar.md)）。
 
+**输入框里也有光标了**（`--example ime_preedit` 能一次看完三件事：预编辑只进缓冲、
+提交才进内容、光标停在预编辑之后）。中文输入时那段还没上屏的拼写会**暗色 + 下划线**
+显示在光标处 —— 见 [`features/ime.md`](features/ime.md)。
+
 **顺带一个「看」的工具**：想一次看清「每种节点到底有哪些属性可以改」，跑
 `cargo run -p deer-gui --example prop_registry` —— 它按 `Kind` 列出属性名、类型、取值域、默认值
 （见 [`features/prop-registry.md`](features/prop-registry.md)）。这是编辑器 Inspector 的数据源，
