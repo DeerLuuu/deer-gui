@@ -177,10 +177,25 @@ pub struct UiState {
 ///
 /// **灌漏了会怎样**：上限表为空 ⇒ 每个容器的 `max_of` 都是 0 ⇒ 滚轮什么都不做
 /// （fail-closed：不会滚进一个「没有上限」的虚空，也不会产生假事件）。
+/// **正在拖动滚动条**的抓取信息（`None` = 没在拖）。
+///
+/// `grab_dy` 是**按下时**指针距滑块顶的像素数：拖动时用它保持手感不变 ——
+/// 没有它的话，滑块会瞬间「跳」到指针正下方（手指按在滑块底部时会明显跳一下）。
+/// 用 `i32` 而不是 `f32` 是为了让 [`ScrollState`] 保住 `Eq`（`f32` 会把它弄没）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScrollDrag {
+    /// 被拖的容器 id。
+    pub id: String,
+    /// 抓取点距滑块顶的像素数。
+    pub grab_dy: i32,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ScrollState {
     /// 当前偏移（整数像素）。
     pub offsets: ScrollOffsets,
+    /// **正在拖动的滚动条**（T3.2）。默认 `None` ⇒ 既有行为逐字节不变。
+    pub drag: Option<ScrollDrag>,
     /// 本帧的滚动上限（来自 [`deer_layout::layout::layout_with_scroll`]）。
     pub metrics: ScrollMetrics,
 }
@@ -694,6 +709,33 @@ pub fn handle(
 
     match ev {
         InputEvent::PointerMoved { x, y } => {
+            // ★ 拖动滚动条期间：把指针位置**反解**成偏移。
+            // 反解在 `deer_layout::scrollbar_offset_for_pointer` —— 与 `scrollbar_geom`
+            // 是同一套映射的两个方向，所以「拖到哪儿对应哪个偏移」不会两边各写一份。
+            if let Some(drag) = state.scroll.drag.clone() {
+                if let Some(f) = geo.get(&drag.id) {
+                    let vp = crate::layout::Rect {
+                        x: f.x,
+                        y: f.y,
+                        w: f.w,
+                        h: f.h,
+                    };
+                    let max = state.scroll.max_of(&drag.id);
+                    let want = crate::layout::scrollbar_offset_for_pointer(
+                        vp,
+                        max,
+                        *y,
+                        drag.grab_dy as f32,
+                    );
+                    // `scroll_to` 在「没变化」时返回 `None` ⇒ 静止的拖动不会刷屏事件
+                    if let Some(offset) = state.scroll.scroll_to(&drag.id, want) {
+                        out.push(UiEvent::Scrolled {
+                            id: drag.id.clone(),
+                            offset,
+                        });
+                    }
+                }
+            }
             let id = node_id_at(root, geo, clip, *x, *y);
             sync_hover(state, &mut out, id);
         }
@@ -702,6 +744,16 @@ pub fn handle(
             x,
             y,
         } => {
+            if let Some(drag) = scrollbar_grab(root, geo, state, *x, *y) {
+                // ★ 按在**滚动条滑块**上 ⇒ 开始拖动，**不**进入下面的焦点/按下语义：
+                // 按滚动条不是「点击内容」（按了它不该让某个按钮看起来被按下、
+                // 更不该在抬起时发 `Clicked`）。
+                //
+                // 默认状态下没有任何滚动条 ⇒ 这条永远不触发 ⇒ 既有行为逐字节不变。
+                state.scroll.drag = Some(drag);
+                let id = node_id_at(root, geo, clip, *x, *y);
+                sync_hover(state, &mut out, id);
+            } else {
             let id = node_id_at(root, geo, clip, *x, *y);
             sync_hover(state, &mut out, id.clone());
             // **点击可聚焦控件 ⇒ 聚焦它**（M5-4）。`id` 来自 `hit`，所以它已经过了
@@ -720,6 +772,7 @@ pub fn handle(
                 }
             }
             state.pressed = id;
+            }
         }
         // 右/中键不参与按下与点击（右键菜单/中键滚动是 M6+ 的事）。
         InputEvent::PointerDown { .. } => {}
@@ -730,7 +783,11 @@ pub fn handle(
         } => {
             let id = node_id_at(root, geo, clip, *x, *y);
             sync_hover(state, &mut out, id.clone());
-            if let Some(pressed) = state.pressed.take() {
+            // 拖动结束时**清掉抓取状态**并跳过点击结算 —— 按在滚动条上不是「点击内容」。
+            // （`take()` 顺手回答了「刚才在拖吗」，不需要另存一个 bool。）
+            if state.scroll.drag.take().is_some() {
+                // 什么都不做：只结束拖动
+            } else if let Some(pressed) = state.pressed.take() {
                 // 抬起处必须是**按下时那个节点**：按下后移出再抬起不算点击。
                 if id.as_deref() == Some(pressed.as_str()) {
                     out.push(UiEvent::Clicked(pressed));
@@ -854,6 +911,59 @@ pub fn handle(
 ///
 /// 三道前置（缺一条就 `None`，不改任何状态）：① 有焦点；② 焦点节点是 `Field`；
 /// ③ 它不在禁用子树里。顺带把「首次输入」变成 `texts` 里的一条空缓冲。
+/// 找到「指针落在其**滑块**上」的可滚动容器 ⇒ 返回这次拖动的抓取信息。
+///
+/// **最深的优先**：内层滚动条画在外层之上，所以指针压在同一条竖带时应当抓内层。
+/// 命中判据直接调 `deer_layout::scrollbar_geom` —— 与**绘制侧同一份实现**
+/// （各写一份的话，「看得见的滑块」与「抓得到的滑块」迟早错开）。
+fn scrollbar_grab(root: &Node, geo: &Geometry, state: &UiState, x: f32, y: f32) -> Option<ScrollDrag> {
+    fn walk(
+        n: &Node,
+        geo: &Geometry,
+        state: &UiState,
+        x: f32,
+        y: f32,
+        depth: usize,
+        best: &mut Option<(usize, ScrollDrag)>,
+    ) {
+        if n.is_scroll_container() {
+            let max = state.scroll.max_of(&n.id);
+            if max > 0 {
+                if let Some(f) = geo.get(&n.id) {
+                    let vp = crate::layout::Rect {
+                        x: f.x,
+                        y: f.y,
+                        w: f.w,
+                        h: f.h,
+                    };
+                    let off = state.scroll.offset_of(&n.id);
+                    if let Some(g) = crate::layout::scrollbar_geom(vp, off, max) {
+                        let inside = x >= g.thumb.x
+                            && x <= g.thumb.x + g.thumb.w
+                            && y >= g.thumb.y
+                            && y <= g.thumb.y + g.thumb.h;
+                        if inside && best.as_ref().is_none_or(|(d, _)| depth > *d) {
+                            *best = Some((
+                                depth,
+                                ScrollDrag {
+                                    id: n.id.clone(),
+                                    grab_dy: (y - g.thumb.y).round() as i32,
+                                },
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        for c in &n.children {
+            walk(c, geo, state, x, y, depth + 1, best);
+        }
+    }
+    let mut best = None;
+    walk(root, geo, state, x, y, 0, &mut best);
+    best.map(|(_, d)| d)
+}
+
 /// 当前焦点所在的**可用输入框** id；不是输入框 / 焦点为空 / 路径已死 ⇒ `None`。
 ///
 /// 校验原本写在文本编辑的辅助函数里，**如今多了一个使用者（光标移动）**，
@@ -2060,6 +2170,143 @@ mod tests {
             assert!(out.is_empty(), "{e:?} 不该产生事件，实际 {out:?}");
         }
         assert_eq!(s, before, "不消费的事件不得改变任何状态");
+    }
+
+    // ---- T3.2：拖动滚动条改偏移 ---------------------------------------------
+
+    /// 一棵「可滚动 Column（视口高 50）+ 5 行」+ 灌好上限的状态。
+    fn scroller_fixture() -> (Node, Geometry, UiState) {
+        let mut col = Node::new(Kind::Column, "box");
+        col.layout.scroll = true;
+        col.layout.height = Some(Size::Px(50.0));
+        col.layout.width = Some(Size::Px(100.0));
+        for i in 0..5 {
+            let mut c = Node::new(Kind::Button, format!("b{i}"));
+            c.props.label = Some("x".into());
+            c.layout.height = Some(Size::Px(40.0));
+            col.children.push(c);
+        }
+        let (geo, metrics) = deer_layout::layout::layout_with_scroll(
+            &col,
+            Rect { x: 0.0, y: 0.0, w: 100.0, h: 50.0 },
+            deer_layout::TextStyle { font_size: 14.0, line_height: 18.0 },
+            &deer_layout::layout::ApproxMeasure,
+            &deer_layout::layout::ScrollOffsets::new(),
+        );
+        let mut st = UiState::default();
+        st.scroll.set_metrics(&metrics);
+        assert!(st.scroll.max_of("box") > 0, "测试前置：内容必须超出视口");
+        (col, geo, st)
+    }
+
+    /// 滑块上的一点（抓它）与该容器的视口矩形。
+    fn thumb_point(geo: &Geometry, st: &UiState) -> (f32, f32, deer_layout::Rect, i32) {
+        let f = geo.get("box").expect("容器有几何");
+        let vp = deer_layout::Rect { x: f.x, y: f.y, w: f.w, h: f.h };
+        let max = st.scroll.max_of("box");
+        let g = crate::layout::scrollbar_geom(vp, st.scroll.offset_of("box"), max).expect("该有滚动条");
+        (g.thumb.x + 2.0, g.thumb.y + 2.0, vp, max)
+    }
+
+    /// ① 按在滑块上 ⇒ 开始拖动、**不置 `pressed`**（按滚动条不是点内容）
+    #[test]
+    fn pressing_the_thumb_starts_a_drag_without_pressing_a_node() {
+        let (tree, geo, mut st) = scroller_fixture();
+        let (px, py, _, _) = thumb_point(&geo, &st);
+        handle(
+            &mut st,
+            &tree,
+            &geo,
+            ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Left, x: px, y: py },
+        );
+        assert_eq!(st.scroll.drag.as_ref().map(|d| d.id.as_str()), Some("box"));
+        assert!(st.pressed.is_none(), "按滚动条不该把任何节点置为 pressed：{:?}", st.pressed);
+        assert!(st.focus.is_none(), "按滚动条不该改焦点：{:?}", st.focus);
+    }
+
+    /// ② 往下拖 ⇒ 偏移增大并发 `Scrolled`；抬起 ⇒ 清状态且**不发 `Clicked`**
+    #[test]
+    fn dragging_the_thumb_changes_the_offset_and_never_clicks() {
+        let (tree, geo, mut st) = scroller_fixture();
+        let (px, py, _, max) = thumb_point(&geo, &st);
+        handle(
+            &mut st,
+            &tree,
+            &geo,
+            ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Left, x: px, y: py },
+        );
+        let before = st.scroll.offset_of("box");
+        assert_eq!(before, 0, "前置：初始偏移为 0");
+
+        let moved = handle(
+            &mut st,
+            &tree,
+            &geo,
+            ClipSnapshot::unclipped(),
+            &InputEvent::PointerMoved { x: px, y: py + 40.0 },
+        );
+        assert!(
+            moved.iter().any(|e| matches!(e, UiEvent::Scrolled { .. })),
+            "拖动改偏移必须发 `Scrolled`（窗口层的 dirty 靠它）：{moved:?}"
+        );
+        assert!(
+            st.scroll.offset_of("box") > before,
+            "往下拖应当增大偏移：{} → {}",
+            before,
+            st.scroll.offset_of("box")
+        );
+
+        let up = handle(
+            &mut st,
+            &tree,
+            &geo,
+            ClipSnapshot::unclipped(),
+            &InputEvent::PointerUp { button: PointerButton::Left, x: px, y: py + 40.0 },
+        );
+        assert!(st.scroll.drag.is_none(), "抬起后应当清掉拖动状态");
+        assert!(
+            !up.iter().any(|e| matches!(e, UiEvent::Clicked(_))),
+            "按在滚动条上抬起**不该**发 `Clicked`：{up:?}"
+        );
+        let _ = max;
+    }
+
+    /// ③ 拖出轨道两端 ⇒ 偏移夹在 `[0, max]`，不越界
+    #[test]
+    fn dragging_beyond_the_ends_clamps() {
+        let (tree, geo, mut st) = scroller_fixture();
+        let (px, py, _, max) = thumb_point(&geo, &st);
+        handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Left, x: px, y: py });
+        // 往上拖到轨道之外
+        handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::PointerMoved { x: px, y: -10_000.0 });
+        assert_eq!(st.scroll.offset_of("box"), 0, "往上拖到底应当停在 0");
+        // 往下拖到轨道之外
+        handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::PointerMoved { x: px, y: 10_000.0 });
+        assert_eq!(st.scroll.offset_of("box"), max, "往下拖到底应当停在 max");
+        // 抬起后**拖动才真的结束**
+        handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::PointerUp { button: PointerButton::Left, x: px, y: 10_000.0 });
+        assert!(st.scroll.drag.is_none());
+    }
+
+    /// ④ 按在**内容上**（不在滑块上）⇒ 一切照旧（既有语义不回退）
+    #[test]
+    fn pressing_off_the_thumb_keeps_the_old_behaviour() {
+        let (tree, geo, mut st) = scroller_fixture();
+        let (.., vp, _) = thumb_point(&geo, &st);
+        // 容器左半边（远离右侧的滚动条竖带）
+        let px = vp.x + 5.0;
+        let py = vp.y + 5.0;
+        let out = handle(&mut st, &tree, &geo, ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Left, x: px, y: py });
+        assert!(st.scroll.drag.is_none(), "没按在滑块上就不该开始拖动");
+        assert_eq!(st.pressed.as_deref(), Some("b0"), "内容上的按下照旧记 pressed");
+        assert!(!out.iter().any(|e| matches!(e, UiEvent::Scrolled { .. })), "不该发 Scrolled：{out:?}");
     }
 
     // ---- T3.2：UiState → InteractState 的唯一转换 ---------------------------

@@ -7,7 +7,7 @@
 ## 1. 这是什么 / 什么时候用它
 
 **内容超出视口的容器会自己长出滚动条** —— 一条轨道 + 一个滑块，滑块的位置与高度反映
-「当前看到的是内容的哪一段」。
+「当前看到的是内容的哪一段」。**滑块可以直接拖**（拖动改偏移、抬起结束）。
 
 什么时候你会看到它：
 
@@ -54,6 +54,9 @@ pub const SCROLLBAR_MIN_THUMB: f32 = 24.0; // 滑块下限（内容极长时仍�
 
 pub struct ScrollbarGeom { pub track: Rect, pub thumb: Rect }
 pub fn scrollbar_geom(viewport: Rect, offset: i32, max_scroll: i32) -> Option<ScrollbarGeom>
+
+// 反解（拖动/命中用）：指针在这儿 ⇒ 偏移该是多少。与上一个函数是同一套映射的两个方向。
+pub fn scrollbar_offset_for_pointer(viewport: Rect, max_scroll: i32, pointer_y: f32, grab_dy: f32) -> i32
 ```
 
 绘制侧的接口是 `InteractState` 上的一个字段：
@@ -94,8 +97,8 @@ pub struct ScrollView { pub offsets: ScrollOffsets, pub metrics: ScrollMetrics }
 
 ### 做不到什么
 
-- **拖动滑块**（以及点轨道跳转）**还没做** —— 这一版只**显示**位置；滚动仍靠滚轮；
-- **惯性滚动**（松手后衰减）**还没做**；
+- **点轨道跳转**（点轨道空白处应当跳到那一页）**还没做** —— 只能**拖滑块**或滚轮；
+- **惯性滚动**（滚轮/拖动松手后的衰减）**还没做**；
 - **横向滚动**：滚动条只有垂直方向（与「滚动容器本期只做垂直」一致）；
 - **不能配颜色/宽度**：三个常量是编译期固定的；主题化需要先给 `Theme` 加字段（公开 API 变更，未登记）；
 - **不会自动隐藏**（没有「静止时淡出」这类行为）。
