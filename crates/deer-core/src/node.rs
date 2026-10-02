@@ -167,6 +167,32 @@ pub struct LayoutProps {
     ///
     /// **默认 `None` ⇒ 既有树逐字节不变**。
     pub position: Option<Pos>,
+    /// **每子节点交叉轴对齐**（L2 · D6 · opt-in）。取值同容器级 `cross_axis`。
+    ///
+    /// 语义（见 `crates/deer-core/tests/l2_cross_self.rs`）：
+    /// - `Some(a)` ⇒ **覆盖**父容器的 `cross_axis`，**只对这一个流内子节点生效**
+    ///   （对齐方式与 stretch 吃满都按 `a` 算）；
+    /// - `None` ⇒ 完全回落容器级 `cross_axis`（⇒ 既有树逐字节不变）；
+    /// - **对流外（`position`）子节点不生效**：流外节点按 L1 语义只看自己的
+    ///   显式/固有尺寸落位，不参与交叉轴对齐（这条边界写进了
+    ///   `docs/features/align-self.md` 的「做不到什么」）。
+    pub cross_self: Option<Align>,
+    /// **最小宽度**（L3 · D6 · opt-in）：`Some` ⇒ 该节点的宽被夹在 `[min_w, ∞)`。
+    ///
+    /// **measure 与 place 两处都生效**（L1 的教训：只改一处必漏）：
+    /// ① measure 阶段固有尺寸先算再夹进 `[min, max]`（容器聚合的是夹过的值）；
+    /// ② place 阶段显式尺寸 / grow 分配结果同样被夹。
+    /// `min > max` ⇒ **min 赢**（先夹 max 再托 min，`clamp_between` 的注释与测试钉住）。
+    /// 百分比相对**父内容盒**解析；measure 阶段没有父宽度 ⇒ 百分比只在 place 生效
+    /// （与 `width`/`height` 的百分比同一惯例）。
+    /// **默认 `None` ⇒ 既有树逐字节不变**。
+    pub min_w: Option<Size>,
+    /// **最大宽度**（L3）：`Some` ⇒ 宽不超过它（grow 分配结果同样被封顶）。其余同 [`LayoutProps::min_w`]。
+    pub max_w: Option<Size>,
+    /// **最小高度**（L3）。语义同 [`LayoutProps::min_w`]，作用在高度上。
+    pub min_h: Option<Size>,
+    /// **最大高度**（L3）。语义同 [`LayoutProps::max_w`]，作用在高度上。
+    pub max_h: Option<Size>,
 }
 
 /// 结构 / 内容参数。

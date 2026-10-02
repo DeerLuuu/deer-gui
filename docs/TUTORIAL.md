@@ -293,6 +293,25 @@ r.button_opts("徽标", |n| n.layout.position = Some(Pos::Offset { x: 120, y: 30
 
 > 对应示例：`cargo run -p deer-gui --example overlay_demo`
 
+**交叉轴单独对齐 + 尺寸夹具**（L2/L3）：某个子节点不想跟大队时，给它设
+`cross_self`（或 `.dui` 的 `cross-self=center`）—— **覆盖**容器级 `cross`，只对它一个生效
+（流外子节点不适用）。尺寸要「不许小于/大于某个数」时，给它设 `min_w`/`max_w`/`min_h`/`max_h`
+（或 `.dui` 的 `min-w=36` / `max-h=50%`）—— **measure 与 place 两处都夹**：固有尺寸聚合、
+显式尺寸、grow 分配结果都过 `[min, max]`；`min > max` ⇒ **min 赢**。两者默认都不设 ⇒
+布局逐字节不变。
+
+```rust
+// 这一个按钮居中，且 grow 分得再少也至少 80px 宽
+r.button_opts("特殊", |n| {
+    n.layout.cross_self = Some(Align::Center);
+    n.layout.min_w = Some(Size::Px(80.0));
+});
+```
+
+> 对应示例：`cargo run -p deer-gui --example layout_refine_demo`
+> （边界与「做不到什么」见 [`features/align-self.md`](features/align-self.md) 与
+> [`features/min-max-sizes.md`](features/min-max-sizes.md)）
+
 ---
 
 ## 7. 拿到绘制命令

@@ -98,6 +98,34 @@ pub const SPECS: &[PropSpec] = &[
         kinds: &ANY,
     },
     PropSpec {
+        name: "min_w",
+        ty: PropType::Size,
+        domain: "px(>=0) 或 pct(0..=100)；下限，min > max ⇒ min 赢",
+        default: "none",
+        kinds: &ANY,
+    },
+    PropSpec {
+        name: "max_w",
+        ty: PropType::Size,
+        domain: "px(>=0) 或 pct(0..=100)；上限，grow 分配结果也被封顶",
+        default: "none",
+        kinds: &ANY,
+    },
+    PropSpec {
+        name: "min_h",
+        ty: PropType::Size,
+        domain: "px(>=0) 或 pct(0..=100)；下限，min > max ⇒ min 赢",
+        default: "none",
+        kinds: &ANY,
+    },
+    PropSpec {
+        name: "max_h",
+        ty: PropType::Size,
+        domain: "px(>=0) 或 pct(0..=100)；上限，grow 分配结果也被封顶",
+        default: "none",
+        kinds: &ANY,
+    },
+    PropSpec {
         name: "grow",
         ty: PropType::F32,
         domain: ">= 0（0 = 不生长）",
@@ -131,6 +159,13 @@ pub const SPECS: &[PropSpec] = &[
         domain: "start | center | end | stretch",
         default: "none",
         kinds: &CONTAINERS,
+    },
+    PropSpec {
+        name: "cross_self",
+        ty: PropType::Align,
+        domain: "start | center | end | stretch（覆盖容器级 cross_axis，仅该流内子节点）",
+        default: "none",
+        kinds: &ANY,
     },
     PropSpec {
         name: "scroll",
@@ -216,6 +251,11 @@ mod tests {
             scroll,
             wrap,
             position,
+            cross_self,
+            min_w,
+            max_w,
+            min_h,
+            max_h,
         } = LayoutProps::default();
         let NodeProps {
             label,
@@ -226,7 +266,7 @@ mod tests {
         // ② 触碰每个绑定（否则编译器会警告 unused，后来者容易一把删掉）
         let _probe = (
             &width, &height, &padding, &gap, &main_axis, &cross_axis, &grow, &scroll, &wrap,
-            &position, &label, &disabled, &extra,
+            &position, &cross_self, &min_w, &max_w, &min_h, &max_h, &label, &disabled, &extra,
         );
 
         // ③ 名字集合必须相等（两边都排序后比较，避免顺序敏感）
@@ -241,6 +281,11 @@ mod tests {
             "scroll",
             "wrap",
             "position",
+            "cross_self",
+            "min_w",
+            "max_w",
+            "min_h",
+            "max_h",
             "label",
             "disabled",
             "extra",
@@ -267,10 +312,15 @@ mod tests {
             match s.name {
                 "width" => format!("{:?}", l.width).to_lowercase(),
                 "height" => format!("{:?}", l.height).to_lowercase(),
+                "min_w" => format!("{:?}", l.min_w).to_lowercase(),
+                "max_w" => format!("{:?}", l.max_w).to_lowercase(),
+                "min_h" => format!("{:?}", l.min_h).to_lowercase(),
+                "max_h" => format!("{:?}", l.max_h).to_lowercase(),
                 "padding" => show_f32(l.padding),
                 "gap" => show_f32(l.gap),
                 "main_axis" => format!("{:?}", l.main_axis).to_lowercase(),
                 "cross_axis" => format!("{:?}", l.cross_axis).to_lowercase(),
+                "cross_self" => format!("{:?}", l.cross_self).to_lowercase(),
                 "grow" => show_f32(l.grow),
                 "scroll" => l.scroll.to_string(),
                 "wrap" => l.wrap.to_string(),
@@ -349,9 +399,13 @@ mod tests {
         assert!(text.contains(&"label"), "Text 有 label：{text:?}");
 
         // 叶子共同点：都能设尺寸/grow/禁用/流外定位（`disabled` 对整棵子树生效 ⇒ 叶子也适用）
+        // L2/L3：`cross_self`（叶子也能是别人家的子节点）与 min/max（与 width/height 同面）也是 ANY
         for leaf in [Kind::Text, Kind::Button, Kind::Field] {
             let ns = names(leaf);
-            for expected in ["width", "height", "grow", "disabled", "position", "label"] {
+            for expected in [
+                "width", "height", "min_w", "max_w", "min_h", "max_h", "grow", "cross_self",
+                "disabled", "position", "label",
+            ] {
                 assert!(ns.contains(&expected), "{leaf:?} 应有 `{expected}`：{ns:?}");
             }
         }

@@ -60,9 +60,11 @@ let tree = parse_scene(&text, "ui.dui")?;    // 第二个参数只用于报错�
 | `pad=` | 数字 | 内边距。**只有给了它容器才画底色** |
 | `gap=` | 数字 | 子元素间距 |
 | `w=` / `h=` | 数字或百分比 | 固定尺寸：`w=200` 或 `w=50%`（相对父内容盒） |
+| `min-w=` / `max-w=` / `min-h=` / `max-h=` | 数字或百分比 | **最小/最大尺寸**（L3）：min 下限、max 上限，测固有尺寸与落位**两处都夹**；`min > max` ⇒ min 赢。见 [min-max-sizes](min-max-sizes.md) |
 | `grow=` | 数字 | 主轴分配权重，剩余空间按权重分 |
 | `main=` | `start`/`center`/`end`/`stretch` | 主轴对齐 |
-| `cross=` | 同上 | 交叉轴对齐 |
+| `cross=` | 同上 | 交叉轴对齐（容器级，管全体子节点） |
+| `cross-self=` | 同上 | **每子节点交叉轴对齐**（L2）：覆盖容器级 `cross`，只对这一个流内子节点生效。见 [align-self](align-self.md) |
 | `scroll` | 裸标记 | **垂直滚动容器**（只对 `column` 有意义）：`[column name=list w=200 h=120 scroll]` |
 | `wrap` | 裸标记 | **文本按宽度换行**（只对 `text` 有意义，换行宽度取节点的 `w=`）：`[text w=120 wrap label="…"]` |
 | `pos=` | `x,y`（整数，可为负） | **流外绝对定位**（L1）：脱离流内布局，位置 = 父内容盒原点 + 偏移；层叠 = 声明序。见 [absolute-positioning](absolute-positioning.md) |

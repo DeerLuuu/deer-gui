@@ -158,6 +158,41 @@ fn resolve(size: Option<Size>, parent: f32) -> Option<f32> {
     }
 }
 
+/// **L3**：把一个方向上声明的 `min` / `max` 解析成 `(下限, 上限)`。
+/// 百分比相对 `avail`（= 父内容盒，与 `width`/`height` 的解析基准一致）。
+fn mm_bounds(min: Option<Size>, max: Option<Size>, avail: f32) -> (Option<f32>, Option<f32>) {
+    (resolve(min, avail), resolve(max, avail))
+}
+
+/// **L3 的夹取**：先夹上限 `hi`、再托下限 `lo` ⇒ **`min > max` 时 min 赢**。
+///
+/// 为什么是这个顺序：`min=60, max=30` 时节点不可能同时满足两条，必须裁断谁赢。
+/// 选 **min 赢**——下限是「不能比这更小」的硬承诺（按钮不能被压得看不见），
+/// 上限通常是排版意图，被下限打破时问题会**显式暴露**（节点撑破上限看得见），
+/// 而不是静默缩成一团。`lo` / `hi` 都是 `None` 时原样返回
+/// （opt-in 红线：不设 min/max ⇒ 逐位不变）。
+fn clamp_between(v: f32, lo: Option<f32>, hi: Option<f32>) -> f32 {
+    let mut v = v;
+    if let Some(hi) = hi {
+        v = v.min(hi);
+    }
+    if let Some(lo) = lo {
+        v = v.max(lo);
+    }
+    v
+}
+
+/// **L3 在 measure 阶段的 min/max**：只取**像素**。
+///
+/// 百分比需要父宽度，measure 自底向上时还没有 —— 与 `width`/`height` 的百分比
+/// 「不在此解析，留给排布阶段」是同一条惯例（有测试钉：`l3_min_max.rs` ⑧）。
+fn mm_px(s: Option<Size>) -> Option<f32> {
+    match s {
+        Some(Size::Px(v)) => Some(v),
+        _ => None,
+    }
+}
+
 /// 测量阶段的中间量：每节点在「无限约束」下的固有尺寸。
 pub type Intrinsics = HashMap<String, (f32, f32)>;
 
@@ -266,6 +301,13 @@ fn measure_into(n: &Node, style: TextStyle, m: &impl Measure, out: &mut Intrinsi
     if let Some(Size::Px(v)) = n.layout.height {
         h = v;
     }
+
+    // **L3（measure 侧）**：固有尺寸（含上面的显式像素覆盖）先算，再夹进 `[min, max]` ——
+    // 容器聚合（主轴 sum / 交叉轴 max）的输入是**夹过**的值。百分比在这里不解析
+    // （measure 没有父宽度可依，`mm_px` 只取像素）；未设 ⇒ 恒等 ⇒ 逐位不变。
+    // `min > max` ⇒ min 赢（`clamp_between`）。
+    w = clamp_between(w, mm_px(n.layout.min_w), mm_px(n.layout.max_w));
+    h = clamp_between(h, mm_px(n.layout.min_h), mm_px(n.layout.max_h));
 
     let result = (w.ceil(), h.ceil());
     out.insert(n.id.clone(), result);
@@ -530,8 +572,17 @@ impl PlaceCtx<'_> {
         if ex_h.is_some() {
             h = h.min(bound.1);
         }
-        let w = w.max(0.0).round();
-    let h = h.max(0.0).round();
+        // **L3（place 侧）**：来源（显式 > 父分配 > 固有）定了之后，再把结果夹进 `[min, max]`
+        // —— min/max 是「修复」不是「来源」，不参与上面的取舍（有测试钉：`l3_min_max.rs` ③）。
+        // 排在 I-6 之后：bound（含滚动主轴的无穷）拦不住的由 min/max 拦 ——
+        // min/max 是节点自身的声明，与视口无关；`min > max` ⇒ min 赢（`clamp_between`）。
+        // 未设 ⇒ 恒等 ⇒ 逐位不变（opt-in 红线）。
+        let w = clamp_between(w, resolve(n.layout.min_w, avail.0), resolve(n.layout.max_w, avail.0))
+            .max(0.0)
+            .round();
+        let h = clamp_between(h, resolve(n.layout.min_h, avail.1), resolve(n.layout.max_h, avail.1))
+            .max(0.0)
+            .round();
 
     self.geo.insert(
         n.id.clone(),
@@ -559,6 +610,23 @@ impl PlaceCtx<'_> {
     // 设了 `position` 的子节点在这段之后单独落位（内容盒原点 + 偏移）。
     // 未设 position ⇒ `flow` = 全部子节点 ⇒ 与旧实现逐位相同（opt-in 红线）。
     let flow: Vec<&Node> = n.children.iter().filter(|c| !c.is_positioned()).collect();
+
+    // **L3**：流内子节点在主轴 / 交叉轴上声明的 `(下限, 上限)`（百分比相对**父内容盒**，
+    // 与 `width`/`height` 的解析基准一致）。未设 ⇒ `(None, None)` ⇒ 夹取恒等。
+    let main_mm = |c: &Node| {
+        if horizontal {
+            mm_bounds(c.layout.min_w, c.layout.max_w, inner_w)
+        } else {
+            mm_bounds(c.layout.min_h, c.layout.max_h, inner_h)
+        }
+    };
+    let cross_mm = |c: &Node| {
+        if horizontal {
+            mm_bounds(c.layout.min_h, c.layout.max_h, inner_h)
+        } else {
+            mm_bounds(c.layout.min_w, c.layout.max_w, inner_w)
+        }
+    };
 
     // 主轴：先给每个子节点固有主轴尺寸（或显式），剩余按 grow 权重分。
     let fixed: Vec<f32> = flow
@@ -593,12 +661,18 @@ impl PlaceCtx<'_> {
         .enumerate()
         .map(|(i, c)| {
             let g = c.layout.grow;
-            if grow_sum > 0.0 && g > 0.0 {
+            let raw = if grow_sum > 0.0 && g > 0.0 {
                 let extra = (remaining * g / grow_sum).floor();
                 main_avail.min(fixed[i] + extra)
             } else {
                 fixed[i]
-            }
+            };
+            // **L3**：grow 分配（或显式/固有）的结果在这里夹进 `[min, max]` ——
+            // 光标推进、主轴对齐、`max_scroll` 全部基于**夹过**的值（兄弟不会重叠）。
+            // max 封顶省下的空间**不**二次分配给别的 grow 节点（简单优先，指南登记）；
+            // min 托底可以让总和超出容器（溢出可见性由裁剪决定）。
+            let (lo, hi) = main_mm(c);
+            clamp_between(raw, lo, hi)
         })
         .collect();
 
@@ -624,6 +698,12 @@ impl PlaceCtx<'_> {
             Align::Start => {}
         }
     }
+    // **L3 收口**：主轴 stretch 均分可能把尺寸再次抬高 ⇒ 最后夹一遍，保证 stretch 的
+    // 结果同样被 `[min, max]` 约束（前一遍夹的是 grow 分配的结果；未设 ⇒ 恒等）。
+    for (i, s) in main_sizes.iter_mut().enumerate() {
+        let (lo, hi) = main_mm(flow[i]);
+        *s = clamp_between(*s, lo, hi);
+    }
 
     let cross_align = n.layout.cross_axis.unwrap_or(Align::Start);
     // 滚动：`max_scroll` 由**内容主轴尺寸之和 + 间隙 + 上下内边距**减去**视口**得到；
@@ -645,6 +725,12 @@ impl PlaceCtx<'_> {
         let main_size = main_sizes[i];
         let ownc = self.intrinsic.get(&c.id).copied().unwrap_or((0.0, 0.0));
 
+        // **L2**：每子节点交叉轴对齐 —— `Some(a)` **覆盖**容器级 `cross_axis`，且只对
+        // **这一个流内子节点**生效（对齐位置与 stretch 吃满都按 `a` 算，兄弟不受影响）；
+        // `None` ⇒ 回落容器级 ⇒ 既有树逐位不变（opt-in 红线）。
+        // 流外子节点不在 `flow` 里 ⇒ `cross_self` 对它们**不生效**（L2 边界，见指南）。
+        let cross_align = c.layout.cross_self.unwrap_or(cross_align);
+
         // 交叉轴：显式 > 固有；stretch 吃满。
         let cross_explicit = if horizontal {
             resolve(c.layout.height, inner_h)
@@ -655,7 +741,10 @@ impl PlaceCtx<'_> {
         if cross_align == Align::Stretch {
             cross_size = cross_avail;
         }
-        let cross_size = cross_size.max(0.0).min(cross_avail).round();
+        // **L3**：交叉轴结果（显式/固有/stretch 吃满）同样夹进 `[min, max]`
+        // （下限可以托出内容盒 —— 溢出语义与主轴一致）。
+        let (lo, hi) = cross_mm(c);
+        let cross_size = clamp_between(cross_size.max(0.0).min(cross_avail), lo, hi).round();
 
         let cross_slack = cross_avail - cross_size;
         let mut cross_pos = if horizontal { rect.y + pad } else { rect.x + pad };
@@ -712,10 +801,15 @@ impl PlaceCtx<'_> {
         // 伸出父盒子（负偏移同理），而且它不计入父固有尺寸 ⇒ 内容盒可能收缩到 0，
         // 拿它当夹取基准会把流外节点整个夹没（变异轮实测踩过：20px 被夹成 0）。
         // 百分比仍相对父内容盒解析（「参照矩形 = 父内容盒」的唯一基准，D10）。
+        // **L3**：流外节点同样受 min/max 约束（它是节点自身的声明；上面的 measure 侧
+        // 已经夹过固有值，这里把显式值也夹掉）。**L2 的 `cross_self` 对流外不生效** ——
+        // 流外只看自己的显式/固有尺寸 + 偏移，不参与任何对齐。
         let ex_w = resolve(c.layout.width, inner_w);
         let ex_h = resolve(c.layout.height, inner_h);
-        let w = ex_w.unwrap_or(ownc.0).max(0.0).round();
-        let h = ex_h.unwrap_or(ownc.1).max(0.0).round();
+        let (wlo, whi) = mm_bounds(c.layout.min_w, c.layout.max_w, inner_w);
+        let (hlo, hhi) = mm_bounds(c.layout.min_h, c.layout.max_h, inner_h);
+        let w = clamp_between(ex_w.unwrap_or(ownc.0).max(0.0), wlo, whi).round();
+        let h = clamp_between(ex_h.unwrap_or(ownc.1).max(0.0), hlo, hhi).round();
         // 偏移本身**不夹取**（可为负 ⇒ 允许伸出到父盒子之外；绘制/命中边界见指南）。
         let (cx, cy) = if horizontal {
             (rect.x + pad + x as f32 - offset, rect.y + pad + y as f32)
