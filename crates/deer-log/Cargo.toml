@@ -1,0 +1,10 @@
+[package]
+name = "deer-log"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# 刻意留空：本 crate **零第三方依赖**（见 src/lib.rs 的说明）。
+# 日志本该是最底层的东西，给它引一棵依赖树是反的。

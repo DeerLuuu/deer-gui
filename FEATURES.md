@@ -67,6 +67,7 @@
 | **GPU 文本渲染**（字形四边形 + 图集纹理 + 最近邻采样，与 CPU **逐字节对照**） | ✅ | [gpu-geometry](docs/features/gpu-geometry.md#3-完整-api) | `cargo run -p deer-gui --example gpu_geometry` |
 | **窗口里显示界面**（把 `DrawList` 的形状与文本**呈到窗口**，上屏像素与 CPU 逐像素对照） | ✅ | [window](docs/features/window.md) | `DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example window_parity` |
 | **输入与焦点**（事件通路 + 命中/状态机（含裁剪与禁用）+ Tab/Shift+Tab/Escape 焦点 + 文本输入 + **输入框光标**（T3.5：在光标处插入 / `Backspace` 删**光标前一个 Unicode 字符** / **左右方向键**移动光标，单位是**字符位**）+ 脚本化重放 + **只在状态变化时重绘**） | ✅ | [input](docs/features/input.md) | `cargo run -p deer-gui --features window --example interactive_form` |
+| **日志**（零依赖门面；分级 + 按 target 过滤；`DEER_LOG` 开关；**默认完全静默**、只写 stderr） | ✅ | [logging](docs/features/logging.md) | `cargo run -p deer-gui --example logging` |
 | **测试接口（testkit）**（建面 + 输入注入（单事件/脚本 + `move @id`）+ 一帧**内置前置断言** + 离屏 CPU/GPU 渲染 + 像素/状态/绘制列表断言 + **CPU↔GPU 对照**（不透明 0 / 半透明 ≤1 LSB）+ 门槛自证 + **可复制的复现命令**） | ✅ | [testing](docs/features/testing.md) | `cargo run -p deer-gui --features testing --example testkit_demo` |
 | **通用纹理 / `RGBA8_UNORM`**（创建 + 上传 + **回读四通道保真**；离屏**纹理 quad** 与 CPU 参考逐字节相同；uv 朝向钉住 V 翻转） | ✅ | [textures](docs/features/textures.md) | `cargo run -p deer-gui --example textures` |
 | **间接绘制**（`vkCmdBindIndexBuffer` + `vkCmdDrawIndexedIndirect(drawCount = 1, stride = 20)`，**离屏 + 窗口两条路径**；`RenderStats::indirect_draws` 与真实调用同处计数 ⇒ 换回 `vkCmdDraw` 必然变红；索引/间接缓冲惰性创建 + 跨帧复用 ⇒ 稳态零分配零上传） | ✅ | [indirect-draw](docs/features/indirect-draw.md) | `cargo run -p deer-gui --example indirect_draw` |

@@ -27,6 +27,20 @@
 
 ---
 
+## 调试：什么时候用日志
+
+跑任何示例时加上 `DEER_LOG`，就能看到内部发生了什么（**默认是完全静默的** ——
+不设它时一个字节都不输出，这是刻意的）：
+
+```bash
+DEER_LOG=deer_gpu=debug cargo run -p deer-gui --example scroll_bar
+```
+
+它专治「不报错但结果不对」。例如滚动条没出现，日志会告诉你是
+「内容装得下（正常）」还是「忘了 `set_metrics`（bug）」——
+这两种情况在画面上**完全一样**，只有日志分得开。
+见 [`features/logging.md`](features/logging.md)。
+
 ## 0. 先跑起来
 
 ```powershell

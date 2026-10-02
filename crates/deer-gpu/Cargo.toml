@@ -11,4 +11,5 @@ name = "deer_gpu"
 path = "src/lib.rs"
 
 [dependencies]
+deer-log.workspace = true
 deer-layout.workspace = true
