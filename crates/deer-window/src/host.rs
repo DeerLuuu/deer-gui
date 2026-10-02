@@ -815,9 +815,10 @@ impl<A: App> RunHandler<A> {
             self.counter.skipped_frames(),
             self.counter.frames(),
         );
-        // M5c 的唤醒账本（再单列一行，同样不打乱上面两行）：`iters` 是**空转探针** ——
-        // 省电空闲下它必须是小数字；退化成「超时打转」时 `frames` 抓不住（没人请求重绘），
-        // 只有这个数会一秒涨上千。
+        // M5c 的唤醒账本（再单列一行，同样不打乱上面两行）：`iters` 是**观测值**，**不是**本层的
+        // 判据 —— 本层不设全局阈值（`Continuous` 档下它与帧数同阶是合法的）；退化成「超时打转」时
+        // `frames` 确实抓不住（没人请求重绘），但抓它的门槛在**空闲档自己**那条：`wake_probe` 的
+        // `DEER_WAKE_TICKS=0` 档断言 `iters` 上界（见 `WakeStats::note_iter`）。
         println!(
             "[deer-window] 唤醒账本：wake={} wake_after={} fired={} requested={} skipped={} iters={}",
             self.wake_stats.looks(),
@@ -949,7 +950,8 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
     ///
     /// 为什么放在这里而不是 `new_events`：`AboutToWait` 是 winit 在**每次**要睡下去之前
     /// 必发的事件（`NewEvents` 只在从 OS 收到新事件时发）—— 「该睡多久」正该在这时候定。
-    /// 迭代计数（`iters`）也在这儿数：它就是「空闲时事件循环醒了几次」这个**可数**的空转探针。
+    /// 迭代计数（`iters`）也在这儿数：它是「空闲时事件循环醒了几次」这个**可数观测值** ——
+    /// **不是**判据（本层不设全局阈值；下断言的是空闲档自己的上界，见 [`WakeStats::note_iter`]）。
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.wake_stats.note_iter();
         if self.error.is_some() || self.exiting {
