@@ -383,6 +383,7 @@ impl UiState {
                 offsets: self.scroll.offsets.clone(),
                 metrics: self.scroll.metrics.clone(),
             },
+            carets: self.carets.clone(),
         }
     }
 
@@ -2690,6 +2691,7 @@ mod tests {
             focus,
             pressed,
             scroll,
+            carets,
         } = i;
         assert_eq!(hover, s.hover, "hover 必须原样带过去");
         assert_eq!(focus, s.focus);
@@ -2704,6 +2706,8 @@ mod tests {
             scroll.metrics.max_of("box") > 0,
             "滚动上限必须带过去 —— 漏了它滚动条根本不会被画（`max_scroll = 0`）"
         );
+        // 光标表也必须带过去（T3.8）：漏了它输入框里不画光标
+        assert_eq!(carets, s.carets, "光标表必须带过去 —— 漏了它输入框里看不到光标");
     }
 
     // ---- T3.5：`texts` 光标（字符位） --------------------------------------
