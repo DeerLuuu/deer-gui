@@ -113,7 +113,7 @@ pub mod prelude {
     pub use deer_text::text::{GlyphPlacement, TextEngine};
     pub use crate::layout::builder::{Builder, L};
     pub use crate::layout::layout::{ApproxMeasure, Measure, TextStyle, hit_test, layout, measure_tree};
-    pub use crate::layout::node::{Align, Kind, Node, Rect, Size};
+    pub use crate::layout::node::{Align, Kind, Node, Pos, Rect, Size};
     pub use crate::layout::scene::{SceneError, encode_scene, parse_scene};
 }
 

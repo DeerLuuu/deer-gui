@@ -221,7 +221,7 @@ let png = render_tree_to_png(&tree, 300, 260, Theme::default())?;
 | `key=value` | 值含空格就加引号：`label="确定 或 取消"` |
 | `#` 开头 | 注释 |
 
-**属性**：`name` `label` `disabled` `pad` `gap` `w` `h` `grow` `main` `cross`
+**属性**：`name` `label` `disabled` `pad` `gap` `w` `h` `grow` `main` `cross` `pos`
 
 **写错会报错并给行号**（不静默忽略）：
 
@@ -278,6 +278,20 @@ assert_eq!(hit.map(|n| n.id.as_str()), Some("button_1"));
 `cargo run -p deer-gui --example prop_registry` —— 它按 `Kind` 列出属性名、类型、取值域、默认值
 （见 [`features/prop-registry.md`](features/prop-registry.md)）。这是编辑器 Inspector 的数据源，
 也是你查「这个属性叫什么、默认多少」最快的入口。
+
+**绝对定位 / 层叠**（L1）：给子节点设 `pos=x,y`（或命令式
+`n.layout.position = Some(Pos::Offset { x, y })`），它就**脱离流内布局** ——
+不占兄弟的槽位、父容器也不为它撑大，位置 = 父内容盒原点 + 偏移（可为负，允许伸出父盒子）。
+层叠 = **声明序**：后声明者后画（在上）且命中优先 —— 徽标、悬浮提示、下拉面板就用它。
+边界：anchors（按比例锚定）、相对视口 fixed、z-index 数值层级都**没有**（见
+[`features/absolute-positioning.md`](features/absolute-positioning.md) 第 6 节）。
+
+```rust
+// 一行接入：徽标钉在内容盒原点右下方，不挤动任何兄弟
+r.button_opts("徽标", |n| n.layout.position = Some(Pos::Offset { x: 120, y: 30 }));
+```
+
+> 对应示例：`cargo run -p deer-gui --example overlay_demo`
 
 ---
 
@@ -382,6 +396,7 @@ deer-gui = { path = "../deer-gui/crates/deer-gui" }
 | **惯性滚动** | ✅ 已支持（T3.2b）：App 在 `redraw()` 里调 `advance_inertia`、`next_deadline()` 返回 `inertia_deadline` 即可（两行接线；参考 `--example scroll_inertia_window`）；衰减、到边界即停、停了不空转都有判据 |
 | **输入法（IME 预编辑）** | ✅ 已支持：中文/日文还没上屏的那一段画在光标处 + 下划线，提交才进内容 ⇒ 无双写；见 [`features/ime.md`](features/ime.md) |
 | **方向键上下导航 / 按键滚动（`PageUp`/`Home`/`End`）/ 右键透传 / 按键重复** | ✅ 已支持（T3.1/T3.2/T3.3/T3.6）：上下按**几何邻近**移焦点；翻页/到顶到底滚**焦点容器**；右键发 `PointerRight`；`KeyDown.repeat` 可区分长按重复。见 [`features/input.md`](features/input.md) |
+| **绝对定位 / 层叠** | ✅ 已支持（L1）：`pos=x,y` ⇒ 脱离流内布局，位置 = 父内容盒原点 + 偏移（可负）；层叠 = 声明序（后声明者在上且命中优先）。**没有** anchors / 视口 fixed / z-index 数值层级。见 [`features/absolute-positioning.md`](features/absolute-positioning.md) |
 | **可停靠面板 dock** / 多窗口 | ❌ M6 |
 | 12 个 `deer-ui` 控件的语义 | ❌ M6（现在只有 5 种节点） |
 
@@ -588,6 +603,7 @@ assert_eq!(gpu_px, cpu.pixels, "不透明内容（形状 + 文本）必须逐字
 | 最小出图 | `cargo run -p deer-gui --example render_to_png` | 一张完整界面图 |
 | 场景文件 | `cargo run -p deer-gui --example scene_file` | 设置面板 + 可编辑的 `.dui` |
 | 只看布局 | `cargo run -p deer-gui --example geometry` | 几何表 + 命中结果 |
+| 绝对定位 / 层叠 | `cargo run -p deer-gui --example overlay_demo` | 流外面板盖在文字上 + 流外/偏移/命中自检输出 |
 | 换主题 | `cargo run -p deer-gui --example theme` | 深/浅/暖三张图 |
 | 绘制命令 | `cargo run -p deer-gui --example draw_list` | 命令清单 + 统计 |
 | 原始像素 | `cargo run -p deer-gui --example pixels` | PNG + PPM |

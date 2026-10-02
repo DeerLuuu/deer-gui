@@ -87,6 +87,41 @@ pub enum Size {
     Pct(f32),
 }
 
+/// **流外定位**（L1 · D6/D10）：[`LayoutProps::position`] 的取值。
+///
+/// **本轮只有 [`Pos::Offset`] 一个变体**（登记口径：anchors 属 L4，本轮不做）。
+/// 设了 `position` 的子节点**脱离流内布局** —— 不参与主轴分配、不占流内空间
+/// （含间隙）、不计入父容器固有尺寸（measure 阶段同样跳过）；
+/// 位置 = **父容器内容盒原点** + 偏移（D10 定死的参照矩形 = 父内容盒，与百分比解析基准一致）。
+///
+/// **默认 `None` ⇒ 既有树逐字节不变**（opt-in，最高红线；沿用 `scroll` / `wrap` 的先例）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Pos {
+    /// 相对父容器内容盒原点的**像素**偏移。可为负（节点可以伸出父盒子之外；
+    /// 能不能被画到 / 点到由裁剪与命中边界决定，见绝对定位指南的「做不到什么」）。
+    Offset { x: i32, y: i32 },
+}
+
+impl Pos {
+    /// 解析 `.dui` 属性值：`"x,y"`（两个整数，逗号分隔，允许负号）。
+    ///
+    /// 场景侧与命令侧**共用这一份语法** —— 各写一份迟早漂（同 `Align::parse` 的理由）。
+    pub fn parse(s: &str) -> Option<Pos> {
+        let (x, y) = s.split_once(',')?;
+        Some(Pos::Offset {
+            x: x.trim().parse().ok()?,
+            y: y.trim().parse().ok()?,
+        })
+    }
+
+    /// 编码回 `.dui` 属性值（与 [`Pos::parse`] 互逆 ⇒ 往返逐字节稳定）。
+    pub fn to_attr(self) -> String {
+        match self {
+            Pos::Offset { x, y } => format!("{x},{y}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct Rect {
     pub x: f32,
@@ -123,6 +158,15 @@ pub struct LayoutProps {
     /// 换行宽度 = 节点自己的**像素**宽度（`width: Some(Size::Px(..))`）—— 测量阶段
     /// 只知道这一个宽度。**默认 `false`** ⇒ 既有语料一行、一个字节都不变（opt-in）。
     pub wrap: bool,
+    /// **流外绝对定位**（L1 · opt-in，最高红线）。取值见 [`Pos`]。
+    ///
+    /// 语义（三条，都有测试钉，见 `crates/deer-core/tests/l1_position.rs`）：
+    /// 1. 设了它的子节点**脱离流内** —— 不参与主轴分配、不占流内空间（含间隙）；
+    /// 2. **不计入父容器固有尺寸**（measure 阶段同样跳过）；
+    /// 3. 位置 = 父**内容盒**原点 + 偏移；层叠序 = **声明序**（后声明者后画、命中优先）。
+    ///
+    /// **默认 `None` ⇒ 既有树逐字节不变**。
+    pub position: Option<Pos>,
 }
 
 /// 结构 / 内容参数。
@@ -221,6 +265,14 @@ impl Node {
     /// **需要换行的文本节点**：`Text` + `layout.wrap`。
     pub fn wraps_text(&self) -> bool {
         self.layout.wrap && self.kind == Kind::Text
+    }
+
+    /// **流外定位的节点**：设了 `layout.position`（L1）。
+    ///
+    /// 「什么算脱离流内」的**唯一判据** —— measure（固有尺寸跳过）、place（不占流、
+    /// 按偏移落位）都读它，免得两处各写一份条件而悄悄分叉（与 `is_scroll_container` 同理）。
+    pub fn is_positioned(&self) -> bool {
+        self.layout.position.is_some()
     }
 
     /// 前序遍历（父先于子）。

@@ -16,7 +16,7 @@
 //! **关键约束**：`IdGen` 按 kind 计数，必须与 `scene` 的规则逐字一致，否则
 //! 两条构筑路径产出的树不等（deer-ui V0 的 B-1 缺陷）。
 
-use crate::node::{Align, IdGen, Kind, LayoutProps, Node, NodeProps, Size};
+use crate::node::{Align, IdGen, Kind, LayoutProps, Node, NodeProps, Pos, Size};
 
 pub struct Builder {
     root: Node,
@@ -216,6 +216,8 @@ pub struct L {
     pub grow: Option<f32>,
     pub scroll: Option<bool>,
     pub wrap: Option<bool>,
+    /// 流外定位（L1）：`Some(Pos::Offset { .. })` ⇒ 脱离流内布局。
+    pub position: Option<Pos>,
 }
 
 impl L {
@@ -268,6 +270,12 @@ impl L {
         self.wrap = Some(v);
         self
     }
+    /// **流外定位**（L1）：相对父内容盒原点的像素偏移，可为负。
+    /// 设了它，该节点脱离流内布局（不参与主轴分配、不占流内空间、不计入父固有尺寸）。
+    pub fn pos(mut self, x: i32, y: i32) -> L {
+        self.position = Some(Pos::Offset { x, y });
+        self
+    }
     /// 便捷构造 `LayoutProps`。
     pub fn to_props(self) -> LayoutProps {
         LayoutProps {
@@ -280,6 +288,7 @@ impl L {
             grow: self.grow.unwrap_or(0.0),
             scroll: self.scroll.unwrap_or(false),
             wrap: self.wrap.unwrap_or(false),
+            position: self.position,
         }
     }
 }
