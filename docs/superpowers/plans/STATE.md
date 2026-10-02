@@ -8,7 +8,7 @@
 | 项 | 值 |
 |---|---|
 | 远端 / 本地 `master` | 见 `git log --oneline -1`（最近推送：`0013ca7` = L2+L3 落地） |
-| 判据规模 | `cargo test --workspace` = **674 passed / 0 failed**（L4 落地轮实测；口径以运行输出为准，任何一轮**不许退化**） |
+| 判据规模 | `cargo test --workspace` = **701 passed / 0 failed**（T3.7+AF-1/2/3 批次轮实测；口径以运行输出为准，任何一轮**不许退化**） |
 | 已完成的里程碑 | M1 · M2a · M2b · M3a · M3b · M3c · M4（真字形）· M5（输入/焦点/重绘闭环）· M5b（事件驱动重绘 + 省电开关）· M5c（唤醒面 `Waker`/deadline）· M3+（统一管线 + 跨帧复用）· **分层物理化（L0–L3，Godot 式）** · L2 align-self · L3 min/max 尺寸 |
 | 零依赖口径 | 除窗口层 `winit 0.30` 外**零第三方依赖**（手写 Vulkan 绑定 + 自研 SPIR-V 汇编器） |
 

@@ -251,9 +251,11 @@ fn diff_split(a: &[u8], b: &[u8], extent: Extent, rect: RectI) -> (usize, usize)
 }
 
 fn fmt_state(s: &UiState) -> String {
+    // carets 必须打出来：T3.5 之后它是终态断言的一部分 —— 少打一个字段，
+    // 失败时就会出现「打印一模一样却判不一致」的自相矛盾诊断（实测踩过）。
     format!(
-        "hover={:?} focus={:?} pressed={:?} texts={:?}",
-        s.hover, s.focus, s.pressed, s.texts
+        "hover={:?} focus={:?} pressed={:?} texts={:?} carets={:?}",
+        s.hover, s.focus, s.pressed, s.texts, s.carets
     )
 }
 
@@ -713,10 +715,13 @@ impl Form {
         if let Some(expected) = self.expected.clone() {
             println!("期望终态    : {}", fmt_state(&expected));
             if self.state != expected {
+                // 完整 Debug 兜底：任何字段漂移都能在这一条里直接看到差异在哪。
                 return Err(format!(
-                    "脚本重放的终态与期望不一致：实际 {} / 期望 {}",
+                    "脚本重放的终态与期望不一致：\n  实际(摘要) {}\n  期望(摘要) {}\n  实际(完整) {:#?}\n  期望(完整) {:#?}",
                     fmt_state(&self.state),
-                    fmt_state(&expected)
+                    fmt_state(&expected),
+                    self.state,
+                    expected
                 ));
             }
             println!("脚本重放终态断言 ✅");
@@ -999,16 +1004,19 @@ impl App for Form {
 /// | `down:left` | `pressed = button_1`；命中的**可聚焦控件** ⇒ `focus = button_1` |
 /// | `up:left` | 抬起处仍是 `button_1` ⇒ `Clicked`，且 `pressed` 清空 |
 /// | `key:Tab` | 焦点按**树序**移到下一个可聚焦控件 `field_1`（禁用按钮不在序列里） |
-/// | `text:hi` | 焦点是启用的输入框 ⇒ `texts["field_1"] = "hi"` |
+/// | `text:hi` | 焦点是启用的输入框 ⇒ `texts["field_1"] = "hi"`，且光标推进到末尾（**字符位 2**，T3.5） |
 ///
-/// ⇒ 终态：`hover=button_1`、`focus=field_1`、`pressed=None`、`texts={field_1: "hi"}`。
+/// ⇒ 终态：`hover=button_1`、`focus=field_1`、`pressed=None`、`texts={field_1: "hi"}`、
+///    `carets={field_1: 2}`。
 fn expected_state() -> UiState {
     UiState {
         hover: Some("button_1".into()),
         focus: Some("field_1".into()),
         pressed: None,
         texts: std::collections::BTreeMap::from([("field_1".to_string(), "hi".to_string())]),
-        carets: Default::default(),
+        // `text:hi` 插入 2 个字符后光标停在**末尾**（字符位 2，T3.5）—— 期望终态必须
+        // 跟着 UiState 的字段一起长（本例曾因漏掉它出现「打印一致却判不一致」的假差异）。
+        carets: std::collections::BTreeMap::from([("field_1".to_string(), 2)]),
         scroll: Default::default(),
         preedit: Default::default(),
     }
