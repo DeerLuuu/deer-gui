@@ -1,7 +1,7 @@
 # 功能指南：属性注册表（prop-registry）
 
 > 跑 `cargo run -p deer-gui --example prop_registry` 看全部登记项 ·
-> 代码在 `crates/deer-layout/src/registry.rs` ·
+> 代码在 `crates/deer-core/src/registry.rs` ·
 > 出处：App 地基任务书 2026-10-02 的 **E1**（编辑器地基第一项）
 
 ## 1. 这是什么 / 什么时候用它

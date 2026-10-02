@@ -325,7 +325,7 @@ let i = ((10 * w + 20) * 4) as usize;
 println!("(20,10) = R{} G{} B{} A{}", pixels[i], pixels[i+1], pixels[i+2], pixels[i+3]);
 
 // 自己编码成 PNG（库里的零依赖编码器）
-let png = deer_gpu::png::encode_rgba(w, h, &pixels).map_err(|e| e.to_string())?;
+let png = deer_text::png::encode_rgba(w, h, &pixels).map_err(|e| e.to_string())?;
 std::fs::write("render_out/pixels.png", png)?;
 ```
 
@@ -404,7 +404,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tree = app.build();
 
     // 字体：consola → arial → segoeui；找不到返回 None（不静默降级）
-    let font = deer_gpu::measure::find_system_font().ok_or("找不到系统字体")?;
+    let font = deer_text::measure::find_system_font().ok_or("找不到系统字体")?;
 
     // 带字体的渲染：布局、绘制列表、光栅化用**同一个字号、同一个度量**
     let png = deer_gui::render_tree_to_png_with_font(&tree, 360, 140, Theme::default(), &font, 16.0)?;

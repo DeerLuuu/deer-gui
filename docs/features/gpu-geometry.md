@@ -38,7 +38,7 @@ fn main() -> Result<(), String> {
     let theme = Theme { surface: Color::rgb(0x10, 0x14, 0x24), ..Theme::default() };
 
     // ① 一棵**含文本**的树 → 用真实字体度量布局 → 绘制列表
-    let font_path = deer_gpu::measure::find_system_font()
+    let font_path = deer_text::measure::find_system_font()
         .ok_or_else(|| "找不到系统字体".to_string())?;
     let engine_gpu = TextEngine::from_font_file(Path::new(&font_path), font_size)
         .map_err(|e| e.to_string())?;

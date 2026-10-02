@@ -28,8 +28,9 @@
 
 ### 2.1 分层总览
 
-自上而下五层：**应用层 → 门面/交互层 → 窗口层 & HAL 层 → 后端层 → 纯核心层**。
-箭头方向 = 依赖方向（下层不知道上层的存在）。
+自上而下是**视觉顺序**（应用 → 门面 → Server → 纯核心）；图中的 ①–⑤ 只是**图内编号**，
+**L0–L3 的归属判据一律看 §2.3**。箭头方向 = 依赖方向（下层不知道上层的存在）。
+**物理拆分（LY1–LY3）已完成**：crate 边界现在与 §2.3 的归属一致。
 
 ```mermaid
 flowchart TB
@@ -46,17 +47,21 @@ flowchart TB
         ENVGATE["env_gate.rs<br/>门槛变量判定（先 trim 再比）"]
     end
 
-    subgraph L3["③ deer-gpu —— GPU HAL（契约层，不含 API 绑定）"]
-        HAL["Backend / Device / Swapchain / Frame<br/>Renderer trait · Theme · RawWindowHandle"]
-        DRAW["平台无关绘制数据：DrawCmd · DrawList · Color"]
+    subgraph L3["③ deer-gpu —— RenderServer·CPU + HAL 契约（L1；HAL 暂驻本 crate）"]
+        HAL["Backend / Device / Swapchain / Frame<br/>Renderer trait · RawWindowHandle"]
         RENDER["render.rs：DefaultRenderer<br/>树+几何 → DrawList"]
         NULLB["null.rs：CpuRenderer（软件光栅化参考后端）"]
+        INTERACTG["interact.rs：交互渲染"]
+    end
+
+    subgraph L3T["③' deer-text —— TextServer（L1）"]
         TEXT["文本引擎栈：font.rs(TTF解析) → raster.rs(光栅化)<br/>→ atlas.rs(图集) → measure.rs(FontMeasure) → text.rs(TextEngine)"]
         PNG["png.rs：零依赖 PNG 编码器"]
     end
 
-    subgraph L3W["③' deer-window —— 窗口层（唯一第三方依赖点）"]
-        WIN["App trait · run() · InputEvent / Key / Mods<br/>Waker · RedrawPolicy(OnDemand/Continuous)<br/>FrameCounter · WakeStats"]
+    subgraph L3W["④ deer-window —— DisplayServer(L1) + host(L3)（唯一第三方依赖点）"]
+        DISP["display.rs：winit 事件循环 · InputEvent / Key / Mods · DPI · 剪贴板"]
+        WIN["host.rs：App trait · run() · Waker<br/>RedrawPolicy(OnDemand/Continuous) · FrameCounter · WakeStats"]
     end
 
     subgraph L2["② deer-vk —— Vulkan 后端（不依赖 ash/wgpu/vulkano）"]
@@ -69,11 +74,13 @@ flowchart TB
         HALVK["hal.rs：VulkanDevice/Frame/Swapchain<br/>（T1.1 已接线：record 真的消费 DrawList，经 prepare_ui 复用 WindowedRenderer）"]
     end
 
-    subgraph L1["① deer-layout —— 语言无关纯核心（零依赖、无 unsafe）"]
+    subgraph L1["⓪ deer-core —— L0 纯核心（零内部依赖、无 unsafe）"]
+        DRAW["draw.rs：DrawCmd · DrawList · Color · RectI"]
+        ERR["error.rs：GpuError / GpuResult"]
         NODE["node.rs：Node 树（唯一真相数据模型）"]
         BUILDER["builder.rs：命令式 Builder / L"]
         SCENE["scene.rs：.dui 解析 / 编码"]
-        LAYOUTM["layout.rs：layout() 纯函数 · hit_test()<br/>Measure trait · wrap_greedy"]
+        LAYOUTM["layout.rs：layout() 纯函数 · hit_test()<br/>Measure trait · TextStyle · wrap_greedy"]
     end
 
     EX --> FACE
@@ -89,7 +96,7 @@ flowchart TB
     HAL --> DRAW
     RENDER --> DRAW
     NULLB --> DRAW
-    TEXT --> NULLB
+    TEXT -.-> L1
     FACE --> HALVK
     FFI --> DEV
     DEV --> OFF
@@ -106,9 +113,13 @@ flowchart TB
 
 要点：
 
-- **纯核心在最底层**：`deer-layout` 不知道 GPU、窗口、事件循环的存在（`crates/deer-layout/src/lib.rs` 模块文档），因此布局与命中测试可在无 GPU 的 CI 里完整断言。
-- **HAL 是「完全从头」的边界**：`deer-gpu` 只定义契约（`Backend`/`Device`/`Swapchain`/`Frame`）与平台无关数据，不包含任何 API 绑定；「加一个后端 = 实现 `Backend` trait」（`crates/deer-gpu/src/lib.rs`）。
-- **窗口层通过不透明句柄解耦**：渲染后端只认 `deer_gpu::RawWindowHandle`（`platform` + `handle` + `display`），不依赖 winit；换窗口实现不动渲染栈（`crates/deer-window/src/lib.rs`、`ROADMAP.md` ④）。
+- **纯核心在最底层**：`deer-core` 不知道 GPU、窗口、事件循环的存在，因此布局与命中测试可在无 GPU 的 CI 里完整断言。
+  （它由原 `deer-layout` 全部 + `deer-gpu` 的 `draw`/`error` 组成；**不含** `measure` 与 HAL —— 见 §2.3 的两处修订。）
+- **HAL 是「完全从头」的边界**：`deer-gpu` 只定义契约（`Backend`/`Device`/`Swapchain`/`Frame`）与平台无关数据，不包含任何 API 绑定；「加一个后端 = 实现 `Backend` trait」。
+  HAL traits **目前暂驻 `deer-gpu`**（`Frame::record` 的签名引用 `TextEngine` ⇒ 属 RenderServer 家族契约，见 §2.3）。
+- **文本是独立的 TextServer**：`deer-text`（`font`/`glyph`/`raster`/`atlas`/`measure`/`text`/`png`）与 `deer-gpu` **只依赖 `deer-core`**；
+  依赖方向单向：`deer-gpu → deer-text → deer-core`（`deer-gpu` 以 `pub use deer_text::png;` **保留 `deer_gpu::png` 路径**）。
+- **窗口层通过不透明句柄解耦**：渲染后端只认 `deer_gpu::RawWindowHandle`（`platform` + `handle` + `display`），不依赖 winit；换窗口实现不动渲染栈。
 - **交互层是纯逻辑**：`deer-gui/src/interaction.rs` 输入是值、输出是值，可在无 winit / 无 Vulkan 环境单测；`InputEvent` 在不开 `window` feature 时使用逐字相同的镜像定义（`interaction.rs` 的 `mirror` 模块）。
 
 ### 2.2 Crate 依赖关系
@@ -118,22 +129,30 @@ flowchart LR
     deer-gui --> deer-vk
     deer-gui --> deer-window
     deer-gui --> deer-gpu
-    deer-gui --> deer-layout
+    deer-gui --> deer-text
+    deer-gui --> deer-core
+    deer-gui --> deer-log
     deer-vk --> deer-gpu
-    deer-vk --> deer-layout
+    deer-vk --> deer-text
+    deer-vk --> deer-core
     deer-window --> deer-gpu
-    deer-gpu --> deer-layout
+    deer-gpu --> deer-text
+    deer-gpu --> deer-core
+    deer-gpu --> deer-log
+    deer-text --> deer-core
     deer-window -.->|唯一第三方依赖| winit["winit 0.30 (0.30.13)"]
-    deer-layout -->|零依赖| none(("∅"))
+    deer-core -->|零依赖| none(("∅"))
 ```
 
-| Crate | 依赖 | 角色 | 出处 |
-|---|---|---|---|
-| `deer-layout` | 无 | 节点树、布局代数、命中测试、`.dui` 解析 | `crates/deer-layout/Cargo.toml` |
-| `deer-gpu` | deer-layout | HAL 契约 + CPU 参考后端 + 文本引擎 + 绘制数据 | `crates/deer-gpu/Cargo.toml` |
-| `deer-vk` | deer-gpu、deer-layout | Vulkan 后端（自声明符号） | `crates/deer-vk/Cargo.toml` |
-| `deer-window` | deer-gpu、**winit** | 原生窗口 + 事件循环（唯一第三方依赖点） | `crates/deer-window/Cargo.toml` |
-| `deer-gui` | 以上全部（deer-window 为 optional） | 门面 + 交互层 + testkit | `crates/deer-gui/Cargo.toml` |
+| Crate | 层 | 依赖 | 角色 | 出处 |
+|---|---|---|---|---|
+| `deer-core` | **L0** | 无 | 节点树、布局代数、命中测试、`.dui` 解析、绘制数据（`draw`）、错误类型（`error`） | `crates/deer-core/Cargo.toml` |
+| `deer-text` | L1 TextServer | deer-core | 字体解析 / 光栅化 / 图集 / 度量（`measure`）/ 文本引擎 / PNG 编码 | `crates/deer-text/Cargo.toml` |
+| `deer-gpu` | L1 RenderServer·CPU | deer-core、deer-text、deer-log | **HAL 契约（暂驻）** + CPU 参考后端（`null`/`render`/`interact`） | `crates/deer-gpu/Cargo.toml` |
+| `deer-vk` | L1 RenderServer·Vulkan | deer-gpu、deer-core、deer-text | Vulkan 后端（自声明符号） | `crates/deer-vk/Cargo.toml` |
+| `deer-window` | L1 DisplayServer + L3 host | deer-gpu、**winit** | 原生窗口 + 事件循环（唯一第三方依赖点）；`lib.rs` 内部拆 `display`/`host` | `crates/deer-window/Cargo.toml` |
+| `deer-gui` | L2 framework | 以上全部（deer-window 为 optional）+ deer-log | 门面 + 交互层 + testkit | `crates/deer-gui/Cargo.toml` |
+| `deer-log` | 工具 | 无 | 日志 crate | `crates/deer-log/Cargo.toml` |
 
 Feature 开关（`crates/deer-gui/Cargo.toml`）：
 
@@ -157,15 +176,19 @@ Feature 开关（`crates/deer-gui/Cargo.toml`）：
 
 **一句话判据**：它有没有「设备 / 句柄 / 平台 / 全局状态」？有 ⇒ Server；没有 ⇒ core。例：`DrawCmd` 无设备 ⇒ core；`create_texture` 有设备 ⇒ RenderServer；`font → 字形位图` 有缓存与字体文件 ⇒ TextServer；`UiState`（hover/pressed）既无设备也无平台 ⇒ **不属 core，属 framework**。
 
-**两处已知错位**（待物理拆分时纠正；当前用 `deer-gpu` 的 `core_layer`/`text_layer`/`backend_layer` 门面模块先行逻辑分层，零行为改动、零路径破坏）：
+**两处已知错位 —— 均已纠正**（LY1–LY3 物理拆分已于 2026-10-02 完成；登记见 `ROADMAP.md` 的「分层物理化（L0–L3）设计登记」）：
 
-1. `deer-gpu` 把 **L0 契约**（`draw.rs`、HAL trait）与 **L1 一个后端 + 文本服务**（`null`/`render`/`interact` + `font`/`glyph`/`raster`/`atlas`/`text`）混装在同一 crate；
-2. `deer-window` 一个文件（1571 行）混装 **L1 DisplayServer**（winit/输入/DPI/剪贴板）与 **L3 host**（`App`/`Waker`/脏重绘）—— 物理拆分待单独立项（大文件、高风险，须独立 P2 任务）。
+1. ~~`deer-gpu` 把 **L0 契约**（`draw.rs`、HAL trait）与 **L1 一个后端 + 文本服务**（`null`/`render`/`interact` + `font`/`glyph`/`raster`/`atlas`/`text`）混装在同一 crate~~ ⇒ **已纠正**：`draw`/`error` 与原 `deer-layout` 全部合成 **L0 `deer-core`**；文本服务（`font`/`glyph`/`raster`/`atlas`/`measure`/`text`/`png`）成为 **L1 `deer-text`**；`deer-gpu` 收缩为 **L1 RenderServer·CPU**（`null`/`render`/`interact`）。
+   **唯一例外**：**HAL traits 暂驻 `deer-gpu`** —— `Frame::record` 的签名引用 `TextEngine`（签名级耦合）⇒ 它目前是 **RenderServer 家族契约**（Godot 的 `RenderingServer` 本身也在 L1）。去 `TextEngine` 化（改 RID 不透明句柄）是**已登记的未来契约任务**，完成后 HAL 才下沉 L0。
+2. ~~`deer-window` 一个文件（1571 行）混装 **L1 DisplayServer**（winit/输入/DPI/剪贴板）与 **L3 host**（`App`/`Waker`/脏重绘）~~ ⇒ **已纠正**：crate **不拆**，`lib.rs` **内部**拆 `display.rs`(L1) / `host.rs`(L3)；**公开 API 逐字不变**（纯搬家）。
 
-**待人裁断的两点**（不臆造）：
+**门面模块已删除**：`core_layer` / `text_layer` / `backend_layer` 是拆 crate 之前的**过渡**手段，现已随物理拆分移除 —— `deer-gpu` 的条目回到**根导出**（如 `CpuRenderer`）；原 `text_layer` 的条目去 `deer-text`；HAL（`Backend`/`Device`/`Swapchain`/`Frame`）仍在 `deer-gpu` 根。
 
-- **"Server" 命名**：Godot 用法是"单例服务对象（进程内）"，中文语境易误读为"服务端"；保留 `Server` 还是换 `Host`/`Service`/`Runtime`？
-- **物理拆 crate 的时机**：当前用门面模块做逻辑分层（`deer_gpu::core_layer::DrawList` 等），零风险且为下游提供迁移路径；真拆 crate 的触发条件建议为**"某模块开始被两个不同上层共用"**——在那之前同 crate 内分模块够用，成本低得多（每加一条 crate 边界 = 多一层 trait + 转发，"改一个字段动 5 个 crate"的代价已在本仓库体会过）。
+**两个待裁断点 —— 维护者已裁断**（2026-10-02；完整登记见 `ROADMAP.md` 的「分层物理化（L0–L3）设计登记」）：
+
+- **"Server" 命名**：**保留** —— Godot 用法是"单例服务对象（进程内）"（非网络服务端）；用户原话：「像 Godot 那样子分层核心与各个 Server」。
+- **物理拆 crate 的时机**：**已执行** —— 不再等触发条件，原文「同 crate 内分模块够用」的倾向**被覆盖**。
+  今后**再拆**的触发条件保留为：**某模块开始被两个不同上层共用**（每加一条 crate 边界 = 多一层 trait + 转发，"改一个字段动 5 个 crate"的代价已在本仓库体会过）。
 
 ---
 
@@ -175,7 +198,7 @@ Feature 开关（`crates/deer-gui/Cargo.toml`）：
 
 **职责**：节点树数据模型、布局代数、命中测试、`.dui` 场景解析。`#![forbid(unsafe_code)]`。
 
-**对外接口**（`crates/deer-layout/src/lib.rs` 的 `pub use`）：
+**对外接口**（`crates/deer-core/src/lib.rs` 的 `pub use`）：
 
 - `Builder` / `L`（`builder.rs`）：命令式 imgui 式 API，`build()` 产出 `Node` 树；
 - `parse_scene` / `encode_scene` / `SceneError`（`scene.rs`）：`.dui` 场景文件双向转换；
@@ -185,7 +208,7 @@ Feature 开关（`crates/deer-gui/Cargo.toml`）：
 **关键设计取舍**：
 
 1. **树是纯数据、不含回调**：事件用 `id` 关联，交互层负责状态（`node.rs` 模块文档）。5 种 `Kind`：`Column`/`Row`/`Text`/`Button`/`Field`（`node.rs:20-32`）。
-2. **确定性 id 规则**（`kind_N`，N 为该 kind 出现序号）：两条构筑路径共用同一规则，保证产出**结构相等**的树 —— 核心不变式，由测试 `t1_two_authoring_paths_produce_the_same_tree` 钉住（`crates/deer-layout/tests/layout_invariants.rs`）。
+2. **确定性 id 规则**（`kind_N`，N 为该 kind 出现序号）：两条构筑路径共用同一规则，保证产出**结构相等**的树 —— 核心不变式，由测试 `t1_two_authoring_paths_produce_the_same_tree` 钉住（`crates/deer-core/tests/layout_invariants.rs`）。
 3. **布局八大不变式 I-1…I-8**（纯函数、确定性、自底向上、像素取整、不假设窗口所有权、不越界、分配≠可用、主轴和/交叉轴最大），每条一个测试（`layout.rs:1-12`、`README.md`「Layout invariants」）。
 4. **文本度量抽象为 `Measure` trait**：布局不绑定字体；`ApproxMeasure`（每字符 0.6em）保留作确定性测试用，`FontMeasure`（真实 advance）由后端注入（`layout.rs:34-54`，ROADMAP Q-3）。换行算法 `wrap_greedy` 只有一份，两个实现共用（`layout.rs:56-115`）。
 5. **`hit_test` 后序遍历、最深命中者胜出、半开区间** —— 它是「输入路由的唯一依据」（`layout.rs:350-367`，`interaction.rs` 模块文档引用）。

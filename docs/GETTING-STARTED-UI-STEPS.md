@@ -65,9 +65,9 @@ fn build_widgets() -> Widgets {
 
 > **为什么按钮的 id 能在闭包里改**：`Builder::button_opts(label, f)` 先建节点、把节点交给
 > `f` 去改，**最后**才定 id —— `f` 里把 `n.id` 写成 `"ok"`，它就是最终 id
-> （`crates/deer-layout/src/builder.rs:96`、`:110`）。
+> （`crates/deer-core/src/builder.rs:96`、`:110`）。
 > 但 `Builder::text()` / `Builder::field()` **没有**这个口子，它们的 id 由 `IdGen` 自动生成
-> （`crates/deer-layout/src/node.rs:238`）⇒ 只能**接住返回值**。
+> （`crates/deer-core/src/node.rs:238`）⇒ 只能**接住返回值**。
 
 ### 应该看到什么
 
@@ -105,7 +105,7 @@ app.field("请输入");
 let tree = app.build();        // ❌ 又调了一次：拿到的还是那一刻的快照
 ```
 
-`Builder::build(&self) -> Node` 是**克隆当前树**（`crates/deer-layout/src/builder.rs:182`），
+`Builder::build(&self) -> Node` 是**克隆当前树**（`crates/deer-core/src/builder.rs:182`），
 不是「定稿」。早调得到的是**一棵缺子节点的树**；而缺子节点的树照样能一路走到
 「一张只有清屏色的图」—— 于是「没有窗口/没有内容」这个现象在后面的步骤里也是
 **静默**的。

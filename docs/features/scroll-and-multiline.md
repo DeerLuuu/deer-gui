@@ -116,7 +116,7 @@ max_scroll = max(0, ceil(内容高 − 视口高))      // 视口高 = 容器自
 | API | 说明 |
 |---|---|
 | `Measure::wrap(text, style, max_width) -> Vec<String>` | **新增的 trait 方法**，默认实现是「不换行」（一行）—— 不覆盖就不会有多行绘制 |
-| `deer_layout::layout::wrap_greedy(text, max_width, width_of)` | 唯一的换行算法（按空格/制表切词、超宽词按字符硬切） |
+| `deer_core::layout::wrap_greedy(text, max_width, width_of)` | 唯一的换行算法（按空格/制表切词、超宽词按字符硬切） |
 | `ApproxMeasure::wrap` / `FontMeasure::wrap` | 两个实现都委托给 `wrap_greedy`，只差「宽度怎么算」 |
 | `Measure::height(text, style, max_width)` | **= `wrap(..).len() * line_height`**（行数与绘制同源，不许两套算法） |
 | `deer_gpu::render::text_lines(&Measure, node, rect, style)` | 渲染器用：回 `(每行矩形, 该行文本)` |
@@ -190,7 +190,7 @@ assert_eq!(lines_i, i as i32 * 18, "第 i 行必须落在 i × 行高 上");
 - 场景文件语法：[`scene-file.md`](scene-file.md)
 - 内部原理：`crates/deer-gui/tests/scroll_multiline.rs`（回归 + 冻结摘要）、
   `crates/deer-gpu/tests/scroll_multiline.rs`（命令与裁剪）、
-  `crates/deer-layout/tests/scroll_multiline.rs`（布局数字）
+  `crates/deer-core/tests/scroll_multiline.rs`（布局数字）
 - **做不到**（本期边界，都如实登记）：
   - **没有水平滚动**（`row` 上的 `scroll` 被忽略）；**滚动条已落地** —— 内容装不下视口的容器会自己长出
     「轨道 + 滑块」，按滑块拖动改偏移（默认 opt-in，见 [`scrollbar.md`](scrollbar.md)）；

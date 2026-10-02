@@ -6,7 +6,7 @@
 ## 1. 这是什么 / 什么时候用它
 
 把「字体文件」接进整条链路：**真实度量**（`FontMeasure`，来自 `hmtx`/`hhea`）
-→ **布局**（`deer_layout::Measure` 注入点）→ **光栅化** → **图集** → **CPU 后端贴像素**。
+→ **布局**（`deer_core::Measure` 注入点）→ **光栅化** → **图集** → **CPU 后端贴像素**。
 结果就是：离屏渲染出来的图里，字是**真字形**，不再是等宽方块占位。
 
 **什么时候用它**：你想让渲染出来的图里出现真字；或者你想知道一段文字在某个字号下
@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tree = app.build();
 
     // ② 找字体（consola → arial → segoeui；找不到是 None，不是静默降级）
-    let font = deer_gpu::measure::find_system_font().ok_or("找不到系统字体")?;
+    let font = deer_text::measure::find_system_font().ok_or("找不到系统字体")?;
 
     // ③ 带字体的渲染：布局与渲染用**同一个度量**
     let theme = Theme::default();
@@ -61,7 +61,7 @@ cargo run -p deer-gui --example text_render
 这样「布局 / 绘制列表 / 光栅化」三处才是同一个字号。**不要**指望用 `theme.font_size`
 单独改字号：带字体的入口以形参 `font_size` 为准。
 
-### 3.2 `deer_gpu::measure::FontMeasure<'a>` —— 真实度量与换行
+### 3.2 `deer_text::measure::FontMeasure<'a>` —— 真实度量与换行
 
 ```rust
 FontMeasure { font: &'a Font, font_size: f32 }
@@ -78,22 +78,22 @@ FontMeasure::new(font, font_size)
 | `text_width(text: &str) -> f32` | `Σ advance(ch)`，结果 **`ceil()`**（整数友好，便于像素级断言）；`text_width("") == 0.0` |
 | `wrap(text: &str, max_width: f32) -> Vec<String>` | 贪心按**空格 / 制表**切分；丢弃行首空白；**单词本身超过 `max_width` 时按字符硬切**（单字符就超宽时允许该行超宽，否则无法前进）；`max_width <= 0` 原样返回单行；空串 / 全空白 → 一行空串（**算 1 行**） |
 
-它还实现了 `deer_layout::layout::Measure`：
+它还实现了 `deer_core::layout::Measure`：
 
 | trait 方法 | 实现 |
 |---|---|
 | `width(text, style)` | `== text_width(text)`（**同一套算法**，不是另写一份）。**忽略 `style.font_size`**：字号由构造 `FontMeasure` 时给定的那个决定 |
 | `height(text, style, max_width)` | `wrap(text, max_width).len() * style.line_height`（空串也算 1 行）。行数来自 `wrap`，**行距来自样式**（不是字体自带行高） |
-| `wrap(text, style, max_width)` | **换行点的第三处入口**（trait 上的方法，默认实现是「不换行」）；`FontMeasure` 覆盖它并**委托**给上面的固有 `wrap`。布局用它算「预留几行」，渲染器用它算「画出几行」——同一处定义。算法本体在 `deer_layout::layout::wrap_greedy`（`ApproxMeasure` 与 `FontMeasure` 共用，只差「宽度怎么算」） |
+| `wrap(text, style, max_width)` | **换行点的第三处入口**（trait 上的方法，默认实现是「不换行」）；`FontMeasure` 覆盖它并**委托**给上面的固有 `wrap`。布局用它算「预留几行」，渲染器用它算「画出几行」——同一处定义。算法本体在 `deer_core::layout::wrap_greedy`（`ApproxMeasure` 与 `FontMeasure` 共用，只差「宽度怎么算」） |
 
 > **多行文本节点**（`text` + `layout.wrap`）就是靠这个 trait 方法实现的：`deer_gpu::render::text_lines`
 > 按行展开成 N 条 `DrawCmd::Text` ⇒ 后端**每个命令仍然只画一行**（`draw_text_real` 不需要懂换行）。
 > 见 [`scroll-and-multiline.md`](scroll-and-multiline.md)。
 
-`deer_gpu::measure::find_system_font() -> Option<PathBuf>`：在 `%WINDIR%\Fonts` 里按
+`deer_text::measure::find_system_font() -> Option<PathBuf>`：在 `%WINDIR%\Fonts` 里按
 `consola.ttf` → `arial.ttf` → `segoeui.ttf` 找。找不到返回 `None`（**明确失败**，不静默降级）。
 
-### 3.3 `deer_gpu::text::TextEngine` —— 度量 + 光栅化 + 图集
+### 3.3 `deer_text::text::TextEngine` —— 度量 + 光栅化 + 图集
 
 ```rust
 TextEngine { /* font + 按 px_size 分桶的 Rasterizer + GlyphAtlas + placements */ }
@@ -155,7 +155,7 @@ GlyphPlacement { slot: AtlasSlot, left: i32, top: i32, advance: f32 }
 ```rust
 let text = std::fs::read_to_string("ui.dui")?;
 let tree = parse_scene(&text, "ui.dui")?;         // 命令式建树也完全等价
-let font = deer_gpu::measure::find_system_font().ok_or("找不到系统字体")?;
+let font = deer_text::measure::find_system_font().ok_or("找不到系统字体")?;
 let png = deer_gui::render_tree_to_png_with_font(&tree, 360, 160, Theme::default(), &font, 16.0)?;
 ```
 
@@ -168,8 +168,8 @@ let png = deer_gui::render_tree_to_png_with_font(&tree, 360, 160, Theme::default
 
 ```rust
 // 片段：放在一个返回 Result 的函数里（`?` 需要）；`tree` 用第 2 节那棵。
-use deer_gpu::measure::FontMeasure;
-use deer_gpu::text::TextEngine;
+use deer_text::measure::FontMeasure;
+use deer_text::text::TextEngine;
 
 // ① 度量交叉验证：advance 必须来自 hmtx（两条独立路径算出同一个数）
 let mut engine = TextEngine::from_system_font(16.0)?;
@@ -195,7 +195,7 @@ assert!(
 //    本机实测全高有墨列数 = 14px（80% advance），直接卡 60% 会**失败**；
 //    去掉顶旗/底横后的竖干（只看中间 1/3 行）= 4px（23% advance）才是「窄」的本意。
 let p = engine.glyph('l', 32.0).expect("'l' 应当能光栅化");
-let key = deer_gpu::glyph::GlyphKey::new(engine.font().glyph_index('l')?.unwrap(), 32);
+let key = deer_text::glyph::GlyphKey::new(engine.font().glyph_index('l')?.unwrap(), 32);
 let (slot, bytes) = engine.atlas().get(key).expect("刚插入就能取到");
 
 let has_ink = |x: u32, lo: u32, hi: u32| (lo..hi).any(|y| bytes[(y * slot.w + x) as usize] > 0);
@@ -212,7 +212,7 @@ let sp = engine.glyph(' ', 16.0).expect("空格应当有 placement");
 assert!(sp.advance > 0.0, "空格必须前进");
 
 // ⑤ 确定性：用第 2 节那棵树，两次渲染逐字节相同
-let font = deer_gpu::measure::find_system_font().ok_or("找不到系统字体")?;
+let font = deer_text::measure::find_system_font().ok_or("找不到系统字体")?;
 let theme = Theme::default();
 let (_, _, a) = deer_gui::render_tree_to_rgba_with_font(&tree, 200, 80, theme.clone(), &font, 16.0)?;
 let (_, _, b) = deer_gui::render_tree_to_rgba_with_font(&tree, 200, 80, theme, &font, 16.0)?;
@@ -267,7 +267,7 @@ assert!((drawn - layout_w).abs() <= 1.0, "两侧宽度只允许 ≤1px 的取整
 - 字形位图与坐标系：[`glyph-raster.md`](glyph-raster.md)
 - 图集与打包：[`glyph-atlas.md`](glyph-atlas.md)
 - 离屏渲染主流程：[`rendering.md`](rendering.md)
-- 字体解析层（`Font` / `Glyph`）：`crates/deer-gpu/src/font.rs`
+- 字体解析层（`Font` / `Glyph`）：`crates/deer-text/src/font.rs`
 - **做不到**（本模块的边界）：
   - **没有 GPU 侧文本**：`CpuRenderer::with_text` 是 CPU 贴图。Vulkan 后端还不消费 `DrawCmd::Text`
     / 字形图集；把 `DrawList` 送上 GPU（含文本）属于 **M3**，图集已是它的前置依赖。

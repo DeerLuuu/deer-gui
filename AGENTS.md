@@ -38,7 +38,7 @@
    `FEATURES.md` 第五节的原文是「**缺一不算完成**」；本节与它是同一套规矩的两处表述，
    **冲突时以 `CONTRIBUTING.md` 为准**。
 2. **不许悄悄加依赖。** 目前登记在案的第三方依赖只有 `deer-window` 的 `winit`
-   （见 `ROADMAP.md`「依赖例外登记（Q-1）」）。`deer-layout` / `deer-gpu` / `deer-vk`
+   （见 `ROADMAP.md`「依赖例外登记（Q-1）」）。`deer-core` / `deer-gpu` / `deer-vk`
    以及**没开 `window` feature** 的 `deer-gui` 都必须保持只有内部依赖。
    `ROADMAP.md` 明令不引的：图形抽象库（`wgpu` / `ash` / `vulkano` / `glow`）
    与 GUI 框架（`egui` / `iced` / `tauri`）。**想引任何新依赖 = 先登记 + 说明理由 + 得到人同意。**
@@ -116,7 +116,7 @@
 | 结论 | 理由 |
 |---|---|
 | 布局是**纯函数 + 确定性**：不改输入树、同输入 ⇒ 逐位相同输出（无时间/随机/环境探测） | 布局不变式 I-1/I-2，有测试 |
-| **父分配尺寸 ≠ 可用空间上限**；容器固有尺寸按主轴/交叉轴语义不同 | 踩过的真缺陷 B-2、B-3，守卫测试在 `crates/deer-layout/tests/layout_invariants.rs` |
+| **父分配尺寸 ≠ 可用空间上限**；容器固有尺寸按主轴/交叉轴语义不同 | 踩过的真缺陷 B-2、B-3，守卫测试在 `crates/deer-core/tests/layout_invariants.rs` |
 | 两条构筑路径（命令式 / `.dui`）产出**结构相等**的树 | 核心不变式，`t1_two_authoring_paths_produce_the_same_tree` |
 | `with_props` / `with_layout` 是**整体赋值** | 先定 id 再设它们会把 id 一起改掉（缺陷 R-1） |
 | 主轴对齐的剩余空间必须在 `grow` **之后**算 | 否则 `grow` 一生效，`center`/`end` **静默失效**（缺陷 R-2） |

@@ -32,7 +32,7 @@ The layout algebra comes from a TypeScript validation prototype (which ran 28 as
 
 | Area | Status |
 |---|---|
-| `deer-layout` — node tree, layout algebra, hit testing, `.dui` scene parsing | ✅ One test per layout invariant in `crates/deer-layout/tests/layout_invariants.rs` |
+| `deer-core` — node tree, layout algebra, hit testing, `.dui` scene parsing | ✅ One test per layout invariant in `crates/deer-core/tests/layout_invariants.rs` |
 | `deer-gpu` — GPU HAL + CPU reference backend (software rasterizer) | ✅ Contract in place; the CPU backend rasterizes draw lists to pixels and can blit real glyphs offscreen |
 | `deer-vk` — Vulkan backend (symbols declared by hand, loaded at runtime) | ✅ Enumerates 2 GPUs on real hardware (Intel RaptorLake / NVIDIA RTX 5070 Ti, Vulkan 1.4.341); device, pipeline, and offscreen readback, plus surface / swapchain / present |
 | `deer-window` — windowing layer (winit) | ✅ Real window and event loop on **Windows**; the only third-party dependency in the workspace |
@@ -141,7 +141,7 @@ One subtlety worth knowing: the older entry point `render_tree_to_png` does not 
 
 ```
 crates/
-├── deer-layout/   Platform-independent core: node tree, layout algebra, hit testing, .dui parsing
+├── deer-core/   Platform-independent core: node tree, layout algebra, hit testing, .dui parsing
 │                  ── zero platform dependencies, fully assertable in a CI without a GPU
 ├── deer-gpu/      GPU HAL: Backend/Device/Swapchain/Frame traits, DrawList, CPU reference backend
 │                  ── adding a backend means implementing one trait
@@ -173,7 +173,7 @@ Both paths produce **structurally equal** trees (`Node::structurally_eq`). That 
 
 ### Layout invariants
 
-Each invariant has a test in `crates/deer-layout/tests/layout_invariants.rs`:
+Each invariant has a test in `crates/deer-core/tests/layout_invariants.rs`:
 
 | # | Invariant |
 |---|---|
@@ -238,7 +238,7 @@ Except for the windowing layer, the workspace has **no third-party dependencies*
 
 | Crate | Third-party dependencies |
 |---|---|
-| `deer-layout` | none |
+| `deer-core` | none |
 | `deer-gpu` | none |
 | `deer-vk` | none |
 | `deer-gui` (without the `window` feature) | none |

@@ -145,12 +145,12 @@ pub fn raw_handle_from_rwh06(raw: RwhRawWindowHandle) -> Result<deer_gpu::RawWin
 | `render_tree_to_png_with_font`（`:169-180`） | `(…, font_path, font_size) -> Result<Vec<u8>, String>` | `render_tree_to_rgba_with_font` → `png::encode_rgba`（`:177-179`） |
 | `layout_tree`（`:183-193`） | `(&Node, w, h, Theme) -> layout::layout::Geometry` | 只算几何，用 `ApproxMeasure`；调试布局用 |
 
-`prelude`（`:59-72`）重导出常用类型；`pub use deer_gpu::{self as gpu, …}` / `deer_layout as layout` / `deer_vk as vk` 在 `:42-44`。crate 级 lint：`#![forbid(unsafe_code)]`、`#![deny(clippy::all)]`（`:39-40`）—— 这两条是「门禁为什么必须 clippy 干净」的来源之一。
+`prelude`（`:59-72`）重导出常用类型；`pub use deer_gpu::{self as gpu, …}` / `deer_core as layout` / `deer_vk as vk` 在 `:42-44`。crate 级 lint：`#![forbid(unsafe_code)]`、`#![deny(clippy::all)]`（`:39-40`）—— 这两条是「门禁为什么必须 clippy 干净」的来源之一。
 
 ### 2.2 树构建入口在哪
 
-- **命令式**：`crates/deer-layout/src/builder.rs` 的 `Builder` / `L`（经 prelude 暴露，`:68`），用法见 `docs/features/imperative-api.md`。
-- **场景文件**：`crates/deer-layout/src/scene.rs` 的 `parse_scene` / `encode_scene`（prelude `:71`），用法见 `docs/features/scene-file.md`。
+- **命令式**：`crates/deer-core/src/builder.rs` 的 `Builder` / `L`（经 prelude 暴露，`:68`），用法见 `docs/features/imperative-api.md`。
+- **场景文件**：`crates/deer-core/src/scene.rs` 的 `parse_scene` / `encode_scene`（prelude `:71`），用法见 `docs/features/scene-file.md`。
 - 两条路径产出**结构相等**的树：`examples/render_to_png.rs:31-37` 用 `encode_scene` → `parse_scene` → `tree.structurally_eq(&from_file)` 现场断言。
 
 ### 2.3 `window` feature 与 `deer-window` 的可选依赖关系
@@ -159,7 +159,7 @@ pub fn raw_handle_from_rwh06(raw: RwhRawWindowHandle) -> Result<deer_gpu::RawWin
 
 ```toml
 : 9  [dependencies]
-:10  deer-layout.workspace = true
+:10  deer-core.workspace = true
 :11  deer-gpu.workspace = true
 :12  deer-vk.workspace = true
 :13  # 窗口层是**可选**的：只有开 `window` feature 才会把 winit 拉进来，
@@ -260,7 +260,7 @@ cargo test -p deer-vk 2>&1 |
 |---|---|
 | `deer-gpu` | lib + `draw_list_and_cpu_backend`、`font_parse`、`font_synthetic`、`glyph_atlas`、`render_pipeline`、`text_measure`、`text_pixels`、`text_raster` |
 | `deer-gui` | lib + `docs_consistency`（文档契约） + doc-test |
-| `deer-layout` | lib + `layout_invariants`（doc-test 里有 1 条 **ignored**，是 workspace `ignored` 计数的来源之一） |
+| `deer-core` | lib + `layout_invariants`（doc-test 里有 1 条 **ignored**，是 workspace `ignored` 计数的来源之一） |
 | `deer-vk` | lib + `device_smoke`、`export_spirv`、`gpu_geom_parity`、`gpu_geom_stream`、`gpu_text_stream`、`gpu_vs_cpu`、`offscreen_render`、`pipeline_smoke`、`raw_ffi_probe`、`spirv_val`、`struct_layout`、`swapchain_smoke`、`validation_probe`、`vbo_probe`、`vulkan_smoke` + doc-test |
 | `deer-window` | lib + `window_logic` + doc-test |
 
@@ -326,9 +326,9 @@ cargo test --workspace 2>&1 | Select-String "^test result:"       # 每个靶一
   `9df8ade merge(m3a): DrawList 的非文本命令上 GPU，并与 CPU 后端逐像素对照`、`6317afb docs(m3a): 校验层测试数 161 -> 167（自身复核实测）+ 注明以运行输出为准`、`38f23bb fix(deer-vk): 终轮 —— 越界 alpha 按 CPU 基线 clamp（M1）+ 关掉 radius_kind 陷阱值（M4-3）+ Text 假阳性明确 defer`。计划里的示例提交命令也是这个形状（`docs/superpowers/plans/2026-09-27-m3a-drawlist-to-gpu-geometry.md:136`）。
 - **`unsafe` 必须带 `// SAFETY:`**：`docs/superpowers/plans/2026-09-27-m3a-drawlist-to-gpu-geometry.md:17`（「每处 `unsafe` 写 `// SAFETY:`；`cargo clippy …` 必须 0 warning」）。`deer-gui` 自身更严：`#![forbid(unsafe_code)]`（`crates/deer-gui/src/lib.rs:39`）。
 
-### ⑥ 依赖规则（deer-vk / deer-gpu / deer-layout 零第三方依赖，窗口层 winit 例外）
+### ⑥ 依赖规则（deer-vk / deer-gpu / deer-core 零第三方依赖，窗口层 winit 例外）
 
-- **规则条文**：`ROADMAP.md:109-118`「依赖纪律（硬性）」三条 —— ① 不引图形抽象库（无 `wgpu`/`ash`/`vulkano`/`glow`）；② 不引 GUI 框架（无 `egui`/`iced`/`tauri`）；③ **最小生态依赖**：目前**1 个登记在案的例外** = `deer-window` 的 `winit`；`deer-layout`/`deer-gpu`/`deer-vk` 与**没开 `window` feature 的 `deer-gui`** 仍然零第三方依赖。
+- **规则条文**：`ROADMAP.md:109-118`「依赖纪律（硬性）」三条 —— ① 不引图形抽象库（无 `wgpu`/`ash`/`vulkano`/`glow`）；② 不引 GUI 框架（无 `egui`/`iced`/`tauri`）；③ **最小生态依赖**：目前**1 个登记在案的例外** = `deer-window` 的 `winit`；`deer-core`/`deer-gpu`/`deer-vk` 与**没开 `window` feature 的 `deer-gui`** 仍然零第三方依赖。
 - **口径纪律（原文）**：`ROADMAP.md:116`「**『零依赖』这个说法此后一律写成『除窗口层（`winit`，已登记）外零第三方依赖』—— 不要再写『完全零依赖』**」。
 - **例外登记位置**：`ROADMAP.md:120-159`「依赖例外登记（Q-1：窗口层引 `winit`）」，四小节 ① 引了什么（含 `cargo tree -p deer-window --target x86_64-pc-windows-msvc -e normal` 的实测依赖树，`:122-144`）② 为什么（与自写 Win32 的对比，`:146-151`）③ 影响面（`:153-155`）④ 如何撤回（`:157-159`）。
 - **其它登记点**：`ROADMAP.md:172`（Q-1 表格行）、`README.md:34` 与 `:39-41`、`FEATURES.md` 相关行、`crates/deer-window/Cargo.toml:3` 与 `:15-16`、`crates/deer-gui/Cargo.toml:13-15`、`docs/features/window.md:100-105`。

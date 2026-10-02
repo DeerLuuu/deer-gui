@@ -19,8 +19,9 @@ cargo test --workspace
 The workspace is:
 
 ```
-crates/deer-layout   language-independent core (node tree, layout, hit testing, .dui parsing)
-crates/deer-gpu      GPU HAL + CPU reference backend
+crates/deer-core     L0 core (node tree, layout, hit testing, .dui parsing, draw, error)
+crates/deer-text     L1 TextServer (font, glyph raster, atlas, measure, text, png)
+crates/deer-gpu      L1 RenderServer·CPU + HAL contracts (Backend/Device/Swapchain/Frame)
 crates/deer-vk       Vulkan backend
 crates/deer-window   windowing layer (the only third-party dependency: winit)
 crates/deer-gui      facade crate + examples
@@ -78,6 +79,21 @@ Some tests are **skipped by default**. A skip counts as a pass, so a green run w
 
 Quoting matters when you set a gate from `cmd`. `cmd /c "set DEER_VK_WINDOW_TESTS=1 && cargo test …"` puts the space before `&&` **into the value**: the variable is `"1 "`, not `"1"`. Write `set "DEER_VK_WINDOW_TESTS=1" && …` (quoted) or `set DEER_VK_WINDOW_TESTS=1&& …` (no space). Every gate in this repository compares the value **after `trim()`**, so both forms are honored — that tolerance is asserted in `crates/deer-vk/src/ffi.rs` (`env_flag_tests`) and `crates/deer-gui/src/env_gate.rs` (unit tests). Numeric gates (`DEER_HAL_FRAMES`, `DEER_VK_FRAMES`, `DEER_WINDOW_ADAPTER`) trim before parsing for the same reason.
 
+### Know what the workspace gate does *not* compile
+
+`cargo check/test/clippy --workspace` covers each crate's **default** feature set only. Examples that declare `required-features` (e.g. `window`, `testing`) are **not compiled** by it — so a broken path inside such an example keeps the gate green and stays invisible.
+
+**Case.** During the L0–L3 crate split (LY1), **five** `required-features` examples still referenced the **old** crate/module paths, and the workspace gate was nevertheless fully green; the breakage was only found by inspecting the examples directly.
+
+⇒ Treat a workspace run as covering the **default** feature matrix only. For anything that touches paths, re-exports or public API, add a feature-inclusive pass:
+
+```sh
+cargo check  -p deer-gui --all-targets --features window,testing
+cargo clippy -p deer-gui --all-targets --features window,testing
+```
+
+This is a **known limitation of the current routine gate** and a **candidate for the standard gate**; until it is part of the routine, a green workspace run says nothing about `required-features` examples.
+
 ### Every gate must prove it is actually on
 
 A gated case or example must **print the gate state it resolved**, and acceptance must **grep that marker** — not just read the exit code. Follow the validation-layer precedent ("校验层：请求=true 实际=true"): print *what was requested* and *what is actually in effect*.
@@ -118,7 +134,7 @@ Test and assertion counts change with every milestone, so **live documentation m
 | **Dated snapshots** — `docs/M1-report.md`, `docs/superpowers/plans/*.md` | A count is allowed **only if** it is clearly dated and marked as "measured at that time", e.g. "cargo test --workspace at the M1 tag printed the numbers below" and "as the run printed". |
 | **Why** | An undated count in live docs is stale the moment the next test lands. `167 passed` was true at one commit and was already wrong one milestone later — that is the failure this rule prevents. |
 
-If you want a number to be verifiable, do not freeze it in prose: assert it in a test, or read it from the run output. When you must reference a magnitude in live docs, prefer a **stable structural fact** instead of a count — for example "one test per layout invariant in `crates/deer-layout/tests/layout_invariants.rs`" rather than "18 tests" or "24 assertions".
+If you want a number to be verifiable, do not freeze it in prose: assert it in a test, or read it from the run output. When you must reference a magnitude in live docs, prefer a **stable structural fact** instead of a count — for example "one test per layout invariant in `crates/deer-core/tests/layout_invariants.rs`" rather than "18 tests" or "24 assertions".
 
 ### Never read or write repository files through the shell
 
@@ -230,7 +246,7 @@ These are not suggestions. Each one exists because a defect was found, and each 
 
 ### Layout invariants
 
-Asserted in `crates/deer-layout/tests/layout_invariants.rs`, one test per invariant:
+Asserted in `crates/deer-core/tests/layout_invariants.rs`, one test per invariant:
 
 | # | Invariant |
 |---|---|
@@ -313,7 +329,7 @@ Please state in the PR what you verified, in what environment, and what you did 
 ## What not to do
 
 - **Do not weaken a check to get a green run.** Deleting tests, relaxing thresholds, replacing real assertions with `assert!(true)`, or turning failures into skips all count as cheating. If you cannot run something, say "not verified in this environment".
-- **Do not silently add dependencies.** `deer-layout`, `deer-gpu`, `deer-vk`, and `deer-gui` without the `window` feature must stay free of third-party dependencies. Graphics abstraction libraries (`wgpu`, `ash`, `vulkano`, `glow`) and GUI frameworks (`egui`, `iced`, `tauri`) are explicitly out of scope.
+- **Do not silently add dependencies.** `deer-core`, `deer-text`, `deer-gpu`, `deer-vk`, `deer-log`, and `deer-gui` without the `window` feature must stay free of third-party dependencies. Graphics abstraction libraries (`wgpu`, `ash`, `vulkano`, `glow`) and GUI frameworks (`egui`, `iced`, `tauri`) are explicitly out of scope.
 - **Do not write "fully zero-dependency."** The correct phrasing is "no third-party dependencies except the windowing layer (`winit`, registered)".
 - **Do not quote numbers from memory.** Test and assertion counts change every milestone; use what the run printed.
 - **Do not refactor opportunistically.** Keep a change to the step it needs.

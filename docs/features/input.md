@@ -105,7 +105,7 @@ cargo run -q -p deer-gui --features window --example interactive_form
 pub fn hit<'a>(root: &'a Node, geo: &Geometry, clip: ClipSnapshot, x: f32, y: f32) -> Option<&'a Node>
 ```
 
-- **唯一路由依据是 `deer_layout::hit_test`**（**最深命中者胜出**）—— 本层**不另写遍历**，
+- **唯一路由依据是 `deer_core::hit_test`**（**最深命中者胜出**）—— 本层**不另写遍历**，
   只补两件它不做的事：**查裁剪**、**查禁用**（否则「谁是输入路由的唯一依据」会有两份，必然漂）。
 - **禁用**：命中节点自身**或任一祖先** `props.disabled` ⇒ **整个点不命中**（**禁用子树不响应**）。
 - **有意的语义选择：不回退到祖先**。理由：回退需要「第二套路由规则」（谁是次优候选），与上一条冲突。

@@ -5,7 +5,7 @@
 >
 > **约束（读这份图前先知道）**：`crates/deer-vk` **没有** `ash` / `vulkano` / `wgpu` /
 > `shaderc` / `glslc`；`Cargo.toml` 只有两个 workspace 依赖（`crates/deer-vk/Cargo.toml:13-15`：
-> `deer-gpu.workspace` / `deer-layout.workspace`）。Vulkan 符号、结构体布局、SPIR-V 字节流
+> `deer-gpu.workspace` / `deer-core.workspace`）。Vulkan 符号、结构体布局、SPIR-V 字节流
 > **全部手写**。
 
 ---
@@ -60,7 +60,7 @@
 
 | 路径 | 内容 |
 |---|---|
-| `Cargo.toml` | 15 行；`[lib] name = "deer_vk"`（`:10`）；依赖只有 `deer-gpu`、`deer-layout`（`:13-15`） |
+| `Cargo.toml` | 15 行；`[lib] name = "deer_vk"`（`:10`）；依赖只有 `deer-gpu`、`deer-core`（`:13-15`） |
 | `spirv_probe/*.spv` | 11 个 `.spv`（`export_spirv.rs` 的产物，供官方 `spirv-val` 校验）；`vs_rect_pushconstant.spv` 也在其中 |
 | `render_out/gpu_raw.png` | 一次真机渲染的输出截图（262488 字节）；未在代码里找到引用（**未确认**它的生成者） |
 

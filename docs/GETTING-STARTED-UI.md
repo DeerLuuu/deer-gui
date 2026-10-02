@@ -18,14 +18,14 @@
 
 | crate | 职责 | 关键类型 / 函数 |
 |---|---|---|
-| `deer-layout` | 节点树、布局代数、命中测试、`.dui` 场景文件解析 | `Node` / `Kind` / `LayoutProps` / `Builder` / `L` / `layout()` / `hit_test()` / `Geometry` |
+| `deer-core` | 节点树、布局代数、命中测试、`.dui` 场景文件解析 | `Node` / `Kind` / `LayoutProps` / `Builder` / `L` / `layout()` / `hit_test()` / `Geometry` |
 | `deer-gpu` | **平台无关的绘制数据** + CPU 参考后端（软件光栅化） | `DrawList` / `DrawCmd` / `Color` / `RectI` / `Theme` / `Extent` / `CpuRenderer` |
 | `deer-vk` | Vulkan 后端：自研绑定、自研 SPIR-V 汇编器、离屏与上屏 | `WindowedRenderer` / `FrameOutcome` / `GpuGeometryRenderer` |
 | `deer-window` | 窗口 + 事件循环（**本 workspace 唯一引入第三方依赖 `winit` 的地方**） | `App` / `run()` / `WindowConfig` / `WindowInfo` / `Flow` / `InputEvent` / `Waker` / `RedrawPolicy` |
 | `deer-gui` | **门面**：一条 `use` 拿到全部能力，并给「离屏出图」的便捷入口 | `prelude` / `render_tree_to_png()` / `interaction` / `input_script` / `window`（要开 feature） |
 
-依赖方向是**单向**的：`deer-gui` → {`deer-layout`, `deer-gpu`, `deer-vk`, `deer-window`}。
-`deer-layout` 不知道 `deer-gpu` 的存在（`Builder` 的注释写明了它只维护一棵保留式节点树）。
+依赖方向是**单向**的：`deer-gui` → {`deer-core`, `deer-gpu`, `deer-vk`, `deer-window`}。
+`deer-core` 不知道 `deer-gpu` 的存在（`Builder` 的注释写明了它只维护一棵保留式节点树）。
 
 ### 1.2 一切「开窗口」的命令都必须带 `--features window`
 
@@ -104,7 +104,7 @@ renderer.draw_and_present(&list, Some(&mut engine))?;
   只在尺寸变化时缓存会造成两者不同步。
 - **度量必须两处一致**：布局用 `&engine.measure()`（`FontMeasure`），绘制也用同一个
   ⇒ 布局算出来的文字宽度与画出来的宽度不会漂。找不到字体时两侧都用 `ApproxMeasure`
-  （确定性近似：每字符 `0.6em`，`crates/deer-layout/src/layout.rs:48`）。
+  （确定性近似：每字符 `0.6em`，`crates/deer-core/src/layout.rs:48`）。
 - **字号是「一处定义」**：`theme.font_size` 同时喂给 `TextStyle.font_size`、`DrawCmd::Text.size`
   和 `TextEngine::from_font_file` 的字号。`TextEngine` 会把字号取整
   （实测 `16.0` → `font_size()` 报 `16`），所以**先建引擎、再用 `engine.font_size()` 去建
@@ -147,7 +147,7 @@ let tree = Node::new(Kind::Column, "app")
     .push(Node::new(Kind::Text, "count").with_label("count = 0"));
 ```
 
-`Builder` 的公开入口（`crates/deer-layout/src/builder.rs`）：
+`Builder` 的公开入口（`crates/deer-core/src/builder.rs`）：
 
 | 方法 | 作用 | 返回 |
 |---|---|---|
@@ -165,7 +165,7 @@ let tree = Node::new(Kind::Column, "app")
 ### 3.2 id 的生成规则（**脚本与断言都依赖它**）
 
 自动 id 是 `IdGen` **按 kind** 计数的：`column_N` / `row_N` / `text_N` / `button_N` / `field_N`
-（`crates/deer-layout/src/node.rs:238`）。显式命名会**占号**（`IdGen::reserve`），所以
+（`crates/deer-core/src/node.rs:238`）。显式命名会**占号**（`IdGen::reserve`），所以
 `Builder::new(Kind::Column, "app")` 之后第一个自动 Text 是 `text_1`。
 
 > ⚠️ **动态内容一定要显式 id**。本示例的计数显示内容每帧都变；如果它用自动 id
@@ -176,7 +176,7 @@ let tree = Node::new(Kind::Column, "app")
 
 ### 3.3 尺寸、对齐、生长
 
-`LayoutProps` 的字段（`crates/deer-layout/src/node.rs:106`）：
+`LayoutProps` 的字段（`crates/deer-core/src/node.rs:106`）：
 
 ```rust
 LayoutProps {

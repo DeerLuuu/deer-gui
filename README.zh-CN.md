@@ -32,7 +32,7 @@ deer-gui 是一个以**节点树**为核心的 GUI 运行时：你描述一棵�
 
 | 模块 / 能力 | 状态 |
 |---|---|
-| `deer-layout` —— 节点树、布局代数、命中测试、`.dui` 场景解析 | ✅ 每个布局不变式一条测试，见 `crates/deer-layout/tests/layout_invariants.rs` |
+| `deer-core` —— 节点树、布局代数、命中测试、`.dui` 场景解析 | ✅ 每个布局不变式一条测试，见 `crates/deer-core/tests/layout_invariants.rs` |
 | `deer-gpu` —— GPU HAL + CPU 参考后端（软件光栅化） | ✅ 类型与契约就位；CPU 后端能把绘制列表渲成像素，并能离屏贴真实字形 |
 | `deer-vk` —— Vulkan 后端（自己声明符号 + 运行时动态加载） | ✅ 真机枚举到 2 个 GPU（Intel RaptorLake / NVIDIA RTX 5070 Ti，Vulkan 1.4.341）；设备、管线、离屏回读，以及 surface / 交换链 / 呈现 |
 | `deer-window` —— 窗口层（winit） | ✅ **Windows** 上可建真窗口 + 事件循环；本 workspace 唯一第三方依赖 |
@@ -142,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ```
 crates/
-├── deer-layout/   语言无关核心：Node 树、布局代数、命中测试、.dui 场景解析
+├── deer-core/   语言无关核心：Node 树、布局代数、命中测试、.dui 场景解析
 │                  ── 零平台依赖，可在没有 GPU 的 CI 里完整断言
 ├── deer-gpu/      GPU HAL：Backend/Device/Swapchain/Frame trait、DrawList、CPU 参考后端
 │                  ── 加一个后端 = 实现一个 trait
@@ -173,7 +173,7 @@ crates/
 
 ### 布局引擎的不变式
 
-每条都有对应测试（`crates/deer-layout/tests/layout_invariants.rs`）：
+每条都有对应测试（`crates/deer-core/tests/layout_invariants.rs`）：
 
 | # | 不变式 |
 |---|---|
@@ -233,7 +233,7 @@ cargo run -p deer-gui --example glyph_atlas     # 字形图集打包
 
 | Crate | 第三方依赖 |
 |---|---|
-| `deer-layout` | 无 |
+| `deer-core` | 无 |
 | `deer-gpu` | 无 |
 | `deer-vk` | 无 |
 | `deer-gui`（不开 `window` feature） | 无 |

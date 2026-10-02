@@ -358,8 +358,8 @@ pub enum Pos {
 | crate | 层 | 内容 |
 |---|---|---|
 | **`deer-core`**（新） | **L0** | **零内部依赖**：原 `deer-layout` **全部** + `deer-gpu` 的 `draw` / `error`。**不含** `measure.rs` 与 HAL traits（见 ⑨⑩ 两处修订） |
-| **`deer-text`**（新） | L1 **TextServer** | `font` / `glyph` / `raster` / `atlas` / `text` + **`measure.rs`**（`FontMeasure`，LY2 随文本一起迁入） |
-| **`deer-gpu`**（收缩） | L1 **RenderServer · CPU** | `null` / `render` / `interact` / `png` + **HAL traits 暂驻本 crate**（本轮不迁，见 ⑨） |
+| **`deer-text`**（新） | L1 **TextServer** | `font` / `glyph` / `raster` / `atlas` / `text` / **`measure.rs`**（LY2 随文本一起迁入）/ **`png`**（**随迁**；`deer-gpu` 以 `pub use deer_text::png;` **保 `deer_gpu::png` 路径**） |
+| **`deer-gpu`**（收缩） | L1 **RenderServer · CPU** | `null` / `render` / `interact` + **HAL traits 暂驻本 crate**（本轮不迁，见 ⑨）—— `text_layer` / `backend_layer` 门面**已删除**（`CpuRenderer` 等回到根导出） |
 | **`deer-vk`** | L1 RenderServer · Vulkan | **不变** —— 只把依赖改指 `deer-core` |
 | **`deer-window`** | L1 DisplayServer + L3 host | **crate 不拆**；`lib.rs` **内部**拆 `display`(L1) / `host`(L3) 两个模块；**公开 API 逐字不变** |
 | **`deer-gui`**（L2）/ **`deer-log`** | L2 / 工具 | **只更新依赖路径**，不改内容语义 |
@@ -405,7 +405,7 @@ deer-gui  → 全部
 - **证据**：`FontMeasure` 的定义体消费 `crate::font::Font`（自带字体文件与缓存语义 ⇒ 属 TextServer）
   ⇒ **放进 L0 就造出 L0→L1 反向依赖**（同样的事实记录在 `feat/layer-core` @ `ed78605` 提交信息的「与计划的两处偏差」里）。
 - ⇒ **本轮处置**：`measure.rs` **留在 `deer-gpu`**，**随 LY2 迁入 `deer-text`**（与 `font`/`text` 一起）。
-- ⇒ **L0 的排版契约**是 `Measure` / `TextStyle` / `wrap_greedy`（在 `crates/deer-layout/src/layout.rs`，
+- ⇒ **L0 的排版契约**是 `Measure` / `TextStyle` / `wrap_greedy`（在 `crates/deer-core/src/layout.rs`，
   **已随 `deer-layout` 进 `deer-core`**）—— 「契约在 L0、具体度量实现在 L1」这个切分是刻意的。
 
 ### M4 的细步与状态
@@ -416,7 +416,7 @@ M4 当时还没有窗口层的 `winit` 例外 —— 该例外是 M2b 引入的�
 
 | 步 | 交付 | 状态 | 说明 |
 |---|---|---|---|
-| **M4-1** | **零依赖 TrueType 解析**（`crates/deer-gpu/src/font.rs`） | ✅ 完成 | `head`/`hhea`/`hmtx`/`maxp`/`cmap`(0/4/6/12)/`loca`/`glyf`（简单 + 复合轮廓）；**CFF（`OTTO`）明确报错**，不静默给空轮廓 |
+| **M4-1** | **零依赖 TrueType 解析**（`crates/deer-text/src/font.rs`） | ✅ 完成 | `head`/`hhea`/`hmtx`/`maxp`/`cmap`(0/4/6/12)/`loca`/`glyf`（简单 + 复合轮廓）；**CFF（`OTTO`）明确报错**，不静默给空轮廓 |
 | **M4-2** | **字形光栅化**（`raster.rs` 的 `Rasterizer`） | ✅ 完成 | 轮廓自适应展平 → **nonzero** 扫描填充 → 超采样抗锯齿；确定性 |
 | **M4-3** | **字形图集**（`atlas.rs` 的 `GlyphAtlas`） | ✅ 完成 | 货架打包 + 1px padding + **增高不搬动已有槽位** + 幂等 + 超限返回 `None` |
 | **M4-4** | **真实度量与换行**（`measure.rs` 的 `FontMeasure`） | ✅ 完成 | 用 `hmtx` 真实 advance + `hhea` 升降部替换「每字符 0.6em」；`ApproxMeasure` 保留作确定性测试用 |
@@ -470,7 +470,7 @@ M4 当时还没有窗口层的 `winit` 例外 —— 该例外是 M2b 引入的�
    以及**没开 `window` feature** 的 `deer-gui`。
    **「零依赖」这个说法此后一律写成「除窗口层（`winit`，已登记）外零第三方依赖」** —— 不要再写「完全零依赖」。
    后续新增例外必须逐条登记并说明理由；字体解析原先预计可能需要 `ttf-parser`，
-   **实际未引**：M4-1 自研（见 `crates/deer-gpu/src/font.rs`）。
+   **实际未引**：M4-1 自研（见 `crates/deer-text/src/font.rs`）。
 
 ### 依赖例外登记（Q-1：窗口层引 `winit`）
 

@@ -15,7 +15,7 @@
 什么时候**不**用它：只想出图的话直接用 `render_tree_to_png`，它内部已经算了布局。
 
 **关键特性**：布局是**纯函数** —— 不改输入树、不读环境、同样的输入永远给同样的输出。
-所以它能在没有 GPU、没有浏览器的环境里被完整测试（`crates/deer-layout/tests/` 下的断言就是这么来的）。
+所以它能在没有 GPU、没有浏览器的环境里被完整测试（`crates/deer-core/tests/` 下的断言就是这么来的）。
 
 ## 2. 最小示例
 
@@ -45,8 +45,8 @@ for (id, r) in &geo {
 | 函数 | 输入 | 输出 |
 |---|---|---|
 | `deer_gui::layout_tree(&tree, w, h, theme)` | 树、画布宽高、主题 | `Geometry`（`HashMap<String, Rect>`） |
-| `deer_layout::layout(&tree, Rect, TextStyle, &Measure)` | 底层版：自己给根盒子与度量 | `Geometry` |
-| `deer_layout::layout_with_scroll(&tree, Rect, TextStyle, &Measure, &ScrollOffsets)` | 带滚动偏移 | `(Geometry, ScrollMetrics)`（上限表） |
+| `deer_core::layout(&tree, Rect, TextStyle, &Measure)` | 底层版：自己给根盒子与度量 | `Geometry` |
+| `deer_core::layout_with_scroll(&tree, Rect, TextStyle, &Measure, &ScrollOffsets)` | 带滚动偏移 | `(Geometry, ScrollMetrics)`（上限表） |
 
 `Rect` 的字段：`x` / `y` / `w` / `h`，都是 `f32`（但**一定是整数**，见下面的不变式）。
 

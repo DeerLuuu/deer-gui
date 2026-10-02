@@ -1,4 +1,4 @@
-# 事实地图 01：`deer-layout` + `deer-gpu`（CPU 链路）
+# 事实地图 01：`deer-core` + `deer-gpu`（CPU 链路）
 
 > **性质**：只读测绘产出的事实地图，供「代码库导览」第 1~4 讲取材。
 > **纪律**：每条结论都带 `path:line` 锚点；签名/常量值/行号照抄真实代码；读不到的写「未确认」。
@@ -11,25 +11,25 @@
 
 | crate | 一句话职责 | 锚点 |
 |---|---|---|
-| `deer-layout` | **语言无关的纯数据核心**：节点树（唯一真相）+ 布局代数（测量/排布/命中测试）+ `.dui` 场景文件解析，完全不知道 GPU／窗口／事件循环的存在。 | `crates/deer-layout/src/lib.rs:1-21` |
+| `deer-core` | **语言无关的纯数据核心**：节点树（唯一真相）+ 布局代数（测量/排布/命中测试）+ `.dui` 场景文件解析，完全不知道 GPU／窗口／事件循环的存在。 | `crates/deer-core/src/lib.rs:1-21` |
 | `deer-gpu` | **GPU 硬件抽象层（HAL）+ CPU 参考后端**：定义后端必须实现的契约与平台无关的绘制数据（`DrawList`），并用纯 CPU 软件光栅化把 `DrawList` 变成像素，充当 GPU 侧的黄金基准；自身**不依赖任何图形库**。 | `crates/deer-gpu/src/lib.rs:1-20`、`crates/deer-gpu/src/null.rs:1-8` |
 
-依赖方向（`crates/deer-gpu/Cargo.toml`）：`deer-gpu` 只依赖 `deer-layout`；`crates/deer-layout/Cargo.toml` 的 `[dependencies]` 为空。两者都没有第三方依赖，也没有 `[dev-dependencies]`。
+依赖方向（`crates/deer-gpu/Cargo.toml`）：`deer-gpu` 只依赖 `deer-core`；`crates/deer-core/Cargo.toml` 的 `[dependencies]` 为空。两者都没有第三方依赖，也没有 `[dev-dependencies]`。
 
 ---
 
 ## 2. 文件清单表
 
-### 2.1 `crates/deer-layout/src/*.rs`
+### 2.1 `crates/deer-core/src/*.rs`
 
 | 文件 | 行数 | 职责 | 关键类型/函数（带行号） |
 |---|---|---|---|
-| `crates/deer-layout/src/lib.rs` | 37 | crate 门面：模块声明 + re-export + 版本常量；用模块文档写清「两条构筑路径、一棵树」。 | `pub mod builder/layout/node/scene`（`:26-29`）；re-exports（`:31-34`）；`pub const CORE_VERSION: &str = "0.0.0"`（`:37`） |
-| `crates/deer-layout/src/node.rs` | 249 | 节点树数据模型（含确定性 id 生成规则）。 | `enum Kind`（`:21-32`）+ `as_str`（`:35`）/`parse`（`:45`）/`is_container`（`:57`）；`enum Align`（`:64-69`）+`parse`（`:72`）；`enum Size { Px, Pct }`（`:85-88`）；`struct Rect`（`:91-96`）+`new`（`:99`）；`struct LayoutProps`（`:106-115`）；`struct NodeProps`（`:119-122`）；`struct Node`（`:125-131`）；`Node::{new:134, with_layout:145, with_props:150, with_id:156, with_label:161, disabled:166, push:171, is_container:176, walk:181, structurally_eq:189}`；`struct IdGen`（`:209-212`）+`reserve`（`:222`）+`next`（`:238`） |
-| `crates/deer-layout/src/layout.rs` | 367 | 布局引擎：文本度量接口 + 固有尺寸测量 + 排布（两趟）+ 命中测试；列出 I-1..I-7 不变量（`:3-12`）。 | `struct TextStyle`（`:20-23`，Default = 13.0/18.0 `:25-32`）；`trait Measure`（`:36-39`）；`struct ApproxMeasure`（`:46`）+ impl（`:48-62`）；`mod metrics`（`:65-71`）；`fn resolve`（`:73-78`）；`type Intrinsics`（`:81`）；`fn measure_tree`（`:83`）；`fn measure_into`（`:89`）；`type Geometry`（`:175`）；`fn layout`（`:178`）；`struct PlaceCtx`（`:203-206`）+ `place`（`:209`）；`fn hit_test`（`:353`） |
-| `crates/deer-layout/src/builder.rs` | 254 | 命令式（imgui 手感）构筑 + 保留式节点树。 | `struct Builder`（`:21-26`）；`new`（`:29`）、`auto`（`:42`）、`padding`（`:52`）、`gap`（`:57`）、`size`（`:62`）、`node_at_mut`（`:68`）、`push`（`:76`）、`text`（`:86`）、`button`（`:91`）、`button_opts`（`:96`）、`field`（`:102`）、`push_named`（`:110`）、`container_auto`（`:122`）、`container`（`:128`）、`container_opts`（`:145`）、`container_with`（`:158`）、`build`（`:182`）、`root_id`（`:186`）；`struct L`（`:193-201`）+ 构造器（`:204-235`）；`fn props`（`:249`） |
-| `crates/deer-layout/src/scene.rs` | 407 | `.dui`（`.tscn` 式缩进格式）解析与编码；纯解析不执行任何东西（`:17`）。 | `struct SceneError`（`:24-28`）+ `Display`（`:30-34`）+ `Error`（`:36`）；`fn preprocess`（`:53`）；`enum AttrVal`（`:89-92`）；`fn parse_attrs`（`:95`）；`const KNOWN_ATTRS`（`:143-145`）；`as_num`（`:147`）/`as_size`（`:156`）/`as_align`（`:175`）；`struct Open`（`:188-192`）；`fn node_at`（`:194`）；`fn parse_scene`（`:203`）；`fn encode_scene`（`:335`）；`fmt_num`（`:382`）/`align_str`（`:390`）/`quote`（`:399`） |
-| `crates/deer-layout/tests/layout_invariants.rs` | 354 | 核心不变式测试套件（T1..T14，含 V0 三个缺陷 B-1/B-2/B-3 的回归守卫，`:1-6`）。 | `geo`（`:18`）、`imperative`（`:23`）、`SCENE`（`:34-41`）；T1 同构（`:48`、`:58`）、T2 确定性/稳定编码（`:83`、`:94`）、T3 纯函数（`:100`）、T4 固有尺寸（`:112`、`:123`）、T5 grow（`:143`）、T6 主轴对齐（`:171`）、T7 交叉轴 stretch（`:195`）、T8 像素取整（`:214`）、T9 命中测试（`:229`、`:239`）、T10 场景往返（`:258`）、T11 错误带行号（`:271`）、T12 百分比（`:297`）、T13（`:319`）、T14（`:330`） |
+| `crates/deer-core/src/lib.rs` | 37 | crate 门面：模块声明 + re-export + 版本常量；用模块文档写清「两条构筑路径、一棵树」。 | `pub mod builder/layout/node/scene`（`:26-29`）；re-exports（`:31-34`）；`pub const CORE_VERSION: &str = "0.0.0"`（`:37`） |
+| `crates/deer-core/src/node.rs` | 249 | 节点树数据模型（含确定性 id 生成规则）。 | `enum Kind`（`:21-32`）+ `as_str`（`:35`）/`parse`（`:45`）/`is_container`（`:57`）；`enum Align`（`:64-69`）+`parse`（`:72`）；`enum Size { Px, Pct }`（`:85-88`）；`struct Rect`（`:91-96`）+`new`（`:99`）；`struct LayoutProps`（`:106-115`）；`struct NodeProps`（`:119-122`）；`struct Node`（`:125-131`）；`Node::{new:134, with_layout:145, with_props:150, with_id:156, with_label:161, disabled:166, push:171, is_container:176, walk:181, structurally_eq:189}`；`struct IdGen`（`:209-212`）+`reserve`（`:222`）+`next`（`:238`） |
+| `crates/deer-core/src/layout.rs` | 367 | 布局引擎：文本度量接口 + 固有尺寸测量 + 排布（两趟）+ 命中测试；列出 I-1..I-7 不变量（`:3-12`）。 | `struct TextStyle`（`:20-23`，Default = 13.0/18.0 `:25-32`）；`trait Measure`（`:36-39`）；`struct ApproxMeasure`（`:46`）+ impl（`:48-62`）；`mod metrics`（`:65-71`）；`fn resolve`（`:73-78`）；`type Intrinsics`（`:81`）；`fn measure_tree`（`:83`）；`fn measure_into`（`:89`）；`type Geometry`（`:175`）；`fn layout`（`:178`）；`struct PlaceCtx`（`:203-206`）+ `place`（`:209`）；`fn hit_test`（`:353`） |
+| `crates/deer-core/src/builder.rs` | 254 | 命令式（imgui 手感）构筑 + 保留式节点树。 | `struct Builder`（`:21-26`）；`new`（`:29`）、`auto`（`:42`）、`padding`（`:52`）、`gap`（`:57`）、`size`（`:62`）、`node_at_mut`（`:68`）、`push`（`:76`）、`text`（`:86`）、`button`（`:91`）、`button_opts`（`:96`）、`field`（`:102`）、`push_named`（`:110`）、`container_auto`（`:122`）、`container`（`:128`）、`container_opts`（`:145`）、`container_with`（`:158`）、`build`（`:182`）、`root_id`（`:186`）；`struct L`（`:193-201`）+ 构造器（`:204-235`）；`fn props`（`:249`） |
+| `crates/deer-core/src/scene.rs` | 407 | `.dui`（`.tscn` 式缩进格式）解析与编码；纯解析不执行任何东西（`:17`）。 | `struct SceneError`（`:24-28`）+ `Display`（`:30-34`）+ `Error`（`:36`）；`fn preprocess`（`:53`）；`enum AttrVal`（`:89-92`）；`fn parse_attrs`（`:95`）；`const KNOWN_ATTRS`（`:143-145`）；`as_num`（`:147`）/`as_size`（`:156`）/`as_align`（`:175`）；`struct Open`（`:188-192`）；`fn node_at`（`:194`）；`fn parse_scene`（`:203`）；`fn encode_scene`（`:335`）；`fmt_num`（`:382`）/`align_str`（`:390`）/`quote`（`:399`） |
+| `crates/deer-core/tests/layout_invariants.rs` | 354 | 核心不变式测试套件（T1..T14，含 V0 三个缺陷 B-1/B-2/B-3 的回归守卫，`:1-6`）。 | `geo`（`:18`）、`imperative`（`:23`）、`SCENE`（`:34-41`）；T1 同构（`:48`、`:58`）、T2 确定性/稳定编码（`:83`、`:94`）、T3 纯函数（`:100`）、T4 固有尺寸（`:112`、`:123`）、T5 grow（`:143`）、T6 主轴对齐（`:171`）、T7 交叉轴 stretch（`:195`）、T8 像素取整（`:214`）、T9 命中测试（`:229`、`:239`）、T10 场景往返（`:258`）、T11 错误带行号（`:271`）、T12 百分比（`:297`）、T13（`:319`）、T14（`:330`） |
 
 ### 2.2 `crates/deer-gpu/src/*.rs`
 
@@ -39,13 +39,13 @@
 | `crates/deer-gpu/src/draw.rs` | 161 | 平台无关绘制数据：颜色 / 整数矩形 / 绘制命令 / 绘制列表 + 裁剪平衡不变式。 | `struct Color`（`:7-12`）+ `rgb`（`:15`）/`rgba`（`:18`）/`TRANSPARENT`（`:21`）/`WHITE`（`:22`）/`packed`（`:25-27`）；`struct RectI`（`:32-37`）+ `new`（`:40`）/`right`（`:43`）/`bottom`（`:46`）/`contains`（`:49-51`）；`struct TextureId(u32)`（`:56`）；`enum DrawCmd`（`:64-85`）；`struct DrawList`（`:89-93`）+ `new`（`:96`）/`from_cmds`（`:104`）/`push`（`:112`）/`len`（`:121`）/`is_empty`（`:125`）/`clip_balanced`（`:130`）/`counts`（`:135`）；`struct DrawCounts`（`:153-161`） |
 | `crates/deer-gpu/src/null.rs` | 554 | **CPU 参考后端**：帧缓冲、CPU HAL 实现、软件光栅化（矩形/圆角/描边/文字/裁剪栈）。 | `const CPU_ADAPTER_NAME`（`:19`）；`struct Framebuffer`（`:23-28`）+ `new`（`:31`）/`clear`（`:41`）/`pixel`（`:52`）/`count_color`（`:66`）/`bytes_eq`（`:75`）/`to_rgba`（`:79`）；`struct CpuBackend`（`:86`）+ `new`（`:89`）+ `impl Backend`（`:94-116`）；`struct CpuDevice`（`:119-122`）+ `render_to_framebuffer`（`:129`）+ `impl Device`（`:139-182`）；`struct CpuSwapchain`（`:184`）+ `impl Swapchain`（`:188-199`）；`struct CpuFrame`（`:202-207`）+ `set_extent`（`:211`）/`framebuffer`（`:216`）/`render_into`（`:221`）+ `impl Frame`（`:226-257`）；`struct CpuRenderer`（`:268-270`）+ `new`（`:274`）/`with_text`（`:279`）/`text`（`:284`）/`render`（`:292`）；`fn soft_rasterize_with`（`:308`）；`fn soft_rasterize`（`:359`）；`fn blend`（`:363`）；`fn blend_cov`（`:370`）；`fn fill`（`:387`）；`fn inside_rounded`（`:400`）；`fn stroke`（`:421`）；`struct TextDraw`（`:435-441`）；`fn draw_text`（`:448`）；`fn draw_text_real`（`:493`） |
 | `crates/deer-gpu/src/render.rs` | 153 | 把「树 + 几何 + 主题」翻成 `DrawList`（新增控件类型唯一要改的地方，`:3-4`）+ 一个只发 `NodeHint` 的诊断渲染器。 | `struct DefaultRenderer<'a, M: Measure>`（`:17-20`）+ `new`（`:23`）/`build`（`:28`）/`emit`（`:34`）/`text_style`（`:117`）；`struct NullRenderer`（`:126`）+ `build`（`:129`）；`fn build_draw_list`（`:148`）；`pub const TRANSPARENT: Color`（`:153`） |
-| `crates/deer-gpu/src/atlas.rs` | 282 | 字形图集：**货架（shelf）打包** + 按需增高 + 双份数据（大图给 GPU / 逐行紧致副本给 `get()`）。 | `const PADDING: u32 = 1`（`:50`）；`pub const MAX_DIMENSION: u32 = 8192`（`:55`）；`struct Entry`（`:58-63`）；`struct GlyphAtlas`（`:66-83`）+ `new`（`:90`）/`slot_of`（`:104`）/`insert`（`:120`）/`get`（`:227`）/`contains`（`:233`）/`size`（`:238`）/`coverage`（`:243`）/`len`（`:248`）/`is_empty`（`:253`）/`used_pixels`（`:258`）/`utilization`（`:263`）/`ensure_height`（`:276`） |
-| `crates/deer-gpu/src/glyph.rs` | 207 | 字形流水线的共享数据契约：覆盖率位图 / 图集键 / 图集槽位；模块文档给出坐标约定（`:7-19`）。 | `struct GlyphImage`（`:25-43`）+ `blank`（`:47`）/`new`（`:59`）/`is_blank`（`:83`）/`coverage_at`（`:88`）/`coverage_sum`（`:96`）/`max_coverage`（`:101`）/`ink_pixels`（`:106`）/`mean_coverage`（`:114`）；`struct GlyphKey`（`:127-132`）+ `new`（`:135`）；`struct AtlasSlot`（`:148-153`）+ `right`（`:156`）/`bottom`（`:159`）/`overlaps`（`:163`）；内联单测 `mod tests`（`:171-206`） |
-| `crates/deer-gpu/src/raster.rs` | 332 | 字形光栅化：轮廓 → 折线（自适应展平）→ **nonzero winding** 填充 → 超采样覆盖率。 | `const FLATNESS_TOLERANCE: f32 = 0.25`（`:52`）；`MAX_FLATTEN_DEPTH: u32 = 16`（`:58`）；`MAX_SUPERSAMPLE: u32 = 64`（`:64`）；`MAX_BITMAP_DIM: u32 = 4096`（`:70`）；`DEGENERATE_LEN2: f32 = 1e-12`（`:73`）；`struct Rasterizer`（`:79-84`）+ `new`（`:88`）/`with_supersample`（`:96`）/`rasterize`（`:109`）/`rasterize_char`（`:223`）；`to_bitmap`（`:236`）/`dist2`（`:241`）/`mid`（`:248`）/`push_distinct`（`:253`）/`point_line_dist`（`:265`）/`flatten_quad`（`:276`）/`flatten_cubic`（`:291`）/`winding_number`（`:315`）/`is_left`（`:330`） |
-| `crates/deer-gpu/src/measure.rs` | 217 | **真实字体度量 + 贪心换行**：`unitsPerEm`/`hmtx`/`hhea` → 像素；实现 `deer_layout::Measure`。 | `struct FontMeasure<'a>`（`:48-53`）+ `new`（`:57`）/`scale`（`:65`）/`ascent`（`:74`）/`descent`（`:83`）/`line_height`（`:88`）/`advance`（`:95`）/`text_width`（`:114`）/`sum_advances`（`:119`）/`wrap`（`:124`）+ `impl Measure`（`:182-196`）；`fn find_system_font`（`:205`） |
-| `crates/deer-gpu/src/text.rs` | 241 | 文字引擎：字体 + 图集 + 每字形排版信息；三条链（font/raster/atlas）的汇合点（`:1-31`）。 | `const ATLAS_WIDTH: u32 = 512`（`:70`）；`struct GlyphPlacement`（`:46-55`）；`struct TextEngine`（`:58-65`）+ `from_font`（`:74`）/`from_font_bytes`（`:85`）/`from_font_file`（`:90`）/`from_system_font`（`:101`）/`font`（`:112`）/`font_size`（`:116`）/`set_font_size`（`:121`）/`measure`（`:126`）/`glyph`（`:138`）/`text_width`（`:186`）/`rasterized_glyphs`（`:197`）/`missing_glyphs`（`:203`）/`atlas`（`:207`）/`atlas_png`（`:212`）；手写 `Debug`（`:230-240`） |
-| `crates/deer-gpu/src/font.rs` | 885 | **零依赖 TrueType 解析**：sfnt/ttcf 目录、`head`/`maxp`/`hhea`/`hmtx`/`cmap`(0/4/6/12)/`loca`/`glyf`（简单 + 复合）。 | `struct Point`（`:39-43`）；`enum Segment`（`:47-58`）；`struct Contour`（`:62-65`）；`struct Glyph`（`:69-78`）+ `is_blank`（`:82`）/`outline_bbox`（`:90`）；`enum CmapFormat`（`:112-117`）；`struct Font`（`:120-137`）；`tag/u8_at/u16_at/i16_at/u32_at`（`:140-169`）；`Font::parse`（`:176`）/`table_range`（`:352`）/`table_directory`（`:360`）/`face_offset`（`:365`）/`table`（`:377`）/`glyph_index`（`:399`）/`cmap0`（`:431`）/`cmap4`（`:438`）/`cmap6`（`:474`）/`cmap12`（`:483`）/`glyph`（`:506`）/`loca_range`（`:558`）/`h_metrics`（`:576`）/`parse_simple_glyph`（`:600`）/`parse_composite_glyph`（`:697`）/`line_height_units`（`:786`）；`f2dot14`（`:792`）/`transform_contour`（`:797`）/`flatten_contour`（`:832`） |
-| `crates/deer-gpu/src/png.rs` | 170 | 零依赖 PNG 编码器（RGBA8）：zlib **stored** deflate + 手写 CRC32/Adler32。 | `fn encode_rgba`（`:14`）/`write_chunk`（`:57`）/`zlib_store`（`:68`）/`crc32`（`:92`）/`adler32`（`:105`）；内联单测（`:115-169`） |
+| `crates/deer-text/src/atlas.rs` | 282 | 字形图集：**货架（shelf）打包** + 按需增高 + 双份数据（大图给 GPU / 逐行紧致副本给 `get()`）。 | `const PADDING: u32 = 1`（`:50`）；`pub const MAX_DIMENSION: u32 = 8192`（`:55`）；`struct Entry`（`:58-63`）；`struct GlyphAtlas`（`:66-83`）+ `new`（`:90`）/`slot_of`（`:104`）/`insert`（`:120`）/`get`（`:227`）/`contains`（`:233`）/`size`（`:238`）/`coverage`（`:243`）/`len`（`:248`）/`is_empty`（`:253`）/`used_pixels`（`:258`）/`utilization`（`:263`）/`ensure_height`（`:276`） |
+| `crates/deer-text/src/glyph.rs` | 207 | 字形流水线的共享数据契约：覆盖率位图 / 图集键 / 图集槽位；模块文档给出坐标约定（`:7-19`）。 | `struct GlyphImage`（`:25-43`）+ `blank`（`:47`）/`new`（`:59`）/`is_blank`（`:83`）/`coverage_at`（`:88`）/`coverage_sum`（`:96`）/`max_coverage`（`:101`）/`ink_pixels`（`:106`）/`mean_coverage`（`:114`）；`struct GlyphKey`（`:127-132`）+ `new`（`:135`）；`struct AtlasSlot`（`:148-153`）+ `right`（`:156`）/`bottom`（`:159`）/`overlaps`（`:163`）；内联单测 `mod tests`（`:171-206`） |
+| `crates/deer-text/src/raster.rs` | 332 | 字形光栅化：轮廓 → 折线（自适应展平）→ **nonzero winding** 填充 → 超采样覆盖率。 | `const FLATNESS_TOLERANCE: f32 = 0.25`（`:52`）；`MAX_FLATTEN_DEPTH: u32 = 16`（`:58`）；`MAX_SUPERSAMPLE: u32 = 64`（`:64`）；`MAX_BITMAP_DIM: u32 = 4096`（`:70`）；`DEGENERATE_LEN2: f32 = 1e-12`（`:73`）；`struct Rasterizer`（`:79-84`）+ `new`（`:88`）/`with_supersample`（`:96`）/`rasterize`（`:109`）/`rasterize_char`（`:223`）；`to_bitmap`（`:236`）/`dist2`（`:241`）/`mid`（`:248`）/`push_distinct`（`:253`）/`point_line_dist`（`:265`）/`flatten_quad`（`:276`）/`flatten_cubic`（`:291`）/`winding_number`（`:315`）/`is_left`（`:330`） |
+| `crates/deer-text/src/measure.rs` | 217 | **真实字体度量 + 贪心换行**：`unitsPerEm`/`hmtx`/`hhea` → 像素；实现 `deer_core::Measure`。 | `struct FontMeasure<'a>`（`:48-53`）+ `new`（`:57`）/`scale`（`:65`）/`ascent`（`:74`）/`descent`（`:83`）/`line_height`（`:88`）/`advance`（`:95`）/`text_width`（`:114`）/`sum_advances`（`:119`）/`wrap`（`:124`）+ `impl Measure`（`:182-196`）；`fn find_system_font`（`:205`） |
+| `crates/deer-text/src/text.rs` | 241 | 文字引擎：字体 + 图集 + 每字形排版信息；三条链（font/raster/atlas）的汇合点（`:1-31`）。 | `const ATLAS_WIDTH: u32 = 512`（`:70`）；`struct GlyphPlacement`（`:46-55`）；`struct TextEngine`（`:58-65`）+ `from_font`（`:74`）/`from_font_bytes`（`:85`）/`from_font_file`（`:90`）/`from_system_font`（`:101`）/`font`（`:112`）/`font_size`（`:116`）/`set_font_size`（`:121`）/`measure`（`:126`）/`glyph`（`:138`）/`text_width`（`:186`）/`rasterized_glyphs`（`:197`）/`missing_glyphs`（`:203`）/`atlas`（`:207`）/`atlas_png`（`:212`）；手写 `Debug`（`:230-240`） |
+| `crates/deer-text/src/font.rs` | 885 | **零依赖 TrueType 解析**：sfnt/ttcf 目录、`head`/`maxp`/`hhea`/`hmtx`/`cmap`(0/4/6/12)/`loca`/`glyf`（简单 + 复合）。 | `struct Point`（`:39-43`）；`enum Segment`（`:47-58`）；`struct Contour`（`:62-65`）；`struct Glyph`（`:69-78`）+ `is_blank`（`:82`）/`outline_bbox`（`:90`）；`enum CmapFormat`（`:112-117`）；`struct Font`（`:120-137`）；`tag/u8_at/u16_at/i16_at/u32_at`（`:140-169`）；`Font::parse`（`:176`）/`table_range`（`:352`）/`table_directory`（`:360`）/`face_offset`（`:365`）/`table`（`:377`）/`glyph_index`（`:399`）/`cmap0`（`:431`）/`cmap4`（`:438`）/`cmap6`（`:474`）/`cmap12`（`:483`）/`glyph`（`:506`）/`loca_range`（`:558`）/`h_metrics`（`:576`）/`parse_simple_glyph`（`:600`）/`parse_composite_glyph`（`:697`）/`line_height_units`（`:786`）；`f2dot14`（`:792`）/`transform_contour`（`:797`）/`flatten_contour`（`:832`） |
+| `crates/deer-text/src/png.rs` | 170 | 零依赖 PNG 编码器（RGBA8）：zlib **stored** deflate + 手写 CRC32/Adler32。 | `fn encode_rgba`（`:14`）/`write_chunk`（`:57`）/`zlib_store`（`:68`）/`crc32`（`:92`）/`adler32`（`:105`）；内联单测（`:115-169`） |
 | `crates/deer-gpu/src/error.rs` | 36 | HAL 错误类型（初始化失败不得 panic，`:3-4`）。 | `enum GpuError`（`:9-20`）；`Display`（`:22-32`）；`Error`（`:34`）；`type GpuResult<T>`（`:36`） |
 
 `crates/deer-gpu/src/paint.rs` **不存在**（导览计划里写的「若存在」可以排除）。
@@ -60,18 +60,18 @@
 
 | 步 | 函数 | 输入 → 输出 | 锚点 |
 |---|---|---|---|
-| A1 | `Builder::new(kind, id)` / `Builder::auto(kind)` | `(Kind, impl Into<String>)` → `Builder`（内部 `Node` + `IdGen`） | `crates/deer-layout/src/builder.rs:29`、`:42` |
+| A1 | `Builder::new(kind, id)` / `Builder::auto(kind)` | `(Kind, impl Into<String>)` → `Builder`（内部 `Node` + `IdGen`） | `crates/deer-core/src/builder.rs:29`、`:42` |
 | A2 | `Builder::{text,button,field,container*}` | `impl Into<String>` / 闭包 → `String`（叶子 id）/ `()` | `builder.rs:86`、`:91`、`:102`、`:122`、`:128` |
 | A3 | `Builder::build()` | `&self` → `Node`（`self.root.clone()`） | `builder.rs:182` |
-| B1 | `parse_scene(src, source)` | `(&str, &str)` → `Result<Node, SceneError>` | `crates/deer-layout/src/scene.rs:203` |
+| B1 | `parse_scene(src, source)` | `(&str, &str)` → `Result<Node, SceneError>` | `crates/deer-core/src/scene.rs:203` |
 | B2 | `encode_scene(root)` | `&Node` → `String`（`parse(encode(t))` 必须结构相等） | `scene.rs:335` |
-| — | 两路相等性判据 `Node::structurally_eq` | `(&Node, &Node)` → `bool` | `crates/deer-layout/src/node.rs:189` |
+| — | 两路相等性判据 `Node::structurally_eq` | `(&Node, &Node)` → `bool` | `crates/deer-core/src/node.rs:189` |
 
 ### 3.2 树 → 几何表（布局，纯函数）
 
 | 步 | 函数 | 输入 → 输出 | 锚点 |
 |---|---|---|---|
-| L1 | `layout(root, box_, style, m)` | `(&Node, Rect, TextStyle, &impl Measure)` → `Geometry`（`HashMap<String, Rect>`） | `crates/deer-layout/src/layout.rs:178` |
+| L1 | `layout(root, box_, style, m)` | `(&Node, Rect, TextStyle, &impl Measure)` → `Geometry`（`HashMap<String, Rect>`） | `crates/deer-core/src/layout.rs:178` |
 | L2 | `layout` 内部第一趟 `measure_tree(root, style, m)` | `(&Node, TextStyle, &impl Measure)` → `Intrinsics`（`HashMap<String,(f32,f32)>`） | `layout.rs:179`、定义 `:83` |
 | L3 | `measure_into(n, style, m, out)` 递归（自底向上） | `&Node` → `(f32, f32)` 固有尺寸（`ceil()` 后写入 `out`） | `layout.rs:89`、`ceil` 在 `:169` |
 | L4 | `PlaceCtx::place(n, rect, assigned, avail_w, avail_h)` 递归（自顶向下） | 分配盒 + 可用盒 → 写入 `Geometry` | `layout.rs:209`、插入 `:226-229` |
@@ -104,7 +104,7 @@
 | C9 | `draw_text_real(engine, fb, cmd, clip)`（**有字库**路径） | `&mut TextEngine` → 逐字形采样图集覆盖率 → `blend_cov` | `null.rs:493` |
 | C10 | `blend(fb, x, y, c, clip)` → `blend_cov(..., cov = 1.0, ...)` | 整数像素坐标 → 就地改写 4 字节 | `null.rs:363-365`、`:370` |
 | C11 | `Framebuffer::pixels` / `to_rgba()` | `&self` → `&[u8]`（RGBA8 行优先无 padding） | `null.rs:27`、`:79` |
-| C12 | `encode_rgba(w, h, pixels)`（可选，落盘） | `(u32,u32,&[u8])` → `Result<Vec<u8>, String>` | `crates/deer-gpu/src/png.rs:14` |
+| C12 | `encode_rgba(w, h, pixels)`（可选，落盘） | `(u32,u32,&[u8])` → `Result<Vec<u8>, String>` | `crates/deer-text/src/png.rs:14` |
 
 ### 3.5 门面 crate 的实际调用链（宿主看一眼就懂）
 
@@ -121,7 +121,7 @@
 
 > 「谁在用它」来自全仓库 `grep`；标注「无调用点」表示除定义/文档/测试外没有消费者。
 
-### 4.1 `deer-layout`
+### 4.1 `deer-core`
 
 #### `node.rs`
 
@@ -159,7 +159,7 @@
 | 签名 | 行 | 谁在用它 |
 |---|---|---|
 | `pub struct TextStyle { pub font_size: f32, pub line_height: f32 }` | `:20-23` | `deer-gui/src/lib.rs:87`/`:150`/`:187`；`render.rs:117-122`；`measure.rs:185`/`:193`；所有测试 |
-| `pub trait Measure { fn width(&self, text: &str, style: TextStyle) -> f32; fn height(&self, text: &str, style: TextStyle, max_width: f32) -> f32; }` | `:36-39` | 实现者只有两个：`ApproxMeasure`（`layout.rs:48`）、`FontMeasure`（`crates/deer-gpu/src/measure.rs:182`） |
+| `pub trait Measure { fn width(&self, text: &str, style: TextStyle) -> f32; fn height(&self, text: &str, style: TextStyle, max_width: f32) -> f32; }` | `:36-39` | 实现者只有两个：`ApproxMeasure`（`layout.rs:48`）、`FontMeasure`（`crates/deer-text/src/measure.rs:182`） |
 | `pub struct ApproxMeasure;` | `:46` | `deer-gui/src/lib.rs:83`/`:191`；`render_pipeline.rs:10`；`layout_invariants.rs:19` 等；`text_measure.rs:144`（作对照） |
 | `pub mod metrics { pub const BUTTON_PAD_X: f32 = 10.0; pub const BUTTON_MIN_W: f32 = 28.0; pub const BUTTON_MIN_H: f32 = 22.0; pub const FIELD_MIN_W: f32 = 60.0; pub const FIELD_H: f32 = 22.0; }` | `:65-71` | 只被 `layout.rs:147`/`:148`/`:155`/`:156` 自己用 |
 | `pub type Intrinsics = HashMap<String, (f32, f32)>;` | `:81` | `measure_tree` 返回值；`layout.rs:184` 的 `PlaceCtx.intrinsic` |
@@ -481,7 +481,7 @@ cargo test -p deer-gpu --test glyph_atlas          # 单个集成测试文件
 cargo test -p deer-gpu --test text_raster -- --nocapture   # 看「跳过系统字体」的说明
 ```
 
-> 依赖系统字体的用例在 `%WINDIR%\Fonts` 找不到 `consola.ttf`/`arial.ttf`/`segoeui.ttf` 时**明确跳过并打印原因**，不伪装通过（`crates/deer-gpu/src/measure.rs:205-216`、`crates/deer-gpu/tests/text_raster.rs:7-8`、`font_parse.rs:9-11`）。
+> 依赖系统字体的用例在 `%WINDIR%\Fonts` 找不到 `consola.ttf`/`arial.ttf`/`segoeui.ttf` 时**明确跳过并打印原因**，不伪装通过（`crates/deer-text/src/measure.rs:205-216`、`crates/deer-gpu/tests/text_raster.rs:7-8`、`font_parse.rs:9-11`）。
 
 | 文件 | 行数 | 守的是什么 | 关键测试（行号） |
 |---|---|---|---|
@@ -496,7 +496,7 @@ cargo test -p deer-gpu --test text_raster -- --nocapture   # 看「跳过系统�
 | `crates/deer-gpu/tests/support/mod.rs` | 281 | 被 `text_measure.rs` 复用的**同源合成字体构造器**（集成测试各自是独立 crate，无法跨文件 `use`，`:3-10`）。 | `build_font`、`table_*`（`:54`/`:79`/`:101`/`:113`/`:134`/`:144`/`:148`/`:160`）、`dir_entry_offset`/`table_offset`（`:246` 前后、`:257`）、**`build_font_with_unreadable_hmtx`（`:269-276`，把 `hmtx` 目录项指到文件最后一字节、长度 0，用来构造 `advance` 的 `0.5em` 兜底分支）**、`visible_ascii`（`:279-281`） |
 
 `crates/deer-gpu` 内部还有两处**单元测试**（`#[cfg(test)] mod tests`）：`src/glyph.rs:171-206`（越界安全、空字形保留 advance、槽位重叠对称性、`GlyphKey` 不吃 0 字号）与 `src/png.rs:115-169`（PNG 头/块结构、CRC32/Adler32 已知向量、zlib 头校验位、多 stored 块）。
-`crates/deer-layout` 的测试在 `crates/deer-layout/tests/layout_invariants.rs`（T1..T14，见 2.1）。
+`crates/deer-core` 的测试在 `crates/deer-core/tests/layout_invariants.rs`（T1..T14，见 2.1）。
 
 ---
 
@@ -532,14 +532,14 @@ cargo test -p deer-gpu --test text_raster -- --nocapture   # 看「跳过系统�
 > `measure.rs` 的 `wrap` 改成委托、`layout.rs` 里加了 `wrap_greedy`/`scroll`，行号整体位移：
 > 引用只给**函数名与文件**，不再逐个给行号）。
 
-1. **唯一实现**：`deer_layout::layout::wrap_greedy`（`crates/deer-layout/src/layout.rs`）——
+1. **唯一实现**：`deer_core::layout::wrap_greedy`（`crates/deer-core/src/layout.rs`）——
    按空格/制表切词、行首不留空白、单词超宽按字符硬切、`max_width <= 0` 或非有限 ⇒ 不换行、空串算 1 行、不丢字。
    两个实现都**委托**给它、只注入「宽度怎么算」：`ApproxMeasure::wrap`（近似）与
-   `FontMeasure::wrap`（真实 advance，`crates/deer-gpu/src/measure.rs`）。
+   `FontMeasure::wrap`（真实 advance，`crates/deer-text/src/measure.rs`）。
 2. **与布局的耦合**（这条**已经变了**）：`ApproxMeasure::height` 现在是
    `wrap(..).len() * line_height`（**不再是** `(w / max_width).ceil()` 的宽度比例近似）——
    理由：度量高度与「画出来的行数」若是两套算法，就会出现「预留 2 行、画出来 3 行」。
-   `deer-gpu/tests/text_measure.rs` 与 `deer-layout/tests/scroll_multiline.rs` 各有一条一致性断言。
+   `deer-gpu/tests/text_measure.rs` 与 `deer-core/tests/scroll_multiline.rs` 各有一条一致性断言。
 3. **测试必须同步**：`crates/deer-gpu/tests/text_measure.rs`（`wrap_respects_max_width_without_losing_characters`，
    含「不丢字」「行首无空白」「单字符硬切例外」三条；`measure_trait_matches_inherent_api` 保证 trait 与固有 API 同源）；
    变异记录在 `text_measure.rs` 文件头。
@@ -560,41 +560,41 @@ cargo test -p deer-gpu --test text_raster -- --nocapture   # 看「跳过系统�
 
 ### 7.5 改图集装箱策略（图集打包：货架 → 装箱 / 加 LRU）
 
-1. **实现**：`crates/deer-gpu/src/atlas.rs` 全文件；关键约束全在模块文档 `:3-45`：
+1. **实现**：`crates/deer-text/src/atlas.rs` 全文件；关键约束全在模块文档 `:3-45`：
    - 增高**只能追加新行**、不能移动已有槽位（`:276-281` 的 `ensure_height` + `:67` 的「`width` 构造后不变」）—— 任何「重排」策略都会让已发给渲染器的 `AtlasSlot` 失效（`:5-8`、`:271-275`）；
    - 每个字形右/下各留 1px padding 防渗色（`:50`、`:18-20`）；
    - 失败必须明确（超宽 / 超 `MAX_DIMENSION=8192` ⇒ `None`）（`:113-115`、`:147-149`、`:174-176`）；
    - 双份数据：`coverage`（GPU 上传的唯一真值）+ 每 key 的逐行紧致 `pixels`（只给 `get()` 借用，`:31-45`、`:192-210`）。
-2. **加 LRU/淘汰**要先回答：`GlyphPlacement`（`crates/deer-gpu/src/text.rs:46-55`）与 `TextEngine::placements`（`:63`）里缓存的槽位如何失效 —— 目前 `TextEngine::glyph` 命中缓存即直接返回（`:152-154`），没有失效协议。现在**明确不做淘汰**（`text.rs:31`）。
+2. **加 LRU/淘汰**要先回答：`GlyphPlacement`（`crates/deer-text/src/text.rs:46-55`）与 `TextEngine::placements`（`:63`）里缓存的槽位如何失效 —— 目前 `TextEngine::glyph` 命中缓存即直接返回（`:152-154`），没有失效协议。现在**明确不做淘汰**（`text.rs:31`）。
 3. **测试必须同步**：`crates/deer-gpu/tests/glyph_atlas.rs` 全部七条（尤其 ⑨ `:205` 的「增高后大图里槽位内容不变」与 ⑪ `:325` 的「槽位外全 0」）；示例 `crates/deer-gui/examples/glyph_atlas.rs:131-142`（利用率下界断言）。
 4. 若改变打包导致「同一插入序列的槽位布局」变化：`glyph_atlas.rs:430`（逐字节确定性）会红，需要更新期望值而不是放松断言。
 
 ### 7.6 额外两条（成本低、但容易漏）
 
-- **加一个 `Kind`（新控件类型）**：`crates/deer-layout/src/node.rs:21-32`（枚举）+ `:35`（`as_str`）+ `:45`（`parse`）+ `:57`（`is_container`）+ `:226`（`IdGen::reserve` 的 kind 列表，**漏了就破坏两路径 id 一致**）；`crates/deer-layout/src/scene.rs:143-145`（`KNOWN_ATTRS` 通常也要加）；`crates/deer-gpu/src/render.rs:42-110`（发命令）+ `crates/deer-layout/src/layout.rs:90-159`（固有尺寸）。测试：`crates/deer-layout/tests/layout_invariants.rs:48`（两条路径同构）、`:58`（自动 id 规则）、`crates/deer-gpu/tests/render_pipeline.rs:35`。
-- **改布局分配语义（`grow` / 对齐 / 百分比）**：`crates/deer-layout/src/layout.rs:209-347`（尤其 I-7 的「分配尺寸 vs 可用空间」`:334-344` 与 `:279-300` 的「剩余量必须在 grow 之后重算」）。测试：`layout_invariants.rs:143`（T5 grow）、`:171`（T6 对齐）、`:195`（T7 stretch）、`:214`（T8 取整）、`:297`（T12 百分比）；回归守卫 `:319`（T13）、`:330`（T14）。
+- **加一个 `Kind`（新控件类型）**：`crates/deer-core/src/node.rs:21-32`（枚举）+ `:35`（`as_str`）+ `:45`（`parse`）+ `:57`（`is_container`）+ `:226`（`IdGen::reserve` 的 kind 列表，**漏了就破坏两路径 id 一致**）；`crates/deer-core/src/scene.rs:143-145`（`KNOWN_ATTRS` 通常也要加）；`crates/deer-gpu/src/render.rs:42-110`（发命令）+ `crates/deer-core/src/layout.rs:90-159`（固有尺寸）。测试：`crates/deer-core/tests/layout_invariants.rs:48`（两条路径同构）、`:58`（自动 id 规则）、`crates/deer-gpu/tests/render_pipeline.rs:35`。
+- **改布局分配语义（`grow` / 对齐 / 百分比）**：`crates/deer-core/src/layout.rs:209-347`（尤其 I-7 的「分配尺寸 vs 可用空间」`:334-344` 与 `:279-300` 的「剩余量必须在 grow 之后重算」）。测试：`layout_invariants.rs:143`（T5 grow）、`:171`（T6 对齐）、`:195`（T7 stretch）、`:214`（T8 取整）、`:297`（T12 百分比）；回归守卫 `:319`（T13）、`:330`（T14）。
 
 ---
 
 ## 8. 已知边界 / 坑（代码注释或文档里**明确写的**）
 
-### 8.1 `deer-layout`
+### 8.1 `deer-core`
 
 | 边界 | 锚点 |
 |---|---|
-| 布局的 7 条不变量（纯函数 / 确定性 / 自底向上 / 像素取整 / 不假设拥有窗口 / 不越界 / **分配尺寸 ≠ 可用空间**）。I-7 是 deer-ui V0 的 B-2 缺陷的显式建模。 | `crates/deer-layout/src/layout.rs:3-12` |
+| 布局的 7 条不变量（纯函数 / 确定性 / 自底向上 / 像素取整 / 不假设拥有窗口 / 不越界 / **分配尺寸 ≠ 可用空间**）。I-7 是 deer-ui V0 的 B-2 缺陷的显式建模。 | `crates/deer-core/src/layout.rs:3-12` |
 | **根不撑满盒子**：宿主给的盒子是上限，根用自己的固有尺寸（除非根自己有显式尺寸）。 | `layout.rs:182-185` |
 | 容器固有尺寸：**主轴 = sum(子)，交叉轴 = max(子)**；只把「显式像素」尺寸计入主轴，且**不能在交叉轴也累加**（否则两个 `w=36` 的按钮会让行算成 72）。 | `layout.rs:96-104`（注释）、实现 `:105-133` |
 | 百分比**不在测量阶段解析**（需要父的实际宽度），留到排布阶段；`resolve` 只在排布用。 | `layout.rs:104`、`:73-78`、`:250`/`:311` |
 | 容器的 `avail_*` 传的是**父的内容盒**（`inner_w`/`inner_h`），不是分配尺寸 —— 传错会让 `50%` 静默变成「已分配空间的一半」。 | `layout.rs:334-344` |
 | 显式尺寸也**不许超过可用空间**（I-6）。 | `layout.rs:216-222` |
-| 场景文件缩进**必须是 2 的倍数**（否则报错带行号）。 | `crates/deer-layout/src/scene.rs:72-78` |
+| 场景文件缩进**必须是 2 的倍数**（否则报错带行号）。 | `crates/deer-core/src/scene.rs:72-78` |
 | 场景**只能有一个根**；叶子节点**不能有子节点**（都报错）。 | `scene.rs:292-295`、`:309-315` |
 | 场景属性白名单（未知属性直接报错）：`name/w/h/pad/gap/main/cross/grow/scroll/wrap/label/disabled`（`scroll`/`wrap` 是**裸开关**，带值会被拒绝；剩余工作第 1 项加的）。 | `scene.rs:143-145`、`:231-239` |
 | 场景只支持 `k=v`、裸 `k`、`k="带 空格"`；`#` 注释要求前面是行首或空白（引号内不算注释）。 | `scene.rs:52`、`:94`、`:63` |
-| 显式命名的节点**必须「占号」**（`IdGen::reserve`），否则自动 id 会撞上显式名（B-1 缺陷）。 | `crates/deer-layout/src/node.rs:203-207`、`:219-235` |
+| 显式命名的节点**必须「占号」**（`IdGen::reserve`），否则自动 id 会撞上显式名（B-1 缺陷）。 | `crates/deer-core/src/node.rs:203-207`、`:219-235` |
 | 树是**纯数据**（不含回调）；事件用 `id` 关联。 | `node.rs:12-15` |
-| 命令式 API 的建造顺序坑：**先设 layout/props，最后 `with_id`** —— 反过来会被整块赋值覆盖而丢 label。 | `crates/deer-layout/src/builder.rs:82-85`、`:165-167` |
+| 命令式 API 的建造顺序坑：**先设 layout/props，最后 `with_id`** —— 反过来会被整块赋值覆盖而丢 label。 | `crates/deer-core/src/builder.rs:82-85`、`:165-167` |
 
 ### 8.2 `deer-gpu`（HAL 与绘制数据）
 
@@ -623,34 +623,34 @@ cargo test -p deer-gpu --test text_raster -- --nocapture   # 看「跳过系统�
 
 | 边界 | 锚点 |
 |---|---|
-| **`left` 通常 ≥ 0**：多数字体 `lsb` 为正 ⇒ `left = floor(lsb*scale)` 落在笔位置右侧；只有斜体/悬垂字形才为负。实测（consola.ttf @32px）：`'.'`=6、`'i'`=2、`'W'`=0。 | `crates/deer-gpu/src/glyph.rs:30-32` |
+| **`left` 通常 ≥ 0**：多数字体 `lsb` 为正 ⇒ `left = floor(lsb*scale)` 落在笔位置右侧；只有斜体/悬垂字形才为负。实测（consola.ttf @32px）：`'.'`=6、`'i'`=2、`'W'`=0。 | `crates/deer-text/src/glyph.rs:30-32` |
 | 位图是**紧致**的（宽高正好包住墨迹），所以「位图尺寸」≠「advance」；`top` 可为负（下伸部）。 | `glyph.rs:19`、`:34-38` |
 | `coverage` 是 8 位覆盖率（0..=255），**不是颜色**。 | `glyph.rs:17-18`、`:41-42` |
 | 位图不变式 `coverage.len() == width * height`（`debug_assert`）；越界用 `coverage_at` 安全取（回 0）。 | `glyph.rs:23`、`:59-80`、`:87-93` |
 | `GlyphKey.px_size` 是**取整后的字号** ⇒ 12.4px 与 12.6px 共用同一张位图（按字号分桶缓存）；`0` 视为 `1`。 | `glyph.rs:122-132`、`:135-141` |
 | `AtlasSlot` 不变式：`x+w <= 图集宽`、`y+h <= 图集高`、任意两槽位不重叠、`get()` 长度恒为 `w*h`；空槽位永不重叠。 | `glyph.rs:143-146`、`:162-168` |
-| 图集**只增不减**（没有 LRU）；长会话里字号种类多会持续增长。 | `crates/deer-gpu/src/text.rs:31`、`atlas.rs`（无淘汰代码） |
+| 图集**只增不减**（没有 LRU）；长会话里字号种类多会持续增长。 | `crates/deer-text/src/text.rs:31`、`atlas.rs`（无淘汰代码） |
 | 图集增高**只追加新行**，`width` 构造后不变 ⇒ 已发出的 `AtlasSlot` 仍然有效；`get()` 借用 `self`，所以活着时无法 `insert`（借用检查器拦住悬垂）。 | `atlas.rs:5-16`、`:66-69`、`:220-230`、`:271-281` |
 | 字形右/下各 1px padding（`PADDING = 1`），padding 必须为 0，否则 GPU 双线性采样会渗色。 | `atlas.rs:18-20`、`:50` |
 | `MAX_DIMENSION = 8192`（移动 GPU 常见 `maxTextureDimension2D` 下界）；超限**明确失败**，不静默截断。 | `atlas.rs:52-55`、`:173-176` |
 | `GlyphAtlas::new(0)` 合法：任何非空字形都因「宽超限」失败，只有空位图能登记。 | `atlas.rs:86-89` |
-| 光栅化**不做 hinting**（有实测依据：hinting-lite 无净收益）、**亚像素水平定位是 opt-in 路径**（默认 `rasterize` 仍整数落位、逐字节不变；opt-in 走 `rasterize_at`/`rasterize_char_at` + `split_subpixel_x` 的 1/4 相位档）、**不支持 CFF**、**不做精确曲线极值**（bbox 用控制点包围盒 ⇒ 位图可能比真实墨迹宽不到 1px）。 | `crates/deer-gpu/src/raster.rs`（模块文档的「诚实边界」与 opt-in API）、落位公式见 `raster.rs` 的整数落位路径 |
+| 光栅化**不做 hinting**（有实测依据：hinting-lite 无净收益）、**亚像素水平定位是 opt-in 路径**（默认 `rasterize` 仍整数落位、逐字节不变；opt-in 走 `rasterize_at`/`rasterize_char_at` + `split_subpixel_x` 的 1/4 相位档）、**不支持 CFF**、**不做精确曲线极值**（bbox 用控制点包围盒 ⇒ 位图可能比真实墨迹宽不到 1px）。 | `crates/deer-text/src/raster.rs`（模块文档的「诚实边界」与 opt-in API）、落位公式见 `raster.rs` 的整数落位路径 |
 | 采样点正好落在轮廓边上时按环绕数算法的朝向约定判定（结果确定，但不保证与解析面积逐位一致）。 | `raster.rs:34-35`、`:309-314` |
 | 退化输入一律给 `blank`（不 panic）：`ppem<=0`/NaN、`units_per_em==0`、非有限 scale、`!advance.is_finite()`、零宽高、单边 > `MAX_BITMAP_DIM=4096`。 | `raster.rs:106-144`、`:70` |
 | `supersample` 是公开字段，误设 `u32::MAX` 会爆；内部夹到 `MAX_SUPERSAMPLE = 64`。展平深度上限 `MAX_FLATTEN_DEPTH = 16`、平坦度 `FLATNESS_TOLERANCE = 0.25`。 | `raster.rs:48-64`、`:193` |
-| 度量回退链三级：① cmap 命中 → 真实 `hmtx` advance；② 未命中或字形读不出 → **glyph 0（`.notdef`）的 advance**（不用 0.6em 猜）；③ 连 glyph 0 都取不到 → `0.5 * font_size` 兜底，**绝不 panic**（合法字体上不可达，是防御分支）。 | `crates/deer-gpu/src/measure.rs:14-23`、`:95-108` |
+| 度量回退链三级：① cmap 命中 → 真实 `hmtx` advance；② 未命中或字形读不出 → **glyph 0（`.notdef`）的 advance**（不用 0.6em 猜）；③ 连 glyph 0 都取不到 → `0.5 * font_size` 兜底，**绝不 panic**（合法字体上不可达，是防御分支）。 | `crates/deer-text/src/measure.rs:14-23`、`:95-108` |
 | `descent` 取 `-descender`；坏字体把 descender 写成正数时会得到负值 —— **不做绝对值**（「读到的就是事实」）。 | `measure.rs:78-85` |
 | `text_width` **向上取整**（`ceil`），与 `ApproxMeasure` 的整数友好约定一致，且 `text_width("") == 0.0`。 | `measure.rs:110-116` |
 | `wrap`：按空格/制表切词（其它空白不切）、行首不留空白、单词超宽按字符硬切（单字符超宽时该行允许超宽，否则死循环）、`max_width<=0` 不换行、空串算 1 行、`wrap(text).concat()` 不丢字。 | `measure.rs:25-36`、`:124-179` |
 | `Measure::height` 用 `style.line_height`（行距属于**样式**）而不是字体自带行高；`width` 忽略 `style.font_size`（字号由构造时给定）。 | `measure.rs:182-196` |
 | `find_system_font` 只找 `consola.ttf` → `arial.ttf` → `segoeui.ttf`（`%WINDIR%\Fonts`，`WINDIR` 缺失退回 `C:\Windows\Fonts`）；**返回 `None` = 明确跳过**，不伪装成功。 | `measure.rs:198-216` |
-| 文字引擎「诚实边界」：**本引擎**不做亚像素水平定位（±1px 抖动；光栅化层已有 opt-in 亚像素路径，**尚未接线**）、不做 hinting、不做字距/连字/替换（GSUB/GPOS 未实现）、**不做多字体回退**（缺字画 `.notdef` 豆腐块并计入 `missing_glyphs()`）、图集不淘汰。 | `crates/deer-gpu/src/text.rs` 的「诚实边界」 |
+| 文字引擎「诚实边界」：**本引擎**不做亚像素水平定位（±1px 抖动；光栅化层已有 opt-in 亚像素路径，**尚未接线**）、不做 hinting、不做字距/连字/替换（GSUB/GPOS 未实现）、**不做多字体回退**（缺字画 `.notdef` 豆腐块并计入 `missing_glyphs()`）、图集不淘汰。 | `crates/deer-text/src/text.rs` 的「诚实边界」 |
 | `TextEngine::from_system_font` **找不到就报错**，绝不静默降级成占位字形。 | `text.rs:97-110` |
 | `missing_glyphs()` 是**按调用次数累计**（不是缺字种类数），三种情况各 +1：cmap 未命中（仍回退 `.notdef`）、字形读不出、图集放不下。 | `text.rs:201-205`、`:144-149`、`:156-162`、`:165-171` |
 | `TextEngine::text_width` 与 `FontMeasure::text_width` **只差末尾取整**（后者 `ceil()`，差 < 1px）：前者是「笔走过多远」，后者是「盒子要留多宽」。 | `text.rs:182-194` |
 | 字形渲染的位图按整数像素落位；`left`/`top` 语义是「位图左边 = `round(pen)+left`」「位图顶边 = `baseline - top`」。 | `text.rs:50-53`、`null.rs:530-531` |
 | **`align` 字段目前全仓库只用 `0`**（`render.rs:65`/`:88`/`:107`；grep `align: [012]` 无 `1`/`2`）⇒ 居中/右对齐分支无生产者也无测试。 | `draw.rs:77-78`、`null.rs:459-463`、`:508-512` |
-| `Font` 支持范围表：支持 sfnt/`head`/`hhea`/`hmtx`/`maxp`/`cmap` 0/4/6/12/`loca` 短长/`glyf` 简单+复合；**CFF(`OTTO`) 直接报错**；竖排/变体/着色/GSUB/GPOS/字距/ hinting 未实现。 | `crates/deer-gpu/src/font.rs:7-23`、`:194-200` |
+| `Font` 支持范围表：支持 sfnt/`head`/`hhea`/`hmtx`/`maxp`/`cmap` 0/4/6/12/`loca` 短长/`glyf` 简单+复合；**CFF(`OTTO`) 直接报错**；竖排/变体/着色/GSUB/GPOS/字距/ hinting 未实现。 | `crates/deer-text/src/font.rs:7-23`、`:194-200` |
 | 解析层**不改坐标**（只给 `units_per_em`），缩放到像素是调用方的事。 | `font.rs:25-30` |
 | `glyph_index` 找不到返回 `None`（**不返回 0** —— 0 是 `.notdef`，含义不同）；规范允许用 0 表示缺失，所以 `g != 0` 才算命中。 | `font.rs:396-398`、`:421-426` |
 | `ttcf` 容器取**第一个**字体（`face_index = 0`）；表目录偏移是「相对字体起始」，代码统一加 `base` 后返回绝对偏移（踩过 `head` 被读成 0 的坑）。 | `font.rs:172-188`、`:232-242`、`:369-376` |
@@ -658,7 +658,7 @@ cargo test -p deer-gpu --test text_raster -- --nocapture   # 看「跳过系统�
 | 复合字形嵌套 **> 8 层报错**（字体可能损坏）；点匹配模式（`ARGS_ARE_XY_VALUES` 未置位）**用 0 偏移兜住**（不支持精确点对齐）。 | `font.rs:703-707`、`:725-728`、`:734-737` |
 | 坏字体必须返回错误**不许 panic**（字体是外部输入）。 | `font.rs` 全域 `GpuResult`；测试 `font_parse.rs:252` |
 | 诊断开关：`DEER_FONT_DEBUG=1` 会往 stderr 打表偏移（临时诊断，不是稳定接口）。 | `font.rs:249-257`、`:516-520`、`:578-584` |
-| PNG 用 **zlib stored（未压缩）deflate**：文件比真实压缩大（约等于原始像素），换取零依赖与实现简单。 | `crates/deer-gpu/src/png.rs:3-9`、`:68-90` |
+| PNG 用 **zlib stored（未压缩）deflate**：文件比真实压缩大（约等于原始像素），换取零依赖与实现简单。 | `crates/deer-text/src/png.rs:3-9`、`:68-90` |
 | `encode_rgba` 要求 `pixels.len() == w*h*4` 且宽高 > 0，否则返回 `Err(String)`。 | `png.rs:14-24` |
 
 ### 8.4 跨 crate 的已知限制（本次顺带核到的）
@@ -679,8 +679,8 @@ cargo test -p deer-gpu --test text_raster -- --nocapture   # 看「跳过系统�
 3. **`Framebuffer::clear` 用截断、`blend_cov` 用 round 这一口径差异是否有测试钉住**：未找到对应用例（`count_color` 也用截断，`null.rs:67`）。
 4. **`stroke` 四角像素被重复 blend 这件事是否被任何测试专门覆盖**：只找到 CPU↔GPU parity 语料（`crates/deer-vk/tests/gpu_vs_cpu.rs:185-191`）间接覆盖，未找到 CPU 侧的独立断言。
 5. **超大 `radius`（> 半宽/半高）在 CPU 侧的行为是否单独钉住**：只看到 parity 语料里的 `round-huge`（`crates/deer-vk/tests/gpu_vs_cpu.rs:180`）。
-6. **`deer-vk` 里承担圆角/描边判据的着色器函数具体位置**：本次范围是 `deer-layout`+`deer-gpu`，未展开 `crates/deer-vk/src/spirv.rs` 与 `gpu_render.rs` 的着色器源码（第 7.2 条因此写成「未确认」）。
+6. **`deer-vk` 里承担圆角/描边判据的着色器函数具体位置**：本次范围是 `deer-core`+`deer-gpu`，未展开 `crates/deer-vk/src/spirv.rs` 与 `gpu_render.rs` 的着色器源码（第 7.2 条因此写成「未确认」）。
 7. **`docs/features/*.md` 中哪些具体章节会因新增 `DrawCmd` 变体而过期**：只确认了 `docs/features/draw-list.md:47` 有「`DrawCmd` 的全部变体」小节，以及一致性检查的范围（`crates/deer-gui/tests/docs_consistency.rs`：链接目标存在、`--example` 存在、✅ 行必须同时有指南+示例），**未逐篇核对内容是否与代码同步**。
 8. **`deer-gpu` 的 HAL trait 在 `deer-window`／`deer-gui` 窗口路径上的完整消费清单**：只核到 `deer-vk` 的实现与示例的 `Backend` 调用；`create_texture`/`upload_texture` 在真实窗口路径上是否被调用未逐一确认。
 9. **若干「无仓库内调用点」的公开 API 是否真的无人用**：`Node::disabled`（`node.rs:166`）、`Node::push`（`:171`）、`Builder::root_id`（`builder.rs:186`）、`builder::props`（`:249`）、`Color::packed`（`draw.rs:25`）、`DrawList::is_empty`（`draw.rs:125`）、`CpuDevice::render_to_framebuffer`（`null.rs:129`）、`Font::{table_range,table_directory,face_offset}`（`font.rs:352`/`:360`/`:365`）、`TextEngine::{font,font_size,set_font_size}`（`text.rs:112`/`:116`/`:121`）、`metrics::*` 常量对外、`Frame`/`Swapchain`/`Renderer` trait 的非 `deer-vk`/`null` 消费点 —— 这些经 grep 在**本仓库**内无消费者，但这只说明仓库内没人用，不能排除它们是给外部使用者准备的公开接口。
-10. **`crates/deer-layout/src/lib.rs:37` 的 `CORE_VERSION = "0.0.0"` 是否与 workspace 版本号有校验关系**：未找到任何引用点。
+10. **`crates/deer-core/src/lib.rs:37` 的 `CORE_VERSION = "0.0.0"` 是否与 workspace 版本号有校验关系**：未找到任何引用点。

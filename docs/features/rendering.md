@@ -74,7 +74,7 @@ let fb = deer_gpu::null::CpuRenderer::new().render(
     theme.surface,      // 背景色
 )?;
 // ④
-let png = deer_gpu::png::encode_rgba(fb.width, fb.height, &fb.pixels)
+let png = deer_text::png::encode_rgba(fb.width, fb.height, &fb.pixels)
     .map_err(|e| format!("编码失败：{e}"))?;
 ```
 

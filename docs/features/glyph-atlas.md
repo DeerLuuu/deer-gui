@@ -20,8 +20,8 @@
 ## 2. 最小示例
 
 ```rust
-use deer_gpu::atlas::GlyphAtlas;
-use deer_gpu::glyph::{GlyphImage, GlyphKey};
+use deer_text::atlas::GlyphAtlas;
+use deer_text::glyph::{GlyphImage, GlyphKey};
 
 fn main() {
     // 宽度 256，初始高度也是 256（正方形起步，按需往下长）
@@ -69,7 +69,7 @@ cmap 未覆盖的可见 ASCII：0
 
 ## 3. 完整 API
 
-### `deer_gpu::atlas::GlyphAtlas`
+### `deer_text::atlas::GlyphAtlas`
 
 | 方法 | 说明 |
 |---|---|
@@ -84,9 +84,9 @@ cmap 未覆盖的可见 ASCII：0
 | `used_pixels(&self) -> usize` | `Σ slot.w * slot.h`（**不含** 1px padding；空位图贡献 0） |
 | `utilization(&self) -> f32` | `used_pixels / (宽 * 高)`（面积非 0 时落在 `0.0..=1.0`） |
 
-高度上限是公开常量 `deer_gpu::atlas::MAX_DIMENSION = 8192`。
+高度上限是公开常量 `deer_text::atlas::MAX_DIMENSION = 8192`。
 
-### `deer_gpu::glyph::GlyphKey` —— 字形的身份
+### `deer_text::glyph::GlyphKey` —— 字形的身份
 
 ```rust
 GlyphKey { glyph_index: u16, px_size: u16 }
@@ -101,7 +101,7 @@ GlyphKey::new(glyph_index, px_size)   // px_size 取 max(1)：0 按 1 处理
 
 `GlyphKey` 实现了 `Hash`/`Eq`/`Ord`（可以当 `HashMap`/`BTreeMap` 的键，排序稳定 ⇒ 确定性）。
 
-### `deer_gpu::glyph::AtlasSlot`
+### `deer_text::glyph::AtlasSlot`
 
 ```rust
 AtlasSlot { x: u32, y: u32, w: u32, h: u32 }   // 图集左上角为原点，单位像素
@@ -132,8 +132,8 @@ AtlasSlot { x: u32, y: u32, w: u32, h: u32 }   // 图集左上角为原点，单
 图集错了往往表现为「画面里字形串位/花屏」，很难目视定位，所以必须断言：
 
 ```rust
-use deer_gpu::atlas::GlyphAtlas;
-use deer_gpu::glyph::{GlyphImage, GlyphKey};
+use deer_text::atlas::GlyphAtlas;
+use deer_text::glyph::{GlyphImage, GlyphKey};
 
 let mut atlas = GlyphAtlas::new(64);
 let mut slots = Vec::new();

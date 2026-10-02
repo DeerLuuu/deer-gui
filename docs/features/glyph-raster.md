@@ -5,8 +5,8 @@
 
 ## 1. 这是什么 / 什么时候用它
 
-把**字体的轮廓**（`deer_gpu::font::Glyph` 里的一堆直线/二次贝塞尔）
-变成一张**像素覆盖率图**（`deer_gpu::glyph::GlyphImage`）：
+把**字体的轮廓**（`deer_text::font::Glyph` 里的一堆直线/二次贝塞尔）
+变成一张**像素覆盖率图**（`deer_text::glyph::GlyphImage`）：
 `coverage[i] == 255` 表示这个像素被字形完全盖住，`0` 表示完全没盖住，
 中间值就是抗锯齿的边缘。
 
@@ -21,12 +21,12 @@
 ## 2. 最小示例
 
 ```rust
-use deer_gpu::font::Font;
-use deer_gpu::raster::Rasterizer;
+use deer_text::font::Font;
+use deer_text::raster::Rasterizer;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // 字体解析：deer_gpu::measure::find_system_font() 按 consola → arial → segoeui 找
-    let path = deer_gpu::measure::find_system_font().ok_or("找不到系统等宽字体")?;
+    // 字体解析：deer_text::measure::find_system_font() 按 consola → arial → segoeui 找
+    let path = deer_text::measure::find_system_font().ok_or("找不到系统等宽字体")?;
     let font = Font::parse(std::fs::read(path)?)?;
 
     // ppem = 每 em 多少像素 = 字号
@@ -53,7 +53,7 @@ cargo run -p deer-gui --example glyph_atlas
 
 ## 3. 完整 API
 
-### `deer_gpu::raster::Rasterizer`
+### `deer_text::raster::Rasterizer`
 
 | 方法 | 说明 |
 |---|---|
@@ -65,7 +65,7 @@ cargo run -p deer-gui --example glyph_atlas
 
 缩放规则：`scale = ppem / units_per_em`（font units → 像素）。
 
-### `deer_gpu::glyph::GlyphImage` —— 坐标系（**这段最重要**）
+### `deer_text::glyph::GlyphImage` —— 坐标系（**这段最重要**）
 
 ```text
                  位图左上角 (left, top)
@@ -123,8 +123,8 @@ cargo run -p deer-gui --example glyph_atlas
 覆盖率图最容易「看起来是字，其实反了/糊了」，所以要**断言**，不要靠眼睛：
 
 ```rust
-use deer_gpu::font::{Contour, Glyph, Segment};
-use deer_gpu::raster::Rasterizer;
+use deer_text::font::{Contour, Glyph, Segment};
+use deer_text::raster::Rasterizer;
 
 // ① 单位正方形：font units 0..10，upem=10，ppem=10 ⇒ 正好铺满 10×10 像素
 let square = Glyph {
@@ -178,7 +178,7 @@ assert_eq!(a, b, "光栅化必须是确定性的");
 
 - 把位图打包进纹理：[`glyph-atlas.md`](glyph-atlas.md)
 - 把「度量 + 光栅化 + 图集」串起来画字：[`text-rendering.md`](text-rendering.md)
-- 字体解析（这些 `Glyph` 从哪来）：`crates/deer-gpu/src/font.rs`
+- 字体解析（这些 `Glyph` 从哪来）：`crates/deer-text/src/font.rs`
 - **做不到**（本模块的边界）：
   - **不做 TrueType hinting（这次有实测依据）**：不读 `glyf` 的 instructions，也不做像素网格拟合；
     小字号清晰度靠超采样抗锯齿 + 亚像素定位。**最省的 hinting-lite（垂直两极对齐整数像素行）已被实现并量过**：
@@ -195,7 +195,7 @@ assert_eq!(a, b, "光栅化必须是确定性的");
   - **「尚未生效」的边界**：这条 opt-in 路径**未接进** `TextEngine` / `CpuRenderer`（超出本次 scope）⇒
     **默认文本像素一点没变**，「整段文本更整齐」**还没有**。接法（下一格）：`GlyphKey` 加**相位档**、
     `GlyphPlacement` 暴露相位、`draw_text_real` 用 `whole + left`；影响面：**图集记录 ×4**、
-    相位相关判据要改写。详见 `crates/deer-gpu/src/text.rs` 的「诚实边界」与 `crates/deer-gpu/src/raster.rs`。
+    相位相关判据要改写。详见 `crates/deer-text/src/text.rs` 的「诚实边界」与 `crates/deer-text/src/raster.rs`。
   - **不支持 CFF / OpenType-CFF**（`OTTO`）：解析层直接报错，不静默给空轮廓。
   - **不做字距与连字**：不读 `GSUB`/`GPOS`/`kern`，`advance` 就是 `hmtx` 的原始值。
   - **不做竖排、变体、着色字体**。

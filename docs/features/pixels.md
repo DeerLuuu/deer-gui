@@ -27,7 +27,7 @@ let i = ((10 * w + 20) * 4) as usize;
 println!("(20,10) = R{} G{} B{} A{}", pixels[i], pixels[i+1], pixels[i+2], pixels[i+3]);
 
 // 编码成 PNG
-let png = deer_gpu::png::encode_rgba(w, h, &pixels).map_err(|e| format!("编码失败：{e}"))?;
+let png = deer_text::png::encode_rgba(w, h, &pixels).map_err(|e| format!("编码失败：{e}"))?;
 std::fs::write("out.png", png)?;
 ```
 
@@ -49,7 +49,7 @@ std::fs::write("out.png", png)?;
 
 | 函数 | 说明 |
 |---|---|
-| `deer_gpu::png::encode_rgba(w, h, &pixels) -> Result<Vec<u8>, String>` | 编成 PNG 字节流（可直接 `fs::write`） |
+| `deer_text::png::encode_rgba(w, h, &pixels) -> Result<Vec<u8>, String>` | 编成 PNG 字节流（可直接 `fs::write`） |
 
 **为什么自己写编码器**：本项目**除窗口层 `winit`（已登记例外，见 [`ROADMAP.md`](../../ROADMAP.md) 的 Q-1）外**不引第三方依赖
 （没有 `image` / `png` crate；`deer-gpu` 本身仍然零第三方依赖）。

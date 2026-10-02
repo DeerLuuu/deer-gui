@@ -1,7 +1,7 @@
 # 功能指南：滚动条（scrollbar）
 
 > 跑 `cargo run -p deer-gui --example scroll_bar` ·
-> 代码：几何 `crates/deer-layout/src/layout.rs`（`scrollbar_geom`）、绘制 `crates/deer-gpu/src/interact.rs` ·
+> 代码：几何 `crates/deer-core/src/layout.rs`（`scrollbar_geom`）、绘制 `crates/deer-gpu/src/interact.rs` ·
 > 出处：App 地基任务书 2026-10-02 的 **T3.2**
 
 ## 1. 这是什么 / 什么时候用它

@@ -108,7 +108,7 @@ target 是**前缀匹配且落在 `::` 边界**：`deer_gui=debug` 命中 `deer_
 - **不接管已有的输出**：校验层回调那套 `[VK ERROR]` 前缀**没有**并进这套系统
   —— 它的格式是既有测试的判据，动它等于改判据；
 - **尚未铺满所有 crate**：目前 `deer-gpu` 接了诊断点、`deer-gui` 可用；
-  `deer-vk` / `deer-layout` / `deer-window` 要用时各自加一条依赖即可
+  `deer-vk` / `deer-core` / `deer-window` 要用时各自加一条依赖即可
   （**内部依赖，不算第三方**，不需要走依赖例外登记）。
 
 ## 7. 检查清单（发布前过一遍）

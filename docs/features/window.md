@@ -18,7 +18,7 @@
 需要无人值守的 CI（真窗口链只能在有桌面的机器上跑，且默认跳过 —— 见第 5 节的门槛）。
 
 > ⚠️ **窗口层是本项目唯一引入第三方依赖的地方**（`winit`，登记在
-> [`ROADMAP.md`](../../ROADMAP.md) 的 Q-1）。`deer-layout` / `deer-gpu` / `deer-vk`
+> [`ROADMAP.md`](../../ROADMAP.md) 的 Q-1）。`deer-core` / `deer-gpu` / `deer-vk`
 > 仍然零第三方依赖；只有 `deer-window`、以及**开了 `window` feature** 的 `deer-gui` 会拿到它。
 
 ## 2. 最小示例

@@ -136,7 +136,7 @@ impl Measure for ApproxMeasure {
         self.wrap(text, style, max_width).len() as f32 * style.line_height
     }
 
-    /// 与 `deer_gpu::measure::FontMeasure::wrap` 同一套词切分规则，词宽用本度量的近似宽度。
+    /// 与 `deer_text::measure::FontMeasure::wrap` 同一套词切分规则，词宽用本度量的近似宽度。
     fn wrap(&self, text: &str, style: TextStyle, max_width: f32) -> Vec<String> {
         wrap_greedy(text, max_width, |s| self.width(s, style))
     }
