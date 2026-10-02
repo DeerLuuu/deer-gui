@@ -24,3 +24,6 @@ spirv_probe/
 
 # WorkBuddy 工作区数据（本地记忆/技能等，机器本地文件，不入库）
 .workbuddy/
+
+# AgentTeams 插件的本地状态（团队计划/名册，机器本地文件，不入库）
+.deers-agent-team/
