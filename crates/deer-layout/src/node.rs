@@ -244,6 +244,15 @@ impl IdGen {
     /// 记录一个**显式** id，并推进对应 kind 的计数（若它形如 `kind_N`）。
     ///
     /// 这样自动生成的名字永远不会与显式名字冲突，且两条构筑路径的计数保持同步。
+    /// 这个 id 是否**已经被别的节点占了**。
+    ///
+    /// 只读、不改状态 —— 给「载入时查重」用。为什么不直接改 `reserve` 的返回值：
+    /// 那是一次**签名变更**，而这里只需要一个查询；查询与占号分开，语义也更清楚
+    /// （`reserve` 是「占号」，不是「问号」）。
+    pub fn is_used(&self, id: &str) -> bool {
+        self.used.contains(id)
+    }
+
     pub fn reserve(&mut self, id: &str) {
         if !self.used.insert(id.to_string()) {
             return;

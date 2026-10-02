@@ -322,6 +322,22 @@ pub fn parse_scene(src: &str, source: &str) -> Result<Node, SceneError> {
         // id：显式 name 优先（并占号，避免自动 id 撞上它）；否则按 kind 确定性编号
         let id = match get("name") {
             Some(AttrVal::Str(s)) => {
+                // **载入时查重**（E2）：同一个文件里两个节点用同一个 `name` 是**静默灾难** ——
+                // 几何按 id 查（`geo.get`）、命中按 id 判、事件按 id 路由，
+                // 重名会让「后写的那个」悄悄顶掉前者，而**没有任何一处会报错**。
+                //
+                // 不查的后果具体长这样：两个 `name=ok` 的按钮，只有一个能收到点击，
+                // 另一个看起来「点了没反应」—— 而代码里找不到任何 bug。
+                if ids.is_used(s) {
+                    return Err(err(
+                        format!(
+                            "id \"{s}\" 重复：同一个场景里每个节点的 `name` 必须唯一 \
+                             （重名会让几何/命中/事件按 id 查时张冠李戴，而且不会报错）"
+                        ),
+                        line,
+                        source,
+                    ));
+                }
                 ids.reserve(s);
                 s.clone()
             }
@@ -570,5 +586,50 @@ mod e2_version_header_tests {
         let t = parse_scene("[column name=app]\n# deer-gui-scene: 999\n", "mid.dui")
             .expect("中间的注释不该当版本头");
         assert_eq!(t.id, "app");
+    }
+}
+
+#[cfg(test)]
+mod e2_id_uniqueness_tests {
+    use super::*;
+
+    /// ① **同一个文件里重名 ⇒ 报错**，且信息里点名是哪个 id。
+    #[test]
+    fn duplicate_ids_are_rejected_with_the_id_named() {
+        let src = "[column name=app]\n  [button name=ok]\n  [button name=ok]\n";
+        let e = parse_scene(src, "dup.dui").expect_err("重名必须报错");
+        let m = format!("{e}");
+        assert!(m.contains("ok"), "错误信息应当点名重复的 id：{m}");
+        assert!(m.contains("重复"), "应当说清是重复：{m}");
+    }
+
+    /// ② **嵌套层级之间也算重名**（不只是兄弟节点）—— id 是全树唯一的，不是同层唯一。
+    #[test]
+    fn duplicates_are_caught_across_nesting_levels() {
+        let src = "[column name=app]\n  [row name=bar]\n    [button name=app]\n";
+        let e = parse_scene(src, "dup2.dui").expect_err("跨层重名也必须报错");
+        assert!(format!("{e}").contains("重复"));
+    }
+
+    /// ③ **自动 id 不会撞上显式 id**（这正是 `IdGen::reserve` 存在的理由）：
+    /// 手写了 `button_1`，后面那个没写名字的按钮应当拿到 **`button_2`**。
+    #[test]
+    fn auto_ids_skip_explicitly_named_ones() {
+        let src = "[column name=app]\n  [button name=button_1]\n  [button]\n";
+        let t = parse_scene(src, "auto.dui").expect("能读");
+        let ids: Vec<&str> = t.children.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["button_1", "button_2"],
+            "自动 id 必须**跳过被显式占用的号**（否则两个节点同名 ⇒ 静默张冠李戴）"
+        );
+    }
+
+    /// ④ 唯一命名的文件照常能读（这条防「查重把正常文件也拦了」）。
+    #[test]
+    fn unique_ids_still_parse() {
+        let src = "[column name=app]\n  [button name=a]\n  [button name=b]\n";
+        let t = parse_scene(src, "ok.dui").expect("唯一命名应当能读");
+        assert_eq!(t.children.len(), 2);
     }
 }
