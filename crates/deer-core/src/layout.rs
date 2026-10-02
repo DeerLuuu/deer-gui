@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 
-use crate::node::{Align, Kind, Node, Rect, Size};
+use crate::node::{Align, Kind, Node, Pos, Rect, Size};
 
 /// 文本样式。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -174,6 +174,16 @@ fn measure_into(n: &Node, style: TextStyle, m: &impl Measure, out: &mut Intrinsi
             let gap = n.layout.gap;
             // 先无条件测子节点（**不做任何覆盖** —— 这一点很关键，见下）。
             let raw: Vec<(f32, f32)> = n.children.iter().map(|c| measure_into(c, style, m, out)).collect();
+            // **L1（D6/D10）：设了 `position` 的子节点脱离流内** —— 它自己的固有尺寸
+            // 照常要测（排布阶段定它自身大小要用），但**不计入父容器的固有尺寸**、不占间隙。
+            // 未设 position ⇒ `flow` = 全部子节点 ⇒ 与旧实现逐位相同（opt-in 红线）。
+            let flow: Vec<usize> = n
+                .children
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| !c.is_positioned())
+                .map(|(i, _)| i)
+                .collect();
             // **只把「显式像素」尺寸计入容器的固有尺寸，且只在主轴方向。**
             //
             // 为什么不能在交叉轴也计入：容器的交叉轴固有尺寸是**子节点的最大值**，
@@ -183,33 +193,33 @@ fn measure_into(n: &Node, style: TextStyle, m: &impl Measure, out: &mut Intrinsi
             // 「容器的交叉轴尺寸 = max(子)，主轴尺寸 = sum(子)」。
             //
             // 百分比不在此解析（需要父的实际宽度），留给排布阶段。
-            let main: Vec<f32> = n
-                .children
+            let main: Vec<f32> = flow
                 .iter()
-                .zip(&raw)
-                .map(|(c, (cw, ch))| {
+                .map(|&i| {
+                    let c = &n.children[i];
+                    let (cw, ch) = raw[i];
                     let explicit = if n.kind == Kind::Row { c.layout.width } else { c.layout.height };
                     match explicit {
                         Some(Size::Px(v)) => v.max(0.0),
                         _ => {
                             if n.kind == Kind::Row {
-                                *cw
+                                cw
                             } else {
-                                *ch
+                                ch
                             }
                         }
                     }
                 })
                 .collect();
-            let count = n.children.len();
+            let count = flow.len();
             let gaps = if count > 0 { gap * (count - 1) as f32 } else { 0.0 };
             if n.kind == Kind::Row {
                 let inner: f32 = main.iter().sum::<f32>() + gaps;
-                let max_h = raw.iter().map(|(_, h)| *h).fold(0.0_f32, f32::max);
+                let max_h = flow.iter().map(|&i| raw[i].1).fold(0.0_f32, f32::max);
                 (inner + pad * 2.0, max_h + pad * 2.0)
             } else {
                 let inner: f32 = main.iter().sum::<f32>() + gaps;
-                let max_w = raw.iter().map(|(w, _)| *w).fold(0.0_f32, f32::max);
+                let max_w = flow.iter().map(|&i| raw[i].0).fold(0.0_f32, f32::max);
                 (max_w + pad * 2.0, inner + pad * 2.0)
             }
         }
@@ -544,9 +554,14 @@ impl PlaceCtx<'_> {
     // 可分：可滚动内容本来就不该被压缩，见指南的「滚动容器」一节）。
     let scrollable = n.is_scroll_container();
 
+    // **L1（D6/D10）：流外子节点不参与流内数学**。`flow` 只收没设 `position` 的子节点，
+    // 下面主轴分配 / 间隙 / grow / 对齐 / `max_scroll` 全部只看 `flow` ——
+    // 设了 `position` 的子节点在这段之后单独落位（内容盒原点 + 偏移）。
+    // 未设 position ⇒ `flow` = 全部子节点 ⇒ 与旧实现逐位相同（opt-in 红线）。
+    let flow: Vec<&Node> = n.children.iter().filter(|c| !c.is_positioned()).collect();
+
     // 主轴：先给每个子节点固有主轴尺寸（或显式），剩余按 grow 权重分。
-    let fixed: Vec<f32> = n
-        .children
+    let fixed: Vec<f32> = flow
         .iter()
         .map(|c| {
             let ownk = self.intrinsic.get(&c.id).copied().unwrap_or((0.0, 0.0));
@@ -564,17 +579,16 @@ impl PlaceCtx<'_> {
         })
         .collect();
 
-    let total_gap = gap * (n.children.len().saturating_sub(1)) as f32;
+    let total_gap = gap * (flow.len().saturating_sub(1)) as f32;
     let used: f32 = fixed.iter().sum::<f32>() + total_gap;
     let remaining = (main_avail - used).max(0.0);
     let grow_sum: f32 = if scrollable {
         0.0
     } else {
-        n.children.iter().map(|c| c.layout.grow).sum()
+        flow.iter().map(|c| c.layout.grow).sum()
     };
 
-    let mut main_sizes: Vec<f32> = n
-        .children
+    let mut main_sizes: Vec<f32> = flow
         .iter()
         .enumerate()
         .map(|(i, c)| {
@@ -597,12 +611,12 @@ impl PlaceCtx<'_> {
     let remaining = (main_avail - used_after_grow).max(0.0);
     let main_align = n.layout.main_axis.unwrap_or(Align::Start);
     let mut main_offset = 0.0_f32;
-    if remaining > 0.0 && grow_sum == 0.0 && !n.children.is_empty() {
+    if remaining > 0.0 && grow_sum == 0.0 && !flow.is_empty() {
         match main_align {
             Align::Center => main_offset = (remaining / 2.0).floor(),
             Align::End => main_offset = remaining,
             Align::Stretch => {
-                let each = (remaining / n.children.len() as f32).floor();
+                let each = (remaining / flow.len() as f32).floor();
                 for s in main_sizes.iter_mut() {
                     *s = main_avail.min(*s + each);
                 }
@@ -627,7 +641,7 @@ impl PlaceCtx<'_> {
     };
     let mut cursor = if horizontal { rect.x + pad } else { rect.y + pad } + main_offset - offset;
 
-    for (i, c) in n.children.iter().enumerate() {
+    for (i, c) in flow.iter().enumerate() {
         let main_size = main_sizes[i];
         let ownc = self.intrinsic.get(&c.id).copied().unwrap_or((0.0, 0.0));
 
@@ -680,12 +694,59 @@ impl PlaceCtx<'_> {
         self.place(c, child_rect, assigned, (inner_w, inner_h), child_bound);
         cursor += main_size + gap;
     }
+
+    // **L1：流外子节点落位** —— 不占流内空间、不推进 `cursor`、不参与主轴分配与
+    // 交叉轴 stretch（那两个都是流内概念）。位置 = **父内容盒原点 + 偏移**（D10 定死
+    // 参照矩形 = 父内容盒，与百分比解析基准一致）；滚动容器的**内容平移同样作用于它**
+    // （它是内容的一部分），但 `max_scroll` **不含**它（流外 ⇒ 不计入内容主轴尺寸）。
+    //
+    // 这里在流内循环**之后**算只是行文次序：几何是按 id 查的表（`Geometry`），
+    // 插入次序不影响任何结果；绘制与命中的层叠序由**声明序**决定（渲染器按树序发命令、
+    // `hit_test` 按声明序遍历）—— 见 `hit_test` 的层叠序说明。
+    for c in n.children.iter().filter(|c| c.is_positioned()) {
+        let Some(Pos::Offset { x, y }) = c.layout.position else {
+            continue; // `is_positioned()` 已保证是 `Some`；穷尽匹配为将来变体（L4 anchors）留位
+        };
+        let ownc = self.intrinsic.get(&c.id).copied().unwrap_or((0.0, 0.0));
+        // 尺寸：显式 > 固有（I-7 同一套）；**不被父内容盒夹取** —— 流外节点本来就允许
+        // 伸出父盒子（负偏移同理），而且它不计入父固有尺寸 ⇒ 内容盒可能收缩到 0，
+        // 拿它当夹取基准会把流外节点整个夹没（变异轮实测踩过：20px 被夹成 0）。
+        // 百分比仍相对父内容盒解析（「参照矩形 = 父内容盒」的唯一基准，D10）。
+        let ex_w = resolve(c.layout.width, inner_w);
+        let ex_h = resolve(c.layout.height, inner_h);
+        let w = ex_w.unwrap_or(ownc.0).max(0.0).round();
+        let h = ex_h.unwrap_or(ownc.1).max(0.0).round();
+        // 偏移本身**不夹取**（可为负 ⇒ 允许伸出到父盒子之外；绘制/命中边界见指南）。
+        let (cx, cy) = if horizontal {
+            (rect.x + pad + x as f32 - offset, rect.y + pad + y as f32)
+        } else {
+            (rect.x + pad + x as f32, rect.y + pad + y as f32 - offset)
+        };
+        self.place(
+            c,
+            Rect::new(cx, cy, w, h),
+            (w, h),
+            (inner_w, inner_h),
+            // bound 给无穷：流外节点的尺寸**不夹取**（见上），上面的 w/h 就是最终值；
+            // 传内容盒会让 `place` 里的 I-6 夹取把它夹回内容盒（内容盒可能已收缩到 0）。
+            (f32::INFINITY, f32::INFINITY),
+        );
+    }
 }
 }
 
 /// 命中测试：在几何表上找**最深**命中节点。
 ///
 /// 这是输入路由的唯一依据 —— 与渲染后端无关（DOM/GPU 后端共用）。
+///
+/// **层叠序（L1）**：遍历就是**声明序**，后访问者覆盖先访问者 ⇒ 与绘制列表（同一个
+/// 声明序的先序遍历）构成同一个「画家算法」：**后声明者后画（在上）且命中优先** ——
+/// 同父兄弟间，positioned 节点与流内节点一视同仁，声明靠后者胜出。所以 `position`
+/// 不需要给命中侧加任何代码，但这条语义由 `crates/deer-core/tests/l1_position.rs` 钉住。
+///
+/// **已知边界**（与滚动视口同源，如实登记）：探查从「矩形包含该点」的祖先往下走 ⇒
+/// 流外节点若被偏移到**父矩形之外**，`hit_test` 探不到它（绘制不受影响 —— 裁剪与否
+/// 是渲染器的事）。
 pub fn hit_test<'a>(root: &'a Node, geo: &Geometry, px: f32, py: f32) -> Option<&'a Node> {
     fn probe<'a>(n: &'a Node, geo: &Geometry, px: f32, py: f32, found: &mut Option<&'a Node>) {
         let Some(f) = geo.get(&n.id) else { return };

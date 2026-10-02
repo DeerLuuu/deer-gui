@@ -18,7 +18,7 @@
 
 use std::fmt;
 
-use crate::node::{Align, IdGen, Kind, LayoutProps, Node, NodeProps, Size};
+use crate::node::{Align, IdGen, Kind, LayoutProps, Node, NodeProps, Pos, Size};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SceneError {
@@ -173,7 +173,8 @@ fn parse_attrs(s: &str, line: usize, source: &str) -> Result<Vec<(String, AttrVa
 }
 
 const KNOWN_ATTRS: &[&str] = &[
-    "name", "w", "h", "pad", "gap", "main", "cross", "grow", "scroll", "wrap", "label", "disabled",
+    "name", "w", "h", "pad", "gap", "main", "cross", "grow", "scroll", "wrap", "pos", "label",
+    "disabled",
 ];
 
 /// 开关属性（裸属性 = 真；**带值就报错**）。
@@ -231,6 +232,15 @@ fn as_align(v: &AttrVal, key: &str, line: usize, source: &str) -> Result<Align, 
                 source,
             )
         }),
+    }
+}
+
+/// `pos=x,y`（L1 流外定位；与 [`Pos::parse`] 共用一份语法，裸属性报错）。
+fn as_pos(v: &AttrVal, key: &str, line: usize, source: &str) -> Result<Pos, SceneError> {
+    match v {
+        AttrVal::Bare => Err(err(format!("{key} 需要一个值（形如 pos=10,-20）"), line, source)),
+        AttrVal::Str(s) => Pos::parse(s)
+            .ok_or_else(|| err(format!("{key} 必须是 \"整数,整数\"（可为负），实际 \"{s}\""), line, source)),
     }
 }
 
@@ -420,6 +430,10 @@ pub fn parse_scene_collect(src: &str, source: &str) -> Result<(Node, Vec<String>
         layout.scroll = as_flag(get("scroll"), "scroll", line, source)?;
         // 文本按宽度换行（只对 `text` 有意义；换行宽度取节点的 `w=`）。
         layout.wrap = as_flag(get("wrap"), "wrap", line, source)?;
+        // 流外定位（L1）：`pos=x,y`，相对父内容盒原点的像素偏移。设了即脱离流内布局。
+        if let Some(v) = get("pos") {
+            layout.position = Some(as_pos(v, "pos", line, source)?);
+        }
 
         let mut nprops = NodeProps::default();
         if let Some(AttrVal::Str(s)) = get("label") {
@@ -530,6 +544,11 @@ pub fn encode_scene(root: &Node) -> String {
         }
         if l.wrap {
             attrs.push("wrap".to_string());
+        }
+        // 流外定位（L1）：`Some` 才写 ⇒ 未设时编码**不多写一个字节**（既有语料逐字节不变）。
+        // 值形如 `10,-20`（无空格 ⇒ 不需要引号；`Pos::parse` 与 `to_attr` 互逆 ⇒ 往返稳定）。
+        if let Some(p) = l.position {
+            attrs.push(format!("pos={}", p.to_attr()));
         }
         if let Some(label) = &n.props.label {
             attrs.push(format!("label={}", quote(label)));

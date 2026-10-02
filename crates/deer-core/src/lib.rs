@@ -39,7 +39,7 @@ pub use layout::{
     SCROLLBAR_INSET, SCROLLBAR_MIN_THUMB, SCROLLBAR_W, ScrollbarGeom, scrollbar_geom,
     scrollbar_offset_for_pointer,
 };
-pub use node::{Align, IdGen, Kind, LayoutProps, Node, NodeProps, Rect, Size};
+pub use node::{Align, IdGen, Kind, LayoutProps, Node, NodeProps, Pos, Rect, Size};
 pub use registry::{PropSpec, PropType, SPECS};
 pub use scene::{SceneError, encode_scene, parse_scene};
 

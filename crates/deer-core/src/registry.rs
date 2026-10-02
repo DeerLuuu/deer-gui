@@ -41,6 +41,8 @@ pub enum PropType {
     Size,
     /// 对齐方式（`main_axis` / `cross_axis`）。
     Align,
+    /// **流外定位**（L1 的 `position`）：`x,y` 像素偏移。
+    Pos,
     /// 文本（`label`）。
     Text,
     /// **不透明**：往返保真的载体 —— **编辑器不该直接编辑它**（D8 的 `extra`）。
@@ -145,6 +147,13 @@ pub const SPECS: &[PropSpec] = &[
         kinds: &TEXT_ONLY,
     },
     PropSpec {
+        name: "position",
+        ty: PropType::Pos,
+        domain: "x,y（整数像素，可为负；设了即脱离流内，位置 = 父内容盒原点 + 偏移）",
+        default: "none",
+        kinds: &ANY,
+    },
+    PropSpec {
         name: "label",
         ty: PropType::Text,
         domain: "任意文本",
@@ -206,6 +215,7 @@ mod tests {
             grow,
             scroll,
             wrap,
+            position,
         } = LayoutProps::default();
         let NodeProps {
             label,
@@ -215,8 +225,8 @@ mod tests {
 
         // ② 触碰每个绑定（否则编译器会警告 unused，后来者容易一把删掉）
         let _probe = (
-            &width, &height, &padding, &gap, &main_axis, &cross_axis, &grow, &scroll, &wrap, &label,
-            &disabled, &extra,
+            &width, &height, &padding, &gap, &main_axis, &cross_axis, &grow, &scroll, &wrap,
+            &position, &label, &disabled, &extra,
         );
 
         // ③ 名字集合必须相等（两边都排序后比较，避免顺序敏感）
@@ -230,6 +240,7 @@ mod tests {
             "grow",
             "scroll",
             "wrap",
+            "position",
             "label",
             "disabled",
             "extra",
@@ -263,6 +274,7 @@ mod tests {
                 "grow" => show_f32(l.grow),
                 "scroll" => l.scroll.to_string(),
                 "wrap" => l.wrap.to_string(),
+                "position" => format!("{:?}", l.position).to_lowercase(),
                 "label" => format!("{:?}", n.label).to_lowercase(),
                 "disabled" => n.disabled.to_string(),
                 "extra" => "none".to_string(), // 空表 ⇒ 登记里写 none
@@ -336,10 +348,10 @@ mod tests {
         assert!(!text.contains(&"padding"), "`padding` 只对容器有意义：{text:?}");
         assert!(text.contains(&"label"), "Text 有 label：{text:?}");
 
-        // 叶子共同点：都能设尺寸/grow/禁用（`disabled` 对整棵子树生效 ⇒ 叶子也适用）
+        // 叶子共同点：都能设尺寸/grow/禁用/流外定位（`disabled` 对整棵子树生效 ⇒ 叶子也适用）
         for leaf in [Kind::Text, Kind::Button, Kind::Field] {
             let ns = names(leaf);
-            for expected in ["width", "height", "grow", "disabled", "label"] {
+            for expected in ["width", "height", "grow", "disabled", "position", "label"] {
                 assert!(ns.contains(&expected), "{leaf:?} 应有 `{expected}`：{ns:?}");
             }
         }

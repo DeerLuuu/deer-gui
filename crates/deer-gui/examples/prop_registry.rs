@@ -104,6 +104,7 @@ fn type_name(t: registry::PropType) -> &'static str {
         registry::PropType::Bool => "bool",
         registry::PropType::Size => "size",
         registry::PropType::Align => "align",
+        registry::PropType::Pos => "pos",
         registry::PropType::Text => "text",
         registry::PropType::Opaque => "opaque",
     }

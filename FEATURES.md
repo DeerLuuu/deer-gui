@@ -41,6 +41,7 @@
 | **固定与百分比尺寸**（`w` / `h`，`50%`） | ✅ | [layout](docs/features/layout.md#尺寸) | `cargo run -p deer-gui --example geometry` |
 | **多行文本 + 垂直滚动容器**（`text` + `wrap` ⇒ 每行一条 `Text` 命令；`column` + `scroll` ⇒ `max_scroll` + 视口裁剪 + 滚轮驱动偏移，到边界不越界、视口外不命中） | ✅ | [scroll-and-multiline](docs/features/scroll-and-multiline.md) | `cargo run -p deer-gui --example scroll` |
 | **滚动条**（可视：轨道 + 滑块，位置与高度反映当前偏移；**拖滑块改偏移** + **点轨道空白跳到指针处**并可续拖（T3.2b）；内容装得下 ⇒ 不画；默认 opt-in。惯性驱动收口为 `advance_inertia`/`inertia_deadline` 两行接线（参考 `scroll_inertia_window`）） | ✅ | [scrollbar](docs/features/scrollbar.md) | `cargo run -p deer-gui --example scroll_bar` |
+| **绝对定位 / 层叠**（L1：`position: Pos::Offset` ⇒ 子节点脱离流内（不占槽、不计入父固有尺寸），位置 = 父内容盒原点 + 像素偏移（可负）；层叠 = **声明序**（后声明者后画且命中优先）；`.dui` 写法 `pos=x,y`；默认 opt-in ⇒ 未设时既有树逐字节不变） | ✅ | [absolute-positioning](docs/features/absolute-positioning.md) | `cargo run -p deer-gui --example overlay_demo` |
 | **命中测试**（坐标 → 哪个控件） | ✅ | [hit-testing](docs/features/hit-testing.md) | `cargo run -p deer-gui --example geometry` |
 
 ## 三、渲染与自检
