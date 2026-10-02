@@ -150,6 +150,15 @@ pub struct Node {
     pub layout: LayoutProps,
     pub props: NodeProps,
     pub children: Vec<Node>,
+    /// **节点上方的注释行**（`.dui` 的 `#` 行，**含 `#` 本身**，按出现顺序）。
+    ///
+    /// 为什么保留：`.dui` 是**用户会手写、编辑器会存回**的文件 ——
+    /// 存一次就把人家的注释吃掉，是**数据丢失**（与 D8 对未知属性的理由同源）。
+    ///
+    /// **不参与 [`Node::structurally_eq`]**：注释不影响布局/命中/渲染，
+    /// 而「两条构筑路径产出结构相等的树」是核心不变式 —— 若注释参与比较，
+    /// 一个带注释的 `.dui` 与等价的命令式树就「不相等」了，那条不变式立刻失效。
+    pub comments: Vec<String>,
 }
 
 impl Node {
@@ -160,6 +169,7 @@ impl Node {
             layout: LayoutProps::default(),
             props: NodeProps::default(),
             children: Vec::new(),
+                    comments: Vec::new(),
         }
     }
 
@@ -222,6 +232,12 @@ impl Node {
     }
 
     /// 结构相等：两条构筑路径的产出必须满足（见模块注释的 B-1）。
+    /// **结构相等**：`kind` / `id` / `props` / `layout` / `children` 递归比较。
+    ///
+    /// ⚠️ **刻意不比 `comments`**：它是文件层的信息，不影响布局/命中/渲染。
+    /// 「两条构筑路径（命令式 / `.dui`）产出结构相等的树」是核心不变式 ——
+    /// 若注释参与比较，同一个界面「带注释的 `.dui`」与「命令式建的树」就会判不等，
+    /// 那条不变式当场失效。注释的往返保真由 `scene.rs` 的往返判据单独负责。
     pub fn structurally_eq(&self, other: &Node) -> bool {
         self.kind == other.kind
             && self.id == other.id

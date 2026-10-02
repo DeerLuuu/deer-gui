@@ -47,25 +47,56 @@ struct RawLine {
     indent: usize,
     text: String,
     line: usize,
+    /// **紧挨在这一行上面的注释行**（含 `#`，已去掉行首空白）。
+    ///
+    /// 为什么挂在「下一行」上：注释在语义上属于它**描述的东西**（在上面写注释是主流），
+    /// 而 `.dui` 的行序就是树的深度优先序 ⇒ 这样挂能原样写回去。
+    comments: Vec<String>,
 }
 
-/// 去注释（`#` 起，前面必须有空白或行首；引号内的 `#` 不算）并去空行。
+/// 切行 + 收集注释（`#` 起，前面必须有空白或行首；引号内的 `#` 不算）。
+///
+/// **注释保留**（D9）：纯注释行与行内注释都挂到「紧接着的下一个节点行」上
+/// （语义上注释属于它描述的东西 —— 在上面写注释是主流）。
+///
+/// ⚠️ **已知限制**：文件**末尾**（最后一个节点之后）的注释没有可挂的节点，**会丢**。
+/// 这一条如实登记，不假装做到了 —— 要保留它有两条路：给 `Node` 再加一个「尾注释」字段，
+/// 或引入文档级结构。目前认为收益不抵复杂度。
 fn preprocess(src: &str, source: &str) -> Result<Vec<RawLine>, SceneError> {
     let mut out = Vec::new();
+    // **注释不再丢弃**（D9）：攒起来，挂到紧接着的**下一个节点行**上。
+    let mut pending: Vec<String> = Vec::new();
+    // **版本头不是注释**：它由 `parse_scene` 单独读走。若不排除，它会被当成
+    // 根节点的前导注释 ⇒ 编码时**再写一遍头**，于是每存一次盘就多一行（往返判据抓住了这个）。
+    let mut first_nonempty_seen = false;
     for (i, raw) in src.lines().enumerate() {
         let line_no = i + 1;
+        let is_first_nonempty = !first_nonempty_seen && !raw.trim().is_empty();
+        if is_first_nonempty {
+            first_nonempty_seen = true;
+            if raw.trim().starts_with(SCENE_HEADER_PREFIX) {
+                continue; // 头交给 parse_scene，不进注释、也不进节点
+            }
+        }
         let mut line = String::new();
         let mut in_quote = false;
-        for ch in raw.chars() {
+        let mut comment_at: Option<usize> = None;
+        for (bi, ch) in raw.char_indices() {
             if ch == '"' {
                 in_quote = !in_quote;
             }
             if ch == '#' && !in_quote && (line.is_empty() || line.ends_with(char::is_whitespace)) {
+                comment_at = Some(bi);
                 break;
             }
             line.push(ch);
         }
+        // 记下这一行的注释原文（**含 `#`**，保留行内注释的位置信息）。
+        if let Some(bi) = comment_at {
+            pending.push(raw[bi..].trim_end().to_string());
+        }
         if line.trim().is_empty() {
+            // 纯注释行 / 空行：不清 `pending` —— 它要留给下一个节点行
             continue;
         }
         let indent = line.len() - line.trim_start().len();
@@ -80,6 +111,7 @@ fn preprocess(src: &str, source: &str) -> Result<Vec<RawLine>, SceneError> {
             indent,
             text: line.trim().to_string(),
             line: line_no,
+            comments: std::mem::take(&mut pending),
         });
     }
     Ok(out)
@@ -396,7 +428,9 @@ pub fn parse_scene_collect(src: &str, source: &str) -> Result<(Node, Vec<String>
         nprops.disabled = as_flag(get("disabled"), "disabled", line, source)?;
         nprops.extra = extra;
 
-        let node = Node::new(kind, id).with_layout(layout).with_props(nprops);
+        let mut node = Node::new(kind, id).with_layout(layout).with_props(nprops);
+        // 该节点**上方**的注释跟着它走（D9）—— 存回去时写在它前面。
+        node.comments = rl.comments.clone();
 
         // 弹出缩进 >= 当前的祖先，找到真正的父
         while let Some(o) = open.last() {
@@ -511,6 +545,10 @@ pub fn encode_scene(root: &Node) -> String {
                 Some(val) => attrs.push(format!("{k}={}", quote(val))),
                 None => attrs.push(k.clone()),
             }
+        }
+        // **注释写在节点行之前**（D9），缩进与节点一致 ⇒ 与读入时同一形态。
+        for c in &n.comments {
+            out.push_str(&format!("{pad}{c}\n"));
         }
         out.push_str(&format!("{pad}[{} {}]\n", n.kind.as_str(), attrs.join(" ")));
         for c in &n.children {
@@ -742,5 +780,62 @@ mod e2_unknown_attrs_tests {
     fn old_entry_point_still_works() {
         let t = parse_scene("[column name=app future=on]\n", "f.dui").expect("老入口照常能读");
         assert_eq!(t.id, "app");
+    }
+}
+
+#[cfg(test)]
+mod e2_comments_tests {
+    use super::*;
+
+    /// ① 节点上方的注释**原样保留**，且存回去仍是同一形态（逐字节稳定）
+    #[test]
+    fn leading_comments_survive_round_trip() {
+        let src = "# deer-gui-scene: 1\n# 顶部说明\n[column name=app]\n  # 按钮的说明\n  [button name=ok]\n";
+        let t = parse_scene(src, "c.dui").expect("能读");
+        assert_eq!(t.comments, vec!["# 顶部说明".to_string()], "根节点上方的注释");
+        assert_eq!(
+            t.children[0].comments,
+            vec!["# 按钮的说明".to_string()],
+            "子节点上方的注释"
+        );
+        let out = encode_scene(&t);
+        assert!(out.contains("# 顶部说明"), "注释必须被写回：\n{out}");
+        assert!(out.contains("  # 按钮的说明"), "缩进应当与节点一致：\n{out}");
+        // 再读一次逐字节相同
+        assert_eq!(encode_scene(&parse_scene(&out, "c.dui").unwrap()), out, "注释往返必须稳定");
+    }
+
+    /// ② 行内注释挂在**它自己那一行**的节点上（不是下一个）
+    #[test]
+    fn inline_comments_attach_to_their_own_node() {
+        // 同一行上的行内注释应当挂到**这一行**的节点（而不是下一个）
+        let t = parse_scene("[column name=app] # 这是根\n", "c.dui").expect("能读");
+        assert_eq!(t.comments, vec!["# 这是根".to_string()]);
+        // 而写在**下一行**的注释属于**下一个**节点（这是「注释在它描述的东西上面」的约定）
+        let t2 = parse_scene("[column name=app]\n  # 属于按钮\n  [button name=x]\n", "c.dui")
+            .expect("能读");
+        assert!(t2.comments.is_empty(), "根节点不该拿到下一行的注释：{:?}", t2.comments);
+        assert_eq!(t2.children[0].comments, vec!["# 属于按钮".to_string()]);
+    }
+
+    /// ③ **注释不参与结构相等** —— 这条是核心不变式的前提：
+    /// 「两条构筑路径产出结构相等的树」不能被一个注释打破。
+    #[test]
+    fn comments_do_not_affect_structural_equality() {
+        let with = parse_scene("# 说明\n[column name=app]\n", "c.dui").unwrap();
+        let without = parse_scene("[column name=app]\n", "c.dui").unwrap();
+        assert!(!with.comments.is_empty(), "前置：确实带了注释");
+        assert!(without.comments.is_empty());
+        assert!(
+            with.structurally_eq(&without),
+            "只有注释不同的两棵树**必须**结构相等（否则 .dui 与命令式树判不等，核心不变式失效）"
+        );
+    }
+
+    /// ④ 没有注释 ⇒ 编码**不多写一个字节**（既有语料逐字节不变）
+    #[test]
+    fn no_comments_means_byte_identical_output() {
+        let out = encode_scene(&parse_scene("[column name=app]\n", "c.dui").unwrap());
+        assert_eq!(out, "# deer-gui-scene: 1\n[column name=app]\n");
     }
 }
