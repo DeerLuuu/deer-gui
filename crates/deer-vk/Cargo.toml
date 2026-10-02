@@ -13,3 +13,5 @@ path = "src/lib.rs"
 [dependencies]
 deer-gpu.workspace = true
 deer-core.workspace = true
+# LY2：`TextEngine` / `GlyphPlacement` / `AtlasSlot` 现在来自 L1 TextServer crate。
+deer-text.workspace = true

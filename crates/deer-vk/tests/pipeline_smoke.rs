@@ -1039,7 +1039,7 @@ use deer_gpu::{ Extent };
     });
     r.render(&l).expect("子进程：形状帧渲染失败");
     // ② 有系统字体时连文本路径一起走（图集纹理 + **描述符改指**也是析构契约的一部分）
-    let text_ran = match deer_gpu::text::TextEngine::from_system_font(16.0) {
+    let text_ran = match deer_text::text::TextEngine::from_system_font(16.0) {
         Ok(engine) => {
             let mut r = r.with_text(engine).expect("子进程：with_text 失败");
             let mut lt = DrawList::new();

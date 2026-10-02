@@ -11,9 +11,9 @@
 //! 像素 `(i, j)` 的覆盖率 = `cx(i) * cy(j)`，所以期望值可以手算出来（见各测试注释）。
 //! 这些手算值就是独立参照 —— 不是把实现跑出来的数字抄回测试。
 
-use deer_gpu::font::{Contour, Font, Glyph, Segment};
-use deer_gpu::glyph::GlyphImage;
-use deer_gpu::raster::{split_subpixel_x, Rasterizer, SUBPIXEL_LEVELS};
+use deer_text::font::{Contour, Font, Glyph, Segment};
+use deer_text::glyph::GlyphImage;
+use deer_text::raster::{split_subpixel_x, Rasterizer, SUBPIXEL_LEVELS};
 
 // ───────────────────────── 手工构造字形的工具 ─────────────────────────
 

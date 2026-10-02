@@ -49,14 +49,17 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use deer_gui::gpu::text::TextEngine;
-use deer_gui::gpu::{self, Color, Extent, Theme};
+use deer_gui::gpu::{self, Extent, Theme};
 use deer_gui::layout::builder::{Builder, L};
 use deer_gui::layout::layout;
 use deer_gui::layout::layout::TextStyle;
 use deer_gui::layout::node::{Kind, Rect};
 use deer_gui::vk::windowed::{FrameOutcome, WindowedRenderer};
 use deer_gui::window::{App, Flow, RedrawPolicy, WindowConfig, WindowInfo, run};
+// LY1/LY2：L0 类型来自 `deer-core`；文本栈来自 L1 crate `deer-text`。
+use deer_core::Color;
+use deer_text::measure::find_system_font;
+use deer_text::TextEngine;
 
 /// 清屏色：**界面没盖住的地方**就是这个颜色（界面树的根面板会盖住大部分窗口）。
 ///
@@ -127,7 +130,7 @@ struct Preview {
     engine: Option<TextEngine>,
     tree: deer_gui::layout::Node,
     /// 当前尺寸下的绘制列表（尺寸变化时重算）。
-    list: Option<deer_gui::gpu::DrawList>,
+    list: Option<deer_core::DrawList>,
     last_extent: Extent,
     target_frames: u64,
     hold: bool,
@@ -315,7 +318,7 @@ impl Preview {
 impl App for Preview {
     fn init(&mut self, info: &WindowInfo) -> Result<(), String> {
         // 字体：**找不到就明确失败**（窗口预览的意义就是「看到真实界面」，不许退化成方块）
-        let font_path = gpu::measure::find_system_font().ok_or_else(|| {
+        let font_path = find_system_font().ok_or_else(|| {
             "找不到系统字体（consola.ttf / arial.ttf / segoeui.ttf）—— 本示例需要真实字形".to_string()
         })?;
         let font_size = 16.0f32;

@@ -96,6 +96,8 @@ pub use deer_window as window;
 use std::path::Path;
 
 use deer_core::layout::{ApproxMeasure, TextStyle};
+// LY2：文本引擎来自 L1 crate `deer-text`（`deer_gui::gpu` 别名只覆盖 deer-gpu 的东西）。
+use deer_text::TextEngine;
 
 /// 常用类型的集中导入。
 pub mod prelude {
@@ -103,11 +105,12 @@ pub mod prelude {
     pub use crate::gpu::null::{CpuRenderer, Framebuffer};
     pub use crate::gpu::{ Extent, Theme };
     pub use deer_core::{ Color, DrawCmd, DrawList, RectI };
-    pub use crate::gpu::atlas::GlyphAtlas;
-    pub use crate::gpu::glyph::{GlyphImage, GlyphKey};
-    pub use crate::gpu::measure::FontMeasure;
-    pub use crate::gpu::raster::Rasterizer;
-    pub use crate::gpu::text::{GlyphPlacement, TextEngine};
+    // LY2：文本栈来自 L1 crate `deer-text`（`deer_gui::prelude::*` 里的**名字**保持不变）。
+    pub use deer_text::atlas::GlyphAtlas;
+    pub use deer_text::glyph::{GlyphImage, GlyphKey};
+    pub use deer_text::measure::FontMeasure;
+    pub use deer_text::raster::Rasterizer;
+    pub use deer_text::text::{GlyphPlacement, TextEngine};
     pub use crate::layout::builder::{Builder, L};
     pub use crate::layout::layout::{ApproxMeasure, Measure, TextStyle, hit_test, layout, measure_tree};
     pub use crate::layout::node::{Align, Kind, Node, Rect, Size};
@@ -158,7 +161,7 @@ pub fn render_tree_to_png(
 ///
 /// 与 [`render_tree_to_rgba`] 的三点区别：
 ///
-/// 1. 布局的文本度量用 [`gpu::FontMeasure`]（字体真实 advance），不是「每字符 0.6em」的近似；
+/// 1. 布局的文本度量用 [`deer_text::FontMeasure`]（字体真实 advance），不是「每字符 0.6em」的近似；
 /// 2. 文字画成**真实字形**（从字形图集采样覆盖率），不是等宽占位格；
 /// 3. `font_size` **同时**决定引擎字号、布局的 `TextStyle.font_size` 与 `theme.font_size`
 ///    —— 三者必须一致，否则「布局算出来的宽度」与「画出来的宽度」会漂。
@@ -173,11 +176,11 @@ pub fn render_tree_to_rgba_with_font(
     font_path: &Path,
     font_size: f32,
 ) -> GpuResult<(u32, u32, Vec<u8>)> {
-    let engine = gpu::TextEngine::from_font_file(font_path, font_size)?;
+    let engine = TextEngine::from_font_file(font_path, font_size)?;
     render_tree_to_rgba_with_engine(tree, width, height, theme, font_size, engine)
 }
 
-/// 同上，但由调用方给一个已经建好的 [`gpu::TextEngine`]
+/// 同上，但由调用方给一个已经建好的 [`TextEngine`]
 /// （例如想复用已解析的字体、或用 `TextEngine::from_system_font`）。
 pub fn render_tree_to_rgba_with_engine(
     tree: &Node,
@@ -185,7 +188,7 @@ pub fn render_tree_to_rgba_with_engine(
     height: u32,
     mut theme: Theme,
     font_size: f32,
-    engine: gpu::TextEngine,
+    engine: TextEngine,
 ) -> GpuResult<(u32, u32, Vec<u8>)> {
     // 字号一处定义：`theme.font_size` 就是绘制列表里 `DrawCmd::Text.size` 的来源，
     // 所以要把它钉到与引擎/度量同一个值上。

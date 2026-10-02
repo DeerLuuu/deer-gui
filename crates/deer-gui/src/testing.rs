@@ -82,11 +82,13 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use deer_gpu::interact::{FieldText, InteractiveRenderer, InteractState};
-use deer_gpu::measure::find_system_font;
 use deer_gpu::null::{CpuRenderer, Framebuffer};
 use deer_core::draw::DrawCounts;
 use deer_core::{ Color, DrawCmd, DrawList, RectI };
-use deer_gpu::{ Extent, TextEngine, Theme };
+use deer_gpu::{ Extent, Theme };
+// LY2：文本栈来自 L1 crate `deer-text`。
+use deer_text::measure::find_system_font;
+use deer_text::TextEngine;
 use deer_core::builder::Builder;
 use deer_core::layout::{self, ApproxMeasure, Geometry, Measure, TextStyle};
 use deer_core::node::{Node, Rect};

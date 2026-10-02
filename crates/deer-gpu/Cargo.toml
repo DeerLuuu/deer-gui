@@ -13,3 +13,6 @@ path = "src/lib.rs"
 [dependencies]
 deer-log.workspace = true
 deer-core.workspace = true
+# LY2：文本栈（font/glyph/raster/atlas/text/measure）物理迁到 L1 crate `deer-text`。
+# 依赖方向单向：deer-gpu → deer-text → deer-core。
+deer-text.workspace = true

@@ -36,9 +36,10 @@
 //! 这是本项目「**读数与真实调用同处**」规矩的一次直接应用。
 
 use deer_core::draw::{Color, DrawCmd, DrawList};
-use deer_gpu::text::TextEngine;
 use deer_core::{ RectI };
 use deer_gpu::{ Extent };
+// LY2：文本引擎来自 L1 crate `deer-text`。
+use deer_text::text::TextEngine;
 use deer_vk::GpuGeometryRenderer;
 
 fn engine(size: f32) -> Option<TextEngine> {

@@ -9,7 +9,8 @@
 
 use deer_core::draw::{Color, DrawCmd, DrawList, RectI};
 use deer_core::error::{GpuError, GpuResult};
-use crate::text::{GlyphPlacement, TextEngine};
+// LY2：文本栈已迁到 L1 crate `deer-text`（依赖方向 deer-gpu → deer-text）。
+use deer_text::{GlyphPlacement, TextEngine};
 use deer_core::{ TextureId };
 use crate::{ AdapterInfo, AdapterKind, Backend, Device, Extent, Frame, PresentResult, RawWindowHandle, Swapchain, TargetFormat, TextureDesc, TextureRegion };
 

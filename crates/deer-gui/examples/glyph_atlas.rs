@@ -2,9 +2,9 @@
 //!
 //! ## 这是什么
 //!
-//! 用 `deer-gpu` 自己的 TrueType 解析器 + 光栅化器把 **94 个可见 ASCII**（`!`..=`~`）
+//! 用 `deer-text`（L1 TextServer）自己的 TrueType 解析器 + 光栅化器把 **94 个可见 ASCII**（`!`..=`~`）
 //! 在 **@16px 与 @24px** 两档字号下光栅化成覆盖率位图，再打进一张**货架打包**的
-//! 字形图集（[`deer_gpu::atlas::GlyphAtlas`]），最后把整张图集写成 PNG。
+//! 字形图集（[`deer_text::atlas::GlyphAtlas`]），最后把整张图集写成 PNG。
 //!
 //! 图集是 GPU 侧文本渲染的必需品：所有字形共用一张纹理，绘制时按槽位采样。
 //! 本示例不碰 GPU —— 它产出的是**那张纹理的 CPU 侧内容**，
@@ -30,12 +30,14 @@
 //! ④ 至少一个字形有 `max_coverage() == 255`（说明真的着墨了，不是全灰糊）；
 //! ⑤ 两次独立构建的图集 `coverage()` 逐字节相同（确定性）。
 
-use deer_gpu::atlas::GlyphAtlas;
-use deer_gpu::font::Font;
-use deer_gpu::glyph::{GlyphImage, GlyphKey};
-use deer_gpu::measure::find_system_font;
+// LY2：文本栈（解析 / 光栅化 / 图集 / 度量）来自 L1 crate `deer-text`；`png` 仍在 deer-gpu
+// （它由 deer-gpu 以模块别名转发 deer-text 的编码器，路径 `deer_gpu::png::encode_rgba` 不变）。
 use deer_gpu::png::encode_rgba;
-use deer_gpu::raster::Rasterizer;
+use deer_text::atlas::GlyphAtlas;
+use deer_text::font::Font;
+use deer_text::glyph::{GlyphImage, GlyphKey};
+use deer_text::measure::find_system_font;
+use deer_text::raster::Rasterizer;
 
 /// 图集宽度（像素）。高度初始 = 宽度，必要时按需增高（货架打包不会移动已有槽位）。
 const ATLAS_WIDTH: u32 = 256;

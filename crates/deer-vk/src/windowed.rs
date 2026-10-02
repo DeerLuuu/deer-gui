@@ -42,7 +42,9 @@ use std::ffi::c_void;
 use std::ptr;
 
 use deer_core::{ Color, DrawCmd, DrawList, GpuError, GpuResult, RectI };
-use deer_gpu::{ AdapterInfo, Extent, RawWindowHandle, TextEngine };
+use deer_gpu::{ AdapterInfo, Extent, RawWindowHandle };
+// LY2：文本引擎来自 L1 crate `deer-text`。
+use deer_text::TextEngine;
 
 use crate::device::{
     vk_result_name, DescriptorPool, DescriptorSet, Pipeline, PipelineLayout, RenderPass,

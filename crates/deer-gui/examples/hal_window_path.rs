@@ -37,7 +37,9 @@
 
 use std::process::ExitCode;
 
-use deer_gui::gpu::{Backend, Color, Device, DrawCmd, DrawList, PresentResult, RectI, TargetFormat};
+// LY1：L0 类型（Color/DrawCmd/DrawList/RectI）来自 `deer-core`；HAL 契约仍在 `deer-gpu`。
+use deer_core::{Color, DrawCmd, DrawList, RectI};
+use deer_gui::gpu::{Backend, Device, PresentResult, TargetFormat};
 use deer_gui::vk::VkBackend;
 use deer_gui::window::{App, Flow, RedrawPolicy, WindowConfig, WindowInfo, run};
 

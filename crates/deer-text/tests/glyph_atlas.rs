@@ -20,8 +20,8 @@
 //! 增高移位后 `get()` 仍然正确、但图集大图已经错位。于是 ⑨ 补上了
 //! `gather_from_coverage()` 这条独立读取路径的断言（现在 M3 会被 ⑨ 直接抓住）。
 
-use deer_gpu::atlas::{GlyphAtlas, MAX_DIMENSION};
-use deer_gpu::glyph::{AtlasSlot, GlyphImage, GlyphKey};
+use deer_text::atlas::{GlyphAtlas, MAX_DIMENSION};
+use deer_text::glyph::{AtlasSlot, GlyphImage, GlyphKey};
 
 fn key(glyph_index: u16, px_size: u16) -> GlyphKey {
     GlyphKey::new(glyph_index, px_size)

@@ -57,9 +57,13 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use deer_gui::gpu::interact::{FieldText, InteractState, InteractiveRenderer};
-use deer_gui::gpu::measure::find_system_font;
 use deer_gui::gpu::null::CpuRenderer;
-use deer_gui::gpu::{Color, DrawCmd, DrawList, Extent, RectI, TextEngine, Theme};
+use deer_gui::gpu::{Extent, Theme};
+// LY1/LY2：L0 类型（Color/DrawCmd/DrawList/RectI）来自 `deer-core`；
+// 文本栈（TextEngine / find_system_font）来自 L1 crate `deer-text`。
+use deer_core::{Color, DrawCmd, DrawList, RectI};
+use deer_text::measure::find_system_font;
+use deer_text::TextEngine;
 use deer_gui::input_script::ENV_VAR;
 use deer_gui::interaction::{self, ClipSnapshot, InputEvent, Key, UiEvent, UiState};
 use deer_gui::layout::builder::L;

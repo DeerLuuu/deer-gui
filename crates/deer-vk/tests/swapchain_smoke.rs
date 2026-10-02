@@ -1364,7 +1364,7 @@ fn child_probe_windowed_renderer_release() {
     r.draw_and_present(&shapes, None)
         .expect("子进程：形状界面帧失败");
     // 有系统字体时连文本路径一起走（图集纹理 + **描述符改指**也是析构契约的一部分）
-    let text_ran = match deer_gpu::text::TextEngine::from_system_font(16.0) {
+    let text_ran = match deer_text::text::TextEngine::from_system_font(16.0) {
         Ok(mut engine) => {
             let mut with_text = shapes.clone();
             with_text.push(deer_core::DrawCmd::Text {

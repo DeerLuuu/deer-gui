@@ -21,7 +21,9 @@ use deer_gpu::interact::{InteractState, InteractiveRenderer};
 use deer_gpu::null::CpuRenderer;
 use deer_gpu::render::{DefaultRenderer, NullRenderer};
 use deer_core::{ DrawCmd, DrawList, RectI };
-use deer_gpu::{ Extent, TextEngine, Theme };
+use deer_gpu::{ Extent, Theme };
+// LY2：文本栈来自 L1 crate `deer-text`。
+use deer_text::TextEngine;
 use deer_gui::interaction::{self, ClipSnapshot, InputEvent, UiEvent, UiState};
 use deer_core::builder::Builder;
 use deer_core::layout::{ApproxMeasure, Geometry, ScrollOffsets, TextStyle, layout};
