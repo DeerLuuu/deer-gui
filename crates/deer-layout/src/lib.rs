@@ -26,11 +26,13 @@
 pub mod builder;
 pub mod layout;
 pub mod node;
+pub mod registry;
 pub mod scene;
 
 pub use builder::{Builder, L};
 pub use layout::{ApproxMeasure, Geometry, Intrinsics, Measure, TextStyle, hit_test, layout, measure_tree, metrics};
 pub use node::{Align, IdGen, Kind, LayoutProps, Node, NodeProps, Rect, Size};
+pub use registry::{PropSpec, PropType, SPECS};
 pub use scene::{SceneError, encode_scene, parse_scene};
 
 /// 本 crate 的语义版本（实验阶段）。

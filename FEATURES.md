@@ -34,6 +34,7 @@
 | 功能 | 状态 | 指南 | 可运行示例 |
 |---|---|---|---|
 | **布局计算**（树 + 画布 → 几何表） | ✅ | [layout](docs/features/layout.md) | `cargo run -p deer-gui --example geometry` |
+| **属性注册表**（按 `Kind` 枚举可编辑属性：名/类型/取值域/默认值/适用面；编辑器 Inspector、undo 粒度、`.dui` 语法面、拖拽写回四个消费者的共同上游） | ✅ | [prop-registry](docs/features/prop-registry.md) | `cargo run -p deer-gui --example prop_registry` |
 | **内边距与间距**（`pad` / `gap`） | ✅ | [layout](docs/features/layout.md#内边距与间距) | `cargo run -p deer-gui --example tutorial`（第 2 步） |
 | **主轴分配**（`grow` 权重） | ✅ | [layout](docs/features/layout.md#主轴分配-grow) | `cargo run -p deer-gui --example geometry` |
 | **对齐**（`main` / `cross`：start/center/end/stretch） | ✅ | [layout](docs/features/layout.md#对齐) | `cargo run -p deer-gui --example scene_file`（`main=end`） |
