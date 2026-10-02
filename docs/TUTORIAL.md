@@ -248,6 +248,11 @@ assert_eq!(hit.map(|n| n.id.as_str()), Some("button_1"));
 
 > 对应示例：`cargo run -p deer-gui --example geometry`
 
+**滚动条**：滚动容器现在会自己长出「轨道 + 滑块」（几何与将来命中侧共用一份实现）。
+跑 `cargo run -p deer-gui --example scroll_bar` 看实测输出；
+注意 `layout_with_scroll` 给出的上限**每帧**都要 `set_metrics` 灌回状态，否则滚动条不出现
+（见 [`features/scrollbar.md`](features/scrollbar.md)）。
+
 **顺带一个「看」的工具**：想一次看清「每种节点到底有哪些属性可以改」，跑
 `cargo run -p deer-gui --example prop_registry` —— 它按 `Kind` 列出属性名、类型、取值域、默认值
 （见 [`features/prop-registry.md`](features/prop-registry.md)）。这是编辑器 Inspector 的数据源，
