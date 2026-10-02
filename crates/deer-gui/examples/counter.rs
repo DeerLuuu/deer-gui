@@ -220,11 +220,7 @@ impl Frame {
             measure,
         );
         // `UiState` 是交互层的真相；渲染层只认它的**只读子集** `InteractState`。
-        let interact = InteractState {
-            hover: state.hover.clone(),
-            focus: state.focus.clone(),
-            pressed: state.pressed.clone(),
-        };
+        let interact = state.to_interact_state();
         // `FieldText::Content` ⇒ 输入框画的是 `state.texts["input"]`（不是占位 label）；
         // `InteractiveRenderer` 会给**每个有几何的节点**发一条 `NodeHint` ⇒ 裁剪快照非空。
         let list = InteractiveRenderer::with_texts(
@@ -397,11 +393,7 @@ fn pixel_diff_split(
 ///
 /// 只算 `hover`/`focus`/`pressed` 三个字段：它们正是 [`InteractState`] 的全部输入。
 fn buttons_whose_visual_changed(before: &Frame, after: &Frame) -> Vec<String> {
-    let st = |f: &Frame| InteractState {
-        hover: f.state.hover.clone(),
-        focus: f.state.focus.clone(),
-        pressed: f.state.pressed.clone(),
-    };
+    let st = |f: &Frame| f.state.to_interact_state();
     let (a, b) = (st(before), st(after));
     let ids = ["plus", "minus"];
     let mut out = Vec::new();

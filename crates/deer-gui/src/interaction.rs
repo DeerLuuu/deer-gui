@@ -256,6 +256,28 @@ pub enum UiEvent {
 pub const WHEEL_STEP_PX: i32 = 40;
 
 impl UiState {
+    /// 渲染层要的**只读子集**：[`deer_gpu::interact::InteractState`]。
+    ///
+    /// ## 为什么必须只有这一处
+    ///
+    /// 这个转换以前散在**每个示例**里各写一遍（只拷 `hover`/`focus`/`pressed`）。
+    /// T3.2 给 `InteractState` 加了 `scroll` 之后，那种写法立刻暴露两个问题：
+    /// ① 得挨个示例去改；② **谁漏了谁就没有滚动条**，而那种漏**不报错**
+    /// （界面看起来只是「滚动条没出现」，很容易被当成功能没做）。
+    ///
+    /// 收口成一处之后，`UiState` 加任何「渲染也要看」的字段，都由这里统一带上。
+    pub fn to_interact_state(&self) -> crate::gpu::interact::InteractState {
+        crate::gpu::interact::InteractState {
+            hover: self.hover.clone(),
+            focus: self.focus.clone(),
+            pressed: self.pressed.clone(),
+            scroll: crate::gpu::interact::ScrollView {
+                offsets: self.scroll.offsets.clone(),
+                metrics: self.scroll.metrics.clone(),
+            },
+        }
+    }
+
     /// 三个**视觉**字段（`hover`/`focus`/`pressed`）是否完全一样（`texts` 不参与）。
     ///
     /// 窗口层的 dirty 约定靠它：`PointerDown` 这类**不发 `UiEvent`** 却会改 `pressed`
@@ -2038,6 +2060,77 @@ mod tests {
             assert!(out.is_empty(), "{e:?} 不该产生事件，实际 {out:?}");
         }
         assert_eq!(s, before, "不消费的事件不得改变任何状态");
+    }
+
+    // ---- T3.2：UiState → InteractState 的唯一转换 ---------------------------
+
+    /// `to_interact_state` 必须把**每个**渲染要看的字段都带上。
+    ///
+    /// **防漂移走编译期**：下面用 `InteractState` 的**穷尽解构**（不写 `..`）——
+    /// 给 `InteractState` 加字段时，本函数会**先编译失败**，逼作者回来把它接上
+    /// （这正是 T3.2 第二块踩到的坑：字段加了，示例里手写的转换没跟上，
+    /// 于是滚动条不出现而且**不报错**）。
+    #[test]
+    fn to_interact_state_carries_every_field() {
+        // ⚠️ 源状态必须是**非空**的滚动状态 —— 否则「漏带滚动快照」在空值上恒等，
+        // 判据就是在测空气（这一点是实测出来的：用默认状态时，把转换改成
+        // `ScrollView::default()` 仍然 30 passed）。
+        let mut col = Node::new(Kind::Column, "box");
+        col.layout.scroll = true;
+        col.layout.height = Some(Size::Px(50.0));
+        for i in 0..5 {
+            let mut c = Node::new(Kind::Button, format!("b{i}"));
+            c.props.label = Some("x".into());
+            c.layout.height = Some(Size::Px(40.0));
+            col.children.push(c);
+        }
+        let (_geo, metrics) = deer_layout::layout::layout_with_scroll(
+            &col,
+            Rect { x: 0.0, y: 0.0, w: 100.0, h: 200.0 },
+            deer_layout::TextStyle { font_size: 14.0, line_height: 18.0 },
+            &deer_layout::layout::ApproxMeasure,
+            &deer_layout::layout::ScrollOffsets::new(),
+        );
+        assert!(
+            metrics.max_of("box") > 0,
+            "测试前置：metrics 必须非空（实测 {}），否则判据没有判别力",
+            metrics.max_of("box")
+        );
+
+        let mut s = UiState {
+            hover: Some("h".into()),
+            focus: Some("f".into()),
+            pressed: Some("p".into()),
+            ..Default::default()
+        };
+        s.scroll.set_metrics(&metrics);
+        assert_eq!(
+            s.scroll.scroll_to("box", 40),
+            Some(40),
+            "测试前置：偏移必须被真的改掉（否则「带没带」测不出来）"
+        );
+
+        let i = s.to_interact_state();
+        // 穷尽解构（**不写 `..`**）：加字段 ⇒ 编译失败
+        let crate::gpu::interact::InteractState {
+            hover,
+            focus,
+            pressed,
+            scroll,
+        } = i;
+        assert_eq!(hover, s.hover, "hover 必须原样带过去");
+        assert_eq!(focus, s.focus);
+        assert_eq!(pressed, s.pressed);
+        // 滚动快照：偏移与上限都要带（否则滚动条要么不画、要么画在错位置）
+        assert_eq!(
+            scroll.offsets.get("box"),
+            40,
+            "滚动偏移必须带过去 —— 漏了它滚动条会永远停在顶部"
+        );
+        assert!(
+            scroll.metrics.max_of("box") > 0,
+            "滚动上限必须带过去 —— 漏了它滚动条根本不会被画（`max_scroll = 0`）"
+        );
     }
 
     // ---- T3.5：`texts` 光标（字符位） --------------------------------------
