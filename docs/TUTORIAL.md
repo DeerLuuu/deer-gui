@@ -381,6 +381,25 @@ std::fs::write("render_out/pixels.png", png)?;
 
 > 对应示例：`cargo run -p deer-gui --example pixels`（还会写一个 `.ppm` 便于交叉验证）
 
+**从 BMP 文件拿像素**（AF-1）：仓库自带一个零依赖的 BMP 解码器 —— 24/32 位、底行优先，
+Windows 画图就能产出这种文件。解码结果与 `png::encode_rgba`、纹理上传用的是**同一套行序**
+（顶行在前、无 padding），拿到就能直接用：
+
+```rust
+let bytes = std::fs::read("render_out/logo.bmp")?;
+let img = deer_gpu::image::decode_bmp(&bytes).map_err(|e| e.to_string())?;
+println!("{}×{}", img.width, img.height);   // img.pixels：RGBA8，pixels[0..4] 是左上角
+
+// 直喂纹理（CPU 参考后端无需 GPU；Vulkan 设备同理）
+let backend = deer_gpu::null::CpuBackend::new();
+let mut device = backend.open(0).map_err(|e| e.to_string())?;
+let tex = deer_gpu::image::upload_bmp_to_texture(&img, device.as_mut()).map_err(|e| e.to_string())?;
+```
+
+> 对应示例：`cargo run -p deer-gui --example bmp_decode`
+> 边界：**PNG 解码未做**（自有 png.rs 只是编码器）、**16 位 BMP 未做**
+> （调色板 / RLE / top-down 也不做）—— 见 [`features/image-decode.md`](features/image-decode.md) 第 6 节。
+
 ---
 
 ## 9. 建你自己的项目
@@ -425,15 +444,18 @@ deer-gui = { path = "../deer-gui/crates/deer-gui" }
 | 界面显示在**窗口**里 | ✅ **窗口里就是真实界面**（M3c，**仅 Windows**）：形状 + 文本呈现到窗口，且上屏像素与 CPU 逐像素对照（不透明 0 / 半透明 ≤1 LSB）；跑 `--example window_parity` 看判据 |
 | **GPU 渲染**出图 | ✅ 离屏 Vulkan 已画出正确像素（M2a-6 修复了 SPIR-V 段序缺陷）；✅ 窗口呈现已打通（M2b）；✅ **消费 `DrawList`（形状 M3a + 文本 M3b + 上屏 M3c）**：三种路径都能与 CPU 逐像素对照（第 13 章） |
 | 图片里的字是**真字体** | ✅ **离屏**已支持（第 11 章 CPU 侧、第 13 章 **GPU 侧 M3b**）：GPU 画真字形与 CPU 逐字节相同 |
-| **鼠标点击 / 键盘输入** | ✅ 已支持：悬停 / 按下 / 点击 / 文本输入 + **输入框光标**（T3.5：在光标处插入 / `Backspace` 删**光标前一个 Unicode 字符** / **左右方向键**移动光标，单位是**字符位**）；见 [`features/input.md`](features/input.md) |
+| **鼠标点击 / 键盘输入** | ✅ 已支持：悬停 / 按下 / 点击（T3.7 **按下即捕获**：按住拖出节点，事件仍归按下的那个，拖出去再抬起也算它的点击；没按下/按在空白的行为不变）/ 文本输入 + **输入框光标**（T3.5：在光标处插入 / `Backspace` 删**光标前一个 Unicode 字符** / **左右方向键**移动光标，单位是**字符位**）；见 [`features/input.md`](features/input.md) |
 | **Tab 焦点** | ✅ 已支持：`Tab` / `Shift+Tab` 循环（树序）、`Escape` 清焦点、点击可聚焦控件即聚焦 |
 | **滚轮 / 滚动容器 / 多行文本** | ✅ 已支持（剩余工作第 1 项）：`column` + `scroll` ⇒ `max_scroll` + 视口裁剪，`text` + `wrap` ⇒ 每行一条 `DrawCmd::Text`；滚轮滚 `hover` 所在容器、到边界不越界；见 [`features/scroll-and-multiline.md`](features/scroll-and-multiline.md) |
 | **滚动条** | ✅ 已支持（**拖滑块**改偏移 + **点轨道空白跳到指针处**并可续拖；**默认 opt-in**）：内容装不下就长出「轨道 + 滑块」，内容装得下则不画；见 [`features/scrollbar.md`](features/scrollbar.md) |
 | **惯性滚动** | ✅ 已支持（T3.2b）：App 在 `redraw()` 里调 `advance_inertia`、`next_deadline()` 返回 `inertia_deadline` 即可（两行接线；参考 `--example scroll_inertia_window`）；衰减、到边界即停、停了不空转都有判据 |
 | **输入法（IME 预编辑）** | ✅ 已支持：中文/日文还没上屏的那一段画在光标处 + 下划线，提交才进内容 ⇒ 无双写；见 [`features/ime.md`](features/ime.md) |
 | **方向键上下导航 / 按键滚动（`PageUp`/`Home`/`End`）/ 右键透传 / 按键重复** | ✅ 已支持（T3.1/T3.2/T3.3/T3.6）：上下按**几何邻近**移焦点；翻页/到顶到底滚**焦点容器**；右键发 `PointerRight`；`KeyDown.repeat` 可区分长按重复。见 [`features/input.md`](features/input.md) |
+| **复制 / 粘贴（系统剪贴板）** | ✅ 已支持（AF-2，**仅 Windows**）：`Clipboard` 纯文本读写（Win32 `CF_UNICODETEXT`，中文/emoji 往返保真；空/非文本/非 Windows 都明确报 `Err` 不静默；**图片/多格式不读写**）。见 [`features/clipboard.md`](features/clipboard.md) |
 | **绝对定位 / 层叠** | ✅ 已支持（L1）：`pos=x,y` ⇒ 脱离流内布局，位置 = 父内容盒原点 + 偏移（可负）；层叠 = 声明序（后声明者在上且命中优先）。见 [`features/absolute-positioning.md`](features/absolute-positioning.md)。**没有**视口 fixed / z-index 数值层级 |
 | **anchors 锚定** | ✅ 已支持（L4）：`Pos::Anchors` ⇒ 四边钉在父内容盒的比例位置，**resize 时锚定边跟随、偏移保持**；与 `Offset` 同一个机制（同一个 `position` 字段）。**没有**百分比偏移（偏移是像素）/ 跨层锚定。见 [`features/anchors.md`](features/anchors.md) |
+| **图片文件 → 像素** | ✅ BMP 已支持（`deer_gpu::image::decode_bmp`：24/32 位、底行优先 → RGBA8 → 直喂纹理）；**PNG 解码未做**（自有 png.rs 只是编码器）。见 [`features/image-decode.md`](features/image-decode.md) |
+| **高分屏 / DPI 缩放** | ✅ 透传（AF-3）：`WindowInfo.scale_factor` + `ScaleFactorChanged` 事件，OS 报多少给多少；**坐标与窗口尺寸仍是物理像素，不自动缩放**。见 [`features/window.md`](features/window.md) 第 8 节 |
 | **可停靠面板 dock** / 多窗口 | ❌ M6 |
 | 12 个 `deer-ui` 控件的语义 | ❌ M6（现在只有 5 种节点） |
 
@@ -644,6 +666,7 @@ assert_eq!(gpu_px, cpu.pixels, "不透明内容（形状 + 文本）必须逐字
 | 换主题 | `cargo run -p deer-gui --example theme` | 深/浅/暖三张图 |
 | 绘制命令 | `cargo run -p deer-gui --example draw_list` | 命令清单 + 统计 |
 | 原始像素 | `cargo run -p deer-gui --example pixels` | PNG + PPM |
+| BMP 解码 | `cargo run -p deer-gui --example bmp_decode` | 三种 BMP 变体解码 → RGBA8 → PNG 回环（`render_out/bmp_decode.png`） |
 | 真实文字 | `cargo run -p deer-gui --example text_render` | 真字形界面图 + 度量/像素自检 |
 | 字形光栅化 + 图集 | `cargo run -p deer-gui --example glyph_atlas` | 图集 PNG + 覆盖率/利用率统计 |
 | 真窗口预览 | `cargo run -p deer-gui --features window --example window_preview` | 真窗口里的**界面树**（形状 + 文本）+ 帧数/像素统计 |

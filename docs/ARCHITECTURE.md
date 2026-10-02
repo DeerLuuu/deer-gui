@@ -284,7 +284,7 @@ Feature 开关（`crates/deer-gui/Cargo.toml`）：
 2. **自证日志**：启动打印「重绘策略：请求=… 实际=…（App 声明=…）」，收尾打印「重绘账本」「唤醒账本」—— 验收 grep 这些行，**别只看退出码**（`run()` 文档）。
 3. **`Occluded(false)` 在 Windows 上系统不喂**（winit 文档明确），接线接好了但不假装跑过。
 4. **平台边界**：只有 Win32 句柄填法实现了；X11/Wayland/macOS 的 `RawWindowHandle` 翻译返回 `Err(UNSUPPORTED_PLATFORM_MSG)`，**绝不静默填 0**（`lib.rs:209-210`、`raw_handle_from_rwh06`）。
-5. **不透传 DPI**：`Resized` 给物理像素直传，缩放换算留给上层。
+5. **DPI 只透传、不换算（AF-3 起，改了旧反述「不透传 DPI」）**：事件坐标与 `extent` 仍是**物理像素直传**；缩放系数本身也透传 —— `WindowInfo.scale_factor`（初值 = 建窗时 `window.scale_factor()`）+ `InputEvent::ScaleFactorChanged`（OS 报多少给多少，`f64` 原样，账本收在可单测的 `ScaleLedger`）。**DPI 变化不触发 `Resized`**（刻意不碰 winit 的 `InnerSizeWriter`，窗口保持物理像素），缩放换算仍留给上层。
 
 ### 3.5 `deer-gui` —— 门面 + 交互层
 

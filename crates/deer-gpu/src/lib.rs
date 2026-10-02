@@ -27,6 +27,7 @@ use deer_core::{Color, DrawList, GpuResult, TextureId};
 // —— 签名逐字不变（仍是 `Option<&mut TextEngine>`），变的是这个类型现在定义在 `deer-text`。
 use deer_text::TextEngine;
 
+pub mod image;
 pub mod interact;
 pub mod null;
 pub mod render;
@@ -40,6 +41,10 @@ pub mod render;
 // 这里用**模块别名**保留 `deer_gpu::png` 这个既有路径（`deer_gpu::png::encode_rgba` 逐字不变）。
 // 长期归属（L0 公共工具）留给 LY4 对账。
 pub use deer_text::png;
+
+// AF-1：BMP 解码（`image` 模块的条目照 `render` / `interact` 的先例同时给根导出 ——
+// 使用者最常用的 `decode_bmp` 一条 `use deer_gpu::…` 就能拿到）。
+pub use image::{decode_bmp, upload_bmp_to_texture, BmpError, BmpImage};
 
 pub use interact::{
     FieldText, InteractState, InteractiveRenderer, ScrollView, build_interactive_draw_list,

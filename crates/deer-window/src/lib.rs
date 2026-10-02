@@ -100,7 +100,11 @@
 //!   `DeviceEvent`（原始设备事件）、物理键码（`physical_key`/scancode）、键盘布局无关的快捷键。
 //!   （已先后摘出本栏：**IME 预编辑** —— T3.4 起 `Ime::Preedit` ⇒ [`InputEvent::ImePreedit`]
 //!   真的派发；**按键重复** —— T3.6 起 winit 的 `event.repeat` 进 `KeyDown.repeat`。）
-//! - **DPI**：只透传 `Resized` 给的物理像素，不做任何缩放换算；`LogicalSize` 只在建窗时用。
+//! - **DPI**（AF-3）：`scale_factor` **只透传** —— `WindowInfo::scale_factor` 初值 +
+//!   `InputEvent::ScaleFactorChanged` 事件（OS 报多少给多少）；坐标与尺寸仍是
+//!   **物理像素**，不做任何缩放换算（布局是像素级纯函数）；窗口物理尺寸也**不**
+//!   因 DPI 变化而改（不碰 winit 的 `InnerSizeWriter`，见该事件的文档）；
+//!   `LogicalSize` 只在建窗时用。
 //!
 //! ## 重绘策略（M5b：从「连续重绘」改成「事件驱动重绘」）
 //!
@@ -204,9 +208,9 @@ mod host;
 // ——— `pub use` 枢纽：公开路径与拆分前**逐字相同**（`lib.rs` 不再定义任何条目）———
 
 pub use display::{
-    InputEvent, Key, Mods, PointerButton, UNSUPPORTED_PLATFORM_MSG, WindowConfig, WindowInfo,
-    map_key, map_mouse_button, map_mods, map_wheel, printable_text, raw_handle_from_rwh06,
-    raw_handle_from_win32,
+    Clipboard, CLIPBOARD_UNSUPPORTED_MSG, InputEvent, Key, Mods, PointerButton,
+    UNSUPPORTED_PLATFORM_MSG, WindowConfig, WindowInfo, map_key, map_mouse_button, map_mods,
+    map_wheel, printable_text, raw_handle_from_rwh06, raw_handle_from_win32,
 };
 pub use host::{
     App, Flow, FrameCounter, REDRAW_ENV, RedrawPolicy, WakePlan, WakeStats, Waker, earliest,

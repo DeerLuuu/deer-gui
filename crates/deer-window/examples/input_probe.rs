@@ -96,6 +96,11 @@ impl Probe {
                 println!("{head} text      {text:?}（chars={}）", text.chars().count());
             }
             InputEvent::FocusChanged { focused } => println!("{head} focus     {focused}"),
+            // AF-3（只透传）：打印 OS 报的原值。注意 `info.scale_factor` 在本条**之前**
+            // 就已记账到同一值 —— 事件与 WindowInfo 口径一致，这里正好能并排看出来。
+            InputEvent::ScaleFactorChanged { scale_factor } => {
+                println!("{head} dpi       {scale_factor}（WindowInfo.scale_factor={}）", info.scale_factor);
+            }
         }
     }
 }

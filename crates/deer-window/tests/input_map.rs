@@ -289,6 +289,7 @@ fn app_input_default_is_side_effect_free() {
     let info = WindowInfo {
         raw: raw_handle_from_win32(0x1A2B, 0x7FF6_0000),
         extent: Extent { width: 320, height: 200 },
+        scale_factor: 1.0,
     };
     let events = [
         InputEvent::PointerMoved { x: 0.0, y: 0.0 },
@@ -299,6 +300,8 @@ fn app_input_default_is_side_effect_free() {
         InputEvent::KeyUp { key: Key::Char('x'), mods: Mods { shift: true, ..Mods::default() } },
         InputEvent::TextInput { text: "hi".to_string() },
         InputEvent::FocusChanged { focused: false },
+        // AF-3：新事件也必须被**默认实现**安静接住 —— M5 之前写的 App 一行不用改。
+        InputEvent::ScaleFactorChanged { scale_factor: 1.25 },
     ];
 
     for ev in &events {

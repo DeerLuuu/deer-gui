@@ -94,6 +94,7 @@ cargo run -q -p deer-gui --features window --example interactive_form
 | `KeyDown/KeyUp { key, mods }` | `key: Key`（`Tab` / `Escape` / `Enter` / `Backspace` / `Left` / `Right` / `Up` / `Down` / `Char(char)` / `Other`），`mods: Mods`（`shift` / `ctrl` / `alt` / `sup`） |
 | `TextInput { text }` | **字符输入**：一段文本（**追加**，不是覆盖） |
 | `FocusChanged { focused }` | **窗口焦点**（不是控件焦点）；`focused: false` 清悬停/按下态 |
+| `ScaleFactorChanged { scale_factor }` | **DPI 缩放系数变了**（AF-3，只透传）：OS 报多少给多少；**坐标/尺寸不换算**（仍是物理像素），交互层不消费、`UiState` 不动 |
 
 > **字符输入与物理键是分开的两个变体**：`TextInput` 只承载「打出来的字」（含 IME 提交与中文），
 > `KeyDown { key: Char(c) }` 承载「物理键」这条通路 —— 两者**语义不同**，状态机对前者的处理是「写进文本缓冲」，
@@ -147,9 +148,9 @@ pub fn focusables(root: &Node) -> Vec<String>   // Kind::Button | Kind::Field，
 
 | 输入 | 效果 |
 |---|---|
-| `PointerMoved` | 更新 `hover`（走 `hit`）；变化时发 `HoverChanged` |
-| `PointerDown { Left }` | 同步 `hover`、记 `pressed`；**命中可聚焦控件（`Button`/`Field`）⇒ 聚焦它** |
-| `PointerUp { Left }` | 抬起落在同一节点 ⇒ `Clicked(id)`；按下后移出再抬起 ⇒ **不产生** `Clicked` |
+| `PointerMoved` | 更新 `hover`（走 `hit`）；变化时发 `HoverChanged`。**捕获中**（`pressed` 在手，T3.7）⇒ **路由给捕获者**：hover 钉在捕获节点上，拖出节点/出树不换人 |
+| `PointerDown { Left }` | 同步 `hover`、记 `pressed`（**按下即捕获**，D7 默认捕获）；**命中可聚焦控件（`Button`/`Field`）⇒ 聚焦它** |
+| `PointerUp { Left }` | **按捕获者结算** `Clicked(id)`（抬起在哪都算 —— 拖出去再抬起也是捕获者的点击）；释放捕获，hover 回到抬起处的物理节点 |
 | `KeyDown { Tab }` / `Shift+Tab` | 在 `focusables()` 里**按树序**循环焦点 ⇒ `FocusChanged` |
 | `KeyDown { Escape }` | 清焦点 ⇒ `FocusChanged(None)` |
 | `KeyDown { Backspace }` | 焦点是启用的输入框 ⇒ 删**一个 Unicode 字符**（不是字节）⇒ `TextChanged` |
@@ -157,7 +158,8 @@ pub fn focusables(root: &Node) -> Vec<String>   // Kind::Button | Kind::Field，
 | `Wheel { dy }` | **滚动**：`hover` 命中节点**最近的可滚动祖先（含自身）**偏移 `−dy × WHEEL_STEP_PX`，夹进 `[0, max_scroll]`；**变了才发** `Scrolled { id, offset }`。禁用子树不响应；没有可滚动祖先 / 上限为 0 / `dy = 0` ⇒ 空转 |
 | 其余（`KeyUp`、右/中键、方向键、`Key::Char`/`Other`、`focused: true`） | **不消费**（有测试钉住：不消费的事件**不得改变任何状态**） |
 
-**`UiState` 是唯一真相**：`hover` / `focus` / `pressed` / `texts: BTreeMap<String, String>`（不在表里的输入框视为空串）
+**`UiState` 是唯一真相**：`hover` / `focus` / `pressed`（= **左键捕获者**，T3.7 起，见上表）
+/ `texts: BTreeMap<String, String>`（不在表里的输入框视为空串）
 / `scroll: ScrollState`（**滚动偏移 + 每个容器的 `max_scroll`**）。
 **`UiEvent`** 是「发生了什么」：`HoverChanged` / `FocusChanged` / `Clicked` / `TextChanged` / `Scrolled { id, offset }`。
 
@@ -275,6 +277,12 @@ assert!(parse_script("# 注释行\nbad:3").unwrap_err().contains("第 2 条"));
 ### 6.2 仍未做 / 边界（**不要以为能跑**）
 
 **已经落地的**（别再当成没做）：
+- **指针捕获**（T3.7，D7 裁定=**按下即默认捕获**）：按下记捕获（`pressed`）；拖拽期间
+  移动**路由给捕获者**（hover 钉在捕获节点上，拖出节点/拖出整棵树都不换人）；抬起
+  **按捕获者结算** `Clicked` 并释放捕获。**未捕获路径**（没按下 / 按在空白、禁用、
+  被裁剪处）行为不变 —— 没按下时 hover 照旧跟随指针；**滚动条拖动**是自己的捕获
+  （`scroll.drag`，从不置 `pressed`）⇒ 行为不变。改前「拖出即丢」的实测差异登记见
+  `ROADMAP.md` 的 D7 行；
 - **方向键上下导航**（T3.1，D2 几何邻近）：严格方向 + 垂直最近 + 水平平手 + 树序兜底；
   无焦点不定义、到边停、聚焦输入框时不消费；
 - **按键滚动**（T3.2 收尾）：`PageUp`/`PageDown` 翻一页（视口高）、`Home`/`End` 到顶/到底；

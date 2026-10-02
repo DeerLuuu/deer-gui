@@ -97,6 +97,7 @@ impl Harness {
             info: WindowInfo {
                 raw: raw_handle_from_win32(0x1A2B, 0x7FF6_0000),
                 extent: Extent { width: 320, height: 200 },
+                scale_factor: 1.0,
             },
             policy: resolve_redraw_policy(declared, env_raw),
             pending: false,

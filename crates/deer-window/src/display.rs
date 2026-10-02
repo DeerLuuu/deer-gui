@@ -11,7 +11,11 @@
 //! - **输入模型与 winit 映射**：[`InputEvent`] / [`Key`] / [`Mods`] / [`PointerButton`] +
 //!   [`map_key`] / [`map_mouse_button`] / [`map_mods`] / [`map_wheel`] / [`printable_text`] ——
 //!   winit 类型**不进回调签名**（物理键与文本分开，见 [`Key`] 的说明）；
-//! - **DPI**：只透传 `Resized` 给的物理像素，不做任何缩放换算。
+//! - **DPI**（AF-3）：`scale_factor` **只透传**（`WindowInfo` 初值 +
+//!   `InputEvent::ScaleFactorChanged` 事件）；坐标与尺寸仍是**物理像素**，
+//!   不做任何缩放换算（红线：布局是像素级纯函数）；
+//! - **剪贴板**（AF-2）：[`Clipboard`] 公共构造器式句柄，自写 Win32 `CF_UNICODETEXT`
+//!   （不引第三方，Q3 裁断）；非 Windows 明确 `Err(`[`CLIPBOARD_UNSUPPORTED_MSG`]`)`。
 //!
 //! **不在这里的**：事件循环与 `App` 运行时（`App` / `Waker` / 帧调度）在 [`crate::host`]（L3）——
 //! 它**驱动**本模块提供的窗口与事件。
@@ -68,13 +72,22 @@ impl Default for WindowConfig {
     }
 }
 
-/// 交给渲染层的窗口信息（原生句柄 + **物理**尺寸）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// 交给渲染层的窗口信息（原生句柄 + **物理**尺寸 + DPI 缩放系数）。
+///
+/// `Eq` 因 `scale_factor`（`f64`）而放弃 —— 比较 `WindowInfo` 用 `PartialEq` 照常可用
+/// （既有三处测试就是 `assert_eq!`，不受影响）。
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct WindowInfo {
     /// `platform = Windows`，`handle = HWND`，`display = HINSTANCE`。
     pub raw: deer_gpu::RawWindowHandle,
-    /// 当前**物理**像素尺寸（`Resized` 事件的值）。
+    /// 当前**物理**像素尺寸（只由 `Resized` 更新；DPI 变化**不改**它 —— 见
+    /// `ScaleFactorChanged`：本层刻意保持现有物理像素，不做「按 OS 建议放大窗口」的换算）。
     pub extent: Extent,
+    /// **DPI 缩放系数**（AF-3，Q4=**只透传**）：OS 报多少就是多少（`f64` 原样），
+    /// 本层**不换算任何东西** —— 事件坐标仍是物理像素、`extent` 仍是物理尺寸，
+    /// 布局仍是像素级纯函数。初值 = 建窗时 `window.scale_factor()`；之后随
+    /// `ScaleFactorChanged` 事件同步更新（同一条 winit 报告，两处**同一值**）。
+    pub scale_factor: f64,
 }
 
 /// 指针按键：winit 的按键在**本层模型**里的表示。
@@ -177,6 +190,23 @@ pub enum InputEvent {
     },
     FocusChanged {
         focused: bool,
+    },
+    /// **DPI 缩放系数变了**（AF-3，Q4=**只透传**）：OS 报多少就带多少（`f64` 原样，
+    /// 不取整、不经 `f32` 折腾），本层**不换算任何坐标** —— 事件坐标与
+    /// `WindowInfo::extent` 仍是同一套物理像素口径，布局仍是像素级纯函数（红线）。
+    /// 要按 DPI 缩放是上层自己的事。
+    ///
+    /// ⚠️ **窗口物理尺寸刻意保持不变**（不碰 winit 给的 `InnerSizeWriter`）：winit 的
+    /// 语义是「写了它 = 改窗口尺寸；不写 = 窗口保持现有物理像素」（Windows 后端
+    /// `runner.rs` 的 `dispatch_event`：只有写了**不同**值才 `set_size`）。因此本事件
+    /// **不会**跟着一条 `Resized`（物理尺寸没变），`App::resized` 不触发 —— 这条变化
+    /// 只有 `scale_factor` 本身。窗口层在派发本事件**之前**已把
+    /// `WindowInfo::scale_factor` 记账到新值（`App::input` 拿到的 `info` 就是新口径）。
+    ///
+    /// ⚠️ 本枚举与 `deer_gui::interaction::InputEvent` 是**两份定义、必须逐字同步**
+    /// （mirror 纪律）：变体名、字段名、语义都要对得上。
+    ScaleFactorChanged {
+        scale_factor: f64,
     },
 }
 
@@ -328,5 +358,380 @@ pub(crate) fn window_info(window: &Window) -> Result<WindowInfo, String> {
         .map_err(|e| format!("取原生窗口句柄失败：{e}"))?;
     let raw = raw_handle_from_rwh06(handle.as_raw())?;
     let size = window.inner_size();
-    Ok(WindowInfo { raw, extent: Extent { width: size.width, height: size.height } })
+    // AF-3：scale_factor 与 extent **同一来源**（winit 的窗口对象），建窗时取一次。
+    let scale_factor = window.scale_factor();
+    Ok(WindowInfo { raw, extent: Extent { width: size.width, height: size.height }, scale_factor })
+}
+
+// ———————————————————————————————————————————————————————————————
+// 剪贴板（AF-2）：自写 Win32 `CF_UNICODETEXT`，不引第三方（Q3 裁断）
+// ———————————————————————————————————————————————————————————————
+
+/// 非 Windows 平台上 [`Clipboard`] 的构造与两个方法都返回这句话。
+///
+/// **不静默**：要么真的复制/读取成功，要么明确说「本平台没实现」—— 绝不假装成功、
+/// 也不静默丢数据。与 [`UNSUPPORTED_PLATFORM_MSG`] 同一条纪律的另一处落实。
+pub const CLIPBOARD_UNSUPPORTED_MSG: &str =
+    "deer-window 的剪贴板目前只实现了 Windows（CF_UNICODETEXT，纯文本）；当前平台明确不支持";
+
+/// **剪贴板句柄**（AF-2）：自写 Win32 `OpenClipboard` / `EmptyClipboard` /
+/// `SetClipboardData` / `GetClipboardData`，只有 `CF_UNICODETEXT` 一种格式；
+/// **不引第三方**（引 `arboard` 要走依赖例外登记，Q3 已裁断自写 —— 就这几十行 FFI）。
+///
+/// # 为什么是「公共构造器」，不是「`init` 交出句柄（与 [`Waker`](crate::Waker) 同型）」
+///
+/// （App 地基任务书 D4 给了两案、本层择一并在此写死理由，免得后人再争一遍：）
+///
+/// 1. [`Waker`] 之所以要经 `App::wake_handle` **交接**，是因为 `EventLoopProxy` 只有
+///    事件循环内部造得出来 —— 它是 host 私产的边角。剪贴板相反：它是 **OS 全局资源**，
+///    跟窗口、事件循环都没有生命周期耦合（`OpenClipboard(NULL)` 不需要任何窗口）⇒
+///    为它扩 `App` trait（**永久面**）买不到任何东西。
+/// 2. **非 Windows 的「明确 Unsupported」必须真的可达**：交接式在非 Windows 根本走不到
+///    （`run()` 在 `window_info` 一步就已 `Err`，任何 `App` 回调都不会被调），
+///    「Unsupported」会变成一句没人能触发的死字。公共构造器让**任何平台**的用户都能调
+///    [`Clipboard::new`] 并拿到明确的 [`CLIPBOARD_UNSUPPORTED_MSG`]。
+/// 3. **调用点最短**：粘贴发生在输入处理处，而 `App::input` 的签名里就带着
+///    `info: &WindowInfo`（`info.raw.handle` 即 HWND）—— 现场
+///    `Clipboard::new(info.raw.handle)` 即用即走，App 不必为存句柄加状态。
+///
+/// # 语义
+///
+/// - **每次 `set_text` / `get_text` 内部原子地完成「开（重试）→ 干活 → 关」**：不跨调用
+///   持有剪贴板 —— 跨调用持有会卡住全系统其它程序的复制粘贴；
+/// - `hwnd` 是打开剪贴板时登记的**属主**窗口（`EmptyClipboard` 会把剪贴板交给它）：
+///   写入**必须**用真实窗口（NULL 属主 ⇒ `SetClipboardData` 失败，Win32 明文 +
+///   本机实测，见 [`Clipboard::set_text`]）；读取（`get_text`）不需要属主，`0` 可用。
+///   我们做**立即渲染**（`SetClipboardData` 直接给数据），永远用不到延迟渲染的
+///   `WM_RENDERFORMAT`；
+/// - **可在任意线程调用**（开与关发生在同一次方法调用里，满足 Win32 的线程约束）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Clipboard {
+    /// 打开剪贴板时关联的窗口（HWND；`0` = 与当前任务关联）。仅传给 Win32，调用方不用读它
+    /// （非 Windows 目标上没有任何人读它 ⇒ 显式 `allow`，别让交叉编译多一条警告）。
+    #[cfg_attr(not(windows), allow(dead_code))]
+    hwnd: usize,
+}
+
+// 与 `Waker` 同一条先例：`Debug` 只说「有个句柄」，不把内部值打出来。
+impl std::fmt::Debug for Clipboard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad("Clipboard { .. }")
+    }
+}
+
+#[cfg(windows)]
+impl Clipboard {
+    /// 构造剪贴板句柄（Windows）。
+    ///
+    /// 构造本身**不碰**剪贴板（真正的 `OpenClipboard` 在每次 `set_text` / `get_text`
+    /// 里原子完成，带重试）；所以 Windows 上它不会失败 —— `Result` 是为了给非 Windows
+    /// 留出「明确 `Unsupported`」的通道（见 [`CLIPBOARD_UNSUPPORTED_MSG`]），两个平台
+    /// 的调用方写法逐字相同。
+    ///
+    /// `hwnd` 传 `WindowInfo::raw.handle`（建窗后就有）。**传 `0` 只够用来读**
+    /// （`get_text` 不需要属主）；**写必须用真实窗口** —— Win32 明文（`EmptyClipboard`
+    /// 的 Remarks）：用 NULL 窗口句柄打开剪贴板时，`EmptyClipboard` 会把属主设成
+    /// NULL，这会让 `SetClipboardData` 失败（本机实测同样如此，且表现为**时灵时不灵**）。
+    /// `set_text` 对 `hwnd = 0` 在动手前就明确拒绝，不让你撞上那面墙。
+    pub fn new(hwnd: usize) -> Result<Clipboard, String> {
+        Ok(Clipboard { hwnd })
+    }
+
+    /// 把 `text` 写进系统剪贴板（`CF_UNICODETEXT`，UTF-16 + 结尾 NUL）。
+    ///
+    /// 成功 ⇒ **所有权交给系统**（缓冲由系统在下次 `EmptyClipboard`/退出时释放）；
+    /// 失败 ⇒ 明确 `Err`，已分配的缓冲当场 `GlobalFree`（不漏）。注意 `EmptyClipboard`
+    /// 成功而 `SetClipboardData` 失败的窗口期里，**原有的剪贴板内容已经没了**（那是
+    /// `EmptyClipboard` 的语义）—— 这个错误信息里会写明。
+    pub fn set_text(&self, text: &str) -> Result<(), String> {
+        if self.hwnd == 0 {
+            // 显式拒绝，不让人撞 MSDN 那面墙（NULL 属主 ⇒ SetClipboardData 失败，
+            // 且实测是「时灵时不灵」的静默坏法 —— 比直接失败更难查）。
+            return Err(
+                "set_text 需要**真实窗口句柄**（hwnd = 0 是 NULL 属主：Win32 规定此时 \
+                 SetClipboardData 会失败）；建窗后用 WindowInfo::raw.handle"
+                    .to_string(),
+            );
+        }
+        let units = text_to_utf16_nul(text)?;
+        win32::set_text(self.hwnd, &units)
+    }
+
+    /// 读出系统剪贴板里的文本（`CF_UNICODETEXT`）。
+    ///
+    /// 剪贴板为空、或放的是图片/文件等**非文本**格式 ⇒ 明确 `Err`（**不静默给空串**）；
+    /// 内容不是合法 UTF-16（残缺代理对）⇒ 同样明确 `Err`，**不做 lossy 替换** ——
+    /// 替换出来的「看起来差不多」的字符串正是「静默改数据」。
+    pub fn get_text(&self) -> Result<String, String> {
+        let units = win32::get_text(self.hwnd)?;
+        utf16_nul_to_text(&units)
+    }
+}
+
+#[cfg(not(windows))]
+impl Clipboard {
+    /// 非 Windows：明确 `Err`（[`CLIPBOARD_UNSUPPORTED_MSG`]），**不静默**。
+    pub fn new(_hwnd: usize) -> Result<Clipboard, String> {
+        Err(CLIPBOARD_UNSUPPORTED_MSG.to_string())
+    }
+
+    /// 非 Windows：明确 `Err`（[`CLIPBOARD_UNSUPPORTED_MSG`]），**不静默**。
+    pub fn set_text(&self, _text: &str) -> Result<(), String> {
+        Err(CLIPBOARD_UNSUPPORTED_MSG.to_string())
+    }
+
+    /// 非 Windows：明确 `Err`（[`CLIPBOARD_UNSUPPORTED_MSG`]），**不静默**。
+    pub fn get_text(&self) -> Result<String, String> {
+        Err(CLIPBOARD_UNSUPPORTED_MSG.to_string())
+    }
+}
+
+/// Rust 文本 → **以 NUL 结尾**的 UTF-16（`CF_UNICODETEXT` 的内存形态）。
+///
+/// **含 NUL 的文本明确拒绝**：`CF_UNICODETEXT` 以第一个 NUL 结尾，带着 NUL 写进去
+/// 会被**所有**读取方截断（记事本只见前半段）—— 那是静默丢数据，不如当场报错。
+/// （非 Windows 目标上只有单测用它 ⇒ 显式 `allow`，别让交叉编译多两条警告。）
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn text_to_utf16_nul(text: &str) -> Result<Vec<u16>, String> {
+    if text.contains('\0') {
+        return Err(
+            "文本包含 NUL 字符（\\0）：CF_UNICODETEXT 以 NUL 结尾，无法无损表示，已明确拒绝"
+                .to_string(),
+        );
+    }
+    let mut units: Vec<u16> = text.encode_utf16().collect();
+    units.push(0); // 结尾 NUL：CF_UNICODETEXT 的终止符
+    Ok(units)
+}
+
+/// **以 NUL 结尾**的 UTF-16 → Rust 文本（严格：非法 UTF-16 明确报错，**不做 lossy 替换**）。
+/// （非 Windows 目标上只有单测用它 ⇒ 同上，显式 `allow`。）
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn utf16_nul_to_text(units: &[u16]) -> Result<String, String> {
+    let len = units.iter().position(|&u| u == 0).ok_or_else(|| {
+        "CF_UNICODETEXT 缓冲里没有结尾的 NUL —— 内容不是合法的文本格式".to_string()
+    })?;
+    String::from_utf16(&units[..len])
+        .map_err(|e| format!("CF_UNICODETEXT 内容不是合法 UTF-16（代理对残缺？）：{e}"))
+}
+
+/// Win32 剪贴板 FFI（**私有**；只在 `cfg(windows)` 下编译）。
+///
+/// 只声明用到的九个函数，类型按 Win32 的宽度写死（指针 = `*mut c_void`、
+/// `BOOL` = `i32`、`UINT` = `u32`）；**不引 `windows-rs`**（Q3：为几十行 FFI 开依赖
+/// 例外不划算，也与「除 winit 外零第三方依赖」的口径冲突）。
+#[cfg(windows)]
+mod win32 {
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn OpenClipboard(hwndnewowner: *mut core::ffi::c_void) -> i32;
+        fn CloseClipboard() -> i32;
+        fn EmptyClipboard() -> i32;
+        fn SetClipboardData(uformat: u32, hmem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+        fn GetClipboardData(uformat: u32) -> *mut core::ffi::c_void;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GlobalAlloc(uflags: u32, dwbytes: usize) -> *mut core::ffi::c_void;
+        fn GlobalLock(hmem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+        fn GlobalUnlock(hmem: *mut core::ffi::c_void) -> i32;
+        fn GlobalSize(hmem: *mut core::ffi::c_void) -> usize;
+        fn GlobalFree(hmem: *mut core::ffi::c_void) -> *mut core::ffi::c_void;
+        fn GetLastError() -> u32;
+        fn Sleep(dwmilliseconds: u32);
+    }
+
+    /// `CF_UNICODETEXT`：UTF-16 字符串、以 NUL 结尾（Win32 剪贴板的标准文本格式编号）。
+    const CF_UNICODETEXT: u32 = 13;
+    /// `GMEM_MOVEABLE`：剪贴板要求可移动内存（`SetClipboardData` 的约定）。
+    const GMEM_MOVEABLE: u32 = 0x0002;
+    /// `OpenClipboard` 的重试上界：剪贴板是**全系统互斥**资源（任何别的进程开着它时这里
+    /// 就失败），撞一下就报错会让合法调用假红 —— 每 2ms 试一次、共约 100ms，仍失败才报。
+    const OPEN_ATTEMPTS: u32 = 50;
+    const OPEN_RETRY_SLEEP_MS: u32 = 2;
+
+    /// `OpenClipboard`（带重试）。失败重试的理由见 [`OPEN_ATTEMPTS`]。
+    fn open_with_retry(hwnd: usize) -> Result<(), String> {
+        let mut last_err = 0u32;
+        for attempt in 0..OPEN_ATTEMPTS {
+            if unsafe { OpenClipboard(hwnd as *mut core::ffi::c_void) } != 0 {
+                return Ok(());
+            }
+            last_err = unsafe { GetLastError() };
+            if attempt + 1 < OPEN_ATTEMPTS {
+                unsafe { Sleep(OPEN_RETRY_SLEEP_MS) };
+            }
+        }
+        Err(format!(
+            "OpenClipboard 连续 {OPEN_ATTEMPTS} 次失败（GetLastError={last_err}）\
+             —— 剪贴板被其它进程长期占用"
+        ))
+    }
+
+    /// 写入：缓冲先在自己进程备好（**不占着**全系统互斥的剪贴板做内存拷贝），再
+    /// 开 → 清空 → 交出所有权 → 关。每个失败分支都把已分配的缓冲 `GlobalFree` 掉。
+    pub(super) fn set_text(hwnd: usize, units: &[u16]) -> Result<(), String> {
+        let bytes = units.len() * 2; // 含结尾 NUL 的完整字节数
+        let mem = unsafe { GlobalAlloc(GMEM_MOVEABLE, bytes) };
+        if mem.is_null() {
+            return Err(format!("GlobalAlloc 失败（要分配 {bytes} 字节）"));
+        }
+        // ① 锁住并逐字节拷入（含结尾 NUL），然后立刻解锁。
+        let locked = unsafe { GlobalLock(mem) };
+        if locked.is_null() {
+            unsafe { GlobalFree(mem) };
+            return Err("GlobalLock 失败（写入剪贴板缓冲）".to_string());
+        }
+        unsafe {
+            core::ptr::copy_nonoverlapping(units.as_ptr(), locked as *mut u16, units.len());
+            GlobalUnlock(mem);
+        }
+        // ② 开（重试）→ 清空 → 交所有权 → 关。
+        if let Err(e) = open_with_retry(hwnd) {
+            unsafe { GlobalFree(mem) };
+            return Err(e);
+        }
+        if unsafe { EmptyClipboard() } == 0 {
+            let err = unsafe { GetLastError() };
+            unsafe { CloseClipboard() };
+            unsafe { GlobalFree(mem) };
+            return Err(format!("EmptyClipboard 失败（GetLastError={err}）"));
+        }
+        if unsafe { SetClipboardData(CF_UNICODETEXT, mem) }.is_null() {
+            // 失败 ⇒ 所有权还在我们手里，必须释放（否则漏一块 GMEM_MOVEABLE）。
+            // ⚠️ 此时原剪贴板内容已被 EmptyClipboard 清掉 —— 错误里写明这一点。
+            let err = unsafe { GetLastError() };
+            unsafe { CloseClipboard() };
+            unsafe { GlobalFree(mem) };
+            return Err(format!(
+                "SetClipboardData(CF_UNICODETEXT) 失败（GetLastError={err}；\
+                 原有剪贴板内容已被清空）"
+            ));
+        }
+        // 成功 ⇒ `mem` 的所有权归系统，**不**再由我们释放；只剩关剪贴板。
+        // CloseClipboard 失败极罕见且数据已进剪贴板（下 anyone 开前系统自己会处理），
+        // 这里忽略返回值、不回滚 —— 数据没有丢，不谎报失败。
+        unsafe { CloseClipboard() };
+        Ok(())
+    }
+
+    /// 读出：开（重试）→ 取句柄 → 锁 → 拷出 → 解锁 → 关。
+    /// 没有 `CF_UNICODETEXT`（空/非文本）⇒ 明确 `Err`，**不静默给空串**。
+    pub(super) fn get_text(hwnd: usize) -> Result<Vec<u16>, String> {
+        open_with_retry(hwnd)?;
+        let result = (|| {
+            let mem = unsafe { GetClipboardData(CF_UNICODETEXT) };
+            if mem.is_null() {
+                return Err(
+                    "剪贴板当前没有 CF_UNICODETEXT 文本（为空，或放的是图片/文件等非文本格式）"
+                        .to_string(),
+                );
+            }
+            let size = unsafe { GlobalSize(mem) }; // 字节数
+            if size < 2 {
+                return Err(format!(
+                    "CF_UNICODETEXT 缓冲只有 {size} 字节，装不下一个 UTF-16 单元"
+                ));
+            }
+            let locked = unsafe { GlobalLock(mem) };
+            if locked.is_null() {
+                return Err("GlobalLock 失败（读取剪贴板缓冲）".to_string());
+            }
+            let units = unsafe {
+                let count = size / 2;
+                core::slice::from_raw_parts(locked as *const u16, count).to_vec()
+            };
+            unsafe { GlobalUnlock(mem) };
+            Ok(units)
+        })();
+        // 无论成败都先关剪贴板（不能跨调用占着全系统互斥的资源），再交出结果。
+        unsafe { CloseClipboard() };
+        result
+    }
+}
+
+/// 剪贴板单测（AF-2）。**碰真 OS 剪贴板的只有一条**（全系统互斥的资源，别让多条测试
+/// 并行互踩）；其余都是纯编解码判据，任何平台都能跑。
+#[cfg(test)]
+mod clipboard_tests {
+    use super::{CLIPBOARD_UNSUPPORTED_MSG, text_to_utf16_nul, utf16_nul_to_text};
+    // `Clipboard` 的构造判据只有 Windows 那条用到（非 Windows 上构造返回 Err，
+    // 没有可断言的句柄本身）⇒ 按目标引入，别让交叉编译多一条 unused 警告。
+    #[cfg(windows)]
+    use super::Clipboard;
+
+    /// **编解码往返保真**（含中文 / emoji 代理对 / ZWJ 序列 / 空串 / ASCII）——
+    /// 「多字节不丢字」的第一道判据，纯函数，任何平台都跑。
+    #[test]
+    fn utf16_codec_round_trips_multibyte_text() {
+        let cases = [
+            "",
+            "plain ascii 123",
+            "中文往返：你好，世界",
+            "é è ñ（2 字节）",
+            "emoji 😀🎉（代理对）",
+            "ZWJ 序列 👨‍👩‍👧 与组合 ✔︎",
+            "mixed aA1 中 😀 tail",
+        ];
+        for text in cases {
+            let units = text_to_utf16_nul(text).expect("这些用例都不含 NUL，编不出错");
+            assert_eq!(
+                units.last(),
+                Some(&0),
+                "结尾必须有 NUL（CF_UNICODETEXT 的终止符）：{text:?}"
+            );
+            let got = utf16_nul_to_text(&units).expect("自己编的合法 UTF-16 必须能解回来");
+            assert_eq!(got, text, "编解码往返必须逐字符保真");
+        }
+    }
+
+    /// **含 NUL 的输入明确拒绝**（不静默截断）：这是「往返保真」的边界判据 ——
+    /// 放行它就是放行「写进去了但读回来变短」这种静默丢数据。
+    #[test]
+    fn codec_rejects_nul_in_input_instead_of_silent_truncation() {
+        let err = text_to_utf16_nul("a\0b").expect_err("含 NUL 的文本必须被拒绝");
+        assert!(err.contains("NUL"), "错误信息要点明原因：{err}");
+        // 解码侧按 CF_UNICODETEXT 语义**只见到第一个 NUL**（这正是「静默截断」本身）：
+        // 带内嵌 NUL 的缓冲解回来只剩 "a" —— 所以拒绝必须发生在**写入之前**。
+        let truncated = utf16_nul_to_text(&[0x61, 0, 0x62, 0]).expect("按定义能解到第一个 NUL");
+        assert_eq!(truncated, "a", "第一个 NUL 之后的内容不属于 CF_UNICODETEXT 文本");
+    }
+
+    /// **非法 UTF-16 明确报错，不做 lossy 替换**：高代理对后面跟的不是低代理对 ⇒ `Err`。
+    /// （把解码改成 `from_utf16_lossy` 的变异会让这条变红 —— 静默替换 U+FFFD 不许有。）
+    #[test]
+    fn codec_rejects_broken_utf16_instead_of_lossy_replacement() {
+        // 0xD83D 是高代理，后面跟普通字符（没有低代理）⇒ 非法序列。
+        let err = utf16_nul_to_text(&[0xD83D, 0x0041, 0]).expect_err("残缺代理对必须报错");
+        assert!(err.contains("UTF-16"), "错误信息要点明原因：{err}");
+    }
+
+    /// **Unsupported 文案是真的明话**（不是空串、不是含糊其辞）：
+    /// 非 Windows 分支返回的就是它 —— 文案本身也是契约的一部分。
+    #[test]
+    fn unsupported_message_is_explicit() {
+        assert!(!CLIPBOARD_UNSUPPORTED_MSG.is_empty());
+        assert!(
+            CLIPBOARD_UNSUPPORTED_MSG.contains("Windows") && CLIPBOARD_UNSUPPORTED_MSG.contains("不支持"),
+            "文案必须写清「只实现到哪 + 当前不支持」：{CLIPBOARD_UNSUPPORTED_MSG}"
+        );
+    }
+
+    /// **`hwnd = 0`（NULL 属主）的写入在动手前就被明确拒绝** —— 这是把 Win32 的坑
+    /// 变成确定性契约的判据：`EmptyClipboard` 的 Remarks（MSDN）写明 NULL 属主会让
+    /// `SetClipboardData` 失败，本机实测还是「时灵时不灵」的坏法。这条测试**不碰**
+    /// 剪贴板（拒绝发生在打开之前），任何环境下都确定。
+    ///
+    /// 变异提示：删掉 `set_text` 里的 `hwnd == 0` 守卫，这条就会真的走 OS 路径并返回
+    /// 别的错误（或「成功」）⇒ 红。
+    #[cfg(windows)]
+    #[test]
+    fn set_text_rejects_null_owner_upfront() {
+        let cb = Clipboard::new(0).expect("构造本身不碰剪贴板，hwnd=0 也能构造（够 get_text 用）");
+        let err = cb.set_text("x").expect_err("NULL 属主的写入必须在打开剪贴板之前被拒绝");
+        assert!(
+            err.contains("真实窗口") && err.contains("hwnd"),
+            "错误信息要点明「要真实窗口句柄」：{err}"
+        );
+    }
 }

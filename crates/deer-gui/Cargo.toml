@@ -75,6 +75,14 @@ required-features = ["window"]
 name = "hello_window"
 required-features = ["window"]
 
+# AF-2：剪贴板探针（真窗口 + 真 OS 剪贴板的往返保真判据，含中文/emoji 多字节）。
+# 写入必须用**真实窗口**作属主（NULL 属主 ⇒ SetClipboardData 按 Win32 语义失败），
+# 所以是 example 不是 #[test]（理由与 input_probe 那条先例相同：CI 无桌面）。
+# 同样是窗口路径 ⇒ 必须显式写 `required-features`（理由与上面那段逐字相同）。
+[[example]]
+name = "clipboard_probe"
+required-features = ["window"]
+
 # testkit 的**可运行示例**（`docs/features/testing.md` 的最小示例的「跑起来」版）。
 # 它需要 `testing` feature ⇒ 必须显式写 `required-features`，否则默认（无 feature）
 # 构建会去编译它而失败 —— 那不是「跳过」，是 `cargo test --workspace` 直接红

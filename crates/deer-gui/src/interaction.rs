@@ -141,6 +141,12 @@ mod mirror {
         FocusChanged {
             focused: bool,
         },
+        /// **DPI 缩放系数变了**（AF-3，Q4=**只透传**）：OS 报多少就带多少（`f64` 原样），
+        /// 交互层**不换算任何坐标** —— 命中/布局/绘制仍是物理像素的纯函数（红线）。
+        /// 与 `deer-window` 的同名变体**逐字同步**（mirror 纪律）。
+        ScaleFactorChanged {
+            scale_factor: f64,
+        },
     }
 }
 
@@ -162,7 +168,19 @@ pub struct UiState {
     pub hover: Option<String>,
     /// 键盘焦点（`Tab`/`Shift+Tab` 改它，`Escape` 清它）。
     pub focus: Option<String>,
-    /// 被**左键**按下的节点（按下时记住，抬起时判定是否成 Clicked）。
+    /// **左键捕获的节点**（T3.7 指针捕获，D7 裁定=**按下即默认捕获**）。
+    ///
+    /// 语义（改前是「按下时记住，抬起处==按下处才成 Clicked」—— 即「拖出即丢」，
+    /// 实测差异已登记进 `ROADMAP.md` 的 D7 行）：
+    ///
+    /// - **按下**命中节点 ⇒ 记下它 = **捕获**（无论它是不是可聚焦控件 —— 容器、文本
+    ///   同样可以被捕获；按下落在空白/禁用/被裁剪处 ⇒ 没有命中者 ⇒ 无捕获）；
+    /// - **拖拽期间**（捕获在手）`PointerMoved` **路由给捕获者**：hover 钉在它身上，
+    ///   指针拖出节点、拖出整棵树都不换人（按钮的 hover/pressed 视觉因此保持）；
+    /// - **抬起**（ wherever）**按捕获者结算** `Clicked`，并**释放捕获**（`take()`）。
+    ///
+    /// 窗口失焦（`FocusChanged { focused: false }`）清空它 —— 抬起事件可能永远不来，
+    /// 捕获必须跟着丢，否则窗口切回来一点就凭空成点击（既有语义，原样保留）。
     pub pressed: Option<String>,
     /// 输入框的文本缓冲（id → 内容）。不在里面的输入框视为空串。
     pub texts: BTreeMap<String, String>,
@@ -901,21 +919,22 @@ fn nearest_focusable(
 ///
 /// | 事件 | 效果 |
 /// |---|---|
-/// | `PointerMoved` | 同步 `hover`（变了才发 `HoverChanged`） |
-/// | `PointerDown { Left }` | 同步 `hover`；**命中的可聚焦控件 ⇒ 聚焦它**（变了才发 `FocusChanged`）；记 `pressed` |
-/// | `PointerUp { Left }` | 同步 `hover`；**抬起处的节点 == 按下时的节点** ⇒ `Clicked`；无论如何清 `pressed` |
+/// | `PointerMoved` | 同步 `hover`（变了才发 `HoverChanged`）；**捕获中（`pressed` 在手）⇒ 路由给捕获者：hover 钉在捕获节点上**（T3.7，D7 按下即默认捕获 —— 拖出不换人） |
+/// | `PointerDown { Left }` | 同步 `hover`；**命中的可聚焦控件 ⇒ 聚焦它**（变了才发 `FocusChanged`）；记 `pressed` = **捕获**（按下即默认捕获，D7） |
+/// | `PointerUp { Left }` | 同步 `hover`（捕获已随抬起释放，hover 回到物理位置）；**按捕获者结算 `Clicked`**（抬起在哪都算 —— 改前是「抬起处==按下处」，即拖出即丢）；释放 `pressed` |
 /// | `KeyDown { Tab }` | 树序循环焦点（`Shift` 反向）⇒ `FocusChanged` |
 /// | `KeyDown { Escape }` | 清焦点 ⇒ `FocusChanged(None)` |
 /// | `KeyDown { Enter }` | 焦点在**启用的按钮**上 ⇒ `Clicked`（键激活 = 点击） |
 /// | `KeyDown { Backspace }` | 焦点是启用的输入框 ⇒ 删**一个字符**（Unicode 字符，不是字节）⇒ `TextChanged` |
 /// | `TextInput` | 焦点是启用的输入框 ⇒ 追加 ⇒ `TextChanged` |
 /// | `FocusChanged { focused: false }` | 窗口失焦：清 `hover`/`pressed`（`focus`/`texts` 不动）|
+/// | `ScaleFactorChanged`（AF-3） | **不消费**（透传红线 Q4：DPI 系数由窗口层转给 App，坐标/尺寸不换算，`UiState` 不动） |
 /// | `Wheel { dy }` | **滚动**：`hover` 最近的可滚动祖先（含自身）偏移 `-dy ×` [`WHEEL_STEP_PX`]`，夹在 `[0, max_scroll]`；变了才发 `Scrolled` |
 /// | `KeyDown { Up/Down }`（T3.1，焦点**不是**输入框时） | **几何邻近**焦点移动（严格方向；无焦点 ⇒ 不定义；到边停） |
 /// | `KeyDown { PageUp/PageDown/Home/End }`（T3.2，焦点**不是**输入框时） | **按键滚动**：焦点容器优先、退 `hover`；翻页 = 视口高；Home/End 到边 |
 /// | `PointerDown { Right }`（T3.3，Q1） | **按下即发** `PointerRight`（纯透传；不 pressed/不焦点；禁用子树不发） |
 /// | `KeyDown { repeat: true }`（T3.6） | 与 `false` 同语义（**能区分**；要不要忽略重复由调用方决定） |
-/// | 其余（`KeyUp`、中键、`Key::Char`/`Other`、`focused: true`） | 不消费（见「已知边界」） |
+/// | 其余（`KeyUp`、中键、`Key::Char`/`Other`、`focused: true`、`ScaleFactorChanged`） | 不消费（见「已知边界」） |
 ///
 /// 只有**状态真的变了**才产出事件（`M5-4` 的 dirty 约定依赖这一点）。
 ///
@@ -967,8 +986,21 @@ pub fn handle(
                     }
                 }
             }
-            let id = node_id_at(root, geo, clip, *x, *y);
-            sync_hover(state, &mut out, id);
+            // ★ T3.7 指针捕获（D7 裁定=按下即默认捕获）：**捕获中（`pressed` 在手）⇒
+            // 移动事件路由给捕获者** —— hover 钉在捕获节点上，指针拖出节点、拖出整棵树
+            // 都不换人（可观察效果：按住的按钮拖出去，hover/pressed 视觉保持不变，
+            // 也不会对着路过的东西刷 `HoverChanged`）。抬起在哪、结算给谁，见 `PointerUp`。
+            //
+            // 两条**不变**（既有判据逐条核对过）：
+            // - **未捕获**（`pressed == None`：没按过、或按在空白/禁用/被裁剪处）⇒
+            //   照旧命中测试 —— 这条路径逐字节不变；
+            // - **滚动条拖动**是自己的捕获（上面那半 `scroll.drag`），它从不置
+            //   `pressed` ⇒ 它的 hover 行为（跟随指针）原样保留。
+            let next = match state.pressed.clone() {
+                Some(captured) => Some(captured),
+                None => node_id_at(root, geo, clip, *x, *y),
+            };
+            sync_hover(state, &mut out, next);
         }
         InputEvent::PointerDown {
             button: PointerButton::Left,
@@ -1060,17 +1092,22 @@ pub fn handle(
             x,
             y,
         } => {
+            // 抬起 = 捕获释放：hover 回到**抬起处的物理节点**（不管捕获者是谁 ——
+            // 捕获只管「按住的这段时间」，抬起这一刻起指针重新属于命中的节点）。
             let id = node_id_at(root, geo, clip, *x, *y);
-            sync_hover(state, &mut out, id.clone());
+            sync_hover(state, &mut out, id);
             // 拖动结束时**清掉抓取状态**并跳过点击结算 —— 按在滚动条上不是「点击内容」。
             // （`take()` 顺手回答了「刚才在拖吗」，不需要另存一个 bool。）
             if state.scroll.drag.take().is_some() {
                 // 什么都不做：只结束拖动
-            } else if let Some(pressed) = state.pressed.take() {
-                // 抬起处必须是**按下时那个节点**：按下后移出再抬起不算点击。
-                if id.as_deref() == Some(pressed.as_str()) {
-                    out.push(UiEvent::Clicked(pressed));
-                }
+            } else if let Some(captured) = state.pressed.take() {
+                // ★ T3.7（D7 裁定）：**按捕获者结算** —— 捕获在手时指针去了哪里无关紧要，
+                // `Clicked` 归按下（捕获）的那个节点：拖出节点、拖出整棵树再抬起**照样是
+                // 它的点击**（改前是「抬起处==按下处才成点击」—— 即拖出即丢；实测差异
+                // 已登记进 `ROADMAP.md` 的 D7 行）。上面那行 `sync_hover` 已经把 hover
+                // 送回抬起处的物理节点（捕获随 `take()` 释放，移动事件从下一条起回到
+                // 普通命中测试）。
+                out.push(UiEvent::Clicked(captured));
             }
         }
         // 右/中键的**抬起**：只同步 hover（按下语义已在 Down 分支完成 —— `PointerRight`
@@ -1284,6 +1321,12 @@ pub fn handle(
             }
         }
         InputEvent::FocusChanged { focused: true } => {}
+        InputEvent::ScaleFactorChanged { .. } => {
+            // **透传红线（Q4）**：DPI 缩放系数由窗口层原样转给 App（`WindowInfo::scale_factor`
+            // 同步记账），交互层**不消费、不换算** —— 命中、布局、绘制仍全是物理像素的
+            // 纯函数；也不动 `UiState`（DPI 变化不是 UI 状态变化；重绘由窗口层的
+            // `Gate::Always` 负责，不经过本层的任何事件）。
+        }
     }
 
     out
@@ -1744,24 +1787,41 @@ mod tests {
         assert_eq!(s.pressed, None, "抬起后必须清 pressed");
     }
 
-    // ---- 规则 3：按下后移出再抬起 ⇒ 不产生 Clicked -------------------------
+    // ---- 规则 3（T3.7 重写，D7 裁定=按下即默认捕获）：按下即捕获；拖出仍路由；
+    //      抬起按捕获者结算 -----------------------------------------------------
+    //
+    // 改前（实测现状，已登记 `ROADMAP.md` D7 行）：按下后移出 ⇒ hover 跟着指针换人
+    // （发 `HoverChanged`），移出后抬起 ⇒ 什么都不发生（「拖出即丢」）。D7 把捕获期
+    // 的路由改掉：事件仍归捕获者。**未捕获路径**（没按下就移动、按在空白/禁用/被裁剪
+    // 处）的行为不变 —— 由下一条 `r3b_*` 与 r4/r12 的既有判据钉住。
 
     #[test]
-    fn r3_press_then_release_outside_emits_no_clicked() {
+    fn r3_press_captures_and_drag_out_still_routes_click_settled_by_capturer() {
         let (t, g) = fixture();
         let mut s = UiState::default();
         let (x, y) = ev_at("btn_ok", &g);
 
-        handle(
+        let down = handle(
             &mut s,
             &t,
             &g,
             ClipSnapshot::unclipped(),
             &InputEvent::PointerDown { button: PointerButton::Left, x, y },
         );
-        assert_eq!(s.pressed.as_deref(), Some("btn_ok"), "前置：确实按下了");
+        // 前置断言：按下即捕获（D7），且 hover 一开始就在捕获者上 —— 否则后面的
+        // 「拖出不换人」只是在测空气。
+        assert_eq!(s.pressed.as_deref(), Some("btn_ok"), "前置：按下即捕获（D7 默认捕获）");
+        assert_eq!(s.hover.as_deref(), Some("btn_ok"), "前置：按下时 hover 在捕获者上");
+        assert_eq!(
+            down,
+            vec![
+                UiEvent::HoverChanged(Some("btn_ok".into())),
+                UiEvent::FocusChanged(Some("btn_ok".into())),
+            ],
+            "按下本身的事件与改前逐条相同（D7 只改捕获期间的路由与抬起结算）"
+        );
 
-        // 移到另一个按钮上（按下仍保持），再抬起。
+        // ① 拖到另一个按钮上：捕获者**仍收** Move ⇒ hover 不换人、不发 `HoverChanged`。
         let (x2, y2) = ev_at("btn_last", &g);
         let moved = handle(
             &mut s,
@@ -1770,49 +1830,128 @@ mod tests {
             ClipSnapshot::unclipped(),
             &InputEvent::PointerMoved { x: x2, y: y2 },
         );
-        println!("按下后移出：event={moved:?} hover={:?} pressed={:?}", s.hover, s.pressed);
-        assert_eq!(moved, vec![UiEvent::HoverChanged(Some("btn_last".into()))]);
-        assert_eq!(s.pressed.as_deref(), Some("btn_ok"), "移动不该清 pressed");
+        println!("拖出节点：event={moved:?} hover={:?} pressed={:?}", s.hover, s.pressed);
+        assert!(
+            moved.is_empty(),
+            "捕获中的移动路由给捕获者 ⇒ 不许产生 hover 事件，实际 {moved:?}"
+        );
+        assert_eq!(
+            s.hover.as_deref(),
+            Some("btn_ok"),
+            "拖出节点 hover 仍钉在捕获者上（改前：变成 btn_last）"
+        );
+        assert_eq!(s.pressed.as_deref(), Some("btn_ok"), "移动不清捕获");
         assert_eq!(
             s.focus.as_deref(),
             Some("btn_ok"),
-            "移动不改焦点（只有按下才聚焦）"
+            "移动不改焦点（既有语义，不回退）"
         );
 
-        let up = handle(
-            &mut s,
-            &t,
-            &g,
-            ClipSnapshot::unclipped(),
-            &InputEvent::PointerUp { button: PointerButton::Left, x: x2, y: y2 },
-        );
-        println!("移出后抬起：event={up:?}");
-        assert!(up.is_empty(), "移出后抬起不该有 Clicked，实际 {up:?}");
-        assert_eq!(s.pressed, None, "无论是否成点击，pressed 都要清掉");
-
-        // 反面补充：直接移出**整个树**再抬起，同样没有 Clicked。
-        handle(
-            &mut s,
-            &t,
-            &g,
-            ClipSnapshot::unclipped(),
-            &InputEvent::PointerDown { button: PointerButton::Left, x, y },
-        );
-        handle(
+        // ② 拖出整棵树：同理（改前：hover 变 None 并发事件）。
+        let out2 = handle(
             &mut s,
             &t,
             &g,
             ClipSnapshot::unclipped(),
             &InputEvent::PointerMoved { x: -1.0, y: -1.0 },
         );
-        let up2 = handle(
+        assert!(out2.is_empty(), "拖出树外的移动同样路由给捕获者：{out2:?}");
+        assert_eq!(s.hover.as_deref(), Some("btn_ok"), "树外也钉在捕获者上");
+
+        // ③ 在树外抬起：**按捕获者结算** `Clicked`；捕获释放；hover 回到物理位置（树外 ⇒ None）。
+        let up = handle(
             &mut s,
             &t,
             &g,
             ClipSnapshot::unclipped(),
             &InputEvent::PointerUp { button: PointerButton::Left, x: -1.0, y: -1.0 },
         );
-        assert!(up2.is_empty(), "移出树外抬起不该有 Clicked，实际 {up2:?}");
+        println!("树外抬起：event={up:?} pressed={:?} hover={:?}", s.pressed, s.hover);
+        assert_eq!(
+            up,
+            vec![
+                UiEvent::HoverChanged(None),
+                UiEvent::Clicked("btn_ok".into()),
+            ],
+            "抬起按捕获者结算（D7）：拖出去再抬起也是 btn_ok 的点击（改前：什么都不发）"
+        );
+        assert_eq!(s.pressed, None, "抬起释放捕获");
+        assert_eq!(s.hover, None, "释放后 hover 回到抬起处的物理位置");
+
+        // ④ 释放之后的移动回到**未捕获路径**：照旧命中测试（hover 跟随指针）。
+        let after = handle(
+            &mut s,
+            &t,
+            &g,
+            ClipSnapshot::unclipped(),
+            &InputEvent::PointerMoved { x: x2, y: y2 },
+        );
+        assert_eq!(
+            after,
+            vec![UiEvent::HoverChanged(Some("btn_last".into()))],
+            "捕获释放后移动回到普通命中测试"
+        );
+    }
+
+    /// 拖出去**再拖回来**抬起：结算与「原地按下抬起」完全一致（捕获语义的自洽性 ——
+    /// 消费方拿到的 `Clicked` 不因中途绕了一圈而不同）。
+    #[test]
+    fn r3c_drag_out_and_back_settles_the_same_as_in_place() {
+        let (t, g) = fixture();
+        let (x, y) = ev_at("btn_ok", &g);
+        let (x2, y2) = ev_at("btn_last", &g);
+
+        let mut s = UiState::default();
+        handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Left, x, y });
+        handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::PointerMoved { x: x2, y: y2 });
+        handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::PointerMoved { x, y });
+        assert_eq!(s.hover.as_deref(), Some("btn_ok"), "前置：拖回来 hover 仍在捕获者上");
+        let up = handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::PointerUp { button: PointerButton::Left, x, y });
+        assert_eq!(up, vec![UiEvent::Clicked("btn_ok".into())],
+            "绕一圈回到原地抬起：与 r2 的原地结算逐条相同");
+        assert_eq!(s.pressed, None);
+        assert_eq!(s.hover.as_deref(), Some("btn_ok"), "抬起处就是捕获者 ⇒ hover 不变");
+    }
+
+    /// **未捕获路径逐字节不变**（T3.7 的另一半判据）：按下落在**空白**（打不中任何节点）
+    /// ⇒ 没有捕获者 ⇒ 移动照旧跟随命中测试、抬起照旧无 `Clicked`。
+    /// （禁用/被裁剪处的按下同样不产生捕获 —— `hit` 在那两种情况下本来就返回 `None`，
+    /// 由 r4/r12 的既有判据钉住。）
+    #[test]
+    fn r3b_press_on_empty_space_captures_nothing_moves_still_follow_the_pointer() {
+        let (t, g) = fixture();
+        let mut s = UiState::default();
+        // 前置：这个点确实打不中任何节点（否则「无捕获」是假象）。
+        assert_eq!(
+            hit(&t, &g, ClipSnapshot::unclipped(), -5.0, -5.0).map(|n| n.id.clone()),
+            None,
+            "测试前置：树外点 (-5,-5) 不该命中任何节点"
+        );
+
+        let down = handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::PointerDown { button: PointerButton::Left, x: -5.0, y: -5.0 });
+        assert!(down.is_empty(), "树外按下无事件，实际 {down:?}");
+        assert_eq!(s.pressed, None, "没有命中者 ⇒ 没有捕获 ⇒ 走未捕获路径");
+
+        // 未捕获 ⇒ 移动照旧命中测试（hover 跟随指针 —— 既有行为，不许回退）。
+        let (x2, y2) = ev_at("btn_last", &g);
+        let moved = handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::PointerMoved { x: x2, y: y2 });
+        assert_eq!(
+            moved,
+            vec![UiEvent::HoverChanged(Some("btn_last".into()))],
+            "未捕获路径：hover 仍跟随指针（D7 只改捕获中的路由）"
+        );
+
+        // 抬起照旧：没有捕获 ⇒ 没有 `Clicked`（「按空白不是点击」既有语义）。
+        let up = handle(&mut s, &t, &g, ClipSnapshot::unclipped(),
+            &InputEvent::PointerUp { button: PointerButton::Left, x: x2, y: y2 });
+        assert!(up.is_empty(), "无捕获 ⇒ 抬起无 Clicked，实际 {up:?}");
+        assert_eq!(s.pressed, None);
     }
 
     // ---- 规则 3b（M5-4）：点击可聚焦控件 ⇒ 聚焦它 --------------------------

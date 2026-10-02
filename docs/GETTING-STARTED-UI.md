@@ -234,7 +234,7 @@ Some(&mut engine))`（窗口侧）。**没有引擎时**文字走「等宽占位
 | 方法 | 何时被调 | 默认实现 |
 |---|---|---|
 | `init(&mut self, info: &WindowInfo) -> Result<(), String>` | 建窗后**一次**（在这里建渲染器） | **必须实现** |
-| `resized(&mut self, width: u32, height: u32) -> Result<(), String>` | 尺寸/DPI 变化（参数是**物理**像素） | 什么都不做 |
+| `resized(&mut self, width: u32, height: u32) -> Result<(), String>` | 尺寸变化（参数是**物理**像素）。**DPI 变化不触发它**（AF-3：只发 `InputEvent::ScaleFactorChanged`，窗口保持现有物理像素） | 什么都不做 |
 | `redraw(&mut self) -> Result<Flow, String>` | 要一帧（画 + 呈现） | **必须实现** |
 | `input(&mut self, info: &WindowInfo, ev: &InputEvent) -> Result<Flow, String>` | 每条输入 | 什么都不做 |
 | `close_requested(&mut self) -> Flow` | 点关闭按钮 | `Flow::Exit` |
@@ -249,6 +249,8 @@ Some(&mut engine))`（窗口侧）。**没有引擎时**文字走「等宽占位
 
 `WindowConfig::new(title, width, height)` 收的是**逻辑**尺寸（建窗时系统按 DPI 换算）；
 `WindowInfo.extent` 与 `InputEvent` 里的坐标是**物理**像素 —— 两者同一套口径。
+DPI 缩放系数本身也透传（AF-3）：`WindowInfo.scale_factor` 初值 = 建窗时 OS 报的值，
+之后随 `InputEvent::ScaleFactorChanged` 更新 —— **只透传不换算**，要缩放是上层自己的事。
 
 ### 4.2 输入路径只有一条
 

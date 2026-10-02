@@ -12,7 +12,7 @@
 | **M2** | Vulkan 逻辑设备 + 交换链 | M2a：逻辑设备/管线/命令/离屏回读；M2b：窗口 + `VkSurfaceKHR` + 交换链 + 帧同步 + 呈现 | ✅ **完成（M2a + M2b）** |
 | **M3** | 渲染器 + 管线（矩形/圆角/裁剪/文本） | M3a：形状的 `DrawList` → GPU（顶点缓冲 + 静态管线 + 与 CPU 逐像素对照）；M3b：文本/字形 → GPU（第二条管线 + 图集纹理 + 逐像素对照）；M3c：把界面**呈到窗口**（共用管线层 + 线性交换链 + 上屏 parity）；M3+：批处理（**统一管线（形状 + 文本 → 一条管线）+ 跨帧复用缓冲已落地**） | 🔄 **进行中（M3a + M3b + M3c 完成；M3+ 批处理部分完成）** |
 | **M4** | 文本 | 字体解析（TTF/OTF）+ 字形光栅化 + 图集 + 文本度量（替换 `ApproxMeasure`）+ 换行 | 🔄 **进行中（解析 / 光栅化 / 图集 / 度量与换行 / CPU 真实字形 ✅；hinting 与亚像素待做）** |
-| **M5** | 输入 + 焦点 + dock | **已落地**：输入事件通路（`InputEvent` + winit 映射 + `App::input`）、命中与状态机（`hit`/`handle`/`ClipSnapshot`，含裁剪与禁用感知）、点击 / `Tab` / `Shift+Tab` / `Escape` 焦点、文本输入（追加 + `Backspace` 按 Unicode 字符删末尾）、脚本化事件重放；**M5b：事件驱动重绘（默认省电）** —— `ControlFlow::Wait` + `App::wants_redraw()` + `RedrawPolicy`（默认 `OnDemand`），可用 `DEER_WINDOW_REDRAW=continuous` 关掉省电（见 [`docs/features/window.md`](docs/features/window.md) 第 6 节）。**仍未做**：**dock**、多窗口、上下文菜单本体与中键语义（M6+）（**输入地基已全部落地**：滚轮垂直滚动、可视滚动条 + 拖滑块 + 点轨道跳转 + 惯性两行接线（T3.2/T3.2b）、IME 预编辑（T3.4）、`texts` 光标 + 光标渲染（T3.5/T3.8）、方向键上下导航（T3.1）、按键滚动（T3.2 收尾）、右键透传（T3.3）、按键重复（T3.6）） | 🔄 **部分完成（见 [`docs/features/input.md`](docs/features/input.md) 第 6 节）** |
+| **M5** | 输入 + 焦点 + dock | **已落地**：输入事件通路（`InputEvent` + winit 映射 + `App::input`）、命中与状态机（`hit`/`handle`/`ClipSnapshot`，含裁剪与禁用感知）、点击 / `Tab` / `Shift+Tab` / `Escape` 焦点、文本输入（追加 + `Backspace` 按 Unicode 字符删末尾）、脚本化事件重放；**M5b：事件驱动重绘（默认省电）** —— `ControlFlow::Wait` + `App::wants_redraw()` + `RedrawPolicy`（默认 `OnDemand`），可用 `DEER_WINDOW_REDRAW=continuous` 关掉省电（见 [`docs/features/window.md`](docs/features/window.md) 第 6 节）。**仍未做**：**dock**、多窗口、上下文菜单本体与中键语义（M6+）（**输入地基已全部落地**：滚轮垂直滚动、可视滚动条 + 拖滑块 + 点轨道跳转 + 惯性两行接线（T3.2/T3.2b）、IME 预编辑（T3.4）、`texts` 光标 + 光标渲染（T3.5/T3.8）、方向键上下导航（T3.1）、按键滚动（T3.2 收尾）、右键透传（T3.3）、按键重复（T3.6）、**指针捕获（T3.7，按下即捕获 —— D7；A 线收官）**） | 🔄 **部分完成（见 [`docs/features/input.md`](docs/features/input.md) 第 6 节）** |
 | **M6** | 控件族 | 从 `deer-ui` 迁移 12 个控件的**语义**：`Btn`/`ChipGroup`/`Segmented`/`TabBar`/`Switch`/`NumberField`/`ScrubNum`/`ColorField`/`Dialog`/`Overlay`/`DropMenu`/`HoverTip`/`Icon`/`Row`/`RowActions`/`Keep` | ⬜ |
 | **M7** | DX12 / Metal 后端 | 各自实现 HAL trait；用 `deer-gpu` 的 CPU 参考后端做像素级对照 | ⬜ |
 
@@ -243,13 +243,13 @@ M3 把界面**画上了窗口**（M3c），但那是走**专用快路** `Windowe
 
 | # | 项 | 决定 | 对实现的影响 |
 |---|---|---|---|
-| **D7** | 指针捕获（T3.7） | **默认捕获** —— 按下即捕获，拖出节点后事件仍路由给它，直至抬起 | ⚠️ **会改掉既有「拖出即丢」行为** ⇒ 实现时必须**先实测现状并登记差异**，再改；未捕获路径的既有判据要逐条核对 |
+| **D7** | 指针捕获（T3.7） | **默认捕获** —— 按下即捕获，拖出节点后事件仍路由给它，直至抬起 | ✅ **已实现（T3.7）**。**实测现状差异（改前）**：按下后移出 ⇒ hover 跟指针换人（发 `HoverChanged`），移出后抬起**无** `Clicked`（「拖出即丢」，旧判据 `r3_press_then_release_outside_emits_no_clicked` 钉住的正是它）。**改后**：捕获期间（`pressed` 在手）移动**路由给捕获者**（hover 钉在捕获节点上、不发 hover 事件），抬起**按捕获者结算** `Clicked`（无论抬起在哪）。落点：`deer-gui/src/interaction.rs`（`PointerMoved` 钉取 + `PointerUp` 按捕获者结算）+ `deer-window/src/host.rs`（`PointerRoute`：移动**不做边界过滤**、按键事件取最近光标位置 —— 拖拽期间流不断的两条窗口侧前提）。**未捕获路径**（没按下 / 按在空白、禁用、被裁剪处）逐字节不变；滚动条拖动是自己的捕获（`scroll.drag`，从不置 `pressed`）⇒ 行为不变；既有判据逐条核对（r2/r4/r12/r18、脚本重放、滚动条组全部原样通过） |
 | **D1** | `InputEvent::ImePreedit { text }`（T3.4） | **各自独立 PR**（不与 D3 合并成批） | `deer-window` + `interaction.rs` 的 mirror **两处逐字同步**，一次只动一个变体 |
 | **D3** | `KeyDown::repeat: bool`（T3.6）与 `InputEvent::ScaleFactorChanged`（AF-3） | 同上：**各自独立 PR** | 同上；既有 `match` 的穷尽性由编译期兜住 |
 | **Q1** | 右键语义（T3.3） | **先纯透传**（`UiEvent::PointerRight` 级别），上下文菜单属 M6 | 地基只保证事件能到上层 |
-| **Q2** | PNG 解码（AF-1） | **先只做 BMP**（零依赖）；PNG 解码单独立项按需决策 | 自写 inflate 的收益要等真实需求 |
-| **Q3** | 剪贴板（AF-2） | **自写 Win32**（`CF_UNICODETEXT`，约 60 行），不引 `arboard` | 与「除 `winit` 外零第三方依赖」的口径一致 |
-| **Q4** | DPI（AF-3） | **只透传 `scale_factor`，不下沉进布局** | 布局是像素级确定性纯函数（I-1/I-2），自动缩放会破坏逐字节判据 |
+| **Q2** | PNG 解码（AF-1） | **先只做 BMP**（零依赖）；PNG 解码单独立项按需决策 | 自写 inflate 的收益要等真实需求。**✅ 已实现（AF-1，BMP 部分）**：`deer_gpu::image` 的零依赖 BMP 解码（24/32 位、底行优先 → RGBA8 **顶行在前** → 直喂纹理；判据=「解码 → 自有 png.rs 重编码」逐字节回环，见 [`docs/features/image-decode.md`](docs/features/image-decode.md)）；**PNG 解码仍按本裁断未做**，确有需求再单独立项（自写 inflate） |
+| **Q3** | 剪贴板（AF-2） | **自写 Win32**（`CF_UNICODETEXT`，约 60 行），不引 `arboard` | 与「除 `winit` 外零第三方依赖」的口径一致。**✅ 已实现（AF-2）**：`deer-window/src/display.rs` 的 `Clipboard` 公共构造器式句柄（**为什么不是 Waker 式交接**：`EventLoopProxy` 才是事件循环私产，剪贴板是 OS 全局资源，且交接式在非 Windows 走不到 —— 理由全文在 `Clipboard` 文档与 [`docs/features/clipboard.md`](docs/features/clipboard.md) 第 3 节）；非 Windows 明确 `Err` 不静默；写入必须真实窗口属主（NULL 属主 ⇒ `SetClipboardData` 失败，Win32 `EmptyClipboard` Remarks + 本机实测，已做成前置拒绝） |
+| **Q4** | DPI（AF-3） | **只透传 `scale_factor`，不下沉进布局** | 布局是像素级确定性纯函数（I-1/I-2），自动缩放会破坏逐字节判据。**✅ 已实现（AF-3）**：`WindowInfo.scale_factor`（初值 = `window.scale_factor()`，与 `InputEvent::ScaleFactorChanged` 同源同值）+ `InputEvent::ScaleFactorChanged { scale_factor: f64 }`（mirror 两处逐字同步；交互层不消费、不换算）；窗口物理尺寸**不**因 DPI 变化而改（刻意不碰 winit 的 `InnerSizeWriter` —— 写它才 resize，保持像素才是纯粹透传）；账本收成可单测纯类型 `ScaleLedger`（`f64` 原样透传，不经 `f32` —— 有单测钉住） |
 | **Q6** | `.dui` 未知属性（E2） | **警告 + 结构化保留**（编辑器往返不能默默吃掉用户文件里的未来字段） | 与 `scene.rs` 既有「写错即报错」哲学有张力，故此处**明确登记为例外**：**未知**属性保留，**已知属性写错**仍报错 |
 | **Q7** | 撤销栈上限（E3） | **固定条数上限**（如 100 步），不做命令式反转 | 小树快照便宜 |
 | **D2** | 方向键上下焦点序（T3.1） | **几何邻近**（不复用 `Tab` 的构建序） | `Tab` 是构建序、方向键是空间语义，两者本就不同 |

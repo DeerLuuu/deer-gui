@@ -32,8 +32,8 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy}
 use winit::window::{Window, WindowId};
 
 use crate::display::{
-    InputEvent, Mods, WindowConfig, WindowInfo, map_key, map_mouse_button, map_mods, map_wheel,
-    printable_text, window_info,
+    InputEvent, Mods, PointerButton, WindowConfig, WindowInfo, map_key, map_mouse_button, map_mods,
+    map_wheel, printable_text, window_info,
 };
 
 /// 一帧/一次关闭请求的处置结果。
@@ -625,7 +625,8 @@ pub fn run<A: App + 'static>(config: WindowConfig, app: A) -> Result<(), String>
         extent: Extent { width: 0, height: 0 },
         counter: FrameCounter::new(),
         mods: Mods::default(),
-        cursor: (0.0, 0.0),
+        pointer: PointerRoute::default(),
+        dpi: ScaleLedger::at_creation(1.0),
         ime_composing: false,
         error: None,
         exiting: false,
@@ -669,6 +670,89 @@ fn print_redraw_policy(
     );
 }
 
+// ---------------------------------------------------------------------------
+// 指针路由账本（T3.7 指针捕获的**窗口侧半**）
+// ---------------------------------------------------------------------------
+
+/// **指针事件的坐标账本 + 事件合成**（T3.7 指针捕获，D7 裁定=按下即默认捕获）。
+///
+/// 捕获语义的** interaction 层半**（按下记 `pressed`、移动路由给捕获者、抬起按捕获者
+/// 结算）住在 `deer-gui`；它成立的前提是**拖拽期间移动/抬起事件仍源源不断地到达** ——
+/// 这半归窗口层，职责收拢成两条（有单测钉住，见本文件末尾 `pointer_route_tests`）：
+///
+/// 1. **移动不做窗口边界过滤**（[`PointerRoute::on_cursor_moved`]）：指针拖出窗口后，
+///    `CursorMoved` 带着窗外坐标**照样**记账并合成 [`InputEvent::PointerMoved`]。
+///    主流平台在按键按住期间本来就会把移动继续投给按下时的窗口（Win32/X11/Wayland
+///    的隐式捕获），本层**不加任何「坐标在窗口内才发」的判断** —— 加了捕获就断流。
+/// 2. **按键事件用最近一次光标位置**（[`PointerRoute::on_mouse_button`]）：winit 的
+///    `MouseInput` 不带坐标，按下/抬起的位置 = 账本里的最近值。拖出去在外面抬起时，
+///    [`InputEvent::PointerUp`] 带的是**最后已知**位置（interaction 层按捕获者结算，
+///    位置只影响 hover 落点，不影响点击归属）。还没收到过移动事件时是 `(0, 0)`
+///    （既有约定，不另造第三种坐标）。
+///
+/// 这两条**改前就在**（`CursorMoved` 直通、`MouseInput` 取 `self.cursor`）—— 本类型
+/// 把它们**收成一处可单测的契约**，捕获语义赖以成立的前提从此有护栏，而不是散在
+/// 事件分支里没人看。
+#[derive(Debug, Clone, Copy, Default)]
+struct PointerRoute {
+    /// 最近一次 `CursorMoved` 的物理坐标（`MouseInput` 合成事件时的位置来源）。
+    cursor: (f32, f32),
+}
+
+impl PointerRoute {
+    /// `CursorMoved` ⇒ **无条件**记账并合成 `PointerMoved`（约定 1：不做边界过滤）。
+    fn on_cursor_moved(&mut self, x: f32, y: f32) -> InputEvent {
+        self.cursor = (x, y);
+        InputEvent::PointerMoved { x, y }
+    }
+
+    /// `MouseInput` ⇒ 用**最近一次**光标位置合成 `PointerDown`/`PointerUp`（约定 2）。
+    fn on_mouse_button(&self, button: PointerButton, pressed: bool) -> InputEvent {
+        let (x, y) = self.cursor;
+        if pressed {
+            InputEvent::PointerDown { button, x, y }
+        } else {
+            InputEvent::PointerUp { button, x, y }
+        }
+    }
+}
+
+/// **DPI 账本**（AF-3，Q4 裁断=**只透传**）—— scale_factor 的**唯一**记账点。
+///
+/// 与 [`PointerRoute`] 同一套做法：把「透传」这条契约收成一处**可单测的纯类型**，
+/// 而不是散在 winit 事件分支里没人看。契约只有一条，但它是**红线**：
+///
+/// > OS 报多少就转发多少（`f64` 原样，不取整、不经 `f32` 折腾、不乘除任何数）——
+/// > 事件坐标与 `WindowInfo::extent` 仍是同一套物理像素，布局仍是像素级纯函数。
+/// > 自动按 DPI 缩放会破坏全仓逐字节像素判据（Q4），本层永远不做。
+///
+/// `WindowInfo::scale_factor` 与账本**同源**（建窗时都取自 winit 的
+/// `window.scale_factor()`；之后都由 `ScaleFactorChanged` 更新）⇒ App 在任何回调里
+/// 看到的 `info.scale_factor` 与最近一条 `ScaleFactorChanged` 事件的值**必然一致**。
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ScaleLedger {
+    scale_factor: f64,
+}
+
+impl ScaleLedger {
+    /// 建窗时的初值（`WindowInfo::scale_factor` 字段与它**同源同值**）。
+    fn at_creation(scale_factor: f64) -> ScaleLedger {
+        ScaleLedger { scale_factor }
+    }
+
+    /// `ScaleFactorChanged` ⇒ 记账并合成事件。**只透传**：值原样进事件、原样进账本。
+    fn on_scale_factor_changed(&mut self, scale_factor: f64) -> InputEvent {
+        self.scale_factor = scale_factor;
+        InputEvent::ScaleFactorChanged { scale_factor }
+    }
+
+    /// 当前记账值（与 `WindowInfo::scale_factor` 恒等 —— 同一处记账的两面）。
+    #[cfg(test)]
+    fn current(&self) -> f64 {
+        self.scale_factor
+    }
+}
+
 /// [`run()`] 的 `ApplicationHandler` 实现：事件循环 → `App` 回调的接线。
 struct RunHandler<A: App> {
     config: WindowConfig,
@@ -684,9 +768,11 @@ struct RunHandler<A: App> {
     counter: FrameCounter,
     /// 当前修饰键状态：由 `ModifiersChanged` 维护（winit 0.30 没有「随时查」的接口）。
     mods: Mods,
-    /// 最近一次 `CursorMoved` 的**物理**坐标：`MouseInput` 只给按键、不给坐标，
-    /// 而 `PointerDown/Up` 需要坐标 ⇒ 用最近一次光标位置补上（还没收到移动事件时是 (0,0)）。
-    cursor: (f32, f32),
+    /// **指针路由账本**（[`PointerRoute`]）：最近光标位置 + Down/Up 的事件合成。
+    /// 捕获语义（T3.7，D7）赖以成立的「拖拽期间流不断」两条约定都在它身上，见类型文档。
+    pointer: PointerRoute,
+    /// **DPI 账本**（[`ScaleLedger`]，AF-3）：scale_factor 的唯一记账点，只透传不换算。
+    dpi: ScaleLedger,
     /// IME 正在预编辑（收到非空 `Preedit` 且还没 `Commit`/`Disabled`）。
     /// 此时 `KeyboardInput` 的文本**不**再转 `TextInput`：否则中文输入会重复上屏
     /// （一次来自 `Ime::Commit`，一次来自按键自带的 `text`）。
@@ -869,6 +955,9 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
             Ok(info) => info,
             Err(e) => return self.fail(event_loop, e),
         };
+        // AF-3：DPI 账本与 `WindowInfo::scale_factor` **同源同值**（都来自这一次
+        // `window_info()` ⇒ 底下都是 winit 的 `window.scale_factor()`）。
+        self.dpi = ScaleLedger::at_creation(info.scale_factor);
         println!(
             "[deer-window] 窗口已建：title=\"{}\" extent={}x{} platform={:?} handle(HWND)=0x{:X} display(HINSTANCE)=0x{:X}",
             self.config.display_title(),
@@ -989,6 +1078,29 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
                 // 而且这不看 `App::wants_redraw`、也不看策略 —— 系统说「要重画」就是「要重画」。
                 self.request_redraw();
             }
+            WindowEvent::ScaleFactorChanged { scale_factor, inner_size_writer: _ } => {
+                // AF-3（Q4=**只透传**）：把 OS 报的 scale_factor 原样记账并转发给 App，
+                // **本层不换算任何坐标**（事件坐标与 `WindowInfo::extent` 仍是物理像素）。
+                //
+                // `inner_size_writer` **刻意不碰**（`_`）：winit 的语义是「写它 = 改窗口
+                // 物理尺寸；不写 = 窗口保持现有物理像素」（winit 0.30.13 Windows 后端
+                // `runner.rs::dispatch_event`：只有写了**不同**值才 `set_size`）。保持
+                // 物理尺寸就是最纯粹的透传 —— 「按 OS 建议把窗口放大」需要复刻 winit 的
+                // `logical×new_scale` 计算（event_loop.rs 的 WM_DPICHANGED 分支），那是
+                // 一层换算、还会跟 winit 的实现漂，Q4 裁断不做。
+                //
+                // ⚠️ 因此**不会**有 `Resized` 跟随（物理尺寸没变），`App::resized` 不触发
+                // —— 这次变化只有 `scale_factor` 本身；几何/坐标全部照旧（物理像素），
+                // App 拿到新系数想怎么用是它自己的事。
+                let ev = self.dpi.on_scale_factor_changed(scale_factor);
+                if let Some(info) = &mut self.info {
+                    info.scale_factor = scale_factor;
+                }
+                // **系统事件一律置位**（与 `Resized`/`Focused` 同档，六条规则表里的一类）：
+                // DPI 变了必须重画一帧 —— 拿到新系数的 App 才有机会在同一帧里用它；
+                // 交换链在 DPI 切换后也值得重present一次。不看 `App::wants_redraw`。
+                self.dispatch(event_loop, &ev, Gate::Always);
+            }
             WindowEvent::RedrawRequested => {
                 let result = self.app.redraw();
                 match self.counter.on_redraw(result) {
@@ -1014,9 +1126,10 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
             // ——— 输入事件的翻译（winit 事件 → 本层 `InputEvent` → `App::input`）———
             // 普通输入一律走 `Gate::AppDecides`：**只有** `App::wants_redraw` 为真才请求重绘。
             WindowEvent::CursorMoved { position, .. } => {
-                self.cursor = (position.x as f32, position.y as f32);
-                let (x, y) = self.cursor;
-                self.dispatch(event_loop, &InputEvent::PointerMoved { x, y }, Gate::AppDecides);
+                // **不做窗口边界过滤**（`PointerRoute` 约定 1）：拖出去的移动照样投给 App，
+                // interaction 层的指针捕获（按下即捕获，D7）靠这条流。
+                let ev = self.pointer.on_cursor_moved(position.x as f32, position.y as f32);
+                self.dispatch(event_loop, &ev, Gate::AppDecides);
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let Some(button) = map_mouse_button(button) else {
@@ -1024,11 +1137,9 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
                     // **不**派发、**不**请求重绘（也就不会产生「不明点击」）。
                     return;
                 };
-                let (x, y) = self.cursor;
-                let ev = match state {
-                    ElementState::Pressed => InputEvent::PointerDown { button, x, y },
-                    ElementState::Released => InputEvent::PointerUp { button, x, y },
-                };
+                // 坐标 = 最近一次光标位置（`PointerRoute` 约定 2）：拖出去在外面抬起，
+                // `PointerUp` 带最后已知位置，结算归 interaction 层的捕获者。
+                let ev = self.pointer.on_mouse_button(button, state == ElementState::Pressed);
                 self.dispatch(event_loop, &ev, Gate::AppDecides);
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -1100,5 +1211,142 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
             // 其余事件（触摸/手势/拖放/CursorEntered…）本期不转发：见模块文档的「仍未接线」。
             _ => {}
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 指针路由账本的单测（T3.7 窗口侧半；不建窗口、不跑事件循环 —— 与
+// `tests/input_map.rs` 同一纪律：测的是纯函数，喂的是 winit 事件的**字段**）
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod pointer_route_tests {
+    use super::PointerRoute;
+    use crate::{InputEvent, PointerButton};
+
+    /// **约定 1：移动不做窗口边界过滤** —— 拖出窗口的坐标照样合成 `PointerMoved`，
+    /// 且账本吃下它（后续抬起带这个窗外位置）。捕获语义（interaction 层）靠这条流。
+    #[test]
+    fn moves_outside_the_window_are_delivered_verbatim_and_ledgered() {
+        let mut r = PointerRoute::default();
+        // 前置：账本初值是既有约定的 (0,0) —— 否则下面的「窗外位置生效」是空话。
+        let probe = r.on_mouse_button(PointerButton::Left, false);
+        assert_eq!(
+            probe,
+            InputEvent::PointerUp { button: PointerButton::Left, x: 0.0, y: 0.0 },
+            "前置：初始账本是 (0,0)（既有约定）"
+        );
+
+        // 拖出窗口：负坐标 / 远超窗口尺寸的坐标都**原样**投递（不许过滤、不许夹取）。
+        for (x, y) in [(-37.5f32, 12.0f32), (9_999.0, -2.0), (-1.0, -1.0)] {
+            let ev = r.on_cursor_moved(x, y);
+            assert_eq!(
+                ev,
+                InputEvent::PointerMoved { x, y },
+                "窗外移动必须逐值透传，实际 {ev:?}"
+            );
+        }
+
+        // 账本吃下了最后一个窗外位置：随后的抬起带**它**（不是 (0,0)）。
+        let up = r.on_mouse_button(PointerButton::Left, false);
+        assert_eq!(
+            up,
+            InputEvent::PointerUp { button: PointerButton::Left, x: -1.0, y: -1.0 },
+            "窗外抬起必须带最后已知（窗外）位置 —— 拖出去松手也是完整的一次点击"
+        );
+    }
+
+    /// **约定 2：按键事件用最近一次光标位置** —— 抬起带**最后**位置，不是按下的位置。
+    #[test]
+    fn button_events_carry_the_last_known_cursor_not_the_press_point() {
+        let mut r = PointerRoute::default();
+        let down = {
+            let ev = r.on_cursor_moved(30.0, 20.0);
+            assert_eq!(ev, InputEvent::PointerMoved { x: 30.0, y: 20.0 }, "前置：移动透传");
+            r.on_mouse_button(PointerButton::Left, true)
+        };
+        assert_eq!(
+            down,
+            InputEvent::PointerDown { button: PointerButton::Left, x: 30.0, y: 20.0 },
+            "按下位置 = 当时最近的移动位置"
+        );
+
+        // 拖到别处再抬起：抬起带**最后**位置（30,20 会被判为「位置错」的红）。
+        let _ = r.on_cursor_moved(120.0, 400.0);
+        let up = r.on_mouse_button(PointerButton::Left, false);
+        assert_eq!(
+            up,
+            InputEvent::PointerUp { button: PointerButton::Left, x: 120.0, y: 400.0 },
+            "抬起必须带最后已知位置，不是按下时的 (30,20)"
+        );
+    }
+
+    /// **变异自检**：账本必须停在**最后一次移动**上 —— 记账被改坏（没更新/只更新一次）
+    /// 时这条会红（停在更早的位置或初值）。它证明约定 1 的第二条（账本吃下窗外位置）
+    /// 有判别力，不是摆设。
+    #[test]
+    fn ledger_stays_on_the_last_move() {
+        let mut r = PointerRoute::default();
+        // 只移动、不按键，再按键：账本必须停在**最后一次移动**上。
+        r.on_cursor_moved(5.0, 5.0);
+        r.on_cursor_moved(500.0, 5.0);
+        let up = r.on_mouse_button(PointerButton::Middle, false);
+        assert_eq!(
+            up,
+            InputEvent::PointerUp { button: PointerButton::Middle, x: 500.0, y: 5.0 },
+            "账本必须跟到最后一次移动（若是 (5,5) ⇒ 记账被改坏；若是 (0,0) ⇒ 移动没记账）"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DPI 账本的单测（AF-3；纯类型，钉「只透传、不换算」这条红线）
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod scale_ledger_tests {
+    use super::ScaleLedger;
+    use crate::InputEvent;
+
+    /// **红线：值原样透传** —— 事件携带的就是 OS 报的那个 `f64`（不取整、不经 `f32`），
+    /// 且账本与事件**同值**（`WindowInfo::scale_factor` 与它同源 ⇒ App 看到的口径一致）。
+    ///
+    /// `1.1` 是故意的：它**不能**被 `f32` 精确表示 —— 变异「把值经 `f32` 折腾一遍」
+    /// （`v as f32 as f64`）会让这条立刻变红（1.1f32 回到 f64 是
+    /// 1.100_000_023_841_857_9，与 1.1f64 不相等），而 1.25 / 2.0 这类恰好可表示的
+    /// 值抓不住那种坏法。
+    #[test]
+    fn scale_factor_is_forwarded_verbatim_and_ledgered() {
+        // 前置：初值就是建窗时 OS 报的那个（`window_info` 的同源值）。
+        let mut dpi = ScaleLedger::at_creation(1.0);
+        assert_eq!(dpi.current(), 1.0, "前置：建窗初值必须先立住，否则后面无从谈『变了』");
+
+        for new in [1.25f64, 1.1f64, 2.0f64] {
+            let ev = dpi.on_scale_factor_changed(new);
+            assert_eq!(
+                ev,
+                InputEvent::ScaleFactorChanged { scale_factor: new },
+                "事件必须携带 OS 报的原值（透传红线）：{new}"
+            );
+            assert_eq!(
+                dpi.current(),
+                new,
+                "账本必须与事件同值（WindowInfo::scale_factor 与它同源 ⇒ 口径一致）：{new}"
+            );
+        }
+    }
+
+    /// **变异自检**：账本不更新（只发事件、不改记账）⇒ 这条红 —— 它钉住
+    /// 「`info.scale_factor` 跟着最近一条事件走」这半边契约（另一半在上面那条）。
+    #[test]
+    fn ledger_must_track_the_latest_change() {
+        let mut dpi = ScaleLedger::at_creation(1.0);
+        let _ = dpi.on_scale_factor_changed(1.5);
+        let _ = dpi.on_scale_factor_changed(2.0);
+        assert_eq!(
+            dpi.current(),
+            2.0,
+            "账本必须停在最近一次变化上（停在 1.5 ⇒ 记账被改坏；停在 1.0 ⇒ 没记账）"
+        );
     }
 }

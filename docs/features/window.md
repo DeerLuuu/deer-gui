@@ -124,11 +124,15 @@ $env:DEER_VK_WINDOW_TESTS='1'; $env:DEER_VK_VALIDATION='1'; cargo run -q -p deer
 WindowInfo {
     pub raw: deer_gpu::RawWindowHandle,  // Windows: handle=HWND，display=HINSTANCE
     pub extent: deer_gpu::Extent,        // 当前尺寸（物理像素）
+    pub scale_factor: f64,               // DPI 缩放系数（AF-3：只透传，不换算）
 }
 ```
 
 - `raw` 是 **HAL 的不透明句柄**：`deer-vk` 只认它，**不依赖 winit** —— 所以换窗口实现不用动渲染层。
 - `init(&WindowInfo)` 拿到的是**建窗后**的尺寸；之后尺寸变化走 `resized`。
+- `scale_factor` 是**建窗时 OS 报的缩放系数**，之后随 `InputEvent::ScaleFactorChanged` 同步更新
+  （事件与字段**同一来源** ⇒ 任何回调里 `info.scale_factor` 与最近一条事件的值一致）。
+  **坐标与 `extent` 始终是物理像素** —— 本层不按 DPI 换算任何东西（要缩放是上层的事）。
 
 ### `Flow` —— 事件循环的去留
 
@@ -143,7 +147,7 @@ pub enum Flow { Continue, Exit }
 | 方法 | 何时被调用 | 必须实现 |
 |---|---|---|
 | `init(&mut self, info: &WindowInfo) -> Result<(), String>` | 窗口建好后**一次**（创建渲染器的地方） | ✅ |
-| `resized(&mut self, width: u32, height: u32) -> Result<(), String>` | 尺寸变化（含 DPI 变化），**物理像素**直接透传；应当重建交换链 | 默认空实现 |
+| `resized(&mut self, width: u32, height: u32) -> Result<(), String>` | 尺寸变化，**物理像素**直接透传；应当重建交换链。DPI 变化**不再**顺带 resize（窗口保持现有物理像素），只发 `InputEvent::ScaleFactorChanged`（AF-3） | 默认空实现 |
 | `redraw(&mut self) -> Result<Flow, String>` | 每帧（窗口要求重绘时），**含呈现** | ✅ |
 | `close_requested(&mut self) -> Flow` | 点关闭按钮 / 系统关闭请求 | 默认 `Flow::Exit`（允许关闭） |
 
@@ -486,7 +490,13 @@ set "DEER_WINDOW_REDRAW=continuous" && cargo run -q -p deer-window --example <�
     `Continuous`，见第 6 节）；**滚动容器已有**，但滚动偏移要由应用自己喂进布局（见
     [`scroll-and-multiline.md`](scroll-and-multiline.md)）。
   - **不支持多窗口、全屏 / 无边框、HDR**，也**没有帧率上限**。
-  - **DPI**：`Resized` 给的是物理像素，直接透传；不做额外的缩放换算。
+  - **DPI（AF-3 起，改了旧反述）**：旧说法是「只透传 `Resized` 给的物理像素，DPI 不透传」——
+    现在**缩放系数也透传了**：`WindowInfo.scale_factor`（建窗初值，之后同步更新）+
+    `InputEvent::ScaleFactorChanged { scale_factor }`（OS 报多少给多少，`f64` 原样）。
+    **「不做任何缩放换算」这条红线没变**：事件坐标与 `extent` 仍是物理像素、布局仍是
+    像素级纯函数（Q4 裁断）；窗口物理尺寸也**不**因 DPI 变化而改（刻意不碰 winit 的
+    `InnerSizeWriter` —— 写它才会 resize，不写则保持现有像素；复刻「OS 建议尺寸」的
+    `logical×new_scale` 计算本身就是一层换算，不做）。想按 DPI 缩放是上层自己的事。
   - **✅ 窗口侧 host→vertex 屏障已有断言（原覆盖缺口，已补上）**：
     **原现象**：窗口路径的屏障计数已就位（与 `cmd_pipeline_barrier` 同一处 ⇒ 删发射必然也删掉计数），
     但**缺一条能咬住它的断言** ⇒ 「**窗口路径从不发屏障**」这类变异**曾经**在门禁下会全绿。

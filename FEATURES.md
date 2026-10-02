@@ -65,7 +65,7 @@
 | **字形图集**（货架打包 + 1px padding + 按需增高） | ✅ | [glyph-atlas](docs/features/glyph-atlas.md) | `cargo run -p deer-gui --example glyph_atlas` |
 | **真实字体度量与换行**（`FontMeasure` 替换「每字符 0.6em」近似） | ✅ | [text-rendering](docs/features/text-rendering.md) | `cargo run -p deer-gui --example text_render` |
 | **真实字形渲染**（CPU 后端贴真实字形，不再是方块占位） | ✅ | [text-rendering](docs/features/text-rendering.md) | `cargo run -p deer-gui --example text_render` |
-| **窗口**（真窗口 + 事件循环，**仅 Windows**） | ✅ | [window](docs/features/window.md) | `cargo run -p deer-gui --features window --example window_preview` |
+| **窗口**（真窗口 + 事件循环，**仅 Windows**；**DPI 缩放系数透传**（AF-3：`WindowInfo.scale_factor` + `InputEvent::ScaleFactorChanged`，OS 报多少给多少 —— 只透传不换算，坐标/尺寸仍是物理像素，DPI 变化不触发 resize）） | ✅ | [window](docs/features/window.md) | `cargo run -p deer-gui --features window --example window_preview` |
 | **Vulkan 上屏**（`VkSurfaceKHR` + 交换链 + 帧同步 + 呈现） | ✅ | [vulkan-swapchain](docs/features/vulkan-swapchain.md) | `cargo run -p deer-gui --features window --example window_preview` |
 | **GPU 几何渲染**（`DrawList` 形状命令 → GPU，与 CPU **逐像素对照**） | ✅ | [gpu-geometry](docs/features/gpu-geometry.md) | `cargo run -p deer-gui --example gpu_geometry` |
 | **GPU 文本渲染**（字形四边形 + 图集纹理 + 最近邻采样，与 CPU **逐字节对照**） | ✅ | [gpu-geometry](docs/features/gpu-geometry.md#3-完整-api) | `cargo run -p deer-gui --example gpu_geometry` |
@@ -73,8 +73,10 @@
 | **输入与焦点**（事件通路 + 命中/状态机（含裁剪与禁用）+ Tab/Shift+Tab/Escape 焦点 + 文本输入 + **输入框光标**（T3.5：在光标处插入 / `Backspace` 删**光标前一个 Unicode 字符** / **左右方向键**移动光标，单位是**字符位**）+ 脚本化重放 + **只在状态变化时重绘**） | ✅ | [input](docs/features/input.md) | `cargo run -p deer-gui --features window --example interactive_form` |
 | **日志**（零依赖门面；分级 + 按 target 过滤；`DEER_LOG` 开关；**默认完全静默**、只写 stderr） | ✅ | [logging](docs/features/logging.md) | `cargo run -p deer-gui --example logging` |
 | **IME 预编辑**（中文/日文「还没上屏的那一段」：只进 `UiState::preedit` 缓冲、**不进 `texts`**；提交进 `texts` 并清缓冲 ⇒ **无双写**；画在光标处 + 下划线、**光标推到它之后**） | ✅ | [ime](docs/features/ime.md) | `cargo run -p deer-gui --example ime_preedit` |
+| **剪贴板**（AF-2：`deer_window::Clipboard` 公共构造器式句柄；自写 Win32 `OpenClipboard`/`EmptyClipboard`/`SetClipboardData`/`GetClipboardData`，只有 `CF_UNICODETEXT` 纯文本，不引第三方；每次调用原子地 Open（带重试）→ 干活 → Close；往返保真含中文/emoji 多字节；**非 Windows 明确 `Err(CLIPBOARD_UNSUPPORTED_MSG)` 不静默**；含 NUL 文本与 NULL 属主写入明确拒绝；写入会按 Win32 语义清掉其它格式） | ✅ | [clipboard](docs/features/clipboard.md) | `cargo run -p deer-gui --features window --example clipboard_probe` |
 | **测试接口（testkit）**（建面 + 输入注入（单事件/脚本 + `move @id`）+ 一帧**内置前置断言** + 离屏 CPU/GPU 渲染 + 像素/状态/绘制列表断言 + **CPU↔GPU 对照**（不透明 0 / 半透明 ≤1 LSB）+ 门槛自证 + **可复制的复现命令**） | ✅ | [testing](docs/features/testing.md) | `cargo run -p deer-gui --features testing --example testkit_demo` |
 | **通用纹理 / `RGBA8_UNORM`**（创建 + 上传 + **回读四通道保真**；离屏**纹理 quad** 与 CPU 参考逐字节相同；uv 朝向钉住 V 翻转） | ✅ | [textures](docs/features/textures.md) | `cargo run -p deer-gui --example textures` |
+| **BMP 图像解码**（`deer_gpu::image`：24/32 位、底行优先 → RGBA8 **顶行在前** → 直喂 `create_texture`/`upload_texture`；32 位 `BI_RGB` 按不透明（GDI 语义）、`BI_BITFIELDS` 读掩码（V1 紧跟/V2–V5 头内嵌）；判据「解码 → 自有 png.rs 重编码」逐字节回环，通道序/行序变异实测必红；**PNG 解码未做、16 位 BMP 未做**） | ✅ | [image-decode](docs/features/image-decode.md) | `cargo run -p deer-gui --example bmp_decode` |
 | **间接绘制**（`vkCmdBindIndexBuffer` + `vkCmdDrawIndexedIndirect(drawCount = 1, stride = 20)`，**离屏 + 窗口两条路径**；`RenderStats::indirect_draws` 与真实调用同处计数 ⇒ 换回 `vkCmdDraw` 必然变红；索引/间接缓冲惰性创建 + 跨帧复用 ⇒ 稳态零分配零上传） | ✅ | [indirect-draw](docs/features/indirect-draw.md) | `cargo run -p deer-gui --example indirect_draw` |
 
 ## 四、还没做的（**不要以为能跑**）
@@ -89,7 +91,7 @@
 | **字距与连字**（`kern` / `GSUB` / `GPOS`） | M4 残余 | 不做整形，`advance` 就是 `hmtx` 的原始值 |
 | **CFF / OpenType-CFF 字体**（`OTTO`） | M4 残余 | 解析层直接报错，不静默给空轮廓；只支持 `glyf` 轮廓 |
 | **竖排 / RTL / 复杂脚本整形** | M4 残余 | 完全没有；不读 `GSUB`/`GPOS` |
-| **输入与焦点的剩余部分**（仅剩：停靠 / 多窗口） | M5/M6 | **输入地基全部落地**：事件通路、命中/状态机、Tab/Escape 焦点、文本输入、脚本重放、事件驱动重绘、滚轮垂直滚动、可视滚动条（拖滑块 + 点轨道跳转）、惯性收口（T3.2b）、输入框光标（T3.5/T3.8）、IME 预编辑（T3.4）、**方向键上下导航（T3.1 几何邻近）**、**按键滚动（`PageUp`/`PageDown`/`Home`/`End`）**、**右键透传 `PointerRight`（T3.3）**、**按键重复 `repeat: bool`（T3.6）**（见 [`input.md`](docs/features/input.md) 第 6 节）；**真机输入法**只能人肉验证 |
+| **输入与焦点的剩余部分**（仅剩：停靠 / 多窗口） | M5/M6 | **输入地基全部落地**：事件通路、命中/状态机、Tab/Escape 焦点、文本输入、脚本重放、事件驱动重绘、滚轮垂直滚动、可视滚动条（拖滑块 + 点轨道跳转）、惯性收口（T3.2b）、输入框光标（T3.5/T3.8）、IME 预编辑（T3.4）、**方向键上下导航（T3.1 几何邻近）**、**按键滚动（`PageUp`/`PageDown`/`Home`/`End`）**、**右键透传 `PointerRight`（T3.3）**、**按键重复 `repeat: bool`（T3.6）**、**指针捕获（T3.7 按下即捕获：拖出仍路由、抬起按捕获者结算，D7）**（见 [`input.md`](docs/features/input.md) 第 6 节）；**真机输入法**只能人肉验证 |
 | **可停靠面板 dock**（拖动改位置 / 边缘折叠） | M6 | 完全没有 |
 | **控件族**（12 个 `deer-ui` 控件的语义） | M6 | 现在只有 5 种节点：`column`/`row`/`text`/`button`/`field` |
 | **DX12 / Metal 后端** | M7 | 完全没有 |

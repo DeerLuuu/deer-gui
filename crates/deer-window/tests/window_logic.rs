@@ -53,17 +53,21 @@ fn window_config_display_title() {
     assert_eq!(WindowConfig::new("汉字窗口", 320, 200).display_title(), "deer-gui — 汉字窗口");
 }
 
-/// `WindowInfo` 只是两个字段的载体：句柄与尺寸原样可读/可比较（Copy）。
+/// `WindowInfo` 只是三个字段的载体：句柄、尺寸、DPI 缩放系数原样可读/可比较（Copy；
+/// `Eq` 因 `scale_factor: f64` 放弃，`PartialEq` 照常可用）。
 #[test]
-fn window_info_carries_handle_and_extent() {
+fn window_info_carries_handle_extent_and_scale_factor() {
     let info = WindowInfo {
         raw: raw_handle_from_win32(0x1234, 0x400000),
         extent: Extent { width: 320, height: 200 },
+        scale_factor: 1.25,
     };
     let copied = info; // Copy
     assert_eq!(copied, info);
     assert_eq!(info.raw, RawWindowHandle { platform: Platform::Windows, handle: 0x1234, display: 0x400000 });
     assert_eq!(info.extent, Extent { width: 320, height: 200 });
+    // AF-3：scale_factor 只透传 —— 存进去什么读出来就是什么（OS 报多少就是多少）。
+    assert_eq!(info.scale_factor, 1.25, "scale_factor 必须原样可读（透传，不换算）");
 }
 
 /// 句柄打包（纯函数）：`hwnd → handle`、`hinstance → display`、`platform = Windows`。
