@@ -8,7 +8,7 @@
 | 项 | 值 |
 |---|---|
 | 远端 / 本地 `master` | 见 `git log --oneline -1`（本轮最后推送：`66ec218` 计划文件；`dc0ca23` = M5b/M5c/testkit 之前的里程碑收口） |
-| 判据规模 | `cargo test --workspace` = **627 passed / 0 failed**（分层物理化轮实测；口径以运行输出为准，任何一轮**不许退化**） |
+| 判据规模 | `cargo test --workspace` = **639 passed / 0 failed**（L1 落地轮实测；口径以运行输出为准，任何一轮**不许退化**） |
 | 已完成的里程碑 | M1 · M2a · M2b · M3a · M3b · M3c · M4（真字形）· M5（输入/焦点/重绘闭环）· M5b（事件驱动重绘 + 省电开关）· M5c（唤醒面 `Waker`/deadline）· M3+（统一管线 + 跨帧复用）· **分层物理化（L0–L3，Godot 式）** |
 | 零依赖口径 | 除窗口层 `winit 0.30` 外**零第三方依赖**（手写 Vulkan 绑定 + 自研 SPIR-V 汇编器） |
 
@@ -27,6 +27,7 @@ git worktree list    # 看全部；下面只列"在飞"的
 - **拓扑**：`deer-core`（L0 = 原 deer-layout + draw/error）· `deer-text`（L1 TextServer = font/glyph/raster/atlas/text/measure/png）· `deer-gpu`（L1 RenderServer·CPU + HAL traits 暂驻）· `deer-vk` · `deer-window`（内部 display/host）· `deer-gui` · `deer-log`
 - **关键裁定**（ROADMAP 登记 ⑨⑩）：HAL traits 暂驻 deer-gpu（`Frame::record` 签名引用 `TextEngine`，RID 化后才下沉 L0）；`FontMeasure` 归 TextServer。门禁盲区（`required-features` 示例不在 `--workspace` 编译面）登记于 CONTRIBUTING Verification 节。
 - **终验**（lead 执行，verifier 故障改由 lead 顶）：四口径 + feature 口径全绿；`window_parity` 形状/不透明逐字节 0、半透明 ≤1；M-A 迁移后复验 = 恰好 5 红（deer-core 2 + deer-gui 3，与原指纹一致）。
+- **L1 绝对定位/层叠已落地**（`feat/l1-position` @ `3f57ba1`，**glm-5.3-flash workflow 团队**交付：实现 + 独立验证双变异互补放行）：`LayoutProps.position: Option<Pos>`（本轮仅 `Offset`，opt-in 流外布局 + 声明序层叠；`hit_test` 零改动靠声明序先序遍历）；639/0。遗留：anchors=L4；`Pos` 形状与 D10 登记字差异待 ROADMAP 补裁定注（docs 待办）。
 | 第 2 项 `node_id_len` 盲区 + `Field` 焦点环 | `..\deer-gui-defects` | `feat/known-defects` | 一次性 worker | — |
 | M5c 复审（欠账） | `%TEMP%` 克隆 | — | 一次性 reviewer | — |
 | 常驻复审岗 | 只读 | — | **`verifier`** | **task-34 (t36)** |
