@@ -414,6 +414,28 @@ deer-gui  → 全部
 - ⇒ **L0 的排版契约**是 `Measure` / `TextStyle` / `wrap_greedy`（在 `crates/deer-core/src/layout.rs`，
   **已随 `deer-layout` 进 `deer-core`**）—— 「契约在 L0、具体度量实现在 L1」这个切分是刻意的。
 
+### 设计登记：多窗口（T4.4）—— 八项决策已锁定（维护者确认）
+
+> 前置：A 线（输入地基）已收官；分层物理化已完成。本轮把 D5 的「待设计」落成八项可执行裁定（维护者经选项确认）。
+
+| # | 决策点 | 裁定 |
+|---|---|---|
+| 1 | App 事件签名 | **新增 `App::window_input(id: WindowId, event: &InputEvent)`，默认实现转发既有 `App::input`** —— 单窗口用户零改动、公开 API 非破坏；多窗口用户覆盖新方法 |
+| 2 | 建窗模型 | **直接做动态 spawn**：`WindowSpawner` 句柄（`App` 经与 `Waker` 同型的通道获取），`spawn_window(config)` 把请求**排队到事件循环**，在安全点借 `ActiveEventLoop` 真正建窗（winit 0.30 约束）；主窗仍由 `run()` 首建 |
+| 3 | 渲染归属 | **Godot 同款**：共享一个 VkDevice（`RenderingDevice` 单例式），按 `WindowId` 索引各自的 surface/swapchain/帧资源；字形图集 / TextEngine / 纹理**全局共享一份** |
+| 4 | 关闭语义 | `CloseRequested` 只关该窗；**全部窗口关闭** ⇒ 事件循环退出 |
+| 5 | 焦点模型 | **每窗口独立焦点**（winit 本就按窗口发焦点） |
+| 6 | 树模型 | **每窗一棵独立 Node 树 + 独立 UiState**（Godot Window=Viewport 同构）；`window_input` 只收该窗的事件 |
+| 7 | 线程 | 单线程轮转不变（Q-4 仍悬置，多窗不引入线程） |
+| 8 | 明确不做（登记） | 跨窗口拖放（DnD）· owned/父子窗口 · 窗口间消息传递 · 每窗独立 GPU 实例 · 多线程渲染 |
+
+**交付切分（三步三 PR，按 §7）**：
+- **R1**：deer-window —— `WindowId` 事件路由 + `WindowSpawner` 排队建窗 + 多 `WindowConfig` 启动（纯窗口层，路由可单测）；
+- **R2**：deer-vk —— 多交换链（Device 级表）+ `WindowedRenderer` 按 WindowId 表化；
+- **R3**：整合 —— 双窗 `window_parity` 各自通过 + 双窗 demo + 四件套。
+
+**验收（R3 出口）**：动态 spawn 第二个窗口 ⇒ 两窗各自渲染、各自收事件、各自 parity；关一窗另一窗存活；最后关窗应用退出。
+
 ### M4 的细步与状态
 
 M4 原来写成一条「字体解析 + 光栅化 + 图集 + 度量 + 换行」。实际按「**先让字变成像素**、
