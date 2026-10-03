@@ -29,6 +29,20 @@ pub enum Kind {
     Button,
     /// 输入框
     Field,
+    /// **分段选择组**（M6 5c）：互斥单选 —— **直接子节点 = 段**（通常是 `Button`），
+    /// 点击一段 = 选中它并（在真的换了选中时）发 `UiEvent::SelectionChanged`。
+    /// 布局与 `Row` 同一套数学（横排）；当前选中住 `deer-gui` 侧 `UiState::segments`
+    /// （组 id → 段 id，值是应用数据，不进树 —— texts 同一条纪律）。
+    Segmented,
+    /// **标签组**（M6 5c）：多选 —— **直接子节点 = 芯片**，每个独立开/关；
+    /// 点击芯片发 `UiEvent::ChipToggled { on: 翻转后的新值 }`。
+    /// 开/关表住 `UiState::chips`（芯片 id → bool，表里没有 = 关）。
+    ChipGroup,
+    /// **页签栏**（M6 5c）：单选页签 —— **直接子节点 = 页签**，点击发
+    /// `UiEvent::TabChanged { index }`（内容切换是 App 的事，TabBar 只报告）。
+    /// 活动页住 `UiState::tabs`（组 id → 页 id）；单个页签禁用 = 该页签自身的
+    /// `props.disabled`（禁用子树静默的既有语义原样生效）。
+    TabBar,
 }
 
 impl Kind {
@@ -39,6 +53,9 @@ impl Kind {
             Kind::Text => "text",
             Kind::Button => "button",
             Kind::Field => "field",
+            Kind::Segmented => "segmented",
+            Kind::ChipGroup => "chip_group",
+            Kind::TabBar => "tab_bar",
         }
     }
 
@@ -49,13 +66,36 @@ impl Kind {
             "text" => Kind::Text,
             "button" => Kind::Button,
             "field" => Kind::Field,
+            "segmented" => Kind::Segmented,
+            "chip_group" => Kind::ChipGroup,
+            "tab_bar" => Kind::TabBar,
             _ => return None,
         })
     }
 
-    /// 容器可含子节点；叶子不可。
+    /// 容器可含子节点；叶子不可。选择类三种组是**容器**（它们的孩子就是选项），
+    /// 与 Row/Column 共用整套布局数学（见 [`Kind::is_horizontal`]）。
     pub const fn is_container(self) -> bool {
-        matches!(self, Kind::Column | Kind::Row)
+        matches!(
+            self,
+            Kind::Column | Kind::Row | Kind::Segmented | Kind::ChipGroup | Kind::TabBar
+        )
+    }
+
+    /// 主轴沿**水平**方向排子的容器（`Row` 与三个选择类组）。
+    ///
+    /// 布局的 measure/place 只在两处区分横竖（`Kind::Row` 判据的原位置）——
+    /// 收口成这一个谓词，免得「新横排容器」在某处被当成竖排而两边各写一份。
+    /// 对既有五种 Kind 它与 `== Kind::Row` **逐点相等**（Row ⇒ true，其余 ⇒ false），
+    /// 所以既有树的布局逐位不变（opt-in 红线）。
+    pub const fn is_horizontal(self) -> bool {
+        matches!(self, Kind::Row | Kind::Segmented | Kind::ChipGroup | Kind::TabBar)
+    }
+
+    /// 选择类组的**直接子节点 = 选项**（M6 5c）。交互层据此把点击结算成
+    /// `SelectionChanged` / `ChipToggled` / `TabChanged`（见 `deer-gui` 的 `handle`）。
+    pub const fn is_selection_group(self) -> bool {
+        matches!(self, Kind::Segmented | Kind::ChipGroup | Kind::TabBar)
     }
 }
 
@@ -422,7 +462,16 @@ impl IdGen {
         if !self.used.insert(id.to_string()) {
             return;
         }
-        for kind in [Kind::Column, Kind::Row, Kind::Text, Kind::Button, Kind::Field] {
+        for kind in [
+            Kind::Column,
+            Kind::Row,
+            Kind::Text,
+            Kind::Button,
+            Kind::Field,
+            Kind::Segmented,
+            Kind::ChipGroup,
+            Kind::TabBar,
+        ] {
             let prefix = format!("{}_", kind.as_str());
             if let Some(n) = id.strip_prefix(&prefix).and_then(|s| s.parse::<u32>().ok()) {
                 let slot = self.counters.entry(kind).or_insert(0);

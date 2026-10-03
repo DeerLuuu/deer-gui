@@ -90,6 +90,9 @@ fn frame_with(tree: &Node, theme: &Theme, geo: &Geometry, state: &UiState) -> Fr
         scroll: Default::default(),
         carets: Default::default(),
         preedit: None,
+        segments: Default::default(),
+        chips: Default::default(),
+        tabs: Default::default(),
     };
     let list = InteractiveRenderer::with_texts(
         theme.clone(),
@@ -208,6 +211,9 @@ fn scripted_replay_is_deterministic_and_matches_expected_state() {
         carets: BTreeMap::from([("field_1".to_string(), 2usize)]),
         scroll: Default::default(),
         preedit: None,
+        segments: Default::default(),
+        chips: Default::default(),
+        tabs: Default::default(),
     };
     println!("期望终态 = {}", fmt_state(&expected_state));
     assert_eq!(r1.state, expected_state, "终态必须逐字段相等");
@@ -462,6 +468,9 @@ fn states(theme: &Theme, tree: &Node, geo: &Geometry) -> Vec<(&'static str, Fram
             carets: Default::default(),
             scroll: Default::default(),
             preedit: None,
+            segments: Default::default(),
+            chips: Default::default(),
+            tabs: Default::default(),
         },
     );
     out
@@ -755,6 +764,10 @@ fn four_states_differ_only_inside_the_expected_rectangles() {
         // 合并提示：这条线给 `UiState` 新增了 `scroll`（合并另一条线时漏它 ⇒ E0063 全 test build 崩）。
         scroll: Default::default(),
         preedit: None,
+        // M6 5c 同一课：`segments`/`chips`/`tabs` 三张值表（漏了 ⇒ E0063 test build 崩）。
+        segments: Default::default(),
+        chips: Default::default(),
+        tabs: Default::default(),
     };
     let no_focus_state = UiState {
         focus: None,

@@ -117,5 +117,8 @@ fn kind_name(k: Kind) -> &'static str {
         Kind::Text => "Text",
         Kind::Button => "Button",
         Kind::Field => "Field",
+        Kind::Segmented => "Segmented",
+        Kind::ChipGroup => "ChipGroup",
+        Kind::TabBar => "TabBar",
     }
 }

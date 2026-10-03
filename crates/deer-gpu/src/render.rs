@@ -90,7 +90,10 @@ impl<'a, M: Measure> DefaultRenderer<'a, M> {
         let disabled = n.props.disabled;
 
         match n.kind {
-            Kind::Column | Kind::Row => {
+            // 容器（含 M6 5c 的三个选择类组）：同一套「有 padding 才画底」。
+            // 默认渲染器**无状态** ⇒ 不画选中/开/关（与 `Field` 只画占位标签同理）；
+            // 选中视觉是 `InteractiveRenderer` 按 `InteractState` 画的。
+            Kind::Column | Kind::Row | Kind::Segmented | Kind::ChipGroup | Kind::TabBar => {
                 // 只有显式给了内边距的容器才画底（否则整屏都是方块，无法看清层次）
                 if n.layout.padding > 0.0 {
                     list.push(DrawCmd::FillRoundRect {

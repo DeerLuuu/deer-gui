@@ -150,7 +150,7 @@ pub fn focusables(root: &Node) -> Vec<String>   // Kind::Button | Kind::Field，
 |---|---|
 | `PointerMoved` | 更新 `hover`（走 `hit`）；变化时发 `HoverChanged`。**捕获中**（`pressed` 在手，T3.7）⇒ **路由给捕获者**：hover 钉在捕获节点上，拖出节点/出树不换人 |
 | `PointerDown { Left }` | 同步 `hover`、记 `pressed`（**按下即捕获**，D7 默认捕获）；**命中可聚焦控件（`Button`/`Field`）⇒ 聚焦它** |
-| `PointerUp { Left }` | **按捕获者结算** `Clicked(id)`（抬起在哪都算 —— 拖出去再抬起也是捕获者的点击）；释放捕获，hover 回到抬起处的物理节点 |
+| `PointerUp { Left }` | **按捕获者结算** `Clicked(id)`（抬起在哪都算 —— 拖出去再抬起也是捕获者的点击）；释放捕获，hover 回到抬起处的物理节点；**落点是选择类组（`Segmented`/`ChipGroup`/`TabBar`）的直接子节点 ⇒ 追加选择结算**（`SelectionChanged`/`ChipToggled`/`TabChanged`，见 §3.5） |
 | `KeyDown { Tab }` / `Shift+Tab` | 在 `focusables()` 里**按树序**循环焦点 ⇒ `FocusChanged` |
 | `KeyDown { Escape }` | 清焦点 ⇒ `FocusChanged(None)` |
 | `KeyDown { Backspace }` | 焦点是启用的输入框 ⇒ 删**一个 Unicode 字符**（不是字节）⇒ `TextChanged` |
@@ -160,8 +160,11 @@ pub fn focusables(root: &Node) -> Vec<String>   // Kind::Button | Kind::Field，
 
 **`UiState` 是唯一真相**：`hover` / `focus` / `pressed`（= **左键捕获者**，T3.7 起，见上表）
 / `texts: BTreeMap<String, String>`（不在表里的输入框视为空串）
-/ `scroll: ScrollState`（**滚动偏移 + 每个容器的 `max_scroll`**）。
-**`UiEvent`** 是「发生了什么」：`HoverChanged` / `FocusChanged` / `Clicked` / `TextChanged` / `Scrolled { id, offset }`。
+/ `scroll: ScrollState`（**滚动偏移 + 每个容器的 `max_scroll`**）
+/ `segments`（M6 5c：分段组 id → 选中段 id）/ `chips`（芯片 id → 开/关）/ `tabs`（页签组 id → 活动页 id）——
+后三张是选择类控件的**值**（应用数据，texts 同一条纪律：按 id 键控、住树外、重建不丢）。
+**`UiEvent`** 是「发生了什么」：`HoverChanged` / `FocusChanged` / `Clicked` / `TextChanged` / `Scrolled { id, offset }`
+/ `SelectionChanged { id, selected }` / `ChipToggled { id, chip, on }` / `TabChanged { id, index }`（M6 5c，见 §3.5）。
 
 > **滚动偏移为什么住在 `UiState` 里**：滚轮必须在**唯一入口**（`handle`）被消费。若另开一个
 > 「带滚动的 `handle`」，那条路径上的滚轮会静默无效而没人看得出来。偏移是**布局的输入**
@@ -178,7 +181,23 @@ pub fn same_visual(&self, other: &UiState) -> bool   // 只比 hover/focus/press
 `PointerDown` 就属于「**会改状态但可能不发 `UiEvent`**」的那一类（点空白处时 `pressed` 由 `Some` 变 `None`、
 事件列表却是空的）⇒ 只看事件会漏掉它，而且漏得很安静（界面看起来只是「不响应按下」）。
 
-### 3.5 脚本化重放：`DEER_INPUT_SCRIPT`
+### 3.5 选择类控件的值与事件（M6 5c）
+
+`Segmented`（互斥单选）/ `ChipGroup`（多选开关）/ `TabBar`（页签）三种组的**值是应用数据**，
+住在 `UiState` 的公开字段里（texts 同一条纪律），控件只负责「点击 → 更新值 → 报告」。
+结算规则（r14，与 `interaction.rs` 的 `resolve_selection` 逐字同步）：
+
+| 组 | 点击直接子节点 | 事件 | 值的落点 |
+|---|---|---|---|
+| `Segmented` | 点**新**段 ⇒ 选中它；点已选段 = 无变化 ⇒ 只发 `Clicked` | `SelectionChanged { id: 组id, selected: 段id }` | `segments[组id] = 段id` |
+| `ChipGroup` | 每次点击**必翻转必发**（翻转本身就是动作） | `ChipToggled { id: 组id, chip: 芯片id, on: 翻转后的新值 }` | `chips[芯片id] = on`（表里没有 = 关） |
+| `TabBar` | 点**新**页 ⇒ 换活动页；点当前页只发 `Clicked` | `TabChanged { id: 组id, index: 页下标 }`（**禁用页也计数**；内容切换是 App 的事） | `tabs[组id] = 页id` |
+
+- `Enter` 激活（焦点在启用的段/芯片/页签上）与指针点击走**同一条**结算路径；
+- 禁用/被裁剪的子节点点不到（`hit` 拒绝）⇒ 天然静默，也不在焦点序里；
+- 只认**直接子节点**：命中落在组内嵌套容器的更深层 ⇒ 不属于任何组，不上溯。
+
+### 3.6 脚本化重放：`DEER_INPUT_SCRIPT`
 
 解析在 `deer_gui::input_script::parse_script`（**纯逻辑**，与窗口示例共用**同一份**解析器，语法只有一处定义）：
 
@@ -209,7 +228,7 @@ bad:3
 ⇒ `Err("第 2 条语句 `bad:3` …没有 `:`（语法是 `动词:参数`，例如 `key:Tab`）")`
 —— 注意它报「**第 2 条**」（序号把**空段与注释段也算进去**了，见 6.3）。
 
-### 3.6 怎么做确定性回归
+### 3.7 怎么做确定性回归
 
 1. **纯逻辑那半（首选）**：`cargo test -p deer-gui --test interaction` 与 `--test interactive_form`
    —— 脚本解析、命中规则、状态机、dirty 账本都能在没有窗口、没有 GPU 的环境里跑。
@@ -316,6 +335,7 @@ assert!(parse_script("# 注释行\nbad:3").unwrap_err().contains("第 2 条"));
 - CPU 基准后端（像素对照）：[`rendering.md`](rendering.md)、[`pixels.md`](pixels.md)
 - 窗口与上屏：[`window.md`](window.md)、[`vulkan-swapchain.md`](vulkan-swapchain.md)
 - 节点与属性（`disabled` / `id`）：[`node-tree.md`](node-tree.md)、[`imperative-api.md`](imperative-api.md)
+- 选择类控件（r14 结算的语义侧）：[`segmented.md`](segmented.md)、[`chip-group.md`](chip-group.md)、[`tab-bar.md`](tab-bar.md)
 
 ## 8. 检查清单（发布前过一遍）
 

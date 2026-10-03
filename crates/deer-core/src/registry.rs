@@ -71,9 +71,25 @@ pub struct PropSpec {
 // —— 适用面常量：把「哪些 Kind 有意义」写成具名集合，避免每条登记各写一遍数组 ——
 
 /// 任何节点都可以设（尺寸与生长权重对容器/叶子都成立）。
-const ANY: [Kind; 5] = [Kind::Column, Kind::Row, Kind::Text, Kind::Button, Kind::Field];
+const ANY: [Kind; 8] = [
+    Kind::Column,
+    Kind::Row,
+    Kind::Text,
+    Kind::Button,
+    Kind::Field,
+    Kind::Segmented,
+    Kind::ChipGroup,
+    Kind::TabBar,
+];
 /// 只有容器排得下子节点 ⇒ 内边距 / 间距 / 主轴对齐。
-const CONTAINERS: [Kind; 2] = [Kind::Column, Kind::Row];
+/// 选择类三种组是容器（M6 5c）——它们的孩子就是选项，同样吃这套布局参数。
+const CONTAINERS: [Kind; 5] = [
+    Kind::Column,
+    Kind::Row,
+    Kind::Segmented,
+    Kind::ChipGroup,
+    Kind::TabBar,
+];
 /// 只有容器有「子节点整体位移」这回事。
 const SCROLLABLE: [Kind; 1] = [Kind::Column];
 /// 有文本内容的节点。

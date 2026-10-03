@@ -165,6 +165,29 @@ let actions = p.row_actions_opts("actions", L::new().gap(8.0).to_props(), &["保
 
 语义与边界（想给单个按钮禁用、想问「溢出折叠呢」）见 [`docs/features/row-actions.md`](docs/features/row-actions.md)。
 
+**选择类控件（M6 5c）**：表单里常见的三种「选择」各有现成构造 —— 它们是三种**容器 Kind**
+（`segmented`/`chip_group`/`tab_bar`），孩子就是选项（按钮）：
+
+```rust
+// 单选（互斥）：点一个段选中它，App 收 UiEvent::SelectionChanged { id, selected }
+let seg = p.segmented_opts("mode", L::new().gap(2.0).to_props(), &["日", "周", "月"]);
+
+// 多选（独立开关）：每个芯片独立开/关，App 收 UiEvent::ChipToggled { id, chip, on }
+let chips = p.chip_group_opts("tags", L::new().gap(4.0).to_props(), &["红", "蓝", "绿"]);
+
+// 页签（单选 + App 换内容）：App 收 UiEvent::TabChanged { id, index } —— index 含禁用页一起数
+let tabs = p.tab_bar_opts("tabs", L::new().gap(2.0).to_props(), &["文件", "编辑", "视图"]);
+```
+
+两个要点：**值在 App 手里**（想默认选中就把初值塞进 `UiState` 的 `segments`/`chips`/`tabs`
+三张表，和 `texts` 一个用法）；当前选中的项是强调色底，未选中的是灰色底。语义、禁用页、
+「做不到什么」见 [`segmented`](features/segmented.md) / [`chip-group`](features/chip-group.md) /
+[`tab-bar`](features/tab-bar.md) 三份指南；能自检的完整示例：
+
+```sh
+cargo run -p deer-gui --features testing --example m6_select
+```
+
 ---
 
 ## 4. 换主题

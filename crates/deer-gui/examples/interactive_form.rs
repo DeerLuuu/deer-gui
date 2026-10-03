@@ -1034,6 +1034,10 @@ fn expected_state() -> UiState {
         carets: std::collections::BTreeMap::from([("field_1".to_string(), 2)]),
         scroll: Default::default(),
         preedit: Default::default(),
+        // M6 5c 的三张选择值表：本示例没有选择类控件 ⇒ 全空（字段随 `UiState` 一起长）。
+        segments: Default::default(),
+        chips: Default::default(),
+        tabs: Default::default(),
     }
 }
 

@@ -142,7 +142,7 @@ impl Builder {
 
     /// 容器 + 闭包式嵌套。**闭包内 new 出来的节点挂在容器下。**
     pub fn container(&mut self, kind: Kind, id: impl Into<String>, body: impl FnOnce(&mut Builder)) {
-        assert!(kind.is_container(), "container() 只接受 Column/Row");
+        assert!(kind.is_container(), "container() 只接受容器 Kind（Column/Row/选择类组）");
         let n = Node::new(kind, id);
         self.push(n);
         let parent_path = self.path.clone();
@@ -165,7 +165,7 @@ impl Builder {
         layout: LayoutProps,
         body: impl FnOnce(&mut Builder),
     ) {
-        assert!(kind.is_container(), "container_opts() 只接受 Column/Row");
+        assert!(kind.is_container(), "container_opts() 只接受容器 Kind（Column/Row/选择类组）");
         let id: String = id.into();
         let resolved = if id.is_empty() { self.ids.next(kind) } else { id };
         self.container_with(kind, resolved, layout, body);
@@ -231,6 +231,99 @@ impl Builder {
             }
         });
         buttons
+    }
+
+    // —— M6 5c：选择类三组（Segmented / ChipGroup / TabBar · **Kind 扩展**）———
+
+    /// 分段选择组：互斥单选，**`Kind::Segmented` + 每标签一个 `button`**（M6 5c）。
+    ///
+    /// 与 RowActions（组合层）不同，三个选择类组**扩了 `Kind`**，理由（逐条写进
+    /// 指南的「语义」）：① 交互层必须在树里认出「这是一组选择」才发得出
+    /// `SelectionChanged` 等值事件（组合层没有任何识别通道；给 `NodeProps` 加
+    /// 「角色」字段要同步 registry/scene/.dui 三处，代价更大还得多一个字段）；
+    /// ② 「选中」是本系统**第一种持久视觉**（hover/pressed/focus 全是瞬态），
+    /// 需要绘制侧新的一档状态色 —— 满足「需要新视觉形态才扩 Kind」的判据。
+    ///
+    /// - 返回**段 id 列表**（顺序与 `labels` 一致；`UiState::segments` 的值、事件里的
+    ///   `selected` 用的就是它）；
+    /// - 组 id 自动生成（`segmented_N`）；要指定 id / 布局（间距、尺寸）用
+    ///   [`Builder::segmented_opts`]；
+    /// - 当前选中**不在树里**：App 把初值塞进 `UiState::segments`（组 id → 段 id），
+    ///   没塞 = 没有选中段（合法状态）；
+    /// - `labels` 为空 ⇒ 一个没有子节点的组（合法；什么也选不了）。
+    pub fn segmented(&mut self, labels: &[&str]) -> Vec<String> {
+        self.selection_group(Kind::Segmented, "", LayoutProps::default(), labels)
+    }
+
+    /// 同 [`Builder::segmented`]，但可指定组 id 与整体布局参数（gap 防粘连是主用途）。
+    /// `id` 传空串 = 自动生成。
+    pub fn segmented_opts(
+        &mut self,
+        id: impl Into<String>,
+        layout: LayoutProps,
+        labels: &[&str],
+    ) -> Vec<String> {
+        self.selection_group(Kind::Segmented, id, layout, labels)
+    }
+
+    /// 标签组：多选，**`Kind::ChipGroup` + 每标签一个 `button`**（M6 5c）。
+    /// 每个芯片独立开/关；开关表住 `UiState::chips`（芯片 id → bool，**表里没有 = 关**）。
+    /// 其余约定见 [`Builder::segmented`]（Kind 扩展的同一份理由）。
+    pub fn chip_group(&mut self, labels: &[&str]) -> Vec<String> {
+        self.selection_group(Kind::ChipGroup, "", LayoutProps::default(), labels)
+    }
+
+    /// 同 [`Builder::chip_group`]，但可指定组 id 与整体布局参数。`id` 传空串 = 自动生成。
+    pub fn chip_group_opts(
+        &mut self,
+        id: impl Into<String>,
+        layout: LayoutProps,
+        labels: &[&str],
+    ) -> Vec<String> {
+        self.selection_group(Kind::ChipGroup, id, layout, labels)
+    }
+
+    /// 页签栏：单选页签，**`Kind::TabBar` + 每标签一个 `button`**（M6 5c）。
+    /// 点击发 `TabChanged { id, index }`（index = 页签在组**直接子节点**里的树序下标，
+    /// **禁用页也一起数**）；内容切换是 App 的事。单个页签禁用 = 该页签自己的
+    /// `props.disabled`：本便捷构造不带禁用参数，需要时用
+    /// `container_opts(Kind::TabBar, …)` + `button_opts(…, |n| n.props.disabled = true)`
+    /// 手写这个组（两条路径产出**结构相等**的树，判据见 `tests/m6_select.rs`）。
+    /// 其余约定见 [`Builder::segmented`]（Kind 扩展的同一份理由）。
+    pub fn tab_bar(&mut self, labels: &[&str]) -> Vec<String> {
+        self.selection_group(Kind::TabBar, "", LayoutProps::default(), labels)
+    }
+
+    /// 同 [`Builder::tab_bar`]，但可指定组 id 与整体布局参数。`id` 传空串 = 自动生成。
+    pub fn tab_bar_opts(
+        &mut self,
+        id: impl Into<String>,
+        layout: LayoutProps,
+        labels: &[&str],
+    ) -> Vec<String> {
+        self.selection_group(Kind::TabBar, id, layout, labels)
+    }
+
+    /// 三个选择类组的**共同构造**：`Kind` 对应的组容器 + 每标签一个 `button`，
+    /// 返回子按钮 id 列表。语义差异（单选/多选/页签）在交互层，不在构造层。
+    fn selection_group(
+        &mut self,
+        kind: Kind,
+        id: impl Into<String>,
+        layout: LayoutProps,
+        labels: &[&str],
+    ) -> Vec<String> {
+        assert!(
+            kind.is_selection_group(),
+            "selection_group() 只接受 Segmented/ChipGroup/TabBar"
+        );
+        let mut items: Vec<String> = Vec::with_capacity(labels.len());
+        self.container_opts(kind, id, layout, |g| {
+            for label in labels {
+                items.push(g.button(*label));
+            }
+        });
+        items
     }
 
     pub fn build(&self) -> Node {
@@ -494,5 +587,112 @@ mod tests {
         assert_eq!(tree.children.len(), 1, "Row 本身还在");
         assert_eq!(tree.children[0].kind, Kind::Row);
         assert!(tree.children[0].children.is_empty());
+    }
+
+    // —— M6 5c：选择类三组的构造判据（与 RowActions 同一套纪律）———————
+
+    /// **判据本体**：三个便捷构造产出的树必须与「手写容器 + button」**结构相等**
+    /// （Kind 扩展改变的是「组是什么」，不是「怎么建组」—— 两条构筑路径仍同一份规则）。
+    #[test]
+    fn selection_groups_build_hand_written_equivalent_trees() {
+        // 便捷路径
+        let mut a = Builder::new(Kind::Column, "app").gap(4.0);
+        let seg = a.segmented_opts("seg", L::new().gap(2.0).to_props(), &["日", "周", "月"]);
+        let chips = a.chip_group_opts("chips", L::new().gap(6.0).to_props(), &["红", "蓝"]);
+        let tabs = a.tab_bar_opts("tabs", L::new().to_props(), &["A", "B"]);
+        let ta = a.build();
+
+        // 手写路径（container_opts + button，逐字对应）
+        let mut b = Builder::new(Kind::Column, "app").gap(4.0);
+        b.container_opts(Kind::Segmented, "seg", L::new().gap(2.0).to_props(), |g| {
+            g.button("日");
+            g.button("周");
+            g.button("月");
+        });
+        b.container_opts(Kind::ChipGroup, "chips", L::new().gap(6.0).to_props(), |g| {
+            g.button("红");
+            g.button("蓝");
+        });
+        b.container_opts(Kind::TabBar, "tabs", L::new().to_props(), |g| {
+            g.button("A");
+            g.button("B");
+        });
+        let tb = b.build();
+
+        assert!(ta.structurally_eq(&tb), "便捷构造必须与手写组结构相等");
+        // 前置断言：返回的 id 必须真的是组孩子的 id（事件关联与 UiState 键全靠它）。
+        for (ids, group) in [(&seg, "seg"), (&chips, "chips"), (&tabs, "tabs")] {
+            let node = ta.children.iter().find(|c| c.id == group).unwrap();
+            assert_eq!(
+                ids,
+                &node.children.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+                "`{group}` 返回的 id 必须与树里的孩子逐一对上"
+            );
+        }
+        // 前置断言：组 Kind 与孩子 Kind 都对（防「便捷构造建错容器」这类低级漂移）。
+        assert_eq!(ta.children[0].kind, Kind::Segmented);
+        assert_eq!(ta.children[1].kind, Kind::ChipGroup);
+        assert_eq!(ta.children[2].kind, Kind::TabBar);
+        assert!(
+            ta.children
+                .iter()
+                .all(|g| g.children.iter().all(|c| c.kind == Kind::Button)),
+            "组的直接子节点必须是 Button"
+        );
+    }
+
+    /// 自动 id 规则与两条构筑路径**同一份**（`IdGen` 按 kind 计数）：
+    /// 组 id 用新 kind 的计数器（`segmented_1` …），按钮计数跨组连续。
+    #[test]
+    fn selection_group_auto_ids_follow_the_kind_counters() {
+        let mut app = Builder::new(Kind::Column, "app");
+        let seg = app.segmented(&["日", "周"]);
+        let chips = app.chip_group(&["红"]);
+        let tabs = app.tab_bar(&["A"]);
+        let again = app.segmented(&["x"]);
+        let tree = app.build();
+
+        assert_eq!(seg, vec!["button_1", "button_2"]);
+        assert_eq!(chips, vec!["button_3"]);
+        assert_eq!(tabs, vec!["button_4"]);
+        assert_eq!(again, vec!["button_5"], "按钮计数跨组连续");
+        let kinds: Vec<&str> = tree.children.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["segmented_1", "chip_group_1", "tab_bar_1", "segmented_2"],
+            "组 id 按 kind 计数，第二次 Segmented 不得撞号"
+        );
+    }
+
+    /// 组是**横排容器**：布局按 Row 同一套数学落位（孩子 x 递增），
+    /// 且吃容器参数（gap 生效）。这是「is_horizontal 收口」的行为判据。
+    #[test]
+    fn selection_groups_lay_out_horizontally_with_gap() {
+        let mut app = Builder::new(Kind::Column, "app");
+        app.segmented_opts("seg", L::new().gap(8.0).to_props(), &["日", "周", "月"]);
+        let tree = app.build();
+        assert!(tree.children[0].layout.gap == 8.0, "前置：opts 的 gap 直通到组");
+
+        let geo = crate::layout::layout(
+            &tree,
+            crate::node::Rect::new(0.0, 0.0, 300.0, 100.0),
+            crate::layout::TextStyle { font_size: 14.0, line_height: 18.0 },
+            &crate::layout::ApproxMeasure,
+        );
+        let xs: Vec<f32> = tree.children[0]
+            .children
+            .iter()
+            .map(|c| geo.get(&c.id).expect("前置：孩子必须有几何").x)
+            .collect();
+        assert!(
+            xs[0] < xs[1] && xs[1] < xs[2],
+            "三个段必须横排（x 递增），实际 x = {xs:?}"
+        );
+        // 间隙判据：x 间距 = 前段宽 + gap（横排数学真的吃到了 gap）。
+        let w0 = geo.get(&tree.children[0].children[0].id).unwrap().w;
+        assert!(
+            (xs[1] - xs[0] - w0 - 8.0).abs() < 0.5,
+            "段间距必须是「前段宽 + gap(8)」，实际 {xs:?} w0={w0}"
+        );
     }
 }

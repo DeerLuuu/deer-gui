@@ -204,6 +204,24 @@ pub struct UiState {
     /// 为什么偏移住在 `UiState` 里：滚轮必须在**唯一入口**（[`handle`]）被消费 ——
     /// 若另开一个「带滚动的 handle」，那条路径上的滚轮就会静默无效，而没人能一眼看出来。
     pub scroll: ScrollState,
+    /// **分段选择的当前选中**（M6 5c：组 id → 选中段的节点 id）。表里没有 = 该组还没有选中段。
+    ///
+    /// 值是**应用数据**（texts 同一条纪律）：按 id 键控、住在树外 ⇒ 整树重建不丢
+    /// （Keep）；App 要初值就自己塞（`state.segments.insert("mode".into(), week_id)`），
+    /// 不塞 = 没有选中段（合法状态）。`handle` 在点击结算时更新它并发
+    /// [`UiEvent::SelectionChanged`]（**真的换了选中才发**）。
+    pub segments: BTreeMap<String, String>,
+    /// **标签组的开/关**（M6 5c：芯片节点 id → 是否开）。表里没有 = 关。
+    ///
+    /// 键是**芯片自己**的 id（不是组 id）：每个芯片独立开/关，值就是它的状态。
+    /// `handle` 每次点击芯片都翻转它并发 [`UiEvent::ChipToggled`]（`on` = 翻转后的新值）。
+    pub chips: BTreeMap<String, bool>,
+    /// **页签栏的活动页**（M6 5c：组 id → 活动页的节点 id）。表里没有 = 没有活动页。
+    ///
+    /// 存节点 id 而不是下标：与 hover/focus/texts 同一套「id 键控」约定，标签重名、
+    /// 树增删页都不会错位；发 [`UiEvent::TabChanged`] 时才换算成 `index`
+    /// （组直接子节点的树序下标，**禁用页也一起数**）。
+    pub tabs: BTreeMap<String, String>,
 }
 
 /// 滚动状态：**偏移**（布局的输入）+ **上限**（布局的输出）。
@@ -421,6 +439,27 @@ pub enum UiEvent {
     /// 语义与 `Clicked` 对称：**按下处 == 抬起处**才发（右键拖走再抬起不算）；
     /// 但**不参与焦点/pressed**（右键不是「激活」）。禁用子树/被裁剪 ⇒ 不发。
     PointerRight { id: String },
+    /// **分段选择**（M6 5c）：点了 `Segmented` 组的一个段，选中**真的换了**。
+    ///
+    /// `id` = 组节点 id；`selected` = **新选中段**的节点 id（不是标签文本 —— 与
+    /// `Clicked` 同一条「事件用 id 关联」约定）。点**已选中**的段没有变化 ⇒ 只发
+    /// `Clicked`、不发这条（与 `Scrolled`「变了才发」同一纪律）；禁用段点不到
+    /// ⇒ 什么都不发。当前选中值随后可读 [`UiState::segments`]。
+    SelectionChanged { id: String, selected: String },
+    /// **标签开关**（M6 5c）：点了 `ChipGroup` 组的一个芯片。
+    ///
+    /// `id` = 组节点 id；`chip` = 芯片节点 id；`on` = **翻转之后**的状态。
+    /// 开关是「翻转」语义：**每次点击必翻转发一次**（这与单选的「变了才发」刻意不同
+    /// —— 点击本身就是动作）。当前开关表见 [`UiState::chips`]。
+    ChipToggled { id: String, chip: String, on: bool },
+    /// **页签切换**（M6 5c）：点了 `TabBar` 的一个页签，活动页**真的换了**。
+    ///
+    /// `id` = 组节点 id；`index` = 新活动页在组**直接子节点**里的树序下标
+    /// （**禁用页也一起数** —— App 自己的页签数组含禁用项，按同一个下标对齐）。
+    /// **内容切换是 App 的事**：TabBar 只报告，App 拿着 index 换自己渲染的内容。
+    /// 点当前活动页没有变化 ⇒ 只发 `Clicked`；禁用页点不到 ⇒ 不发。
+    /// 活动页见 [`UiState::tabs`]（存的是节点 id，发事件时才换算下标）。
+    TabChanged { id: String, index: usize },
 }
 
 /// 滚轮的**每「一格」对应的像素数**（`InputEvent::Wheel::dy` 的单位由窗口层决定：
@@ -458,6 +497,9 @@ impl UiState {
                 id: p.id.clone(),
                 text: p.text.clone(),
             }),
+            segments: self.segments.clone(),
+            chips: self.chips.clone(),
+            tabs: self.tabs.clone(),
         }
     }
 
@@ -912,6 +954,84 @@ fn nearest_focusable(
 }
 
 // ---------------------------------------------------------------------------
+// 五c、选择类结算（M6 5c：Segmented / ChipGroup / TabBar）
+// ---------------------------------------------------------------------------
+
+/// 按 id 找节点，**带回它的父节点**（前序遍历，确定性；找不到 ⇒ `None`）。
+///
+/// 根没有父 ⇒ 找到的是根时返回 `None`（点击结算到组外的普通容器上，
+/// 本来就不该触发任何选择语义）。
+fn find_with_parent<'a>(n: &'a Node, id: &str) -> Option<(&'a Node, &'a Node)> {
+    for c in &n.children {
+        if c.id == id {
+            return Some((n, c));
+        }
+        if let Some(found) = find_with_parent(c, id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// 点击结算后的**选择类语义**（M6 5c）：落点若是 [`Kind::Segmented`]/
+/// [`Kind::ChipGroup`]/[`Kind::TabBar`] 的**直接子节点**，就更新 `UiState`
+/// 里的值映射（`segments`/`chips`/`tabs`）并发对应事件。
+///
+/// 规则（r14，与 input.md 的事件表逐字同步）：
+///
+/// - **r14a** Segmented：点新段 ⇒ 写 `segments[组] = 段` + 发 `SelectionChanged`；
+///   点**已选中**的段 = 没有变化 ⇒ 什么都不发（`Clicked` 已由调用方发过）；
+/// - **r14b** ChipGroup：点芯片 ⇒ 翻转 `chips[芯片]` + 发 `ChipToggled { on: 新值 }`
+///   —— **每次点击都发**（翻转本身就是动作，与 r14a 的「变了才发」刻意不同）；
+/// - **r14c** TabBar：点新页 ⇒ 写 `tabs[组] = 页` + 发 `TabChanged { index }`
+///   （index = 直接子节点的树序下标，**禁用页也一起数**）；点当前页不发；
+/// - **r14d** 只认**直接子节点**：更深一层的命中（嵌套容器里的文本）不属于任何组，
+///   不上溯（边界写进指南的「做不到什么」）；
+/// - **r14e** 禁用/被裁剪的子节点根本不会成为捕获者（`hit` 拒绝）⇒ 天然到不了这里，
+///   不需要再判一遍（与「禁用子树静默」同一道闸门，不设第二道）。
+///
+/// 调用点只有两处 —— 左键抬起（按捕获者结算）与 `Enter` 键激活：**所有** `Clicked`
+/// 的来源都过这里，指针路径与键盘路径不可能分叉。
+fn resolve_selection(state: &mut UiState, root: &Node, clicked: &str, out: &mut Vec<UiEvent>) {
+    let Some((parent, node)) = find_with_parent(root, clicked) else {
+        return;
+    };
+    match parent.kind {
+        Kind::Segmented => {
+            if state.segments.get(&parent.id).map(String::as_str) != Some(node.id.as_str()) {
+                state.segments.insert(parent.id.clone(), node.id.clone());
+                out.push(UiEvent::SelectionChanged {
+                    id: parent.id.clone(),
+                    selected: node.id.clone(),
+                });
+            }
+        }
+        Kind::ChipGroup => {
+            let on = !state.chips.get(&node.id).copied().unwrap_or(false);
+            state.chips.insert(node.id.clone(), on);
+            out.push(UiEvent::ChipToggled {
+                id: parent.id.clone(),
+                chip: node.id.clone(),
+                on,
+            });
+        }
+        // 守卫 = 「活动页真的换了」；守卫体内的不变式 expect 见 r14c 注释。
+        Kind::TabBar
+            if state.tabs.get(&parent.id).map(String::as_str) != Some(node.id.as_str()) =>
+        {
+            // 内部不变式：`find_with_parent` 找到的节点必是 parent 的**直接孩子** ——
+            // 走到这里说明遍历写错了（与 `hit()` 的不变式 expect 同一风格）。
+            let index = parent.children.iter().position(|c| c.id == node.id).expect(
+                "内部不变式：选择结算的落点必是组的直接子节点 —— 走到这里说明遍历写错了",
+            );
+            state.tabs.insert(parent.id.clone(), node.id.clone());
+            out.push(UiEvent::TabChanged { id: parent.id.clone(), index });
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 六、状态机（M5-2）
 // ---------------------------------------------------------------------------
 
@@ -921,10 +1041,10 @@ fn nearest_focusable(
 /// |---|---|
 /// | `PointerMoved` | 同步 `hover`（变了才发 `HoverChanged`）；**捕获中（`pressed` 在手）⇒ 路由给捕获者：hover 钉在捕获节点上**（T3.7，D7 按下即默认捕获 —— 拖出不换人） |
 /// | `PointerDown { Left }` | 同步 `hover`；**命中的可聚焦控件 ⇒ 聚焦它**（变了才发 `FocusChanged`）；记 `pressed` = **捕获**（按下即默认捕获，D7） |
-/// | `PointerUp { Left }` | 同步 `hover`（捕获已随抬起释放，hover 回到物理位置）；**按捕获者结算 `Clicked`**（抬起在哪都算 —— 改前是「抬起处==按下处」，即拖出即丢）；释放 `pressed` |
+/// | `PointerUp { Left }` | 同步 `hover`（捕获已随抬起释放，hover 回到物理位置）；**按捕获者结算 `Clicked`**（抬起在哪都算 —— 改前是「抬起处==按下处」，即拖出即丢）；释放 `pressed`；**落点是选择类组的直接子节点 ⇒ 追加选择结算**（r14：`SelectionChanged`/`ChipToggled`/`TabChanged`，变了才发 —— 芯片是翻转语义，每次都发） |
 /// | `KeyDown { Tab }` | 树序循环焦点（`Shift` 反向）⇒ `FocusChanged` |
 /// | `KeyDown { Escape }` | 清焦点 ⇒ `FocusChanged(None)` |
-/// | `KeyDown { Enter }` | 焦点在**启用的按钮**上 ⇒ `Clicked`（键激活 = 点击） |
+/// | `KeyDown { Enter }` | 焦点在**启用的按钮**上 ⇒ `Clicked`（键激活 = 点击）；选择类组的子节点同样过 r14 结算 ⇒ 键盘与指针路径不分叉 |
 /// | `KeyDown { Backspace }` | 焦点是启用的输入框 ⇒ 删**一个字符**（Unicode 字符，不是字节）⇒ `TextChanged` |
 /// | `TextInput` | 焦点是启用的输入框 ⇒ 追加 ⇒ `TextChanged` |
 /// | `FocusChanged { focused: false }` | 窗口失焦：清 `hover`/`pressed`（`focus`/`texts` 不动）|
@@ -1107,7 +1227,10 @@ pub fn handle(
                 // 已登记进 `ROADMAP.md` 的 D7 行）。上面那行 `sync_hover` 已经把 hover
                 // 送回抬起处的物理节点（捕获随 `take()` 释放，移动事件从下一条起回到
                 // 普通命中测试）。
-                out.push(UiEvent::Clicked(captured));
+                out.push(UiEvent::Clicked(captured.clone()));
+                // ★ M6 5c 选择类结算（r14）：落点是 Segmented/ChipGroup/TabBar 的直接
+                // 子节点 ⇒ 更新值映射 + 发对应事件（没有变化就只有 `Clicked`）。
+                resolve_selection(state, root, &captured, &mut out);
             }
         }
         // 右/中键的**抬起**：只同步 hover（按下语义已在 Down 分支完成 —— `PointerRight`
@@ -1164,7 +1287,10 @@ pub fn handle(
                 .filter(|n| n.kind == Kind::Button && !path_is_dead(root, n))
                 .map(|n| n.id.clone());
             if let Some(id) = live_button {
-                out.push(UiEvent::Clicked(id));
+                out.push(UiEvent::Clicked(id.clone()));
+                // ★ M6 5c（r14）：键盘激活与指针点击走**同一条**选择结算 ——
+                // 焦点在段/芯片/页签上按 `Enter`，效果与点它完全一致。
+                resolve_selection(state, root, &id, &mut out);
             }
         }
         InputEvent::KeyDown {
@@ -2680,6 +2806,9 @@ mod tests {
             carets: Default::default(),
             scroll: Default::default(),
             preedit: None,
+            segments: Default::default(),
+            chips: Default::default(),
+            tabs: Default::default(),
         };
         // 前置：这份语料确实一个可滚动容器都没有（否则下面的 `Wheel` 断言在测空气）。
         let mut scrollers = Vec::new();
@@ -3377,6 +3506,11 @@ mod tests {
         // ⚠️ 预编辑也要**非空** —— 空值上「带没带」恒等，判据就没判别力
         //    （今天第二条判据栽在这个模式上，见记忆）
         s.preedit = Some(Preedit { id: "box".into(), text: "zhong".into() });
+        // ⚠️ 选择类三张值表同理（M6 5c）：先塞非空值，再断言「带过去了」。
+        s.segments.insert("seg".into(), "b0".into());
+        s.chips.insert("b1".into(), true);
+        s.tabs.insert("bar".into(), "b2".into());
+        s.carets.insert("f".into(), 3);
         assert_eq!(
             s.scroll.scroll_to("box", 40),
             Some(40),
@@ -3392,6 +3526,9 @@ mod tests {
             scroll,
             carets,
             preedit,
+            segments,
+            chips,
+            tabs,
         } = i;
         assert_eq!(hover, s.hover, "hover 必须原样带过去");
         assert_eq!(focus, s.focus);
@@ -3414,6 +3551,13 @@ mod tests {
             s.preedit.as_ref().map(|p| (p.id.as_str(), p.text.as_str())),
             "预编辑必须带过去 —— 漏了它看不到正在拼的那一段"
         );
+        // 选择类三张值表也必须带过去（M6 5c）：漏了它们组内永远画不出选中/开/关。
+        // ⚠️ 前置：三张表必须**非空** —— 空表上「带没带」恒等，判据没有判别力
+        //    （与上面偏移/预编辑的教训同一条）。
+        assert!(!s.segments.is_empty() && !s.chips.is_empty() && !s.tabs.is_empty(), "测试前置：三张值表都要非空");
+        assert_eq!(segments, s.segments, "分段选中表必须带过去 —— 漏了它选中段不亮");
+        assert_eq!(chips, s.chips, "芯片开关表必须带过去 —— 漏了它开着的芯片画成关");
+        assert_eq!(tabs, s.tabs, "页签活动页表必须带过去 —— 漏了它活动页不亮");
     }
 
     // ---- T3.5：`texts` 光标（字符位） --------------------------------------

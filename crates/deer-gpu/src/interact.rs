@@ -124,6 +124,16 @@ pub struct InteractState {
     /// 默认 `None` ⇒ 什么都不画（既有语料逐字节不变）。想看到它就把
     /// `deer-gui` 那边 `UiState::preedit` 的内容灌进来。
     pub preedit: Option<PreeditView>,
+    /// **分段选择的当前选中**（M6 5c：组 id → 选中段 id）。
+    ///
+    /// 默认空 ⇒ 没有任何选中视觉（既有语料逐字节不变，opt-in —— 与 `scroll` 同一条
+    /// 纪律）。想看到选中，就把 `UiState::segments` 灌进来（`UiState::to_interact_state`
+    /// 已经替你做）。
+    pub segments: std::collections::BTreeMap<String, String>,
+    /// **标签组的开/关**（M6 5c：芯片 id → 是否开）。默认空 ⇒ 全部按「关」画。
+    pub chips: std::collections::BTreeMap<String, bool>,
+    /// **页签栏的活动页**（M6 5c：组 id → 活动页 id）。默认空 ⇒ 没有活动页。
+    pub tabs: std::collections::BTreeMap<String, String>,
 }
 
 /// 绘制时读的**预编辑**（还没上屏的一段拼写 + 它挂在哪个输入框上）。
@@ -263,7 +273,7 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
     /// 树 + 几何 + 状态 → 绘制列表（每个有几何的节点**先**发一条 `NodeHint`）。
     pub fn build(&self, tree: &Node, geo: &Geometry) -> DrawList {
         let mut list = DrawList::new();
-        self.walk(tree, geo, false, &mut list);
+        self.walk(tree, geo, false, false, &mut list);
         list
     }
 
@@ -283,6 +293,24 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
 
     fn is_focused(&self, n: &Node, dead: bool) -> bool {
         !dead && !n.props.disabled && self.state.focus.as_deref() == Some(n.id.as_str())
+    }
+
+    /// 选择类组（`Segmented`/`ChipGroup`/`TabBar`）里，`child` 是不是**当前选中/开着的**。
+    ///
+    /// 三种组各读 `InteractState` 里自己那张表（`segments` / `chips` / `tabs`）；
+    /// 表里没有 = 「没有选中 / 关着」。判据是**节点 id**，不是标签文本 —— 标签会重名，
+    /// id 不会（与 `UiEvent` 用 id 关联是同一条约定）。
+    fn is_picked(&self, group: &Node, child: &Node) -> bool {
+        match group.kind {
+            Kind::Segmented => {
+                self.state.segments.get(&group.id).map(String::as_str) == Some(child.id.as_str())
+            }
+            Kind::ChipGroup => self.state.chips.get(&child.id).copied().unwrap_or(false),
+            Kind::TabBar => {
+                self.state.tabs.get(&group.id).map(String::as_str) == Some(child.id.as_str())
+            }
+            _ => false,
+        }
     }
 
     /// `Field` 这一帧显示的文本（见 [`FieldText`]）。
@@ -310,7 +338,7 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
         }
     }
 
-    fn walk(&self, n: &Node, geo: &Geometry, dead: bool, list: &mut DrawList) {
+    fn walk(&self, n: &Node, geo: &Geometry, dead: bool, muted: bool, list: &mut DrawList) {
         let Some(f) = geo.get(&n.id) else { return };
         let dead = dead || n.props.disabled;
         let visual = self.visual_of(n, dead);
@@ -342,7 +370,7 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
         } else {
             let rect = RectI::new(r, ry, rw, rh);
             match n.kind {
-                Kind::Column | Kind::Row => {
+                Kind::Column | Kind::Row | Kind::Segmented | Kind::ChipGroup | Kind::TabBar => {
                     // 只有显式给了内边距的容器才画底（与 `DefaultRenderer` 逐字相同）。
                     if n.layout.padding > 0.0 {
                         list.push(DrawCmd::FillRoundRect {
@@ -378,7 +406,12 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
                     }
                 }
                 Kind::Button => {
-                    let base = if n.props.disabled {
+                    // **持久选中视觉**（M6 5c）：`muted` = 「本节点是选择类组的直接子节点、
+                    // 且不是当前选中/开着的那个」。组内未选中用 `border` 底 + 正文字
+                    // （视觉上让位），选中/开着的与组外普通按钮**同一档**（`accent` 底 +
+                    // `on_accent` 字）—— 所以组外的按钮一个字节都不变（opt-in 红线）。
+                    // 禁用仍然赢过一切（`border` 底 + `text_dim` 字，既有规则原样）。
+                    let base = if n.props.disabled || muted {
                         self.theme.border
                     } else {
                         self.theme.accent
@@ -398,19 +431,24 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
                         text: label,
                         color: if n.props.disabled {
                             self.theme.text_dim
+                        } else if muted {
+                            self.theme.text
                         } else {
                             self.theme.on_accent
                         },
                         size: self.theme.font_size,
                         align: 0,
                     });
-                    // ③ 焦点环：**对比色**（`theme.on_accent`）+ 内缩。按钮的填充就是
-                    //    `theme.accent`，环再用 accent 等于没画（改前实测 idle vs focused
-                    //    只差 56 px，且 32 px 还是方角补角）—— 见模块文档「焦点环」。
+                    // ③ 焦点环：**对比色** + 内缩。按钮的填充是 `accent` ⇒ 环用
+                    //    `theme.on_accent`（改前实测 idle vs focused 只差 56 px，且 32 px
+                    //    还是方角补角）—— 见模块文档「焦点环」。
+                    //    **组内未选中**的按钮填充是 `border` ⇒ 环改用 `theme.accent`
+                    //    （与 `Field` 同一对颜色，实测平均通道差 106.7 —— 白环压灰底
+                    //    太浅，会让「Tab 聚焦到未选中段」看不出来）。
                     if focused {
                         list.push(DrawCmd::StrokeRect {
                             rect: focus_ring_rect(rect),
-                            color: self.theme.on_accent,
+                            color: if muted { self.theme.accent } else { self.theme.on_accent },
                             width: FOCUS_STROKE_WIDTH,
                         });
                     }
@@ -528,8 +566,13 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
             });
         }
 
+        // **选择类组**（M6 5c）：逐个孩子解析「它是不是当前选中/开着的那个」，
+        // 未选中的直接孩子按 `muted` 档画（见 `Kind::Button` 分支的注释）。
+        // 只对**直接孩子**生效（孙辈重置为普通视觉）—— 与交互层「只认直接子节点」
+        // 的结算规则同一条边界，两边不许各写一套。
         for c in &n.children {
-            self.walk(c, geo, dead, list);
+            let child_muted = n.kind.is_selection_group() && !self.is_picked(n, c);
+            self.walk(c, geo, dead, child_muted, list);
         }
 
         if clip {
