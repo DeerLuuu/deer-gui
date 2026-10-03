@@ -155,6 +155,16 @@ let tree = app.build();
 - **禁用按钮是灰的**（用 `border` 色，不是强调色）—— 这是渲染器的既定行为，有测试钉住
 - 只有带 `pad` 的容器才画底色，否则整屏都是方块、看不出层次
 
+**顺手一提（M6 5a）**：上面那个 `actions` 行是常见样板，`row_actions_opts` 一次建出
+「Row + 每个标签一个按钮」，返回按钮 id 列表（事件关联用）—— 产出的树与手写逐字
+等价（结构相等 + 绘制命令逐条相同，都有测试钉住）：
+
+```rust
+let actions = p.row_actions_opts("actions", L::new().gap(8.0).to_props(), &["保存", "另存为", "删除"]);
+```
+
+语义与边界（想给单个按钮禁用、想问「溢出折叠呢」）见 [`docs/features/row-actions.md`](docs/features/row-actions.md)。
+
 ---
 
 ## 4. 换主题

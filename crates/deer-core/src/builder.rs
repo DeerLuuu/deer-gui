@@ -195,6 +195,44 @@ impl Builder {
         self.path = parent_path;
     }
 
+    // —— M6 5a：RowActions（行尾动作按钮组 · **组合层**） ————————————————
+
+    /// 行尾动作按钮组：**`Row` + 每个标签一个 `button`**（M6 控件族 5a · 组合层）。
+    ///
+    /// 为什么是组合而不是扩 `Kind`：RowActions 的每个像素、每条 `Clicked`、每个
+    /// 可聚焦项都**已经**来自 `Row`（布局/命中）与 `Button`（绘制/交互）——
+    /// 扩 `Kind` 要同步 registry/scene/builder/绘制四处，却不会带来任何新行为；
+    /// 组合层只是把「建一个 Row、逐个建 button、收好 id」这段样板收进库里
+    /// （判据：与手写等价树 `structurally_eq` 且绘制命令逐条相同，见
+    /// `crates/deer-gui/tests/m6_basics.rs`）。
+    ///
+    /// - 返回**按钮 id 列表**（顺序与 `labels` 一致；事件关联用 id，不进树）；
+    /// - Row 自身 id 自动生成（`row_N`）；要指定 id / 布局（间距、对齐、尺寸）用
+    ///   [`Builder::row_actions_opts`]；
+    /// - `labels` 为空 ⇒ 一个没有子节点的 Row（合法；无 padding 的容器零绘制命令）。
+    pub fn row_actions(&mut self, labels: &[&str]) -> Vec<String> {
+        self.row_actions_opts("", LayoutProps::default(), labels)
+    }
+
+    /// 同 [`Builder::row_actions`]，但可指定 Row 的 id 与整体布局参数。
+    ///
+    /// 典型用法：`L::new().gap(8.0).main(Align::End).to_props()` —— 间距防粘连、
+    /// 主轴 `end` 让动作组贴到行尾（组在父 Row 里时）。`id` 传空串 = 自动生成。
+    pub fn row_actions_opts(
+        &mut self,
+        id: impl Into<String>,
+        layout: LayoutProps,
+        labels: &[&str],
+    ) -> Vec<String> {
+        let mut buttons: Vec<String> = Vec::with_capacity(labels.len());
+        self.container_opts(Kind::Row, id, layout, |r| {
+            for label in labels {
+                buttons.push(r.button(*label));
+            }
+        });
+        buttons
+    }
+
     pub fn build(&self) -> Node {
         self.root.clone()
     }
@@ -362,5 +400,99 @@ pub fn props(label: Option<&str>, disabled: bool) -> NodeProps {
         label: label.map(|s| s.to_string()),
         disabled,
             extra: Default::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RowActions 的**构造判据**：便捷构造出的树必须与「手写 Row + button」
+    /// 结构相等（组合层 = 既有控件的等价书写，不产生第二种树形）。
+    #[test]
+    fn row_actions_builds_exactly_the_hand_written_row_of_buttons() {
+        let mut a = Builder::new(Kind::Column, "app");
+        let ids = a.row_actions_opts("actions", L::new().gap(8.0).to_props(), &["编辑", "删除"]);
+
+        let mut b = Builder::new(Kind::Column, "app");
+        b.container_opts(Kind::Row, "actions", L::new().gap(8.0).to_props(), |r| {
+            r.button("编辑");
+            r.button("删除");
+        });
+
+        let ta = a.build();
+        let tb = b.build();
+        // 前置断言：返回的 id 必须真的是树里那两个按钮的 id（否则「收 id」收错了人，
+        // 后面按 id 关联事件的用法全会静默落空）。
+        let row = &ta.children[0];
+        assert_eq!(
+            ids,
+            row.children.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+            "返回的按钮 id 必须与树里的按钮逐一对上"
+        );
+        assert!(ta.structurally_eq(&tb), "组合层必须产出与手写等价的树");
+    }
+
+    /// 自动 id 规则与两条构筑路径**同一份**（`IdGen` 按 kind 计数 —— B-1 的前提）：
+    /// 第一次调用得 `row_1` + `button_1/2`，第二次调用不得撞号。
+    #[test]
+    fn row_actions_auto_ids_follow_the_kind_counters() {
+        let mut app = Builder::new(Kind::Column, "app");
+        let first = app.row_actions(&["a", "b"]);
+        let second = app.row_actions(&["c"]);
+        let tree = app.build();
+
+        assert_eq!(first, vec!["button_1", "button_2"]);
+        assert_eq!(second, vec!["button_3"]);
+        let rows: Vec<&Node> = tree
+            .children
+            .iter()
+            .filter(|c| c.kind == Kind::Row)
+            .collect();
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["row_1", "row_2"],
+            "两次便捷构造的 Row 自动 id 不得撞号"
+        );
+        // 前置断言：标签按序进树（「顺序与 labels 一致」是文档承诺，得真钉住）。
+        assert_eq!(rows[0].children[0].props.label.as_deref(), Some("a"));
+        assert_eq!(rows[0].children[1].props.label.as_deref(), Some("b"));
+        assert_eq!(rows[1].children[0].props.label.as_deref(), Some("c"));
+    }
+
+    /// `row_actions_opts` 的参数直通：指定 id 就用指定 id（并进 `IdGen` 占号），
+    /// 布局参数原样落在 Row 上（ gap 是防粘连的主用途）。
+    #[test]
+    fn row_actions_opts_passes_id_and_layout_through() {
+        let mut app = Builder::new(Kind::Column, "app");
+        let ids =
+            app.row_actions_opts("actions", L::new().gap(8.0).to_props(), &["编辑"]);
+        let tree = app.build();
+        let row = &tree.children[0];
+        assert_eq!(row.id, "actions");
+        assert_eq!(row.layout.gap, 8.0);
+        assert_eq!(ids, vec!["button_1"], "显式 Row id 不影响 button 的自动编号");
+        // 占号：之后再自动生成 Row 不得撞上显式名（`IdGen::reserve` 的职责）。
+        let mut app2 = Builder::new(Kind::Column, "app");
+        let _ = app2.row_actions_opts("actions", L::new().to_props(), &["x"]);
+        let again = app2.row_actions(&["y"]);
+        let tree2 = app2.build();
+        assert_ne!(
+            tree2.children[0].id, tree2.children[1].id,
+            "显式 id 之后的自动 Row id 不得与显式名冲突"
+        );
+        assert_eq!(again, vec!["button_2"], "button 计数跨调用连续");
+    }
+
+    /// 空标签组：合法（空 Row）。这条钉的是「不 panic、不静默吞容器」。
+    #[test]
+    fn row_actions_with_no_labels_is_an_empty_row() {
+        let mut app = Builder::new(Kind::Column, "app");
+        let ids = app.row_actions(&[]);
+        let tree = app.build();
+        assert!(ids.is_empty());
+        assert_eq!(tree.children.len(), 1, "Row 本身还在");
+        assert_eq!(tree.children[0].kind, Kind::Row);
+        assert!(tree.children[0].children.is_empty());
     }
 }

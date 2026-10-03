@@ -91,6 +91,14 @@ required-features = ["window"]
 name = "testkit_demo"
 required-features = ["testing"]
 
+# M6 5a：基础控件（Btn 语义 / RowActions / Keep）的自检示例。它用 testkit 注入输入
+# 并断言状态（离屏，不开窗口）⇒ 需要 `testing` feature ⇒ 必须显式写 `required-features`，
+# 否则默认（无 feature）构建会去编译它而失败 —— 那不是「跳过」，是 `cargo test --workspace`
+# 直接红（理由与上面 testkit_demo 那段逐字相同）。
+[[example]]
+name = "m6_basics"
+required-features = ["testing"]
+
 [lib]
 name = "deer_gui"
 path = "src/lib.rs"
