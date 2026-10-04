@@ -11,7 +11,10 @@
 //!   [`RedrawPolicy::OnDemand`] 省电）+ `DEER_WINDOW_REDRAW` 运行时覆盖；
 //! - **唤醒面**：[`Waker`] / [`WakePlan`] / [`plan_wake`] / [`earliest`] / [`WakeStats`]、
 //!   以及纯函数 `plan_to_control_flow`；
-//! - **账本**：[`FrameCounter`]（帧 / 请求 / 跳过帧 / 退出标记）与 [`WakeStats`]。
+//! - **账本**：[`FrameCounter`]（帧 / 请求 / 跳过帧 / 退出标记）与 [`WakeStats`]；
+//! - **多窗口**（T4.4-R1）：[`WindowId`] 事件路由 + [`WindowSpawner`] 排队建窗 +
+//!   多 [`WindowConfig`] 启动 + 关闭语义（只关该窗；全关 ⇒ 退出）+ 每窗独立焦点
+//!   （决策 1/2/3/4/5，见 `ROADMAP.md` 的「设计登记：多窗口（T4.4）」）。
 //!
 //! **平台面**（窗口句柄 / winit 输入翻译 / DPI）在 [`crate::display`]（L1）—— 本模块**驱动**它：
 //! 依赖方向是**单向**的 host → display。
@@ -20,7 +23,11 @@
 //! 驱动面**（L3），不是平台句柄面（L1）—— 平台句柄与输入映射才在 `display`。
 //!
 //! 拆分前这些内容与 L1 同住在 `lib.rs`；**公开路径一个都没变**（`lib.rs` 用 `pub use` 重新导出）。
+//!
+//! ⚠️ 本模块里 `WindowId` 是**本层自己的**窗口标识（winit 那个以 `WinitWindowId` 的别名进来，
+//! 不出现在任何公开签名里 —— 与 [`InputEvent`] 同一条纪律）。
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,7 +36,9 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, Ime, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::window::{Window, WindowId};
+// `WindowId` 名字留给本层自己的公开类型（见下面 [`WindowId`]）；winit 的那个只在
+// `alive` 表的键上出现，从不进任何公开签名。
+use winit::window::{Window, WindowId as WinitWindowId};
 
 use crate::display::{
     InputEvent, Mods, PointerButton, WindowConfig, WindowInfo, map_key, map_mouse_button, map_mods,
@@ -125,8 +134,9 @@ pub fn resolve_redraw_policy(app_policy: RedrawPolicy, raw: Option<&str>) -> Red
 
 /// winit 的**用户事件**类型：**私有**（本轮不开自定义用户事件面 —— 「Not Doing」）。
 ///
-/// App 那一侧只看得到 [`Waker`]；winit 的类型与这个枚举都不进回调签名（与 [`InputEvent`] 同一条纪律）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// App 那一侧只看得到 [`Waker`] 与 [`WindowSpawner`]（各是一根**同型**通道的薄封装）；
+/// winit 的类型与这个枚举都不进回调签名（与 [`InputEvent`] 同一条纪律）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Wake {
     /// [`Waker::wake`]：立刻醒来看一眼。
     Look,
@@ -135,6 +145,12 @@ enum Wake {
     /// 带上**绝对**时刻而不是 `Duration`：走一趟通道/消息队列也要时间，用相对量会让每次唤醒
     /// 都往后漂一点（要做 60fps 的定时动画时，那种漂移会累积）。
     At(Instant),
+    /// [`WindowSpawner::spawn_window`]：把「想建一个窗」的请求**排队**进事件循环
+    /// （T4.4-R1，决策 2）。winit 0.30 只允许在持 [`ActiveEventLoop`] 的安全点建窗 ⇒
+    /// 真正的建窗发生在 [`RunHandler::user_event`] 收到这条请求的时刻 —— 排队与建窗之间
+    /// 隔一次事件循环迭代是**设计**，不是延迟。
+    /// （`Copy` 因此放弃 —— `WindowConfig` 带着 `String`；消息本就应当按值走一趟通道。）
+    Spawn(WindowConfig),
 }
 
 /// **可克隆的唤醒句柄**（M5c）：App 在建好窗后由 [`App::wake_handle`] 拿到，存下来即可在
@@ -201,6 +217,65 @@ impl std::fmt::Debug for Waker {
 const _: fn() = || {
     fn assert_send<T: Send>() {}
     assert_send::<Waker>();
+};
+
+// ——————————————— T4.4-R1：多窗口（WindowId / WindowSpawner）———————————————
+
+/// **窗口标识**（T4.4-R1）：多窗口路由的**钥匙** —— [`App::window_input`] 用它告诉 App
+/// 「这条事件属于哪个窗」，App 用它给「每窗一棵树 / 每窗一份状态」当 `HashMap` 的键（决策 6）。
+///
+/// 它是**本层建窗时自发**的序号（主窗 = `1`，之后每扇窗递增），**不是** winit 的 `WindowId`：
+/// ① 同一条纪律 —— winit 类型不进回调签名（与 [`InputEvent`] 一致）；
+/// ② winit 的 id 没有公开构造（只有值恒相同的 `dummy()`），纯逻辑单测造不出两个不同的 id，
+/// 路由表和关闭语义就没法测 —— 本层自己的序号两样都解决。
+/// `Copy + Eq + Hash + Ord` ⇒ 键控、排序、日志都顺手。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct WindowId(u64);
+
+impl WindowId {
+    /// 原始序号 → 标识（**唯一**的构造点：本层建窗时分配；单测里用它造两个不同的键）。
+    pub(crate) fn from_raw(n: u64) -> WindowId {
+        WindowId(n)
+    }
+}
+
+/// **多窗口的建窗句柄**（T4.4-R1，决策 2）：与 [`Waker`] **同一根通道**（同一个
+/// `EventLoopProxy`）的薄封装 ——「与 Waker 同型的通道」就是这个意思。
+///
+/// [`WindowSpawner::spawn_window`] 只做一件事：把「想建一个窗」的请求**排队**进事件循环。
+/// winit 0.30 的硬约束是「只能在持 [`ActiveEventLoop`] 的安全点建窗」⇒ 真正的建窗发生在
+/// 事件循环收到这条请求的时刻（[`RunHandler::user_event`] 的 `Spawn` 臂）—— App 在
+/// `init` / `redraw` / 任何回调里调用它都安全，因为重的建窗动作不在调用点上发生。
+///
+/// 与 [`Waker`] 同一条纪律：App 拿不到 `send_event` 原始面；`Send` 是承诺（同样有编译期
+/// 断言）；事件循环已结束时请求**静默丢弃**（App 正在退出，没有可报告的对象，不 panic）。
+#[derive(Clone)]
+pub struct WindowSpawner {
+    proxy: EventLoopProxy<Wake>,
+}
+
+impl WindowSpawner {
+    /// 请求建一个新窗口（参数与 [`run()`] 的 `config` 同型：标题 + **逻辑**尺寸）。
+    ///
+    /// **不等待、没有回执**：请求只是排队；建窗成不成功经由正常的生命周期抵达
+    /// （新窗的 [`App::init`] / `Err` 路径），本层不另设「spawn 的回执」这一个面。
+    /// 事件循环**已经结束**时静默丢弃（与 [`Waker::wake`] 同一口径：不 panic）。
+    pub fn spawn_window(&self, config: WindowConfig) {
+        let _ = self.proxy.send_event(Wake::Spawn(config));
+    }
+}
+
+/// `WindowSpawner` 的 `Debug`：只说「有个句柄」（与 [`Waker`] 的做法一致）。
+impl std::fmt::Debug for WindowSpawner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.pad("WindowSpawner { .. }")
+    }
+}
+
+/// **编译期断言**：`WindowSpawner` 必须是 `Send`（与 [`Waker`] 同一承诺、同一依据）。
+const _: fn() = || {
+    fn assert_send<T: Send>() {}
+    assert_send::<WindowSpawner>();
 };
 
 /// 一轮「该睡多久」的**纯逻辑**答案（[`plan_wake`] 的返回值，可单测）。
@@ -366,6 +441,10 @@ pub trait App {
     /// 窗口建好后**调一次**：在这里创建渲染器（Vulkan 设备/交换链）。
     ///
     /// 返回 `Err` 会让 `run()` 打印原因、退出事件循环并返回 `Err`。
+    ///
+    /// T4.4-R1 起是「**每建一扇窗调一次**」（多 `WindowConfig` 启动 / 动态 spawn 的窗各一次，
+    /// 按建窗顺序）：单窗口用户的感知完全不变；多窗口下按 id 区分窗靠的是
+    /// [`App::window_input`]（决策 6 的每窗状态从收到该窗第一条事件起初始化即可）。
     fn init(&mut self, info: &WindowInfo) -> Result<(), String>;
 
     /// 尺寸变化（含 DPI 变化）：调用方应当重建交换链。默认什么都不做。
@@ -396,6 +475,29 @@ pub trait App {
         // 用 `let _` 消化掉。
         let _ = (info, ev);
         Ok(Flow::Continue)
+    }
+
+    /// **多窗口输入路由**（T4.4-R1，决策 1/6）：这条输入属于哪个窗，连同**该窗自己的**
+    /// [`WindowInfo`] 一起交给你；它**只收这一个窗**的事件（决策 6「每窗一棵树」的前提）。
+    ///
+    /// 默认实现**转发既有 [`App::input`]**（忽略 id）—— 单窗口用户**零改动**：只实现过
+    /// `input` 的 App 照常收到事件。要多窗口的实现**覆盖本方法**；覆盖之后 [`App::input`]
+    /// **不再被调用**（转发只发生在默认实现里 —— 不然两条路都会响）。
+    ///
+    /// 为什么签名里有 `info`：登记文本写的是 `(id, event)` 的简写 —— 转发目标 [`App::input`]
+    /// 需要 `info`（该窗的物理尺寸/句柄），缺了它「默认转发」根本写不出来，这也是唯一让
+    /// 「单窗口零改动」成立的非破坏读法。`info` 就是**这个窗**的当前信息（口径与
+    /// [`App::resized`] 一致：物理像素，`Resized` 之后同步更新）。
+    ///
+    /// 返回值与 [`App::input`] 同义：`Flow::Exit` ⇒ 结束事件循环；`Err` ⇒ 打印 + 退出 + 返回。
+    fn window_input(
+        &mut self,
+        id: WindowId,
+        info: &WindowInfo,
+        ev: &InputEvent,
+    ) -> Result<Flow, String> {
+        let _ = id;
+        self.input(info, ev)
     }
 
     /// 点了关闭按钮/系统关闭：默认允许关闭。
@@ -429,22 +531,35 @@ pub trait App {
         RedrawPolicy::OnDemand
     }
 
-    /// **唤醒句柄**（M5c）：窗口建好后**调一次**，把 [`Waker`] 交给你 —— **存下来**。
+    /// **唤醒句柄**（M5c）：主窗建好后**调一次**，把 [`Waker`] 交给你 —— **存下来**。
     ///
     /// 默认实现**什么都不做** ⇒ M5c 之前写的 `App` 实现一行都不用改（它们拿不到句柄，
     /// 想做按时间的动画就仍然只能声明 [`RedrawPolicy::Continuous`]）。
     ///
     /// 调用时机（可依赖的三条）：
     ///
-    /// 1. 在 [`App::init`] **成功之后**（渲染器已经建好了，可以立刻排一个唤醒）；
+    /// 1. 在**第一扇窗**的 [`App::init`] **成功之后**（渲染器已经建好了，可以立刻排一个唤醒）；
     /// 2. 在**建窗引导帧**之前；
-    /// 3. **只调一次** —— 与 `init` 共用「建窗只做一次」的保证（`resumed` 在部分平台会重复到达）。
+    /// 3. 整个 `run()` **只调一次**（T4.4-R1 起多窗共享同一个 [`Waker`]：唤醒是 App 级的，
+    ///    不属于某扇窗）。
     ///
     /// 拿到之后就有三个手段（语义见 `lib.rs` 的 crate 文档「唤醒面」）：[`Waker::wake`]（提示）、
     /// [`Waker::wake_after`]（预约）、[`App::next_deadline`]（拉式预约）。
     fn wake_handle(&mut self, waker: Waker) {
         // 默认实现什么都不做。参数名保持易读（不改成 `_waker`），用 `let _` 消化掉 unused 警告。
         let _ = waker;
+    }
+
+    /// **建窗句柄**（T4.4-R1，决策 2）：主窗建好后**调一次**，把 [`WindowSpawner`] 交给你 ——
+    /// 与 [`App::wake_handle`] **同型**的交付面（「App 经与 Waker 同型的通道获取句柄」）。
+    /// **存下来**，之后任何回调里都能 `spawner.spawn_window(config)` 排队建新窗
+    /// （真正的建窗在事件循环的安全点完成，见 [`WindowSpawner`]）。
+    ///
+    /// 默认实现**什么都不做** ⇒ 单窗口实现一行不用改。调用时机与 [`App::wake_handle`]
+    /// 完全同批：第一扇窗 `init` 成功之后、引导帧之前，整个 `run()` 只调一次。
+    fn window_spawner(&mut self, spawner: WindowSpawner) {
+        // 默认实现什么都不做（同 wake_handle 的纪律）。
+        let _ = spawner;
     }
 
     /// **我希望被唤醒的最近时刻**（M5c，**拉**式）：`Some(t)` ⇒ 事件循环用
@@ -598,6 +713,26 @@ impl FrameCounter {
 ///   （`Continuous` 档下它与帧数同阶是合法的）—— 读它下断言的是**空闲档**的
 ///   `examples/wake_probe.rs`（上界），账本经 [`App::on_wake_stats`] 交给 App）。
 pub fn run<A: App + 'static>(config: WindowConfig, app: A) -> Result<(), String> {
+    run_multi(&[config], app)
+}
+
+/// 建多扇窗口并跑事件循环（T4.4-R1：**多 `WindowConfig` 启动**，决策 3；**必须在主线程**调用）。
+///
+/// 与 [`run()`] 唯一的差别是**开多少扇窗**：`configs` 的每一项都会在 `resumed` 里按顺序
+/// 建成真窗并各走一次 [`App::init`]（**第一项 = 主窗**，仍是「`run()` 首建」的那扇，决策 2；
+/// 主窗建好后 [`App::wake_handle`] / [`App::window_spawner`] 各交一次句柄）。之后的一切 ——
+/// 事件按 [`WindowId`] 路由（决策 1/6）、`CloseRequested` 只关该窗、全关 ⇒ 退出（决策 4）、
+/// 每窗独立焦点（决策 5）—— 与 [`run()`] 走**同一条代码路径**（[`run()`] 就是 `configs`
+/// 只有一项的 [`run_multi`]）。
+///
+/// 出错返回 `Err(说明)`，**不 panic**（错误面与 [`run()`] 完全一致，见它的文档）；
+/// `configs` 为空是**调用方 bug** ⇒ 直接 `Err`（没有窗的事件循环只会永远等待）。
+pub fn run_multi<A: App + 'static>(configs: &[WindowConfig], app: A) -> Result<(), String> {
+    if configs.is_empty() {
+        return Err(
+            "run_multi 至少要一个 WindowConfig：没有窗口的事件循环只会永远等待".to_string(),
+        );
+    }
     // 重绘策略在这里定，**在建 EventLoop 之前**：策略 = App 自己声明的 + 环境变量的覆盖，
     // 与窗口无关 ⇒ 就算建窗失败，自证那行也已经打出来了。
     let requested = std::env::var(REDRAW_ENV).ok();
@@ -614,23 +749,28 @@ pub fn run<A: App + 'static>(config: WindowConfig, app: A) -> Result<(), String>
         .build()
         .map_err(|e| format!("创建 winit EventLoop 失败（run() 必须在主线程调用）：{e}"))?;
     // 句柄在建窗**之前**就取好：`resumed` 里才有东西交给 App（`App::wake_handle`）。
-    let waker = Waker { proxy: event_loop.create_proxy() };
+    // T4.4-R1：`WindowSpawner` 与 `Waker` **同一根通道**（同一个 proxy，决策 2）——
+    // 两张「薄封装」各挡住各自的面（`wake`/`wake_after` vs `spawn_window`）。
+    let proxy = event_loop.create_proxy();
+    let waker = Waker { proxy: proxy.clone() };
+    let spawner = WindowSpawner { proxy };
 
     let mut handler = RunHandler {
-        config,
+        configs: configs.to_vec(),
         app,
         policy,
-        window: None,
-        info: None,
+        table: WindowTable::new(),
+        alive: HashMap::new(),
+        main: None,
         extent: Extent { width: 0, height: 0 },
         counter: FrameCounter::new(),
         mods: Mods::default(),
-        pointer: PointerRoute::default(),
-        dpi: ScaleLedger::at_creation(1.0),
-        ime_composing: false,
         error: None,
         exiting: false,
         waker,
+        spawner,
+        handles_given: false,
+        next_window_id: 1,
         armed: None,
         wake_stats: WakeStats::new(),
     };
@@ -753,30 +893,120 @@ impl ScaleLedger {
     }
 }
 
-/// [`run()`] 的 `ApplicationHandler` 实现：事件循环 → `App` 回调的接线。
+// ---------------------------------------------------------------------------
+// 多窗口路由表（T4.4-R1 的**纯逻辑核心**；不碰窗口、可直接单测 —— 与
+// `PointerRoute` / `ScaleLedger` 同一套做法：契约收成一处可单测的纯类型）
+// ---------------------------------------------------------------------------
+
+/// **一个活窗口的纯状态**（T4.4-R1）——不含 winit 句柄 ⇒ 能脱离窗口单测。
+///
+/// 从 [`RunHandler`] 的单窗字段（拆分前的 `info` / `pointer` / `dpi` / `ime_composing`）
+/// **原样**搬进来：这四样本就是「每窗一份」的状态（光标账本、DPI 账本、IME 状态都是
+/// 窗口自己的），单窗口时代它们只是恰好只有一个实例。
+struct WindowEntry {
+    /// 建窗时算好、`Resized` / `ScaleFactorChanged` 时同步更新的 [`WindowInfo`]。
+    info: WindowInfo,
+    /// 指针路由账本（T3.7 的窗口侧半）：最近光标位置 + Down/Up 的事件合成。
+    pointer: PointerRoute,
+    /// DPI 账本（AF-3）：**该窗**的 scale_factor 唯一记账点。
+    dpi: ScaleLedger,
+    /// 该窗的 IME 是否正在预编辑（收到非空 `Preedit` 且还没 `Commit`/`Disabled`）。
+    ime_composing: bool,
+}
+
+impl WindowEntry {
+    /// 建窗时的初始纯状态（DPI 初值与 [`WindowInfo::scale_factor`] 同源同值）。
+    fn at_creation(info: WindowInfo) -> WindowEntry {
+        WindowEntry {
+            info,
+            pointer: PointerRoute::default(),
+            dpi: ScaleLedger::at_creation(info.scale_factor),
+            ime_composing: false,
+        }
+    }
+}
+
+/// [`WindowTable::close`] 的**纯判定**结果（决策 4 的关闭语义）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseOutcome {
+    /// 该窗被移除。`last` = 这是不是**最后一扇**窗（true ⇒ 事件循环该退出）。
+    Closed { last: bool },
+    /// 表里没有这个 id（重复的 `Destroyed` / 关闭竞态）⇒ 什么都不发生（幂等）。
+    Unknown,
+}
+
+/// **活窗口表**（T4.4-R1）：[`WindowId`] → [`WindowEntry`]。
+///
+/// 「事件到对的窗」（决策 1/6）与关闭语义（决策 4：只关该窗；全关 ⇒ 退出）的**判定**
+/// 全收在这一个类型里，[`RunHandler`] 只做 IO（真正的 `request_redraw` / 窗口销毁）。
+/// winit 的 `Arc<Window>` **不在**表里（没有公开构造 ⇒ 在表里就没法单测），由
+/// [`RunHandler::alive`] 平行持有；两张表只经 [`RunHandler::create_window`] 与
+/// close/`Destroyed` 两处同步改动，其余代码各取所需（纯状态查 `table`，句柄查 `alive`）。
+struct WindowTable {
+    entries: HashMap<WindowId, WindowEntry>,
+}
+
+impl WindowTable {
+    fn new() -> WindowTable {
+        WindowTable { entries: HashMap::new() }
+    }
+
+    /// 登记一扇新窗（建窗成功后的**唯一**入口；同 id 重复登记是本层的 bug）。
+    fn insert(&mut self, id: WindowId, entry: WindowEntry) {
+        let prev = self.entries.insert(id, entry);
+        debug_assert!(prev.is_none(), "同一 {id:?} 登记了两次（建窗路径有 bug）");
+    }
+
+    fn get(&self, id: WindowId) -> Option<&WindowEntry> {
+        self.entries.get(&id)
+    }
+
+    fn get_mut(&mut self, id: WindowId) -> Option<&mut WindowEntry> {
+        self.entries.get_mut(&id)
+    }
+
+    /// 关闭语义（决策 4）的**唯一**实现：移除该窗并回答「这是不是最后一扇」。
+    /// `CloseRequested`（App 允许关闭时）与 `Destroyed`（外部销毁/清理回执）都走它。
+    fn close(&mut self, id: WindowId) -> CloseOutcome {
+        match self.entries.remove(&id) {
+            Some(_) => CloseOutcome::Closed { last: self.entries.is_empty() },
+            None => CloseOutcome::Unknown,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// 窗口数（单测断言用；生产路径只关心 `is_empty`）。
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+/// [`run()`] 的 `ApplicationHandler` 实现：事件循环 → `App` 回调的接线（T4.4-R1 起多窗）。
 struct RunHandler<A: App> {
-    config: WindowConfig,
+    /// 尚未建窗的配置（`resumed` 里按顺序清空 = **主窗批**，决策 3；spawn 的请求走用户事件，
+    /// 不进这里）。
+    configs: Vec<WindowConfig>,
     app: A,
     /// **实际生效**的重绘策略（[`App::redraw_policy`] + [`REDRAW_ENV`] 的覆盖，在 `run()` 里算好）。
     policy: RedrawPolicy,
-    /// `resumed` 里建好后由事件循环持有；窗口活到 `run()` 结束。
-    window: Option<Arc<Window>>,
-    /// 建窗时算好的 [`WindowInfo`]（`Resized` 时同步 `extent`）：原样转发给 `App::input`。
-    info: Option<WindowInfo>,
-    /// 最近一次已知的物理尺寸（初始取自 `inner_size()`，之后由 `Resized` 更新）。
+    /// **活窗口表**（纯状态；路由与关闭语义的判定在这里，见 [`WindowTable`]）。
+    table: WindowTable,
+    /// 活窗口的 winit 句柄（`request_redraw` / 关窗销毁用）。键是 winit 的 id（事件带来的），
+    /// 值里带着**本层的** [`WindowId`] —— 两套 id 的**唯一**换算点。
+    /// 与 `table` 只经 [`RunHandler::create_window`] / close/`Destroyed` 两处同步改动。
+    alive: HashMap<WinitWindowId, LiveWindow>,
+    /// **主窗**（第一扇建成的窗，决策 2「主窗仍由 run() 首建」）：收尾摘要的 extent 口径。
+    main: Option<WindowId>,
+    /// 主窗最近一次已知的物理尺寸（收尾摘要那行用；口径与拆分前一致）。
     extent: Extent,
     counter: FrameCounter,
     /// 当前修饰键状态：由 `ModifiersChanged` 维护（winit 0.30 没有「随时查」的接口）。
+    /// 键盘是连接级状态（同一时刻至多一扇窗有焦点）⇒ 保持**单份**，与拆分前一致。
     mods: Mods,
-    /// **指针路由账本**（[`PointerRoute`]）：最近光标位置 + Down/Up 的事件合成。
-    /// 捕获语义（T3.7，D7）赖以成立的「拖拽期间流不断」两条约定都在它身上，见类型文档。
-    pointer: PointerRoute,
-    /// **DPI 账本**（[`ScaleLedger`]，AF-3）：scale_factor 的唯一记账点，只透传不换算。
-    dpi: ScaleLedger,
-    /// IME 正在预编辑（收到非空 `Preedit` 且还没 `Commit`/`Disabled`）。
-    /// 此时 `KeyboardInput` 的文本**不**再转 `TextInput`：否则中文输入会重复上屏
-    /// （一次来自 `Ime::Commit`，一次来自按键自带的 `text`）。
-    ime_composing: bool,
     /// 第一个错误（后续错误不再覆盖它）。
     error: Option<String>,
     /// 已经请求 `event_loop.exit()`：同一批事件里后面的回调不再处理，
@@ -784,6 +1014,12 @@ struct RunHandler<A: App> {
     exiting: bool,
     /// 交给 App 的唤醒句柄（`resumed` 里 clone 一份给 [`App::wake_handle`]）。
     waker: Waker,
+    /// 交给 App 的建窗句柄（与 [`App::window_spawner`] 同批交付；与 `waker` 同一根 proxy）。
+    spawner: WindowSpawner,
+    /// `wake_handle` / `window_spawner` 是否已交付（「只调一次」的保证落点）。
+    handles_given: bool,
+    /// 下一个待分配的 [`WindowId`]（从 1 起；1 号 = 主窗）。
+    next_window_id: u64,
     /// [`Waker::wake_after`] **推**来的最近 deadline（`None` = 没推过，或被兑现后清掉了）。
     ///
     /// 与「App 声明的那个」（[`App::next_deadline`]，每轮现问）分开存：推来的这个**本层**负责
@@ -794,6 +1030,12 @@ struct RunHandler<A: App> {
     wake_stats: WakeStats,
 }
 
+/// [`RunHandler::alive`] 的值：winit 句柄 + 它在本层的 [`WindowId`]（换算就发生在这一步）。
+struct LiveWindow {
+    id: WindowId,
+    window: Arc<Window>,
+}
+
 impl<A: App> RunHandler<A> {
     /// 统一出错处理：打印原因 → 记住 → 请求退出。`run()` 最终返回这个 `Err`。
     fn fail(&mut self, event_loop: &ActiveEventLoop, msg: String) {
@@ -802,6 +1044,79 @@ impl<A: App> RunHandler<A> {
             self.error = Some(msg);
         }
         event_loop.exit();
+    }
+
+    /// 建**一扇**窗（主窗批与 `spawn` 共用的**唯一**建窗点；持 [`ActiveEventLoop`] ⇒
+    /// winit 0.30 的安全点，决策 2）。成功后依次：`窗口已建` 日志 → [`App::init`] →
+    /// （仅第一扇之后）`wake_handle` + `window_spawner` → IME 允许 → 入两张表 → 引导帧。
+    /// 失败走 [`RunHandler::fail`]（打印 + 记住 + 请求退出）。
+    fn create_window(&mut self, event_loop: &ActiveEventLoop, config: &WindowConfig) {
+        let attrs = Window::default_attributes()
+            .with_title(config.display_title())
+            // 建窗用逻辑尺寸（系统按 DPI 换算）；之后的 Resized 一律物理像素直传。
+            .with_inner_size(LogicalSize::new(f64::from(config.width), f64::from(config.height)));
+        let window = match event_loop.create_window(attrs) {
+            Ok(w) => Arc::new(w),
+            Err(e) => return self.fail(event_loop, format!("创建窗口失败：{e}")),
+        };
+
+        let info = match window_info(&window) {
+            Ok(info) => info,
+            Err(e) => return self.fail(event_loop, e),
+        };
+        let is_main = self.main.is_none();
+        let id = WindowId::from_raw(self.next_window_id);
+        self.next_window_id += 1;
+        if is_main {
+            // 主窗 = 第一扇（决策 2「主窗仍由 run() 首建」）；收尾摘要的 extent 口径就是它
+            // （单窗口时它就是那扇窗 —— 与拆分前一致）。
+            self.extent = info.extent;
+            self.main = Some(id);
+        }
+        println!(
+            "[deer-window] 窗口已建：title=\"{}\" extent={}x{} platform={:?} handle(HWND)=0x{:X} display(HINSTANCE)=0x{:X}",
+            config.display_title(),
+            info.extent.width,
+            info.extent.height,
+            info.raw.platform,
+            info.raw.handle,
+            info.raw.display
+        );
+        println!(
+            "[deer-window] 窗口身份：id={id:?}{}（单窗口用户的 App 仍然只看到 init/redraw/input）",
+            if is_main { "，主窗" } else { "" }
+        );
+
+        if let Err(e) = self.app.init(&info) {
+            return self.fail(event_loop, format!("App::init 失败：{e}"));
+        }
+
+        // `wake_handle` / `window_spawner` 的「只调一次」保证：第一扇窗 init 成功之后、
+        // 引导帧之前（与拆分前 `wake_handle` 的时机一致；`window_spawner` 同批交付）。
+        if !self.handles_given {
+            self.handles_given = true;
+            self.app.wake_handle(self.waker.clone());
+            self.app.window_spawner(self.spawner.clone());
+        }
+
+        // IME：winit 要求**显式允许**才会发 `Ime` 事件（`Ime::Commit` 是中文/日文输入的
+        // 文本来源）。不开的话 CJK 输入在本层完全收不到 —— 那就与「输入通路已接通」相反。
+        // 每扇窗都要开（各自有各自的 IME 上下文）。
+        window.set_ime_allowed(true);
+
+        let winit_id = window.id();
+        self.table.insert(id, WindowEntry::at_creation(info));
+        self.alive.insert(winit_id, LiveWindow { id, window });
+
+        // **引导帧**（每扇窗各一次）：winit 对「建窗后一定发一条 `RedrawRequested`」**没有保证**
+        // （winit 0.30 `Window::request_redraw` 的「no strong guarantees」），而 `OnDemand` 下
+        // App 没有别的办法要到第一帧（它拿不到窗口句柄）⇒ 主动要一帧，否则窗口会一直留一块
+        // 没画过的区域，`Continuous` 的续帧链也根本起不来。这是一次性的引导，不是空转。
+        //
+        // ⚠️ 诚实注记（M5c 复审 M2，单窗时代实测）：**这一行在 Windows 上删掉也全绿** —— 那一帧
+        // 其实是 OS（窗口显示后的 WM_PAINT）给的。保留它是为了**非 Windows / 其它 winit 后端**，
+        // 以及「没有 OS 帧时 OnDemand 也能起步」。
+        self.request_redraw_for(winit_id);
     }
 
     /// **唯一**决定「睡多久」的地方（`resumed` / `user_event` / `about_to_wait` 都调它，实现只有这一份）。
@@ -827,55 +1142,94 @@ impl<A: App> RunHandler<A> {
                 self.armed = None;
             }
             self.wake_stats.on_fire();
-            self.request_redraw();
+            // deadline 是 **App 级**的（不属于某扇窗）⇒ 所有活窗都该重画。
+            self.request_redraw_all();
         }
         // 翻译只有这一处：`WakePlan` ⇒ `ControlFlow`（见 `plan_to_control_flow` 的单测）。
         event_loop.set_control_flow(plan_to_control_flow(plan));
     }
 
-    /// 把一条输入事件交给 `App::input`，并按**置位规则**决定要不要请求重绘。
+    /// 把一条输入事件交给**它所属的窗**（T4.4-R1 路由：[`App::window_input`]，默认实现转发
+    /// [`App::input`] —— 单窗口零改动），并按**置位规则**决定要不要请求重绘。
     ///
     /// 走到这里的事件都是**已映射的输入**（hover/press/focus/text/滚轮…）；反过来，**没有**
     /// 映射成 [`InputEvent`] 的 winit 事件（`ModifiersChanged`、`CursorEntered/Left`、被丢弃的侧键…）
     /// 根本走不到这里，也就不会请求重绘 —— 「每个 winit 事件都重绘」这条被刻意避开了。
     ///
     /// `gate` 决定置位规则：普通输入看 [`App::wants_redraw`]（**为假就不请求**，这是 M5b 的省电核心），
-    /// 系统类输入（`Focused`）**一律**请求（见 [`Gate`]）。取消/出错的语义与旧版一致。
-    ///
-    /// `Err` 走 [`RunHandler::fail`]（打印 + 记住 + 退出）；`Flow::Exit` 与 `redraw` 同义。
-    fn dispatch(&mut self, event_loop: &ActiveEventLoop, ev: &InputEvent, gate: Gate) {
-        let Some(info) = self.info else {
-            // 还没成功建窗（理论上到不了这里）：没有窗口就没有输入，直接丢弃。
-            return;
-        };
-        match self.app.input(&info, ev) {
-            Ok(Flow::Continue) => match gate {
-                Gate::AppDecides => {
-                    // **先问 App 这一条输入改了状态没有**（`input` 之后问，App 才有机会更新脏标记）。
-                    let wants = self.app.wants_redraw();
-                    if self.counter.on_input(wants) {
-                        self.request_redraw();
+    /// 系统类输入（`Focused`）**一律**请求（见 [`Gate`]）。置位与 T3.7 一样**定向给来源窗**
+    /// （[`RunHandler::request_redraw_for`]）。`Err` 走 [`RunHandler::fail`]；`Flow::Exit` 与 `redraw` 同义。
+    fn dispatch(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        winit_id: WinitWindowId,
+        ev: &InputEvent,
+        gate: Gate,
+    ) {
+        /// `dispatch` 与「行动」分离出来的中间决定（先算完、再动 `self`，借用才不打架）。
+        enum After {
+            Request,
+            Nothing,
+            Exit,
+            Fail(String),
+        }
+        let after = {
+            // 两套 id 的换算点：winit 事件带来 winit 的 id，App 只认本层的 [`WindowId`]。
+            let Some(id) = self.alive.get(&winit_id).map(|live| live.id) else {
+                // 未知窗（销毁竞态里的事件）：没有属主 ⇒ 丢弃（不派发、不记账、不请求）。
+                return;
+            };
+            // `info` 是**这个窗**的（Copy 取出，借用到此为止）。
+            let Some(info) = self.table.get(id).map(|e| e.info) else {
+                return;
+            };
+            match self.app.window_input(id, &info, ev) {
+                Ok(Flow::Continue) => match gate {
+                    Gate::AppDecides => {
+                        // **先问 App 这一条输入改了状态没有**（回调之后问，App 才有机会更新脏标记）。
+                        let wants = self.app.wants_redraw();
+                        if self.counter.on_input(wants) {
+                            After::Request
+                        } else {
+                            After::Nothing
+                        }
                     }
-                }
-                Gate::Always => self.request_redraw(),
-            },
-            Ok(Flow::Exit) => {
+                    Gate::Always => After::Request,
+                },
+                Ok(Flow::Exit) => After::Exit,
+                Err(e) => After::Fail(format!("App::window_input 失败：{e}")),
+            }
+        };
+        match after {
+            After::Request => self.request_redraw_for(winit_id),
+            After::Nothing => {}
+            After::Exit => {
                 self.exiting = true;
                 event_loop.exit();
             }
-            Err(e) => self.fail(event_loop, format!("App::input 失败：{e}")),
+            After::Fail(e) => self.fail(event_loop, e),
         }
     }
 
-    /// 请求重绘 + **记账**（`request_redraw()` 的**唯一**落点 ⇒ 「请求次数」只有一个真相来源）。
+    /// 请求**某一扇**窗重绘 + **记账**（置位规则的定向版：输入/系统事件都属于**来源窗** ——
+    /// 尺寸变了重画那扇、hover 变了重画那扇）。
     ///
-    /// 触发一共四种：输入置位、系统事件（含 `Resized`/`Focused`/窗口暴露/建窗引导帧）、
-    /// `Continuous` 的续帧、以及**唤醒面**（`wake()` 答真 / deadline 到点，M5c）。
-    /// 窗口还没建时只记账（没有窗口可请求，也没别的地方会读这个数）。
-    fn request_redraw(&mut self) {
+    /// 「请求次数」的**唯一**加计数点仍是 [`FrameCounter::note_request`]（与全窗版共享同一个
+    /// 真相来源）。窗已不在 `alive`（关闭竞态）时只记账 —— 与拆分前「窗口还没建时只记账」同口径。
+    fn request_redraw_for(&mut self, winit_id: WinitWindowId) {
         self.counter.note_request();
-        if let Some(window) = &self.window {
-            window.request_redraw();
+        if let Some(live) = self.alive.get(&winit_id) {
+            live.window.request_redraw();
+        }
+    }
+
+    /// 请求**所有**活窗重绘 + 记账（App 级的「该画了」：`wake()` 答真 / deadline 到点 ——
+    /// 它们不属于任何一扇窗）。**单窗口时与拆分前的 `request_redraw` 逐字同行为**
+    /// （记一次账 + 那一扇窗 `request_redraw`）。
+    fn request_redraw_all(&mut self) {
+        self.counter.note_request();
+        for live in self.alive.values() {
+            live.window.request_redraw();
         }
     }
 
@@ -932,56 +1286,22 @@ enum Gate {
 
 impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.error.is_some() || self.window.is_some() {
-            // 已经出过错就不再建窗；`resumed` 在部分平台会被多次调用，窗口只建一次。
+        if self.error.is_some() || self.configs.is_empty() {
+            // 已经出过错就不再建窗；`resumed` 在部分平台会被多次调用，
+            // 主窗批（`configs`）只在这里清空一次。
             return;
         }
 
-        let attrs = Window::default_attributes()
-            .with_title(self.config.display_title())
-            // 建窗用逻辑尺寸（系统按 DPI 换算）；之后的 Resized 一律物理像素直传。
-            .with_inner_size(LogicalSize::new(
-                f64::from(self.config.width),
-                f64::from(self.config.height),
-            ));
-        let window = match event_loop.create_window(attrs) {
-            Ok(w) => Arc::new(w),
-            Err(e) => return self.fail(event_loop, format!("创建窗口失败：{e}")),
-        };
-
-        let size = window.inner_size();
-        self.extent = Extent { width: size.width, height: size.height };
-        let info = match window_info(&window) {
-            Ok(info) => info,
-            Err(e) => return self.fail(event_loop, e),
-        };
-        // AF-3：DPI 账本与 `WindowInfo::scale_factor` **同源同值**（都来自这一次
-        // `window_info()` ⇒ 底下都是 winit 的 `window.scale_factor()`）。
-        self.dpi = ScaleLedger::at_creation(info.scale_factor);
-        println!(
-            "[deer-window] 窗口已建：title=\"{}\" extent={}x{} platform={:?} handle(HWND)=0x{:X} display(HINSTANCE)=0x{:X}",
-            self.config.display_title(),
-            info.extent.width,
-            info.extent.height,
-            info.raw.platform,
-            info.raw.handle,
-            info.raw.display
-        );
-
-        if let Err(e) = self.app.init(&info) {
-            return self.fail(event_loop, format!("App::init 失败：{e}"));
+        // **主窗批**（决策 2「主窗仍由 run() 首建」+ 决策 3「多 WindowConfig 启动」）：
+        // 按顺序每项建一扇窗；第一扇就是主窗。真正的建窗动作收在 [`RunHandler::create_window`]
+        // 一个点里（`spawn` 的动态建窗走的也是它）。
+        for config in std::mem::take(&mut self.configs) {
+            self.create_window(event_loop, &config);
+            if self.error.is_some() {
+                // create_window 内部已经 fail()（打印 + 记住 + 请求退出），别再往下建。
+                return;
+            }
         }
-
-        // M5c：把唤醒句柄交给 App（**建窗后调一次**，在 `init` 之后、引导帧之前）。
-        // 默认实现什么都不做 ⇒ M5c 之前写的 App 一行都不用改。
-        self.app.wake_handle(self.waker.clone());
-
-        // IME：winit 要求**显式允许**才会发 `Ime` 事件（`Ime::Commit` 是中文/日文输入的
-        // 文本来源）。不开的话 CJK 输入在本层完全收不到 —— 那就与「输入通路已接通」相反。
-        window.set_ime_allowed(true);
-
-        self.info = Some(info);
-        self.window = Some(window);
 
         // **纯阻塞**：没有事件就睡死（旧版是 `Poll`：一直空转问「有没有事」）。
         // 刻意**不**用 `WaitUntil` 兜底 —— 超时唤醒就是隐藏的空转，省电模式会名存实亡。
@@ -989,32 +1309,26 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
         // 由 `refresh_control_flow` 按 `App::next_deadline` / `Waker::wake_after` 收敛。
         // App 什么都没声明 ⇒ 走 `Wait` 这一支（与 M5b 逐字同行为）。
         self.refresh_control_flow(event_loop);
-
-        // **引导帧**：winit 对「建窗后一定发一条 `RedrawRequested`」**没有保证**
-        // （见 winit 0.30 `Window::request_redraw` 的「no strong guarantees」），
-        // 而 `OnDemand` 下 App 没有别的办法要到第一帧（它拿不到窗口句柄）⇒ 这里主动要一帧，
-        // 否则窗口会一直留一块没画过的区域，`Continuous` 的续帧链也根本起不来。
-        // 这是一次性的引导，不是空转：之后要么由输入/系统事件置位，要么由 `Continuous` 续帧。
-        //
-        // ⚠️ 诚实注记（M5c 复审 M2）：**这一行在 Windows 上删掉也全绿** —— 那一帧其实是 OS
-        // （窗口显示后的 WM_PAINT）给的，`wake_probe` 恒等式里那个 `+1` 因此**没有对应计数器**，
-        // 它是一个关于 winit/OS 的**假设**（实测：删掉本行 `frames` 仍是 6、`requests` 9→8）。
-        // 保留它是为了**非 Windows / 其它 winit 后端**，以及「没有 OS 帧时 OnDemand 也能起步」。
-        self.request_redraw();
     }
 
-    /// **用户事件到达**（唯一来源是本层的 [`Waker`]；`Wake` 是私有类型，App 塞不进来别的）。
+    /// **用户事件到达**（来源只有本层的 [`Waker`] 与 [`WindowSpawner`]；`Wake` 是私有类型，
+    /// App 塞不进来别的）。
     ///
-    /// 两条路（语义差异见 `lib.rs` 的 crate 文档「唤醒面」，别把两者写成一样）：
+    /// 三条路（语义差异见 `lib.rs` 的 crate 文档，别把三者写成一样）：
     ///
     /// - `Wake::Look`（[`Waker::wake`]）：**与输入同一把尺** —— 先问 [`App::wants_redraw`]，
     ///   答真才请求一帧（答假记一次 `skipped`，**不**混进输入的「跳过帧」口径）；
+    ///   唤醒是 **App 级**的 ⇒ 请求发给**所有**活窗。
     /// - `Wake::At(t)`（[`Waker::wake_after`]）：只**装** deadline（记一次 `arms`），
     ///   **不画** —— 到点由 [`RunHandler::refresh_control_flow`] 兑现（那时才请求）。
+    /// - `Wake::Spawn(config)`（[`WindowSpawner::spawn_window`]，T4.4-R1）：**排队的建窗请求
+    ///   到站** —— 这里正持 [`ActiveEventLoop`]，就是决策 2 说的「安全点」，真正建窗
+    ///   （[`RunHandler::create_window`]，与主窗批同一条路）。错误/退出中到达的请求被丢弃
+    ///   （与 `Look`/`At` 同一守卫）。
     ///
-    /// 收尾处**显式重算** `ControlFlow`：`wake_after` 的 deadline 就是在这一刻装上的。
-    /// 不靠「`about_to_wait` 反正马上会来一次」——那种依赖 winit 事件顺序的推理，
-    /// 读代码的人不该被迫做。
+    /// 收尾处**显式重算** `ControlFlow`：`wake_after` 的 deadline 与 spawn 的建窗都是在
+    /// 这一刻落地的。不靠「`about_to_wait` 反正马上会来一次」——那种依赖 winit 事件顺序的
+    /// 推理，读代码的人不该被迫做。
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Wake) {
         if self.error.is_some() || self.exiting {
             return;
@@ -1023,7 +1337,7 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
             Wake::Look => {
                 let wants = self.app.wants_redraw();
                 if self.wake_stats.on_look(wants) {
-                    self.request_redraw();
+                    self.request_redraw_all();
                 }
             }
             Wake::At(at) => {
@@ -1031,6 +1345,7 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
                 // 排了多次取最近的那个：早的先到点。
                 self.armed = earliest(self.armed, Some(at));
             }
+            Wake::Spawn(config) => self.create_window(event_loop, &config),
         }
         self.refresh_control_flow(event_loop);
     }
@@ -1051,55 +1366,67 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
         self.refresh_control_flow(event_loop);
     }
 
+    /// winit 把窗口事件连同**它的**窗口 id 一起送来（T4.4-R1 的路由入口）：先换算成本层的
+    /// [`WindowId`]（`alive` 表是两套 id 的唯一换算点），再把事件落到**该窗自己的**纯状态上
+    /// （[`WindowEntry`]：光标账本 / DPI 账本 / IME 状态 / info）。未知窗的事件（销毁竞态）
+    /// 直接丢弃 —— 与「没有窗口就没有输入」同一口径。
+    ///
+    /// 单窗口行为与拆分前**逐字一致**：只有一扇窗时，这里的每条路由都落在那唯一一份状态上。
     fn window_event(
         &mut self,
         event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
+        window_id: WinitWindowId,
         event: WindowEvent,
     ) {
         if self.error.is_some() || self.exiting {
             return;
         }
+        // 两套 id 的换算点（后续所有分支都要用本层 id 查 `table`）。
+        let Some(id) = self.alive.get(&window_id).map(|live| live.id) else {
+            return;
+        };
         match event {
             WindowEvent::Resized(size) => {
-                self.extent = Extent { width: size.width, height: size.height };
-                // `WindowInfo` 跟着更新：`App::input` 拿到的尺寸必须与 `resized` 同口径，
+                let Some(entry) = self.table.get_mut(id) else { return };
+                let extent = Extent { width: size.width, height: size.height };
+                // `WindowInfo` 跟着更新：`window_input` 拿到的尺寸必须与 `resized` 同口径，
                 // 否则输入坐标会按旧尺寸解释（点偏）。
-                if let Some(info) = &mut self.info {
-                    info.extent = self.extent;
+                entry.info.extent = extent;
+                // 收尾摘要的口径 = 主窗的最近尺寸（单窗时就是那扇 —— 与拆分前一致）。
+                if self.main == Some(id) {
+                    self.extent = extent;
                 }
                 if let Err(e) = self.app.resized(size.width, size.height) {
                     self.fail(
                         event_loop,
                         format!("App::resized({}x{}) 失败：{e}", size.width, size.height),
-                    )
+                    );
+                    return;
                 }
                 // **系统事件一律置位**：尺寸变了必须重画（不然窗口留一片脏区），
                 // 而且这不看 `App::wants_redraw`、也不看策略 —— 系统说「要重画」就是「要重画」。
-                self.request_redraw();
+                // （T4.4-R1：定向给**变了的那扇窗**。）
+                self.request_redraw_for(window_id);
             }
             WindowEvent::ScaleFactorChanged { scale_factor, inner_size_writer: _ } => {
                 // AF-3（Q4=**只透传**）：把 OS 报的 scale_factor 原样记账并转发给 App，
                 // **本层不换算任何坐标**（事件坐标与 `WindowInfo::extent` 仍是物理像素）。
                 //
                 // `inner_size_writer` **刻意不碰**（`_`）：winit 的语义是「写它 = 改窗口
-                // 物理尺寸；不写 = 窗口保持现有物理像素」（winit 0.30.13 Windows 后端
-                // `runner.rs::dispatch_event`：只有写了**不同**值才 `set_size`）。保持
-                // 物理尺寸就是最纯粹的透传 —— 「按 OS 建议把窗口放大」需要复刻 winit 的
-                // `logical×new_scale` 计算（event_loop.rs 的 WM_DPICHANGED 分支），那是
-                // 一层换算、还会跟 winit 的实现漂，Q4 裁断不做。
+                // 物理尺寸；不写 = 窗口保持现有物理像素」。保持物理尺寸就是最纯粹的透传 ——
+                // 「按 OS 建议把窗口放大」需要复刻 winit 的 `logical×new_scale` 计算，
+                // 那是一层换算，Q4 裁断不做。⇒ **不会**有 `Resized` 跟随（物理尺寸没变）。
                 //
-                // ⚠️ 因此**不会**有 `Resized` 跟随（物理尺寸没变），`App::resized` 不触发
-                // —— 这次变化只有 `scale_factor` 本身；几何/坐标全部照旧（物理像素），
-                // App 拿到新系数想怎么用是它自己的事。
-                let ev = self.dpi.on_scale_factor_changed(scale_factor);
-                if let Some(info) = &mut self.info {
-                    info.scale_factor = scale_factor;
-                }
+                // T4.4-R1：DPI 账本与 `info.scale_factor` 都是该窗**自己**的那一份。
+                let ev = {
+                    let Some(entry) = self.table.get_mut(id) else { return };
+                    let ev = entry.dpi.on_scale_factor_changed(scale_factor);
+                    entry.info.scale_factor = scale_factor;
+                    ev
+                };
                 // **系统事件一律置位**（与 `Resized`/`Focused` 同档，六条规则表里的一类）：
-                // DPI 变了必须重画一帧 —— 拿到新系数的 App 才有机会在同一帧里用它；
-                // 交换链在 DPI 切换后也值得重present一次。不看 `App::wants_redraw`。
-                self.dispatch(event_loop, &ev, Gate::Always);
+                // DPI 变了必须重画一帧。不看 `App::wants_redraw`。
+                self.dispatch(event_loop, window_id, &ev, Gate::Always);
             }
             WindowEvent::RedrawRequested => {
                 let result = self.app.redraw();
@@ -1109,27 +1436,56 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
                             self.exiting = true;
                             event_loop.exit();
                         } else if self.policy.wants_next_frame() {
-                            // `Continuous`：每画完一帧再请求下一帧（这一条就是「连续重绘」的发动机）。
-                            // `OnDemand` 什么都不做 ⇒ 没有输入/系统事件就**不再有下一帧**（省电）。
-                            self.request_redraw();
+                            // `Continuous`：每画完一帧再请求下一帧（这一条就是「连续重绘」的发动机）；
+                            // T4.4-R1：续帧续在**刚画完的那扇窗**上。`OnDemand` 什么都不做 ⇒
+                            // 没有输入/系统事件就**不再有下一帧**（省电）。
+                            self.request_redraw_for(window_id);
                         }
                     }
                     Err(e) => self.fail(event_loop, format!("App::redraw 失败：{e}")),
                 }
             }
-            // 关闭请求：只有 App 说 Exit 才退（`close_requested` 的返回值语义）。
-            WindowEvent::CloseRequested if self.app.close_requested() == Flow::Exit => {
-                self.exiting = true;
-                event_loop.exit();
+            // 关闭语义（决策 4）：`CloseRequested` **只关被请求的那扇窗**（`Arc` 落下 ⇒
+            // winit 销毁它）；**全部窗口关闭** ⇒ 事件循环退出。App 仍有一票否决
+            // （`close_requested() == Continue` ⇒ 哪扇都不关 —— 与拆分前同语义）。
+            WindowEvent::CloseRequested => {
+                if self.app.close_requested() == Flow::Exit {
+                    match self.table.close(id) {
+                        CloseOutcome::Closed { last } => {
+                            self.alive.remove(&window_id);
+                            if last {
+                                self.exiting = true;
+                                event_loop.exit();
+                            }
+                        }
+                        CloseOutcome::Unknown => {}
+                    }
+                }
+            }
+            // 窗口被外部销毁（或上面 close 落地后的回执）：账面清理**必须幂等**
+            // （[`WindowTable::close`] 对未知 id 是 `Unknown` ⇒ 无动作）。
+            // 最后一扇窗没了 ⇒ 退出（决策 4 的另一半：「全部窗口关闭 ⇒ 事件循环退出」）。
+            WindowEvent::Destroyed => {
+                let _ = self.table.close(id);
+                self.alive.remove(&window_id);
+                if self.table.is_empty() {
+                    self.exiting = true;
+                    event_loop.exit();
+                }
             }
 
-            // ——— 输入事件的翻译（winit 事件 → 本层 `InputEvent` → `App::input`）———
-            // 普通输入一律走 `Gate::AppDecides`：**只有** `App::wants_redraw` 为真才请求重绘。
+            // ——— 输入事件的翻译（winit 事件 → 本层 `InputEvent` → 该窗 → `App::window_input`）———
+            // 普通输入一律走 `Gate::AppDecides`：**只有** `App::wants_redraw` 为真才请求重绘，
+            // 且**定向给来源窗**。
             WindowEvent::CursorMoved { position, .. } => {
                 // **不做窗口边界过滤**（`PointerRoute` 约定 1）：拖出去的移动照样投给 App，
                 // interaction 层的指针捕获（按下即捕获，D7）靠这条流。
-                let ev = self.pointer.on_cursor_moved(position.x as f32, position.y as f32);
-                self.dispatch(event_loop, &ev, Gate::AppDecides);
+                // T4.4-R1：账本是**该窗自己的**（A 窗的拖拽不会污染 B 窗的最近光标）。
+                let ev = {
+                    let Some(entry) = self.table.get_mut(id) else { return };
+                    entry.pointer.on_cursor_moved(position.x as f32, position.y as f32)
+                };
+                self.dispatch(event_loop, window_id, &ev, Gate::AppDecides);
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 let Some(button) = map_mouse_button(button) else {
@@ -1137,14 +1493,17 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
                     // **不**派发、**不**请求重绘（也就不会产生「不明点击」）。
                     return;
                 };
-                // 坐标 = 最近一次光标位置（`PointerRoute` 约定 2）：拖出去在外面抬起，
+                // 坐标 = **该窗**最近一次光标位置（`PointerRoute` 约定 2）：拖出去在外面抬起，
                 // `PointerUp` 带最后已知位置，结算归 interaction 层的捕获者。
-                let ev = self.pointer.on_mouse_button(button, state == ElementState::Pressed);
-                self.dispatch(event_loop, &ev, Gate::AppDecides);
+                let ev = {
+                    let Some(entry) = self.table.get_mut(id) else { return };
+                    entry.pointer.on_mouse_button(button, state == ElementState::Pressed)
+                };
+                self.dispatch(event_loop, window_id, &ev, Gate::AppDecides);
             }
             WindowEvent::MouseWheel { delta, .. } => {
                 let (dx, dy) = map_wheel(&delta);
-                self.dispatch(event_loop, &InputEvent::Wheel { dx, dy }, Gate::AppDecides);
+                self.dispatch(event_loop, window_id, &InputEvent::Wheel { dx, dy }, Gate::AppDecides);
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 // 合成的按键事件（失焦时系统补发的 KeyUp）**照发**：上层的「按住的键」
@@ -1156,56 +1515,100 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
                         // **物理键先发**：`Char('a')`/`Enter`/`Tab`… 一律先来 KeyDown。
                         // T3.6：winit 的 `event.repeat` 首次建模进事件 —— OS 的按键重复
                         // （长按补发）从此**可区分**；`Gate::AppDecides` 照旧。
-                        self.dispatch(event_loop, &InputEvent::KeyDown { key, mods, repeat: event.repeat }, Gate::AppDecides);
+                        self.dispatch(
+                            event_loop,
+                            window_id,
+                            &InputEvent::KeyDown { key, mods, repeat: event.repeat },
+                            Gate::AppDecides,
+                        );
                         // **文本与物理键分开**：IME 预编辑中由 `Ime::Commit` 负责文本
                         // （免得中文重复上屏）；`Enter/Tab/Backspace/Esc` 的 text 是
                         // 控制字符，被 `printable_text` 挡掉 ⇒ 它们只有 KeyDown。
-                        let text = if self.ime_composing {
+                        // T4.4-R1：预编辑状态是**该窗自己**的。
+                        let composing =
+                            self.table.get(id).is_some_and(|entry| entry.ime_composing);
+                        let text = if composing {
                             None
                         } else {
                             printable_text(event.text.as_deref())
                         };
                         if let Some(text) = text {
-                            self.dispatch(event_loop, &InputEvent::TextInput { text }, Gate::AppDecides);
+                            self.dispatch(
+                                event_loop,
+                                window_id,
+                                &InputEvent::TextInput { text },
+                                Gate::AppDecides,
+                            );
                         }
                     }
                     ElementState::Released => {
-                        self.dispatch(event_loop, &InputEvent::KeyUp { key, mods }, Gate::AppDecides);
+                        self.dispatch(
+                            event_loop,
+                            window_id,
+                            &InputEvent::KeyUp { key, mods },
+                            Gate::AppDecides,
+                        );
                     }
                 }
             }
             WindowEvent::Ime(ime) => match ime {
                 Ime::Commit(text) => {
-                    self.ime_composing = false;
                     // 空提交（预编辑被清掉）不算输入 ⇒ 不派发、不重绘。
+                    if let Some(entry) = self.table.get_mut(id) {
+                        entry.ime_composing = false;
+                    }
                     if !text.is_empty() {
-                        self.dispatch(event_loop, &InputEvent::TextInput { text }, Gate::AppDecides);
+                        self.dispatch(
+                            event_loop,
+                            window_id,
+                            &InputEvent::TextInput { text },
+                            Gate::AppDecides,
+                        );
                     }
                 }
                 Ime::Preedit(text, _) => {
                     // ① 仍用它抑制按键文本（避免「预编辑中按键的 text」与「Commit」双写）；
                     // ② **并且真的派发**（T3.4 起预编辑被建模了 —— UI 层要拿它画下划线）。
-                    // `Gate::Always`：预编辑是**视觉**状态（与焦点同类），一变就该重画；
-                    // 若走 `AppDecides`，中文输入时那一段拼写就不会显示出来。
-                    self.ime_composing = !text.is_empty();
-                    self.dispatch(event_loop, &InputEvent::ImePreedit { text }, Gate::Always);
+                    // `Gate::Always`：预编辑是**视觉**状态（与焦点同类），一变就该重画。
+                    // T4.4-R1：状态记在**该窗自己**的账上。
+                    if let Some(entry) = self.table.get_mut(id) {
+                        entry.ime_composing = !text.is_empty();
+                    }
+                    self.dispatch(
+                        event_loop,
+                        window_id,
+                        &InputEvent::ImePreedit { text },
+                        Gate::Always,
+                    );
                 }
-                Ime::Enabled | Ime::Disabled => self.ime_composing = false,
+                Ime::Enabled | Ime::Disabled => {
+                    if let Some(entry) = self.table.get_mut(id) {
+                        entry.ime_composing = false;
+                    }
+                }
             },
             WindowEvent::Focused(focused) => {
-                // **系统事件一律置位**：焦点变化算系统事件（`Gate::Always`），不看 `wants_redraw` ——
-                // 光标/焦点框这类视觉状态一变，界面就该重画，不该由 App 的脏标记决定。
-                self.dispatch(event_loop, &InputEvent::FocusChanged { focused }, Gate::Always);
+                // **每窗独立焦点**（决策 5）：winit 本就按窗发 `Focused`，这里按 id 路由 ——
+                // App 收到的 `FocusChanged` 只关于**这一扇窗**（每窗一份 UiState 焦点的前提）。
+                // **系统事件一律置位**：焦点变化算系统事件（`Gate::Always`），不看
+                // `wants_redraw` —— 光标/焦点框这类视觉状态一变，界面就该重画。
+                self.dispatch(
+                    event_loop,
+                    window_id,
+                    &InputEvent::FocusChanged { focused },
+                    Gate::Always,
+                );
             }
             WindowEvent::Occluded(false) => {
                 // 窗口**重新暴露**（从被遮挡状态回来）：必须重画（期间交换链可能已过期）⇒ 系统事件一律置位。
                 // 诚实说明：winit 0.30 的文档明确写 Windows **不支持**这个事件（iOS/Android 才有），
                 // 所以这一臂在 Windows 上是「接线接好了但系统不喂」—— 不假装它在 Windows 上跑过。
-                self.request_redraw();
+                self.request_redraw_for(window_id);
             }
             WindowEvent::ModifiersChanged(modifiers) => {
                 // 只记账：修饰键在 `InputEvent` 里是键盘事件的**字段**，没有单独的事件 ⇒
                 // 不派发、也不请求重绘（单独按 Shift 不会让界面有任何变化）。
+                // 键盘是连接级状态 ⇒ 记在 handler 的一份上（不是每窗一份）。
                 self.mods = map_mods(modifiers.state());
             }
             // 其余事件（触摸/手势/拖放/CursorEntered…）本期不转发：见模块文档的「仍未接线」。
@@ -1347,6 +1750,217 @@ mod scale_ledger_tests {
             dpi.current(),
             2.0,
             "账本必须停在最近一次变化上（停在 1.5 ⇒ 记账被改坏；停在 1.0 ⇒ 没记账）"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 多窗口路由 / 关闭语义的单测（T4.4-R1；不建窗口、不跑事件循环 —— 与
+// `pointer_route_tests` 同一纪律：测的是纯逻辑，`Arc<Window>` 根本不出现。
+// `WindowId` 用本层自发的序号（`from_raw`）造两个不同的键 —— winit 的 id 没有
+// 公开构造，这正是「本层自己发 id」这个设计的原因之一）
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod window_table_tests {
+    use super::{CloseOutcome, WindowEntry, WindowTable, WindowId};
+    use crate::{InputEvent, PointerButton, WindowInfo, raw_handle_from_win32};
+    use deer_gpu::Extent;
+
+    /// 造一份假窗的纯状态（句柄值是编的 —— 纯逻辑测试不碰真窗口；scale 用来区分窗）。
+    fn entry(scale_factor: f64) -> WindowEntry {
+        WindowEntry::at_creation(WindowInfo {
+            raw: raw_handle_from_win32(0x1A2B, 0x7FF6_0000),
+            extent: Extent { width: 320, height: 200 },
+            scale_factor,
+        })
+    }
+
+    fn id(n: u64) -> WindowId {
+        WindowId::from_raw(n)
+    }
+
+    /// **事件到对的窗**（决策 1/6）：喂给 B 的移动只进 **B 的**账本；A 的账本纹丝不动、
+    /// A 的 info 也不被 B 的事件改掉 —— 「每窗一份状态」是路由表存在的意义。
+    #[test]
+    fn input_routes_to_the_window_it_belongs_to() {
+        let mut t = WindowTable::new();
+        t.insert(id(1), entry(1.0));
+        t.insert(id(2), entry(2.0));
+        assert_eq!(t.len(), 2, "前置：两扇窗都得在表上");
+
+        // B(2) 收到一条**窗外**移动；随后 B 的抬起带它（T3.7 捕获语义依赖的账本行为）。
+        let moved = {
+            let e = t.get_mut(id(2)).expect("B 在表上");
+            e.pointer.on_cursor_moved(-37.5, 12.0)
+        };
+        assert_eq!(moved, InputEvent::PointerMoved { x: -37.5, y: 12.0 });
+        let up_b = {
+            let e = t.get(id(2)).expect("B 在表上");
+            e.pointer.on_mouse_button(PointerButton::Left, false)
+        };
+        assert_eq!(
+            up_b,
+            InputEvent::PointerUp { button: PointerButton::Left, x: -37.5, y: 12.0 },
+            "B 的抬起必须带 **B 的**最近光标位置"
+        );
+
+        // A(1) 从头到尾没收到事件：它的抬起必须还带它自己的 (0,0) 初值 ——
+        // 被 B 的移动污染（共享账本）或停在别处（路由错了窗）都会在这里红。
+        let up_a = {
+            let e = t.get(id(1)).expect("A 在表上");
+            e.pointer.on_mouse_button(PointerButton::Left, false)
+        };
+        assert_eq!(
+            up_a,
+            InputEvent::PointerUp { button: PointerButton::Left, x: 0.0, y: 0.0 },
+            "A 没收到过移动 ⇒ 抬起带它自己的初值，不能被 B 的移动污染"
+        );
+
+        // DPI 同理：B 的 ScaleFactorChanged 只动 B 的账本与 info。
+        let ev_b = {
+            let e = t.get_mut(id(2)).expect("B 在表上");
+            let ev = e.dpi.on_scale_factor_changed(1.5);
+            e.info.scale_factor = 1.5; // 与 RunHandler 同一步（info 与账本同源同值）
+            ev
+        };
+        assert_eq!(ev_b, InputEvent::ScaleFactorChanged { scale_factor: 1.5 });
+        assert_eq!(
+            t.get(id(1)).expect("A 在表上").info.scale_factor,
+            1.0,
+            "A 的 DPI 不能被 B 的事件改掉"
+        );
+        assert_eq!(
+            t.get(id(2)).expect("B 在表上").info.scale_factor,
+            1.5,
+            "B 的 info 必须跟着它自己的 DPI 事件走"
+        );
+    }
+
+    /// **关闭语义状态机**（决策 4）：只关被请求的那扇；还剩别的窗 ⇒ `last=false`
+    /// （事件循环继续）；关到最后一扇 ⇒ `last=true`（该退出）；关不存在的 id ⇒
+    /// `Unknown` 且**不动表**（幂等 —— `Destroyed` 回执与关闭竞态靠它不炸）。
+    #[test]
+    fn close_semantics_state_machine() {
+        let mut t = WindowTable::new();
+        t.insert(id(1), entry(1.0));
+        t.insert(id(2), entry(1.0));
+        t.insert(id(3), entry(1.0));
+
+        // 关中间那扇：还剩两扇 ⇒ 不退出。
+        assert_eq!(t.close(id(2)), CloseOutcome::Closed { last: false }, "还剩别的窗 ⇒ 不退出");
+        assert_eq!(t.len(), 2);
+
+        // 再关同一扇（重复 CloseRequested / Destroyed 回执）：Unknown ⇒ 无动作。
+        assert_eq!(t.close(id(2)), CloseOutcome::Unknown, "未知/已关的 id 必须是 Unknown");
+        assert_eq!(t.len(), 2, "Unknown 不得动表（幂等）");
+
+        // 关到最后一扇：last=true ⇒ handler 据此请求事件循环退出。
+        assert_eq!(t.close(id(1)), CloseOutcome::Closed { last: false });
+        assert_eq!(t.close(id(3)), CloseOutcome::Closed { last: true }, "最后一扇 ⇒ 该退出");
+        assert!(t.is_empty());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// `App::window_input` 默认转发的单测（T4.4-R1，决策 1；trait 级纯逻辑 —— 不碰事件循环）
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod window_input_forwarding_tests {
+    use super::{App, Flow, WindowId};
+    use crate::{InputEvent, WindowInfo, raw_handle_from_win32};
+    use deer_gpu::Extent;
+
+    fn info() -> WindowInfo {
+        WindowInfo {
+            raw: raw_handle_from_win32(0x1A2B, 0x7FF6_0000),
+            extent: Extent { width: 320, height: 200 },
+            scale_factor: 1.0,
+        }
+    }
+
+    /// 只实现 `input` 的 App（**单窗口用户的既有写法**）：默认 `window_input` 必须把事件
+    /// **原样转发**进 `input` —— 「单窗口用户零改动」就是这一条（决策 1）。
+    struct LegacyApp {
+        inputs: Vec<InputEvent>,
+    }
+
+    impl App for LegacyApp {
+        fn init(&mut self, _info: &WindowInfo) -> Result<(), String> {
+            Ok(())
+        }
+        fn redraw(&mut self) -> Result<Flow, String> {
+            Ok(Flow::Continue)
+        }
+        fn input(&mut self, _info: &WindowInfo, ev: &InputEvent) -> Result<Flow, String> {
+            self.inputs.push(ev.clone());
+            Ok(Flow::Continue)
+        }
+    }
+
+    /// **覆盖了** `window_input` 的多窗口 App：它必须拿到 (id, 事件)，而 `input` **不再被调**
+    /// （转发只发生在默认实现里 —— 不然两条路都会响，多窗口 App 会被同一事件打两次）。
+    struct MultiApp {
+        calls: Vec<(WindowId, InputEvent)>,
+        legacy_inputs: usize,
+    }
+
+    impl App for MultiApp {
+        fn init(&mut self, _info: &WindowInfo) -> Result<(), String> {
+            Ok(())
+        }
+        fn redraw(&mut self) -> Result<Flow, String> {
+            Ok(Flow::Continue)
+        }
+        fn window_input(
+            &mut self,
+            id: WindowId,
+            _info: &WindowInfo,
+            ev: &InputEvent,
+        ) -> Result<Flow, String> {
+            self.calls.push((id, ev.clone()));
+            Ok(Flow::Continue)
+        }
+        fn input(&mut self, _info: &WindowInfo, _ev: &InputEvent) -> Result<Flow, String> {
+            self.legacy_inputs += 1;
+            Ok(Flow::Continue)
+        }
+    }
+
+    #[test]
+    fn default_window_input_forwards_to_input() {
+        let mut app = LegacyApp { inputs: Vec::new() };
+        let ev = InputEvent::PointerMoved { x: 3.0, y: 4.0 };
+        // 两条**不同的** id 都要转发（默认实现不挑窗 —— 单窗口时代它只有一个 id 而已）。
+        for wid in [WindowId::from_raw(1), WindowId::from_raw(2)] {
+            let flow = app
+                .window_input(wid, &info(), &ev)
+                .expect("默认转发不该报错");
+            assert_eq!(flow, Flow::Continue, "默认实现不改变 Flow 语义");
+        }
+        assert_eq!(app.inputs.len(), 2, "每条 window_input 都应转发进 input");
+        assert_eq!(app.inputs[0], ev, "转发的是**同一条**事件（不丢不改）");
+    }
+
+    #[test]
+    fn overridden_window_input_receives_its_own_window_and_silences_input() {
+        let mut app = MultiApp { calls: Vec::new(), legacy_inputs: 0 };
+        let ev = InputEvent::TextInput { text: "hi".to_string() };
+        let flow = app
+            .window_input(WindowId::from_raw(2), &info(), &ev)
+            .expect("覆盖者自己决定语义；本实现返回 Continue");
+        assert_eq!(flow, Flow::Continue);
+        assert_eq!(app.calls.len(), 1, "覆盖者恰好收到这一次调用");
+        assert_eq!(
+            app.calls[0].0,
+            WindowId::from_raw(2),
+            "覆盖者必须拿到**事件所属窗**的 id（路由的钥匙）"
+        );
+        assert_eq!(app.calls[0].1, ev, "事件原样抵达");
+        assert_eq!(
+            app.legacy_inputs, 0,
+            "覆盖 window_input 之后 input **不再被调**（转发只在默认实现里）"
         );
     }
 }
