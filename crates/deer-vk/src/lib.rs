@@ -52,7 +52,7 @@ pub use pipelines::{build_pipeline_resources, PipelineResources, PipelineState, 
 pub use surface::Surface;
 pub use vertex_unify::{UnifiedVertex, SHAPE_UV_SENTINEL};
 pub use swapchain::{Acquire, Present, Semaphore, Swapchain, SwapchainConfig};
-pub use windowed::{FrameOutcome, WindowedRenderer};
+pub use windowed::{FrameOutcome, PRIMARY_WINDOW_ID, WindowId, WindowedRenderer};
 
 use deer_core::{ GpuError, GpuResult };
 use deer_gpu::{ AdapterInfo, AdapterKind, Backend, Device };
