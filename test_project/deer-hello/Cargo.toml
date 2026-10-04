@@ -6,4 +6,11 @@ edition = "2024"
 [dependencies]
 # 相对路径：从本清单所在目录（`test_project/deer-hello/`）回两级就是仓库根。
 # 这样 clone 到任何盘符/目录都能直接 `cargo build`，不必按作者的机器改路径。
-deer-gui = { path = "../../crates/deer-gui" }
+# `window` feature：main.rs 的四档跑法里有三档是真窗口，`deer_gui::window` 在
+# deer-gui 里是 `#[cfg(feature = "window")]` ⇒ 不开它连编译都过不了。
+# （winit 是本 workspace 唯一登记在案的第三方依赖例外，见 ROADMAP.md Q-1。）
+deer-gui = { path = "../../crates/deer-gui", features = ["window"] }
+# `find_system_font` 公开在 L1 crate `deer-text` 上（`deer_gui::gpu` 别名只覆盖
+# deer-gpu 的东西，prelude 也没导出它）⇒ 独立工程必须直接依赖它才能 `use deer_text::…`，
+# 与权威示例 `crates/deer-gui/examples/hello_window.rs` 的导入完全一致。
+deer-text = { path = "../../crates/deer-text" }
