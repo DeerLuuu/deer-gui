@@ -71,7 +71,7 @@ pub struct PropSpec {
 // —— 适用面常量：把「哪些 Kind 有意义」写成具名集合，避免每条登记各写一遍数组 ——
 
 /// 任何节点都可以设（尺寸与生长权重对容器/叶子都成立）。
-const ANY: [Kind; 8] = [
+const ANY: [Kind; 12] = [
     Kind::Column,
     Kind::Row,
     Kind::Text,
@@ -80,6 +80,10 @@ const ANY: [Kind; 8] = [
     Kind::Segmented,
     Kind::ChipGroup,
     Kind::TabBar,
+    Kind::NumberField,
+    Kind::ScrubNum,
+    Kind::Switch,
+    Kind::ColorField,
 ];
 /// 只有容器排得下子节点 ⇒ 内边距 / 间距 / 主轴对齐。
 /// 选择类三种组是容器（M6 5c）——它们的孩子就是选项，同样吃这套布局参数。
@@ -92,8 +96,18 @@ const CONTAINERS: [Kind; 5] = [
 ];
 /// 只有容器有「子节点整体位移」这回事。
 const SCROLLABLE: [Kind; 1] = [Kind::Column];
-/// 有文本内容的节点。
-const TEXTUAL: [Kind; 3] = [Kind::Text, Kind::Button, Kind::Field];
+/// 有文本内容的节点。M6 5d 的四种数值类控件全部带标签
+/// （`NumberField`/`ColorField` 是占位草稿、`ScrubNum` 是**值的显示串**、
+/// `Switch` 是开关上的文字）⇒ 与 Text/Button/Field 同进 `label` 的适用面。
+const TEXTUAL: [Kind; 7] = [
+    Kind::Text,
+    Kind::Button,
+    Kind::Field,
+    Kind::NumberField,
+    Kind::ScrubNum,
+    Kind::Switch,
+    Kind::ColorField,
+];
 /// 换行只对纯文本有意义（按钮/输入框的换行是另一件事，本期没做）。
 const TEXT_ONLY: [Kind; 1] = [Kind::Text];
 
@@ -417,7 +431,16 @@ mod tests {
 
         // 叶子共同点：都能设尺寸/grow/禁用/流外定位（`disabled` 对整棵子树生效 ⇒ 叶子也适用）
         // L2/L3：`cross_self`（叶子也能是别人家的子节点）与 min/max（与 width/height 同面）也是 ANY
-        for leaf in [Kind::Text, Kind::Button, Kind::Field] {
+        // M6 5d：四种数值类控件同为叶子 ⇒ 与 Text/Button/Field 同一套共同点（有 `label` 在上）。
+        for leaf in [
+            Kind::Text,
+            Kind::Button,
+            Kind::Field,
+            Kind::NumberField,
+            Kind::ScrubNum,
+            Kind::Switch,
+            Kind::ColorField,
+        ] {
             let ns = names(leaf);
             for expected in [
                 "width", "height", "min_w", "max_w", "min_h", "max_h", "grow", "cross_self",

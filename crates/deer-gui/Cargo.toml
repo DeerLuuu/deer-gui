@@ -105,6 +105,12 @@ required-features = ["testing"]
 name = "m6_select"
 required-features = ["testing"]
 
+# M6 5d：数值类（NumberField / ScrubNum / Switch / ColorField）的自检示例。同 m6_basics：
+# testkit 注入 + 离屏断言 ⇒ 必须显式写 `required-features`（理由与上段逐字相同）。
+[[example]]
+name = "m6_values"
+required-features = ["testing"]
+
 [lib]
 name = "deer_gui"
 path = "src/lib.rs"

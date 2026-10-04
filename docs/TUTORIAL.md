@@ -188,6 +188,33 @@ let tabs = p.tab_bar_opts("tabs", L::new().gap(2.0).to_props(), &["文件", "编
 cargo run -p deer-gui --features testing --example m6_select
 ```
 
+**数值类控件（M6 5d）**：表单里四种「值」各有现成构造 —— 它们是四种**叶子 Kind**：
+
+```rust
+// 数值输入框：草稿随便打，**提交才解析**（Enter 或点别处失焦）——
+// App 收 UiEvent::NumberChanged { id, value }（已按值域夹取）
+let age = p.number_field_opts("age", "0", |n| n.layout.width = Some(Size::Px(80.0)));
+
+// 拖动调值：按住左右拖改值（label 就是当前值的显示串，App 拿事件改数据后重建树）
+let vol = p.scrub_num_opts("vol", "40", |_| {});
+
+// 开关：点击 / Enter / Space 三路翻转 —— App 收 UiEvent::Toggled { id, on }
+let wifi = p.switch_opts("wifi", "Wi-Fi", |_| {});
+
+// 颜色输入框：#RRGGBB + 色块预览 —— App 收 UiEvent::ColorChanged { id, rgb }
+let tint = p.color_field_opts("tint", "#ff8800", |_| {});
+```
+
+两个要点：**值域/步长在 App 手里**（塞 `UiState` 的 `num_opts` 表，`NumOpts { min, max, step }`；
+不塞 = 无值域、步长 1.0/px）；数值/颜色**提交成功才发事件**（打字过程只有草稿在长），
+`Switch` 则是每次激活必翻转必发。开关开着是强调色底、关着是灰色底。语义、提交规则、
+「做不到什么」见 [`number-field`](features/number-field.md) / [`scrub-num`](features/scrub-num.md) /
+[`switch`](features/switch.md) / [`color-field`](features/color-field.md) 四份指南；能自检的完整示例：
+
+```sh
+cargo run -p deer-gui --features testing --example m6_values
+```
+
 ---
 
 ## 4. 换主题
@@ -490,7 +517,7 @@ deer-gui = { path = "../deer-gui/crates/deer-gui" }
 | **图片文件 → 像素** | ✅ BMP 已支持（`deer_gpu::image::decode_bmp`：24/32 位、底行优先 → RGBA8 → 直喂纹理）；**PNG 解码未做**（自有 png.rs 只是编码器）。见 [`features/image-decode.md`](features/image-decode.md) |
 | **高分屏 / DPI 缩放** | ✅ 透传（AF-3）：`WindowInfo.scale_factor` + `ScaleFactorChanged` 事件，OS 报多少给多少；**坐标与窗口尺寸仍是物理像素，不自动缩放**。见 [`features/window.md`](features/window.md) 第 8 节 |
 | **可停靠面板 dock** / 多窗口 | ❌ M6 |
-| 12 个 `deer-ui` 控件的语义 | ❌ M6（现在只有 5 种节点） |
+| 12 个 `deer-ui` 控件的语义 | 🔄 M6（节点已有 **12 种**：基础 5 种 + 选择类 3 种（5c）+ 数值类 4 种（5d）；仍缺 `Icon`/`DropMenu`/`Dialog`/`Overlay`/`HoverTip`） |
 
 完整清单与每个功能的边界：[`../FEATURES.md`](../FEATURES.md)。
 里程碑与顺序：[`../ROADMAP.md`](../ROADMAP.md)。

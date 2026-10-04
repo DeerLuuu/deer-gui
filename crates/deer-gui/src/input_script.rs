@@ -241,7 +241,11 @@ fn parse_key(s: &str, mods: Mods) -> Result<(Key, Mods), String> {
 }
 
 /// 一次脚本重放的**账本**（可断言、可打印）。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// ⚠️ M6 5d 起只保 `PartialEq`：`UiEvent::NumberChanged` 携带 `f64`、`UiState`
+/// 也含浮点字段（`NumOpts`/`ScrubAnchor`）⇒ `Eq` 不再成立（与 `UiEvent`/`UiState`
+/// 的 derive 同步收窄，理由见 `interaction.rs`）。
+#[derive(Debug, Clone, PartialEq)]
 pub struct ReplayResult {
     /// 脚本里每一条事件产生的 UI 事件（拼接在一起，按时间序）。
     pub events: Vec<UiEvent>,

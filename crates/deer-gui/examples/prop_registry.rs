@@ -120,5 +120,9 @@ fn kind_name(k: Kind) -> &'static str {
         Kind::Segmented => "Segmented",
         Kind::ChipGroup => "ChipGroup",
         Kind::TabBar => "TabBar",
+        Kind::NumberField => "NumberField",
+        Kind::ScrubNum => "ScrubNum",
+        Kind::Switch => "Switch",
+        Kind::ColorField => "ColorField",
     }
 }

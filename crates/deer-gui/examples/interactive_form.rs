@@ -1038,6 +1038,10 @@ fn expected_state() -> UiState {
         segments: Default::default(),
         chips: Default::default(),
         tabs: Default::default(),
+        // M6 5d 同一课：`num_opts`/`switches`/`scrub` 三个新字段 ⇒ 全空。
+        num_opts: Default::default(),
+        switches: Default::default(),
+        scrub: None,
     }
 }
 

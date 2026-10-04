@@ -143,28 +143,34 @@ pub fn unclipped() -> ClipSnapshot
 
 ```rust
 pub fn handle(state: &mut UiState, root: &Node, geo: &Geometry, clip: ClipSnapshot, ev: &InputEvent) -> Vec<UiEvent>
-pub fn focusables(root: &Node) -> Vec<String>   // Kind::Button | Kind::Field，且跳过禁用子树
+pub fn focusables(root: &Node) -> Vec<String>   // Button / Field / NumberField / ColorField / Switch，且跳过禁用子树
 ```
 
 | 输入 | 效果 |
 |---|---|
-| `PointerMoved` | 更新 `hover`（走 `hit`）；变化时发 `HoverChanged`。**捕获中**（`pressed` 在手，T3.7）⇒ **路由给捕获者**：hover 钉在捕获节点上，拖出节点/出树不换人 |
-| `PointerDown { Left }` | 同步 `hover`、记 `pressed`（**按下即捕获**，D7 默认捕获）；**命中可聚焦控件（`Button`/`Field`）⇒ 聚焦它** |
-| `PointerUp { Left }` | **按捕获者结算** `Clicked(id)`（抬起在哪都算 —— 拖出去再抬起也是捕获者的点击）；释放捕获，hover 回到抬起处的物理节点；**落点是选择类组（`Segmented`/`ChipGroup`/`TabBar`）的直接子节点 ⇒ 追加选择结算**（`SelectionChanged`/`ChipToggled`/`TabChanged`，见 §3.5） |
-| `KeyDown { Tab }` / `Shift+Tab` | 在 `focusables()` 里**按树序**循环焦点 ⇒ `FocusChanged` |
-| `KeyDown { Escape }` | 清焦点 ⇒ `FocusChanged(None)` |
-| `KeyDown { Backspace }` | 焦点是启用的输入框 ⇒ 删**一个 Unicode 字符**（不是字节）⇒ `TextChanged` |
-| `TextInput { text }` | 焦点是启用的输入框 ⇒ **追加**到 `texts[id]` ⇒ `TextChanged` |
+| `PointerMoved` | 更新 `hover`（走 `hit`）；变化时发 `HoverChanged`。**捕获中**（`pressed` 在手，T3.7）⇒ **路由给捕获者**：hover 钉在捕获节点上，拖出节点/出树不换人。**拖动调值锚点在手且捕获者仍是它** ⇒ 反解成值，**变了才发** `NumberChanged`（M6 5d） |
+| `PointerDown { Left }` | 同步 `hover`、记 `pressed`（**按下即捕获**，D7 默认捕获）；**命中可聚焦控件（`Button`/`Field`/`NumberField`/`ColorField`/`Switch`）⇒ 聚焦它**；**落在 `ScrubNum` 上 ⇒ 建立拖动锚点**（label 解析失败 = 不进入） |
+| `PointerUp { Left }` | **按捕获者结算** `Clicked(id)`（抬起在哪都算 —— 拖出去再抬起也是捕获者的点击）；释放捕获、清拖动锚点，hover 回到抬起处的物理节点；**落点是选择类组（`Segmented`/`ChipGroup`/`TabBar`）的直接子节点 ⇒ 追加选择结算**（`SelectionChanged`/`ChipToggled`/`TabChanged`，见 §3.5）；**落点本身是 `Switch` ⇒ 追加开关结算**（`Toggled`，翻转语义每次都发） |
+| `KeyDown { Tab }` / `Shift+Tab` | 在 `focusables()` 里**按树序**循环焦点 ⇒ `FocusChanged`；焦点从值输入框离开 ⇒ **失焦提交**（见下） |
+| `KeyDown { Escape }` | 清焦点 ⇒ `FocusChanged(None)`；焦点从值输入框离开 ⇒ 失焦提交 |
+| `KeyDown { Enter }` | 焦点在启用的**按钮**上 ⇒ `Clicked` + 选择结算；焦点在启用的**开关**上 ⇒ `Clicked` + 翻转；焦点在**值输入框**（`NumberField`/`ColorField`）上 ⇒ **提交**（解析 → 值事件 → 规范化回写）；普通 `Field` 不受 `Enter` 影响 |
+| `KeyDown { Char(' ') }`（= winit 的 Space） | 焦点在启用的**开关**上 ⇒ 与 `Enter` 同一条翻转路径；焦点在**值输入框**上不消费（空格是草稿正文）；其余不消费 |
+| `KeyDown { Backspace }` | 焦点是启用的**值输入框**（`Field`/`NumberField`/`ColorField`）⇒ 删**一个 Unicode 字符**（不是字节）⇒ `TextChanged` |
+| `TextInput { text }` | 焦点是启用的**值输入框** ⇒ 插入**光标处** ⇒ `TextChanged` |
+| 失焦提交（所有事件共用，`handle` 末尾） | 处理**前**焦点在值输入框、处理**后**焦点换了人（Tab/Escape/点别处）⇒ 替它提交一次（解析 → 发值事件 → 规范化回写）。窗口失焦**不动 UI 焦点** ⇒ 不触发 |
 | `Wheel { dy }` | **滚动**：`hover` 命中节点**最近的可滚动祖先（含自身）**偏移 `−dy × WHEEL_STEP_PX`，夹进 `[0, max_scroll]`；**变了才发** `Scrolled { id, offset }`。禁用子树不响应；没有可滚动祖先 / 上限为 0 / `dy = 0` ⇒ 空转 |
-| 其余（`KeyUp`、右/中键、方向键、`Key::Char`/`Other`、`focused: true`） | **不消费**（有测试钉住：不消费的事件**不得改变任何状态**） |
+| 其余（`KeyUp`、右/中键、非空格 `Key::Char`、`Key::Other`、`focused: true`） | **不消费**（有测试钉住：不消费的事件**不得改变任何状态**） |
 
 **`UiState` 是唯一真相**：`hover` / `focus` / `pressed`（= **左键捕获者**，T3.7 起，见上表）
-/ `texts: BTreeMap<String, String>`（不在表里的输入框视为空串）
+/ `texts: BTreeMap<String, String>`（不在表里的输入框视为空串；`Field`/`NumberField`/`ColorField` 共用）
 / `scroll: ScrollState`（**滚动偏移 + 每个容器的 `max_scroll`**）
-/ `segments`（M6 5c：分段组 id → 选中段 id）/ `chips`（芯片 id → 开/关）/ `tabs`（页签组 id → 活动页 id）——
-后三张是选择类控件的**值**（应用数据，texts 同一条纪律：按 id 键控、住树外、重建不丢）。
+/ `segments`（M6 5c：分段组 id → 选中段 id）/ `chips`（芯片 id → 开/关）/ `tabs`（页签组 id → 活动页 id）
+/ `num_opts`（M6 5d：控件 id → 值域/步长 `NumOpts`，表里没有 = 无值域、步长 1.0）
+/ `switches`（M6 5d：开关自身 id → 开/关，表里没有 = 关）/ `scrub`（M6 5d：拖动调值的**瞬态**锚点，抬起/失焦即清）——
+选择类与数值类的**值**是应用数据（texts 同一条纪律：按 id 键控、住树外、重建不丢）。
 **`UiEvent`** 是「发生了什么」：`HoverChanged` / `FocusChanged` / `Clicked` / `TextChanged` / `Scrolled { id, offset }`
-/ `SelectionChanged { id, selected }` / `ChipToggled { id, chip, on }` / `TabChanged { id, index }`（M6 5c，见 §3.5）。
+/ `SelectionChanged { id, selected }` / `ChipToggled { id, chip, on }` / `TabChanged { id, index }`（M6 5c，见 §3.5）
+/ `NumberChanged { id, value }` / `Toggled { id, on }` / `ColorChanged { id, rgb }`（M6 5d，见 §3.5）。
 
 > **滚动偏移为什么住在 `UiState` 里**：滚轮必须在**唯一入口**（`handle`）被消费。若另开一个
 > 「带滚动的 `handle`」，那条路径上的滚轮会静默无效而没人看得出来。偏移是**布局的输入**
@@ -181,11 +187,15 @@ pub fn same_visual(&self, other: &UiState) -> bool   // 只比 hover/focus/press
 `PointerDown` 就属于「**会改状态但可能不发 `UiEvent`**」的那一类（点空白处时 `pressed` 由 `Some` 变 `None`、
 事件列表却是空的）⇒ 只看事件会漏掉它，而且漏得很安静（界面看起来只是「不响应按下」）。
 
-### 3.5 选择类控件的值与事件（M6 5c）
+### 3.5 值类控件的值与事件（M6 5c 选择类 / 5d 数值类）
 
-`Segmented`（互斥单选）/ `ChipGroup`（多选开关）/ `TabBar`（页签）三种组的**值是应用数据**，
-住在 `UiState` 的公开字段里（texts 同一条纪律），控件只负责「点击 → 更新值 → 报告」。
-结算规则（r14，与 `interaction.rs` 的 `resolve_selection` 逐字同步）：
+`Segmented`（互斥单选）/ `ChipGroup`（多选开关）/ `TabBar`（页签）三种组与
+`NumberField` / `ScrubNum` / `Switch` / `ColorField` 四种数值类控件的**值是应用数据**，
+住在 `UiState` 的公开字段里（texts 同一条纪律），控件只负责「交互 → 更新值 → 报告」。
+结算规则（与 `interaction.rs` 的 `resolve_selection` / `resolve_switch` /
+`commit_value_field` 逐字同步）：
+
+**选择类（5c，r14）**：
 
 | 组 | 点击直接子节点 | 事件 | 值的落点 |
 |---|---|---|---|
@@ -196,6 +206,22 @@ pub fn same_visual(&self, other: &UiState) -> bool   // 只比 hover/focus/press
 - `Enter` 激活（焦点在启用的段/芯片/页签上）与指针点击走**同一条**结算路径；
 - 禁用/被裁剪的子节点点不到（`hit` 拒绝）⇒ 天然静默，也不在焦点序里；
 - 只认**直接子节点**：命中落在组内嵌套容器的更深层 ⇒ 不属于任何组，不上溯。
+
+**数值类（5d，r16 = 开关结算 + 提交）**：
+
+| 控件 | 交互 | 事件 | 值的落点 |
+|---|---|---|---|
+| `NumberField` | 编辑进 `texts`（与 `Field` 同一套机械）；**提交**（失焦 / `Enter`）才解析 | `NumberChanged { id, value: f64 }`（**夹取后**；失败不发） | 草稿在 `texts[id]`（成功后规范化回写）；值域/步长在 `num_opts[id]` |
+| `ScrubNum` | 按下从 label 解析基准 + 建锚点；拖动 = 基准 + (x−按下x)·step，**变了才发** | `NumberChanged { id, value: f64 }` | 值的真相在 **App**（label 是显示串）；锚点是 `scrub`（瞬态，抬起/失焦即清） |
+| `Switch` | 点击 / `Enter` / `Space`（= winit `Named(Space) ⇒ Char(' ')`）三路**同一条**翻转结算（每次激活必发） | `Toggled { id, on: 翻转后的新值 }` | `switches[开关自身id]`（表里没有 = 关） |
+| `ColorField` | 编辑进 `texts`；提交按 `#RRGGBB` 解析（`#` 可省、大小写都行） | `ColorChanged { id, rgb: [u8; 3] }`（失败不发） | 草稿在 `texts[id]`（成功后回写 `#rrggbb`） |
+
+- 「提交」的全部来源（`Enter`、Tab、Escape、点到别处）都经过焦点变化 ⇒ `handle`
+  末尾的一个失焦钩子覆盖全部路径；**窗口失焦不动 UI 焦点 ⇒ 不触发**；
+- 提交成功后的**规范化回写不发 `TextChanged`**（值已由值事件报告，回写不是用户新输入）；
+- 解析/格式化的唯一实现在 `deer_core::values`（交互层发不发事件、绘制层画不画标记
+  用**同一份**）；指南见 [`number-field`](number-field.md) / [`scrub-num`](scrub-num.md) /
+  [`switch`](switch.md) / [`color-field`](color-field.md)。
 
 ### 3.6 脚本化重放：`DEER_INPUT_SCRIPT`
 

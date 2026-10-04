@@ -120,6 +120,101 @@ impl Builder {
         self.push_named(n, Kind::Field)
     }
 
+    // —— M6 5d：数值类四件（NumberField / ScrubNum / Switch / ColorField）—————
+
+    /// 数值输入框：[`Kind::Field`] 的数值变体（M6 5d）。
+    ///
+    /// 编辑期草稿住 `UiState::texts`（与 `Field` 同一套光标/退格/IME 机械），
+    /// 提交时（失焦 / `Enter`）才解析；值域/步长住 `UiState::num_opts`（按 id 键控，
+    /// App 塞，表里没有 = 无值域、步长 1.0）。返回节点 id（事件与两张表用的就是它）。
+    /// 扩 `Kind` 的裁定见 `docs/features/number-field.md`（交互层必须认出它才发得出
+    /// `NumberChanged`，且「不可解析」下划线是新的绘制档）。
+    pub fn number_field(&mut self, label: impl Into<String>) -> String {
+        self.value_leaf(Kind::NumberField, "", label, |_| {})
+    }
+
+    /// 同 [`Builder::number_field`]，可指定 id（事件/`num_opts`/`texts` 的键）并就地改节点
+    /// （宽度、禁用等）。`id` 传空串 = 自动生成（`number_field_N`）。
+    pub fn number_field_opts(
+        &mut self,
+        id: impl Into<String>,
+        label: impl Into<String>,
+        f: impl FnOnce(&mut Node),
+    ) -> String {
+        self.value_leaf(Kind::NumberField, id, label, f)
+    }
+
+    /// 拖动调值（M6 5d）：显示一个数值（`label` = App 格式化的当前值），按住左右拖改值，
+    /// 拖动中持续发 `UiEvent::NumberChanged`（依赖 T3.7 指针捕获）。基准值 = 按下时
+    /// `parse_num(label)` —— **App 必须把当前值格式化进 label**（事件 → 改自己的数据 →
+    /// 重建树 → 新 label，这就是整个回路）。
+    pub fn scrub_num(&mut self, label: impl Into<String>) -> String {
+        self.value_leaf(Kind::ScrubNum, "", label, |_| {})
+    }
+
+    /// 同 [`Builder::scrub_num`]，可指定 id 并就地改节点。`id` 传空串 = 自动生成。
+    pub fn scrub_num_opts(
+        &mut self,
+        id: impl Into<String>,
+        label: impl Into<String>,
+        f: impl FnOnce(&mut Node),
+    ) -> String {
+        self.value_leaf(Kind::ScrubNum, id, label, f)
+    }
+
+    /// 开关（M6 5d）：点击 / `Enter` / `Space`（后两者需焦点在它上）翻转并发
+    /// `UiEvent::Toggled { id, on }`；开/关值住 `UiState::switches`（**键 = 它自己的
+    /// id**，表里没有 = 关）。想默认开就塞表：`state.switches.insert(id, true)`。
+    pub fn switch(&mut self, label: impl Into<String>) -> String {
+        self.value_leaf(Kind::Switch, "", label, |_| {})
+    }
+
+    /// 同 [`Builder::switch`]，可指定 id 并就地改节点。`id` 传空串 = 自动生成。
+    pub fn switch_opts(
+        &mut self,
+        id: impl Into<String>,
+        label: impl Into<String>,
+        f: impl FnOnce(&mut Node),
+    ) -> String {
+        self.value_leaf(Kind::Switch, id, label, f)
+    }
+
+    /// 颜色输入框（M6 5d 最小版）：文本输入 `#RRGGBB` + 色块预览；提交时（失焦 /
+    /// `Enter`）解析，成功发 `UiEvent::ColorChanged { rgb }` 并回写规范化串。
+    /// 完整取色器不做（见 color-field.md「做不到什么」）。
+    pub fn color_field(&mut self, label: impl Into<String>) -> String {
+        self.value_leaf(Kind::ColorField, "", label, |_| {})
+    }
+
+    /// 同 [`Builder::color_field`]，可指定 id 并就地改节点。`id` 传空串 = 自动生成。
+    pub fn color_field_opts(
+        &mut self,
+        id: impl Into<String>,
+        label: impl Into<String>,
+        f: impl FnOnce(&mut Node),
+    ) -> String {
+        self.value_leaf(Kind::ColorField, id, label, f)
+    }
+
+    /// 四种数值类控件的**共同构造**：叶子 + 标签 + 可选显式 id。
+    /// `f` 在 `push_named` 之前跑：它只能就地改字段（layout/props/id），改不动
+    /// 「先设参数、最后定 id」的顺序纪律（那对消费式方法才成立，见模块头注释）。
+    fn value_leaf(
+        &mut self,
+        kind: Kind,
+        id: impl Into<String>,
+        label: impl Into<String>,
+        f: impl FnOnce(&mut Node),
+    ) -> String {
+        let mut n = Node::new(kind, "").with_label(label);
+        let explicit = id.into();
+        if !explicit.is_empty() {
+            n.id = explicit;
+        }
+        f(&mut n);
+        self.push_named(n, kind)
+    }
+
     /// 挂载一个节点；`id` 为空时按 kind 自动生成。
     ///
     /// 显式名字会被 [`IdGen::reserve`] 记下并占号 —— 否则自动 id 可能撞上它。
@@ -694,5 +789,102 @@ mod tests {
             (xs[1] - xs[0] - w0 - 8.0).abs() < 0.5,
             "段间距必须是「前段宽 + gap(8)」，实际 {xs:?} w0={w0}"
         );
+    }
+
+    // —— M6 5d：数值类四件的构造判据（与选择类同一套纪律）———————————
+
+    /// **判据本体**：四个便捷构造产出的树必须与「手写 `Node::new(kind, id).with_label`」
+    /// **结构相等**（扩的是 Kind 与语义，不是「怎么建叶子」—— 两条构筑路径仍同一份规则）。
+    #[test]
+    fn value_leaf_builders_match_hand_written_nodes() {
+        let mut a = Builder::new(Kind::Column, "app");
+        let num = a.number_field_opts("age", "年龄", |n| n.layout.width = Some(Size::Px(80.0)));
+        let vol = a.scrub_num_opts("vol", "40", |_| {});
+        let wifi = a.switch_opts("wifi", "Wi-Fi", |_| {});
+        let tint = a.color_field_opts("tint", "#ff8800", |_| {});
+        let ta = a.build();
+
+        // 手写路径（逐字对应）
+        let tb = Node::new(Kind::Column, "app").push(
+            Node::new(Kind::NumberField, "age")
+                .with_label("年龄")
+                .with_layout(crate::node::LayoutProps {
+                    width: Some(Size::Px(80.0)),
+                    ..Default::default()
+                }),
+        ).push(Node::new(Kind::ScrubNum, "vol").with_label("40"))
+            .push(Node::new(Kind::Switch, "wifi").with_label("Wi-Fi"))
+            .push(Node::new(Kind::ColorField, "tint").with_label("#ff8800"));
+
+        assert!(ta.structurally_eq(&tb), "便捷构造必须与手写叶子结构相等");
+        // 前置断言：返回的 id 就是显式指定的那批（事件与 UiState 两张表的键）。
+        assert_eq!(num, "age");
+        assert_eq!(vol, "vol");
+        assert_eq!(wifi, "wifi");
+        assert_eq!(tint, "tint");
+        // 前置断言：Kind 落对（防「便捷构造建错控件」这类低级漂移）。
+        let kinds: Vec<Kind> = ta.children.iter().map(|c| c.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![Kind::NumberField, Kind::ScrubNum, Kind::Switch, Kind::ColorField]
+        );
+        // 叶子判据：四种都不是容器、不横排（与 Button/Field 同一侧）。
+        for k in kinds {
+            assert!(!k.is_container(), "{k:?} 必须是叶子");
+            assert!(!k.is_horizontal(), "{k:?} 不是横排容器");
+        }
+    }
+
+    /// 自动 id 规则与两条构筑路径同一份（`IdGen` 按 kind 计数）：
+    /// 四种控件各有自己的计数器，跨调用连续且不与显式名冲突。
+    #[test]
+    fn value_leaf_auto_ids_follow_the_kind_counters() {
+        let mut app = Builder::new(Kind::Column, "app");
+        let a1 = app.number_field("a");
+        let s1 = app.scrub_num("s");
+        let w1 = app.switch("w");
+        let c1 = app.color_field("c");
+        let a2 = app.number_field("a2");
+        let tree = app.build();
+
+        assert_eq!(a1, "number_field_1");
+        assert_eq!(s1, "scrub_num_1");
+        assert_eq!(w1, "switch_1");
+        assert_eq!(c1, "color_field_1");
+        assert_eq!(a2, "number_field_2", "计数跨调用连续");
+        assert_eq!(tree.children[0].props.label.as_deref(), Some("a"), "标签按序进树");
+
+        // 占号：显式名之后的自动 id 不得撞上（`IdGen::reserve` 认得新前缀）。
+        let mut app2 = Builder::new(Kind::Column, "app");
+        let _ = app2.switch_opts("switch_1", "x", |_| {});
+        let again = app2.switch("y");
+        assert_eq!(again, "switch_2", "显式 `switch_1` 必须占掉 1 号");
+    }
+
+    /// 四种数值类叶子能走完整布局（有几何）—— measure 的合并臂没有漏人。
+    #[test]
+    fn value_leaves_get_geometry_from_layout() {
+        let mut app = Builder::new(Kind::Column, "app").padding(4.0).gap(4.0);
+        app.number_field_opts("age", "年龄", |_| {});
+        app.scrub_num_opts("vol", "40", |_| {});
+        app.switch_opts("wifi", "Wi-Fi", |_| {});
+        app.color_field_opts("tint", "#ff8800", |_| {});
+        let tree = app.build();
+        let geo = crate::layout::layout(
+            &tree,
+            crate::node::Rect::new(0.0, 0.0, 200.0, 200.0),
+            crate::layout::TextStyle { font_size: 14.0, line_height: 18.0 },
+            &crate::layout::ApproxMeasure,
+        );
+        for id in ["age", "vol", "wifi", "tint"] {
+            let f = geo.get(id).unwrap_or_else(|| panic!("测试前置：{id} 必须有几何"));
+            assert!(f.w > 0.0 && f.h > 0.0, "{id} 的几何必须是正面积，实际 {f:?}");
+        }
+        // 前置断言：四个叶子的 y 必须递增（竖排容器真的在排它们）。
+        let ys: Vec<f32> = ["age", "vol", "wifi", "tint"]
+            .iter()
+            .map(|id| geo.get(*id).expect("前置").y)
+            .collect();
+        assert!(ys[0] < ys[1] && ys[1] < ys[2] && ys[2] < ys[3], "四个叶子必须竖排，y = {ys:?}");
     }
 }

@@ -275,7 +275,7 @@ fn measure_into(n: &Node, style: TextStyle, m: &impl Measure, out: &mut Intrinsi
             };
             (w, h)
         }
-        Kind::Field => {
+        Kind::Field | Kind::NumberField | Kind::ColorField => {
             let label_w = n
                 .props
                 .label
@@ -287,7 +287,9 @@ fn measure_into(n: &Node, style: TextStyle, m: &impl Measure, out: &mut Intrinsi
                 metrics::FIELD_H.max(style.line_height),
             )
         }
-        Kind::Button => {
+        // M6 5d：`ScrubNum`/`Switch` 与 Button 同一套按钮数学（`ScrubNum` 显示一个数值、
+        // `Switch` 是带文字的开关 —— 固有尺寸都来自标签）。
+        Kind::Button | Kind::ScrubNum | Kind::Switch => {
             let label = n.props.label.as_deref().unwrap_or("");
             let label_w = m.width(label, style);
             (

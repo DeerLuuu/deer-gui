@@ -99,6 +99,9 @@
 
 use deer_core::layout::{Geometry, Measure};
 use deer_core::node::{Kind, Node};
+// 值解析的**唯一**实现（M6 5d）：「画不画不可解析标记」「色块用什么颜色」都要当场
+// 对显示中的串再判一次 —— 判据与交互层（提交发不发事件）是同一份，两边不可能漂。
+use deer_core::values::{parse_hex_color, parse_num};
 
 use deer_core::draw::{Color, DrawCmd, DrawList, RectI};
 use crate::Theme;
@@ -134,6 +137,11 @@ pub struct InteractState {
     pub chips: std::collections::BTreeMap<String, bool>,
     /// **页签栏的活动页**（M6 5c：组 id → 活动页 id）。默认空 ⇒ 没有活动页。
     pub tabs: std::collections::BTreeMap<String, String>,
+    /// **开关的开/关**（M6 5d：开关自身 id → 是否开）。默认空 ⇒ 全部按「关」画。
+    ///
+    /// 只在 `Kind::Switch` 上被读 ⇒ 既有树（没有 Switch）即使表里有杂散 id 也
+    /// 一个字节不变（opt-in 红线，与 segments/chips/tabs 同一条）。
+    pub switches: std::collections::BTreeMap<String, bool>,
 }
 
 /// 绘制时读的**预编辑**（还没上屏的一段拼写 + 它挂在哪个输入框上）。
@@ -218,6 +226,15 @@ pub const PREEDIT_UNDERLINE_H: i32 = 1;
 
 /// **光标竖线**的宽度（像素）。1px 足够看得见，且不会盖住相邻字形。
 pub const CARET_W: i32 = 1;
+
+/// **不可解析草稿**的下划线厚度（M6 5d，`NumberField`）：显示中的草稿非空且
+/// `parse_num` 失败 ⇒ 文本区底部一条 1px 下划线（与预编辑下划线同一视觉语言：
+/// 贴底、1px、`text_dim`）。
+pub const INVALID_UNDERLINE_H: i32 = 1;
+/// `ColorField` 色块距右缘/上/下的留白（M6 5d）；色块边长 = `rect.h − 2×` 本值。
+const SWATCH_INSET: i32 = 2;
+/// `ColorField` 色块与文本之间的间隙（像素）。
+const SWATCH_GAP: i32 = 2;
 
 /// 一个节点的**状态视觉等级**。
 ///
@@ -338,11 +355,143 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
         }
     }
 
+    /// 值输入框族的**共用壳**（M6 5d 从 `Kind::Field` 臂原样抽出，一行不改）：
+    /// 填充（focus 不改填充）→ 1px 边框 → 焦点环 → 内缩文本 → IME 预编辑 → 光标。
+    ///
+    /// 为什么抽：`NumberField`（不可解析下划线）与 `ColorField`（色块）都要同一套壳，
+    /// 各抄一份 = 「输入框长什么样」三处各说各话，迟早漂 —— 抽出后 `Kind::Field`
+    /// 的字节级行为由既有像素判据原样钉住（`extra_right_inset = 0` 时与抽出前逐字等价）。
+    ///
+    /// `extra_right_inset`：文本矩形**右侧**额外收窄的像素（`ColorField` 传「色块边长 +
+    /// 间隙 + 右缘」，其余传 0）—— 色块与文本不重叠，且文本矩形仍在节点矩形内。
+    /// 返回实际使用的文本矩形（`NumberField` 的下划线画在它底部）。
+    fn emit_field_shell(
+        &self,
+        n: &Node,
+        rect: RectI,
+        focused: bool,
+        visual: Visual,
+        list: &mut DrawList,
+        extra_right_inset: i32,
+    ) -> RectI {
+        // 填充：pressed/hover 改色；**focus 不改填充**（焦点只由下面那条环表达）。
+        let fill = if focused {
+            self.theme.border
+        } else {
+            tint(self.theme.border, visual)
+        };
+        list.push(DrawCmd::FillRoundRect {
+            rect,
+            radius: FILL_ROUND_RADIUS,
+            color: fill,
+        });
+        // 边框：**恒为 1px 的 `text_dim`** —— focus **不再**把边框本身加粗变色。
+        // 那正是「贴边画」的老缺陷：3px 的**直角**描边压在半径 4 的**圆角**填充上，
+        // 把四个圆角补成方角（本语料实测 32 px 补块，与按钮当初同一根因）。
+        list.push(DrawCmd::StrokeRect {
+            rect,
+            color: self.theme.text_dim,
+            width: 1,
+        });
+        // 焦点环：**对比色**（`theme.accent`，与填充 `border` 的平均通道差 **106.7**）
+        // + **内缩 `FOCUS_RING_INSET`**（环的直角顶点落回圆角内 ⇒ 补块 0）。
+        // 保留上面那条 1px 边框是刻意的：于是「focused vs idle」的差异**恰好**是环带，
+        // 判据才能升级成「框内差异一个都不许落在环带之外」（见模块测试）。
+        if focused {
+            list.push(DrawCmd::StrokeRect {
+                rect: focus_ring_rect(rect),
+                color: self.theme.accent,
+                width: FOCUS_STROKE_WIDTH,
+            });
+        }
+        // 文本**内缩**：文字与描边不重叠 ⇒「文本变化」只发生在框内（判据更强）。
+        let text_rect = RectI::new(
+            rect.x + TEXT_INSET,
+            rect.y + TEXT_INSET,
+            (rect.w - 2 * TEXT_INSET - extra_right_inset).max(1),
+            (rect.h - 2 * TEXT_INSET).max(1),
+        );
+        let label = self.field_label(n);
+        list.push(DrawCmd::Text {
+            rect: text_rect,
+            text: label.clone(),
+            color: self.theme.text,
+            size: self.theme.font_size,
+            align: 0,
+        });
+        // **IME 预编辑**（T3.4 渲染半）：把「还没上屏的那一段」画在**光标处**，
+        // 并加一条**下划线** —— 下划线是「这段还没定」的通用视觉约定。
+        //
+        // 它画在**光标位置**（字符位）之后：光标在它**前面**，因为它正是从那里长出来的。
+        // 之后再画光标时要把光标推到预编辑**之后**（见下）—— 那是 IME 的常态：
+        // 拼写过程中，插入符跟着拼写走。
+        let mut caret_x = text_rect.x + self.caret_dx(&label, &n.id);
+        if focused {
+            if let Some(p) = self
+                .state
+                .preedit
+                .as_ref()
+                .filter(|p| p.id == n.id && !p.text.is_empty())
+            {
+                let w = self
+                    .measure
+                    .width(&p.text, self.text_style())
+                    .round() as i32;
+                list.push(DrawCmd::Text {
+                    rect: RectI::new(caret_x, text_rect.y, text_rect.w, text_rect.h),
+                    text: p.text.clone(),
+                    // 暗一档：与**已上屏**的文字区分开（它还不是内容）
+                    color: self.theme.text_dim,
+                    size: self.theme.font_size,
+                    align: 0,
+                });
+                list.push(DrawCmd::FillRoundRect {
+                    rect: RectI::new(
+                        caret_x,
+                        text_rect.y + text_rect.h - PREEDIT_UNDERLINE_H,
+                        w,
+                        PREEDIT_UNDERLINE_H,
+                    ),
+                    radius: 0,
+                    color: self.theme.text_dim,
+                });
+                // 光标推到预编辑之后
+                caret_x += w;
+            }
+        }
+        // **光标**（T3.8）：只在焦点框里画，位置 = 文本起点 + 「光标前那一段」的宽度。
+        //
+        // 为什么要 `measure`：光标位置是**字符位**（T3.5 的模型），
+        // 而画出来是**像素** —— 两者之间必须过一次真实度量，
+        // 且**与文本布局用同一个度量**（这是 Q-3 定下的纪律：
+        // 布局、绘制、光栅化不许各算各的字宽）。
+        //
+        // 默认 `carets` 为空 ⇒ 这条不触发 ⇒ 既有语料逐字节不变。
+        if focused && self.state.carets.contains_key(&n.id) {
+                list.push(DrawCmd::FillRoundRect {
+                    // 半径 0 = 纯矩形：光标要一条实心竖线，不需要圆角
+                    rect: RectI::new(caret_x, text_rect.y, CARET_W, text_rect.h),
+                    radius: 0,
+                    color: self.theme.text,
+                });
+
+        }
+        text_rect
+    }
+
     fn walk(&self, n: &Node, geo: &Geometry, dead: bool, muted: bool, list: &mut DrawList) {
         let Some(f) = geo.get(&n.id) else { return };
         let dead = dead || n.props.disabled;
         let visual = self.visual_of(n, dead);
         let focused = self.is_focused(n, dead);
+        // **开关的关 = muted 档**（M6 5d）：`Switch` 复用 5c 的「选中/未选中」双色档
+        // —— 开 = `accent`/`on_accent`（与选中段、普通按钮同款），关 = `border`/正文
+        // （让位）。只对 `Kind::Switch` 读 `switches` 表 ⇒ 既有树（没有 Switch）即使
+        // 表里有杂散 id 也一个字节不变（opt-in 红线）；禁用照旧赢过一切
+        // （`Kind::Button` 臂的既有顺序：disabled 先于 muted）。
+        let muted = muted
+            || (n.kind == Kind::Switch
+                && !self.state.switches.get(&n.id).copied().unwrap_or(false));
 
         // ① 提示**先发**：与 `NullRenderer::build` 同序（每个有几何的节点一条，零面积也算）。
         list.push(DrawCmd::node_hint(
@@ -405,12 +554,16 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
                         });
                     }
                 }
-                Kind::Button => {
+                // 按钮族三件共用同一份绘制（M6 5d）：`Button` 本体、`ScrubNum`
+                //（显示值 = label，拖动时 pressed 加深就是拖动反馈）、`Switch`
+                //（开/关由 walk 开头的 muted 折算成 5c 的双色档）。
+                Kind::Button | Kind::ScrubNum | Kind::Switch => {
                     // **持久选中视觉**（M6 5c）：`muted` = 「本节点是选择类组的直接子节点、
-                    // 且不是当前选中/开着的那个」。组内未选中用 `border` 底 + 正文字
-                    // （视觉上让位），选中/开着的与组外普通按钮**同一档**（`accent` 底 +
-                    // `on_accent` 字）—— 所以组外的按钮一个字节都不变（opt-in 红线）。
-                    // 禁用仍然赢过一切（`border` 底 + `text_dim` 字，既有规则原样）。
+                    // 且不是当前选中/开着的那个」**或**「开关正处于关」。组内未选中/关
+                    // 用 `border` 底 + 正文字（视觉上让位），选中/开着与组外普通按钮
+                    // **同一档**（`accent` 底 + `on_accent` 字）—— 所以组外的按钮一个
+                    // 字节都不变（opt-in 红线）。禁用仍然赢过一切（`border` 底 +
+                    // `text_dim` 字，既有规则原样）。
                     let base = if n.props.disabled || muted {
                         self.theme.border
                     } else {
@@ -453,104 +606,57 @@ impl<'a, M: Measure> InteractiveRenderer<'a, M> {
                         });
                     }
                 }
+                // 值输入框族（M6 5d）：三种输入框共用「壳」（填充/边框/焦点环/文本/
+                // 预编辑/光标 —— 见 `emit_field_shell`），再各叠自己的档位。
                 Kind::Field => {
-                    // 填充：pressed/hover 改色；**focus 不改填充**（焦点只由下面那条环表达）。
-                    let fill = if focused {
-                        self.theme.border
-                    } else {
-                        tint(self.theme.border, visual)
-                    };
-                    list.push(DrawCmd::FillRoundRect {
-                        rect,
-                        radius: FILL_ROUND_RADIUS,
-                        color: fill,
-                    });
-                    // 边框：**恒为 1px 的 `text_dim`** —— focus **不再**把边框本身加粗变色。
-                    // 那正是「贴边画」的老缺陷：3px 的**直角**描边压在半径 4 的**圆角**填充上，
-                    // 把四个圆角补成方角（本语料实测 32 px 补块，与按钮当初同一根因）。
-                    list.push(DrawCmd::StrokeRect {
-                        rect,
-                        color: self.theme.text_dim,
-                        width: 1,
-                    });
-                    // 焦点环：**对比色**（`theme.accent`，与填充 `border` 的平均通道差 **106.7**）
-                    // + **内缩 `FOCUS_RING_INSET`**（环的直角顶点落回圆角内 ⇒ 补块 0）。
-                    // 保留上面那条 1px 边框是刻意的：于是「focused vs idle」的差异**恰好**是环带，
-                    // 判据才能升级成「框内差异一个都不许落在环带之外」（见模块测试）。
-                    if focused {
-                        list.push(DrawCmd::StrokeRect {
-                            rect: focus_ring_rect(rect),
-                            color: self.theme.accent,
-                            width: FOCUS_STROKE_WIDTH,
+                    self.emit_field_shell(n, rect, focused, visual, list, 0);
+                }
+                Kind::NumberField => {
+                    let text_rect = self.emit_field_shell(n, rect, focused, visual, list, 0);
+                    // **不可解析标记**：显示中的串**非空**且 `parse_num` 失败 ⇒ 文本区
+                    // 底部一条 1px 下划线。判据与交互层是同一份
+                    // （`deer_core::values::parse_num`）—— 「界面说非法 ⇔ 事件发不
+                    // 出去」两边永不分叉；空串 = 「还没输入」，**不**标记。
+                    let label = self.field_label(n);
+                    if !label.trim().is_empty() && parse_num(&label).is_none() {
+                        list.push(DrawCmd::FillRoundRect {
+                            rect: RectI::new(
+                                text_rect.x,
+                                text_rect.bottom() - INVALID_UNDERLINE_H,
+                                text_rect.w,
+                                INVALID_UNDERLINE_H,
+                            ),
+                            radius: 0,
+                            color: self.theme.text_dim,
                         });
                     }
-                    // 文本**内缩**：文字与描边不重叠 ⇒「文本变化」只发生在框内（判据更强）。
-                    let text_rect = inset(rect, TEXT_INSET);
-                    let label = self.field_label(n);
-                    list.push(DrawCmd::Text {
-                        rect: text_rect,
-                        text: label.clone(),
-                        color: self.theme.text,
-                        size: self.theme.font_size,
-                        align: 0,
+                }
+                Kind::ColorField => {
+                    // 色块占掉右侧：边长 = `rect.h − 2×SWATCH_INSET`（min 1），右缘留
+                    // `SWATCH_INSET`；文本右侧收窄「色块 + 间隙 + 右缘」，两者不重叠。
+                    // 颜色 = 对显示中的串再解析一次（成功 = 该颜色；失败 = 退回
+                    // `border` 色 —— 与壳同色 ⇒ 色块「消失」本身就是标记，指南有写）。
+                    let side = (rect.h - 2 * SWATCH_INSET).max(1);
+                    self.emit_field_shell(
+                        n,
+                        rect,
+                        focused,
+                        visual,
+                        list,
+                        side + SWATCH_GAP + SWATCH_INSET,
+                    );
+                    let rgb = parse_hex_color(&self.field_label(n))
+                        .map(|c| Color::rgb(c[0], c[1], c[2]));
+                    list.push(DrawCmd::FillRoundRect {
+                        rect: RectI::new(
+                            rect.right() - SWATCH_INSET - side,
+                            rect.y + SWATCH_INSET,
+                            side,
+                            side,
+                        ),
+                        radius: 0,
+                        color: rgb.unwrap_or(self.theme.border),
                     });
-                    // **IME 预编辑**（T3.4 渲染半）：把「还没上屏的那一段」画在**光标处**，
-                    // 并加一条**下划线** —— 下划线是「这段还没定」的通用视觉约定。
-                    //
-                    // 它画在**光标位置**（字符位）之后：光标在它**前面**，因为它正是从那里长出来的。
-                    // 之后再画光标时要把光标推到预编辑**之后**（见下）—— 那是 IME 的常态：
-                    // 拼写过程中，插入符跟着拼写走。
-                    let mut caret_x = text_rect.x + self.caret_dx(&label, &n.id);
-                    if focused {
-                        if let Some(p) = self
-                            .state
-                            .preedit
-                            .as_ref()
-                            .filter(|p| p.id == n.id && !p.text.is_empty())
-                        {
-                            let w = self
-                                .measure
-                                .width(&p.text, self.text_style())
-                                .round() as i32;
-                            list.push(DrawCmd::Text {
-                                rect: RectI::new(caret_x, text_rect.y, text_rect.w, text_rect.h),
-                                text: p.text.clone(),
-                                // 暗一档：与**已上屏**的文字区分开（它还不是内容）
-                                color: self.theme.text_dim,
-                                size: self.theme.font_size,
-                                align: 0,
-                            });
-                            list.push(DrawCmd::FillRoundRect {
-                                rect: RectI::new(
-                                    caret_x,
-                                    text_rect.y + text_rect.h - PREEDIT_UNDERLINE_H,
-                                    w,
-                                    PREEDIT_UNDERLINE_H,
-                                ),
-                                radius: 0,
-                                color: self.theme.text_dim,
-                            });
-                            // 光标推到预编辑之后
-                            caret_x += w;
-                        }
-                    }
-                    // **光标**（T3.8）：只在焦点框里画，位置 = 文本起点 + 「光标前那一段」的宽度。
-                    //
-                    // 为什么要 `measure`：光标位置是**字符位**（T3.5 的模型），
-                    // 而画出来是**像素** —— 两者之间必须过一次真实度量，
-                    // 且**与文本布局用同一个度量**（这是 Q-3 定下的纪律：
-                    // 布局、绘制、光栅化不许各算各的字宽）。
-                    //
-                    // 默认 `carets` 为空 ⇒ 这条不触发 ⇒ 既有语料逐字节不变。
-                    if focused && self.state.carets.contains_key(&n.id) {
-                            list.push(DrawCmd::FillRoundRect {
-                                // 半径 0 = 纯矩形：光标要一条实心竖线，不需要圆角
-                                rect: RectI::new(caret_x, text_rect.y, CARET_W, text_rect.h),
-                                radius: 0,
-                                color: self.theme.text,
-                            });
-
-                    }
                 }
             }
         }
