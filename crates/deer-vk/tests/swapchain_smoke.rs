@@ -29,7 +29,7 @@ use deer_vk::swapchain::{
     VK_FORMAT_R8G8B8A8_SRGB, VK_FORMAT_UNDEFINED, VK_PRESENT_MODE_FIFO_KHR,
     VK_PRESENT_MODE_IMMEDIATE_KHR, VK_PRESENT_MODE_MAILBOX_KHR,
 };
-use deer_vk::windowed::{FrameOutcome, WindowedRenderer};
+use deer_vk::windowed::{FrameOutcome, WindowId, WindowedRenderer, PRIMARY_WINDOW_ID};
 
 /// `VK_FORMAT_R8G8B8A8_UNORM`（线性，用来验证「没有 sRGB 时的退回」）。
 const VK_FORMAT_R8G8B8A8_UNORM: i32 = 37;
@@ -553,6 +553,25 @@ fn windowed_chain_end_to_end() {
     }
 }
 
+/// **真窗口测试的进程级串行锁**（T4.4 评审期实测，不是猜的）：
+/// 三个真窗判据（`windowed_chain_end_to_end` / `two_windows_share_one_device…` /
+/// `validation_layer_pins_the_two_drain_fixes`）在 cargo test 的线程池里**并行**跑时，
+/// 驱动（本机 Intel）会偶发 `vkCreateSwapchainKHR → VK_ERROR_INITIALIZATION_FAILED`
+/// —— 多路 WSI 同时建链是驱动的薄弱点。锁住「建窗 → 建链 → 画帧 → 收尾」全程，
+/// 一次只让一个真窗判据碰驱动 ⇒ 竞态消失（连续复跑验证）。
+/// 残余边界（如实说明）：dtor 探针是**子进程**，跨进程不经这把锁 —— 它只建一扇窗、
+/// 生命周期极短，历史上也未与在程测试撞过；若哪天真撞，升级成命名互斥体再议。
+#[cfg(windows)]
+static REAL_WINDOW_TESTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 拿真窗串行锁（容忍 poison：前一个判据崩了不该连坐后面的判据）。
+#[cfg(windows)]
+fn real_window_lock() -> std::sync::MutexGuard<'static, ()> {
+    REAL_WINDOW_TESTS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(windows)]
 fn run_windowed_e2e() {
     use std::time::Instant;
@@ -564,6 +583,8 @@ fn run_windowed_e2e() {
         eprintln!("跳过：本机 Vulkan 不提供 VK_KHR_surface / VK_KHR_win32_surface");
         return;
     }
+    // 真窗判据串行（见 REAL_WINDOW_TESTS_LOCK 的说明）
+    let _serial = real_window_lock();
 
     // 数值门槛也要先 `trim()`：`cmd /c "set DEER_WINDOW_ADAPTER=1 && …"` 的值是 `"1 "`，
     // 不带 `trim` 时 `parse()` 失败 ⇒ **静默退回适配器 0**（以为在测指定 GPU、实际测的是另一块）。
@@ -1046,6 +1067,511 @@ fn run_windowed_e2e() {
         "收尾完成 ✅ 累计呈现 {total} 帧（含 resize 前后），OutOfDate 观测 {out_of_date} 次；\
          渲染器已按依赖倒序销毁（无校验层错误即无泄漏/无顺序错误）"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5b. 真窗口端到端：**两个窗口共享一个 VkDevice**（T4.4-R2，默认跳过，同一门槛）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// **T4.4-R2 多交换链判据**：两个 surface 各建各的交换链/帧资源，**互不串扰**。
+///
+/// 与 `windowed_chain_end_to_end` 同一门槛（`DEER_VK_WINDOW_TESTS=1` 才跑）。
+/// 注意定位：这是 **deer-vk 渲染层**的双窗验证（两个真 HWND + 真 surface + 真呈现），
+/// **不含** winit 事件路由 —— 「App 级双窗联调（事件各归各窗、关一窗另一窗存活）」
+/// 属 T4.4-R3 整合验收，本条不替代它。
+///
+/// 判据（全部真机执行，跳过时明确打印）：
+/// 1. **各建各的**：`window_count() == 2`；两窗的 `extent_of` / `format_of` 独立读出，
+///    且两窗尺寸不同（同尺寸会削弱「读数来自各自 surface」的说服力）；
+/// 2. **呈现互不串扰**：两窗**交替**呈现若干帧后，各自回读四角 = **各自**的清屏色
+///    （A 窗回读里没有 B 窗的颜色，反之亦然 —— 前置断言两种清屏色不同保证判据有判别力）；
+/// 3. **计数独立**：`frames_presented_of(id)` 各自等于各自的实际呈现次数；
+/// 4. **界面路径共享图集**：两窗各画一帧 `draw_and_present_window`（共享 UiResources/描述符集、
+///    每窗自己的顶点缓冲），屏障计数照常增长；随后再回读，四角仍是各自清屏色；
+/// 5. **关一窗另一窗存活**（渲染侧半边；事件循环侧语义属 R3）：`remove_window(第二窗)` 后，
+///    主窗继续呈现 + 回读正确；重复 remove 报 `Ok(false)`；
+///    `remove_window(主窗)` 后单窗口 API 明确报错、表空。
+#[test]
+fn two_windows_share_one_device_and_do_not_cross_talk() {
+    if !window_tests_enabled() {
+        eprintln!("跳过：需要真实窗口（设 DEER_VK_WINDOW_TESTS=1 启用）");
+        return;
+    }
+    #[cfg(windows)]
+    {
+        run_two_window_multi_swapchain();
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("跳过：真窗口端到端验证目前只在 Windows 上实现（surface.rs 也只实现了 Windows）");
+    }
+}
+
+/// 按「附件格式」给清屏色算回读期望值（线性直通 / sRGB 编码 —— 与 `run_windowed_e2e`
+/// 同一套规则；抽成函数是因为本测试要对**两种颜色 × 两个窗口**各算一次）。
+#[cfg(windows)]
+fn expected_clear_bytes(c: Color, format: i32) -> [u8; 4] {
+    let linear = format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_R8G8B8A8_UNORM;
+    if linear {
+        [c.r, c.g, c.b, 0xFF]
+    } else {
+        [
+            deer_vk::windowed::srgb_encoded_byte(c.r),
+            deer_vk::windowed::srgb_encoded_byte(c.g),
+            deer_vk::windowed::srgb_encoded_byte(c.b),
+            0xFF,
+        ]
+    }
+}
+
+#[cfg(windows)]
+fn run_two_window_multi_swapchain() {
+    use deer_core::{ DrawCmd, DrawList, RectI };
+    use std::time::Instant;
+
+    // 真窗判据串行（见 REAL_WINDOW_TESTS_LOCK 的说明）
+    let _serial = real_window_lock();
+
+    // 本机没有 Vulkan / 没有 WSI 扩展 ⇒ 如实跳过（不伪装通过）
+    if !ffi::Instance::extension_available(surface::SURFACE_EXTENSION)
+        || !ffi::Instance::extension_available(surface::WIN32_SURFACE_EXTENSION)
+    {
+        eprintln!("跳过：本机 Vulkan 不提供 VK_KHR_surface / VK_KHR_win32_surface");
+        return;
+    }
+
+    let adapter: usize = std::env::var("DEER_WINDOW_ADAPTER")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+
+    // 两个**尺寸不同**的真窗口（同尺寸会削弱「读数来自各自 surface」的说服力）。
+    // ⚠️ 类名必须与 `run_windowed_e2e` 用**同一个**：`Win32TestWindow::create` 的类注册是
+    // 进程级 `Once`（只注册第一次调用时的那个类名），cargo test 默认多线程并行 ⇒
+    // 谁先跑谁注册；第二个类名从没被注册过 ⇒ `CreateWindowExW` 直接失败（实测踩过）。
+    let win_a = Win32TestWindow::create("deer-vk-swapchain-smoke", 480, 360)
+        .expect("建测试窗口 A 失败");
+    let win_b = Win32TestWindow::create("deer-vk-swapchain-smoke", 520, 400)
+        .expect("建测试窗口 B 失败");
+    pump_messages();
+    let raw_a = RawWindowHandle {
+        platform: Platform::Windows,
+        handle: win_a.hwnd as usize,
+        display: win_a.hinstance as usize,
+    };
+    let raw_b = RawWindowHandle {
+        platform: Platform::Windows,
+        handle: win_b.hwnd as usize,
+        display: win_b.hinstance as usize,
+    };
+
+    // 两种**互不相同**的清屏色（前置断言：如果一样，「互不串扰」就没了判别力）。
+    // 命名避开文件顶部的 CLEAR_R/CLEAR_G/CLEAR_B 三个 u8 —— 块内 item 会遮蔽外层同名。
+    const CLEAR_A: Color = Color::rgb(CLEAR_R, CLEAR_G, CLEAR_B); // 0x10,0x14,0x24
+    const CLEAR_WIN_B: Color = Color::rgb(0x24, 0x10, 0x14);
+    assert_ne!(
+        [CLEAR_A.r, CLEAR_A.g, CLEAR_A.b],
+        [CLEAR_WIN_B.r, CLEAR_WIN_B.g, CLEAR_WIN_B.b],
+        "前置：两个窗口的清屏色必须不同，否则「互不串扰」无从判定"
+    );
+
+    let want_a = Extent { width: 480, height: 360 };
+    let want_b = Extent { width: 520, height: 400 };
+
+    // ① 主窗（保留键 0）+ 第二窗（故意用「不像默认值」的键 7 —— 表键是任意 u64）
+    let mut r = match WindowedRenderer::new(adapter, raw_a, want_a, CLEAR_A) {
+        Ok(r) => r,
+        Err(GpuError::Unsupported(msg)) => {
+            eprintln!("跳过：本机这个适配器无法在此窗口上呈现（{msg}）");
+            return;
+        }
+        Err(e) => panic!("创建主窗渲染器失败（adapter={adapter}）：{e}"),
+    };
+    const SECOND: WindowId = 7;
+    r.add_window(SECOND, raw_b, want_b, CLEAR_WIN_B)
+        .expect("第二窗入表失败（共享设备的呈现支持检查没过？）");
+
+    // —— 判据 1：各建各的 ——
+    assert_eq!(r.window_count(), 2, "表里应当恰好两条链");
+    assert!(r.contains_window(PRIMARY_WINDOW_ID) && r.contains_window(SECOND));
+    assert_eq!(
+        r.window_ids(),
+        vec![PRIMARY_WINDOW_ID, SECOND],
+        "window_ids 升序可复现（BTreeMap 键序）"
+    );
+    let ext_a = r.extent_of(PRIMARY_WINDOW_ID).expect("主窗 extent");
+    let ext_b = r.extent_of(SECOND).expect("第二窗 extent");
+    assert!(ext_a.width > 0 && ext_a.height > 0, "主窗交换链尺寸必须 > 0：{ext_a:?}");
+    assert!(ext_b.width > 0 && ext_b.height > 0, "第二窗交换链尺寸必须 > 0：{ext_b:?}");
+    assert_ne!(ext_a, ext_b, "两窗尺寸不同是本测试的前提（各自 surface 各自 currentExtent）");
+    let fmt_a = r.format_of(PRIMARY_WINDOW_ID).unwrap();
+    let fmt_b = r.format_of(SECOND).unwrap();
+    for (name, fmt) in [("主窗", fmt_a), ("第二窗", fmt_b)] {
+        let ok = fmt == VK_FORMAT_B8G8R8A8_UNORM
+            || fmt == VK_FORMAT_R8G8B8A8_UNORM
+            || fmt == VK_FORMAT_B8G8R8A8_SRGB
+            || fmt == VK_FORMAT_R8G8B8A8_SRGB;
+        assert!(ok, "{name} 的交换链格式 {fmt:#x} 既非线性也不在 sRGB 退路里");
+    }
+    println!(
+        "两窗各建各的 ✅ 主窗 {}×{}（fmt {fmt_a:#x}）/ 第二窗 {}×{}（fmt {fmt_b:#x}）",
+        ext_a.width, ext_a.height, ext_b.width, ext_b.height
+    );
+
+    // 重复入表必须明确报错（不静默替换 —— 旧实现正是这个缺陷形态）
+    assert!(
+        r.add_window(SECOND, raw_b, want_b, CLEAR_WIN_B).is_err(),
+        "重复的窗口 id 必须报错（替换会悄悄销毁旧窗资源）"
+    );
+
+    // —— 判据 2 + 3：交替呈现、各自回读各自的清屏色、帧计数独立 ——
+    let rounds = 5u64;
+    let started = Instant::now();
+    let mut out_of_date = 0u64;
+    for _ in 0..rounds {
+        for id in [PRIMARY_WINDOW_ID, SECOND] {
+            match r.render_and_present_window(id).expect("多窗呈现一帧") {
+                FrameOutcome::Presented => {}
+                FrameOutcome::OutOfDate => {
+                    out_of_date += 1;
+                    let cur = r.extent_of(id).expect("extent");
+                    r.resize_window(id, cur).expect("过期后重建该窗交换链");
+                }
+            }
+        }
+    }
+    println!(
+        "交替呈现 {} 轮（两窗）/ 过期 {out_of_date} 次 / 耗时 {:.2}s",
+        rounds,
+        started.elapsed().as_secs_f64()
+    );
+    let n_a = r.frames_presented_of(PRIMARY_WINDOW_ID).unwrap();
+    let n_b = r.frames_presented_of(SECOND).unwrap();
+    assert!(n_a >= rounds, "主窗至少呈现 {rounds} 帧，实际 {n_a}");
+    assert!(n_b >= rounds, "第二窗至少呈现 {rounds} 帧，实际 {n_b}");
+
+    // 各自回读 = 各自的清屏色（互不串扰的像素级证据）
+    for (name, id, clear, other) in [
+        ("主窗", PRIMARY_WINDOW_ID, CLEAR_A, CLEAR_WIN_B),
+        ("第二窗", SECOND, CLEAR_WIN_B, CLEAR_A),
+    ] {
+        let fmt = r.format_of(id).unwrap();
+        let expected = expected_clear_bytes(clear, fmt);
+        let other_expected = expected_clear_bytes(other, fmt);
+        let px = r.read_back_last_frame_window(id).expect("回读该窗呈现帧");
+        let ext = r.extent_of(id).unwrap();
+        assert_eq!(
+            px.len(),
+            (ext.width as usize) * (ext.height as usize) * 4,
+            "{name} 回读长度必须是 宽×高×4"
+        );
+        let at = |x: u32, y: u32| -> [u8; 4] {
+            let i = ((y as usize) * (ext.width as usize) + (x as usize)) * 4;
+            [px[i], px[i + 1], px[i + 2], px[i + 3]]
+        };
+        for (corner, x, y) in [
+            ("左上", 0u32, 0u32),
+            ("右上", ext.width - 1, 0),
+            ("左下", 0, ext.height - 1),
+            ("右下", ext.width - 1, ext.height - 1),
+        ] {
+            let c = at(x, y);
+            assert_eq!(
+                c, expected,
+                "{name} {corner} ({x},{y}) 必须是**本窗**清屏色（互不串扰）：\
+                 期望 {expected:?}，实际 {c:?}（={other_expected:?} 说明读到的是另一窗的颜色）"
+            );
+        }
+        println!("{name} 四角 = 本窗清屏色 ✅（另一窗颜色 {other_expected:?} 未出现）");
+    }
+
+    // —— 判据 4：界面路径（共享图集/描述符集 + 每窗自己的缓冲）——
+    let mut shapes_a = DrawList::new();
+    shapes_a.push(DrawCmd::FillRect {
+        rect: RectI::new(20, 20, 120, 60),
+        color: Color::rgb(200, 30, 40),
+    });
+    let mut shapes_b = DrawList::new();
+    shapes_b.push(DrawCmd::FillRect {
+        rect: RectI::new(20, 20, 120, 60),
+        color: Color::rgb(30, 40, 200),
+    });
+    assert!(
+        !shapes_a.is_empty() && shapes_a.clip_balanced() && !shapes_b.is_empty(),
+        "前置：界面判据需要非空且裁剪平衡的列表"
+    );
+    let barriers_before = (
+        r.ui_host_to_vertex_barrier_count(),
+        r.ui_index_barrier_count(),
+        r.ui_indirect_barrier_count(),
+    );
+    let uploads_before = r.render_stats().buffer_uploads;
+    r.draw_and_present_window(PRIMARY_WINDOW_ID, &shapes_a, None)
+        .expect("主窗界面帧");
+    r.draw_and_present_window(SECOND, &shapes_b, None)
+        .expect("第二窗界面帧");
+    let barriers_after = (
+        r.ui_host_to_vertex_barrier_count(),
+        r.ui_index_barrier_count(),
+        r.ui_indirect_barrier_count(),
+    );
+    let uploads_after = r.render_stats().buffer_uploads;
+    assert!(
+        uploads_after >= uploads_before + 2,
+        "前置：两窗首帧界面应当各上传过缓冲（buffer_uploads {uploads_before} → {uploads_after}）"
+    );
+    assert!(
+        barriers_after.0 >= barriers_before.0 + 2
+            && barriers_after.1 >= barriers_before.1 + 2
+            && barriers_after.2 >= barriers_before.2 + 2,
+        "两窗首帧界面各发过三类屏障（顶点/索引/间接 {barriers_before:?} → {barriers_after:?}）\
+         ⇒ 共享 UiResources + 每窗缓冲的路径真的都走到了"
+    );
+    assert!(
+        r.ui_build_count() >= 1,
+        "前置：界面资源（共享部分）必须真的被建过"
+    );
+    // 界面帧之后四角仍是各自清屏色（矩形没碰到角落；共享描述符没有污染清屏）
+    for (name, id, clear) in [
+        ("主窗", PRIMARY_WINDOW_ID, CLEAR_A),
+        ("第二窗", SECOND, CLEAR_WIN_B),
+    ] {
+        let fmt = r.format_of(id).unwrap();
+        let expected = expected_clear_bytes(clear, fmt);
+        let px = r.read_back_last_frame_window(id).expect("界面帧后回读");
+        // 左上角 (0,0) 的字节偏移
+        let i = 0usize;
+        assert_eq!(
+            [px[i], px[i + 1], px[i + 2], px[i + 3]],
+            expected,
+            "{name} 界面帧后左上角仍应是本窗清屏色"
+        );
+    }
+    println!(
+        "界面路径（共享图集/描述符集 + 每窗缓冲）✅ 屏障 {barriers_before:?} → {barriers_after:?}"
+    );
+
+    // —— 判据 5：remove —— 关一窗，另一窗存活（渲染侧半边）——
+    assert!(r.remove_window(SECOND).expect("移除第二窗"), "移除存在的链应返回 true");
+    assert!(!r.contains_window(SECOND), "移除后第二窗不应在表里");
+    assert_eq!(r.window_count(), 1);
+    assert!(
+        !r.remove_window(SECOND).expect("幂等移除"),
+        "移除不存在的链应返回 false（幂等）"
+    );
+    assert!(
+        r.render_and_present_window(SECOND).is_err(),
+        "已移除的窗口 id 再呈现必须明确报错"
+    );
+    for _ in 0..3 {
+        match r.render_and_present_window(PRIMARY_WINDOW_ID).expect("移除后主窗呈现") {
+            FrameOutcome::Presented => {}
+            FrameOutcome::OutOfDate => {
+                let cur = r.extent_of(PRIMARY_WINDOW_ID).unwrap();
+                r.resize_window(PRIMARY_WINDOW_ID, cur).expect("重建");
+            }
+        }
+    }
+    let fmt = r.format_of(PRIMARY_WINDOW_ID).unwrap();
+    let expected = expected_clear_bytes(CLEAR_A, fmt);
+    let px = r.read_back_last_frame_window(PRIMARY_WINDOW_ID).expect("移除后回读主窗");
+    assert_eq!([px[0], px[1], px[2], px[3]], expected, "另一窗存活：主窗回读仍正确");
+    println!("remove 第二窗后主窗继续呈现 + 回读正确 ✅（渲染侧「关一窗另一窗存活」）");
+
+    // 移除主窗：允许；此后单窗口 API 明确报错、表空
+    assert!(r.remove_window(PRIMARY_WINDOW_ID).expect("移除主窗"));
+    assert_eq!(r.window_count(), 0, "两窗都移除后表必须为空");
+    let empty = DrawList::new();
+    assert!(
+        r.draw_and_present(&empty, None).is_err(),
+        "主窗移除后单窗口 API 必须明确报错（诊断读数回退 0 的契约见 windowed.rs）"
+    );
+    println!("remove 主窗后表空、单窗口 API 明确报错 ✅；空表渲染器随 Drop 正常析构");
+    drop(r);
+    // win_a / win_b 在 r 之后析构（声明顺序反序）⇒ VkSurface 必先于 HWND 销毁
+    drop(win_a);
+    drop(win_b);
+    println!("T4.4-R2 多交换链判据全部通过 ✅");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5c. 真窗口：**两个「排空」根因修复的自动化判据**（F-48-1 / F-49-2；默认跳过，同一门槛）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// **两个「排空」修复点的「改坏必红」判据**（评审 F-48-1/F-49-2；按 stacked 惯例落在 r3 分支）。
+///
+/// 钉住的两个修复点（都在 `windowed.rs`，实测由校验层抓出的真缺陷）：
+///
+/// ① **`remove_window` 的排空顺序**：先 `vkDeviceWaitIdle` 再整链析构。判据形态：
+///    窗 2 呈现一帧（提交**在飞**）后**立即** `remove_window` ⇒ 断言校验消息计数不增。
+///    改坏（删掉排空）⇒ destroy 与在飞提交竞态 ⇒ `vkDestroySemaphore/SwapchainKHR in use`
+///    （双窗 demo 首跑的实测形态）⇒ 本测试红。
+///
+/// ② **界面缓冲容量增长前排空**：prepare 阶段（本帧栅栏等待**之前**）触发的旧缓冲销毁。
+///    判据形态：窗 1 先画一份极小语料（vb 初始容量 4 KiB），**紧接着**画一份超容量语料
+///    ⇒ 旧缓冲销毁 + 新建 ⇒ 断言计数不增。改坏（删掉增长前排空）⇒
+///    `vkDestroyBuffer in use by VkCommandBuffer`（点击改内容触发了重分配的实测形态）⇒ 本测试红。
+///
+/// 断言口径：[`deer_vk::ffi::validation_message_count`]（**按线程**）的窗口差值 == 0 ——
+/// 与 `gpu_vs_cpu.rs::assert_no_validation_messages` 同一套（不含并行测试的干扰）。
+///
+/// **门槛**：真窗（`DEER_VK_WINDOW_TESTS=1`）**且校验层**（`DEER_VK_VALIDATION=1`）——
+/// 没有校验层时「改坏」不会产生任何消息，判据空转 ⇒ 未设校验层时明确打印
+/// 「这不是通过，是被显式跳过」。
+#[test]
+fn validation_layer_pins_the_two_drain_fixes() {
+    if !window_tests_enabled() {
+        eprintln!("跳过：需要真实窗口（设 DEER_VK_WINDOW_TESTS=1 启用）");
+        return;
+    }
+    if !ffi::env_flag("DEER_VK_VALIDATION") {
+        eprintln!(
+            "跳过：**这不是通过，是被显式跳过** —— 本判据钉的是「改坏 ⇒ 校验消息 > 0」，\
+             没有校验层（DEER_VK_VALIDATION=1）时改坏也不会产生消息"
+        );
+        return;
+    }
+    #[cfg(windows)]
+    {
+        run_validation_pins_drain_fixes();
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("跳过：真窗口端到端验证目前只在 Windows 上实现（surface.rs 也只实现了 Windows）");
+    }
+}
+
+#[cfg(windows)]
+fn run_validation_pins_drain_fixes() {
+    use deer_core::{ DrawCmd, DrawList, RectI };
+
+    // 真窗判据串行（见 REAL_WINDOW_TESTS_LOCK 的说明）
+    let _serial = real_window_lock();
+
+    // 本机没有 Vulkan / 没有 WSI 扩展 ⇒ 如实跳过（不伪装通过）
+    if !ffi::Instance::extension_available(surface::SURFACE_EXTENSION)
+        || !ffi::Instance::extension_available(surface::WIN32_SURFACE_EXTENSION)
+    {
+        eprintln!("跳过：本机 Vulkan 不提供 VK_KHR_surface / VK_KHR_win32_surface");
+        return;
+    }
+    let adapter: usize = std::env::var("DEER_WINDOW_ADAPTER")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+
+    // 类名与 `run_windowed_e2e` / 双窗判据一致（类注册是进程级 Once，见那边的 ⚠️ 注记）
+    let win_a = Win32TestWindow::create("deer-vk-swapchain-smoke", 480, 360)
+        .expect("建测试窗口 A 失败");
+    let win_b = Win32TestWindow::create("deer-vk-swapchain-smoke", 520, 400)
+        .expect("建测试窗口 B 失败");
+    let raw_a = RawWindowHandle {
+        platform: Platform::Windows,
+        handle: win_a.hwnd as usize,
+        display: win_a.hinstance as usize,
+    };
+    let raw_b = RawWindowHandle {
+        platform: Platform::Windows,
+        handle: win_b.hwnd as usize,
+        display: win_b.hinstance as usize,
+    };
+
+    let mut r = match WindowedRenderer::new(
+        adapter,
+        raw_a,
+        Extent { width: 480, height: 360 },
+        Color::rgb(CLEAR_R, CLEAR_G, CLEAR_B),
+    ) {
+        Ok(r) => r,
+        Err(GpuError::Unsupported(msg)) => {
+            eprintln!("跳过：本机这个适配器无法在此窗口上呈现（{msg}）");
+            return;
+        }
+        Err(e) => panic!("创建主窗渲染器失败（adapter={adapter}）：{e}"),
+    };
+    const SECOND: WindowId = 7;
+    r.add_window(
+        SECOND,
+        raw_b,
+        Extent { width: 520, height: 400 },
+        Color::rgb(0x24, 0x10, 0x14),
+    )
+    .expect("第二窗入表失败");
+
+    /// 极小语料（1 个矩形 ⇒ 6 顶点 ⇒ 初始 4 KiB 容量装得下）。
+    fn tiny_list() -> DrawList {
+        let mut l = DrawList::new();
+        l.push(DrawCmd::FillRect {
+            rect: RectI::new(8, 8, 32, 24),
+            color: Color::WHITE,
+        });
+        l
+    }
+    /// **超容量**语料（300 个矩形 ⇒ 1800 顶点 × 52 B ≈ 93.6 KiB > 4 KiB ⇒ 必然触发
+    /// 顶点/索引缓冲的容量增长 —— 修复点 ② 的场景）。矩形全部落在窗内 ⇒ 不被裁剪掉。
+    fn huge_list() -> DrawList {
+        let mut l = DrawList::new();
+        for i in 0..300u32 {
+            l.push(DrawCmd::FillRect {
+                rect: RectI::new((i % 30) as i32 * 15, (i / 30) as i32 * 12, 10, 8),
+                color: Color::rgb(30, 40, 200),
+            });
+        }
+        l
+    }
+    fn present(r: &mut WindowedRenderer, id: WindowId, list: &DrawList) {
+        match r.draw_and_present_window(id, list, None) {
+            Ok(FrameOutcome::Presented) => {}
+            Ok(FrameOutcome::OutOfDate) => {
+                let cur = r.extent_of(id).expect("extent");
+                r.resize_window(id, cur).expect("过期后重建该窗交换链");
+            }
+            Err(e) => panic!("呈现失败（id={id}）：{e}"),
+        }
+    }
+
+    // ── 修复点 ①（F-49-2）：remove_window 的排空顺序 ──────────────────────
+    // 窗 2 呈现一帧 ⇒ 提交在飞 ⇒ **立即**移除（修复 = 先 wait_idle 再析构）。
+    let before = ffi::validation_message_count();
+    present(&mut r, SECOND, &tiny_list());
+    let removed = r.remove_window(SECOND).expect("remove_window 失败");
+    assert!(removed, "前置：被移除的链必须在表上");
+    // 排空一次，让校验层对「非法销毁」的任何滞后报告也落进本窗口差值里
+    r.wait_idle().expect("wait_idle 失败");
+    let after_remove = ffi::validation_message_count();
+    assert_eq!(
+        after_remove, before,
+        "修复点①被改坏：remove_window 在提交仍在飞时析构了窗 2 的链 \
+         （先排空再销毁的顺序被删？）⇒ 校验层报 {} 条消息（vkDestroySemaphore/SwapchainKHR in use）",
+        after_remove - before
+    );
+    println!(
+        "修复点①（remove_window 排空顺序）✅ 在飞提交下整链移除，校验消息 {before} → {after_remove}（要求不增）"
+    );
+
+    // ── 修复点 ②（F-48-1）：界面缓冲容量增长前排空 ──────────────────────
+    // 窗 1 先画极小语料（vb 初始 4 KiB），**紧接着**画超容量语料 ⇒ 旧缓冲销毁。
+    present(&mut r, PRIMARY_WINDOW_ID, &tiny_list());
+    let before_growth = ffi::validation_message_count();
+    present(&mut r, PRIMARY_WINDOW_ID, &huge_list());
+    // 前一帧（极小语料）的提交此刻大概率仍在飞（FRAMES_IN_FLIGHT=2，本帧走另一槽不等待）
+    // ⇒ 修复在场（增长前排空）⇒ 旧缓冲销毁时队列已排空 ⇒ 零消息。
+    let after_growth = ffi::validation_message_count();
+    assert_eq!(
+        after_growth, before_growth,
+        "修复点②被改坏：容量增长销毁旧缓冲时上一帧命令缓冲仍在飞 \
+         （增长前排空的守卫被删？）⇒ 校验层报 {} 条消息（vkDestroyBuffer in use by VkCommandBuffer）",
+        after_growth - before_growth
+    );
+    println!(
+        "修复点②（缓冲容量增长前排空）✅ 极小语料 → 超容量语料触发重分配，校验消息 {before_growth} → {after_growth}（要求不增）"
+    );
+
+    r.wait_idle().expect("收尾 wait_idle");
+    drop(r);
+    drop(win_a);
+    drop(win_b);
+    println!("T4.4 两个「排空」修复点的自动化判据全部通过 ✅（落实评审 F-48-1/F-49-2）");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

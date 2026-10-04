@@ -199,8 +199,78 @@
 //! [deer-window] 唤醒账本：wake=<wake()投递到达> wake_after=<wake_after()投递到达> fired=<deadline到点> requested=<唤醒面请求的重绘次数> skipped=<wake()答假而没请求> iters=<事件循环迭代次数>
 //! ```
 //!
-//! **仍未做（别当成已实现）**：自定义用户事件类型（对外**只有** [`Waker`] 这一个面 —— `Wake`
-//! 是私有类型，App 拿不到 `EventLoopProxy::send_event`）、跨进程唤醒、多窗口唤醒。
+//! ## 多窗口（T4.4-R1：路由 + 排队建窗 + 多配置启动）
+//!
+//! 八项决策里属于**窗口层**的五条在这里落地（设计登记见 `ROADMAP.md`「设计登记：多窗口
+//! （T4.4）」，渲染归属（决策 3）/树模型整合（决策 6 的上层）在 R2/R3）：
+//!
+//! | 决策 | 落点 |
+//! |---|---|
+//! | 1 事件签名 | 新增 [`App::window_input`]，**默认实现转发既有 `App::input`** ⇒ 单窗口用户零改动；多窗口用户覆盖它，拿 [`WindowId`] 区分窗。（实现签名比登记文本多一个 `info: &WindowInfo` 参数 —— 默认转发 `App::input` 需要该窗的信息，维护者裁决接受；见 `ROADMAP.md` 设计登记的收口注记） |
+//! | 2 建窗模型 | 主窗仍由 [`run()`] 首建；之后经 [`WindowSpawner`]（`App::window_spawner` 交付，与 [`Waker`] **同一根通道**）`spawn_window(config)` **排队**，在事件循环的安全点（持 `ActiveEventLoop` 的 `user_event` 臂）真正建窗 |
+//! | 3 多配置启动 | [`run_multi`]：每一项各建一扇窗（第一项 = 主窗），与 [`run()`] **同一条代码路径** |
+//! | 4 关闭语义 | `CloseRequested` **只关该窗**（判定收在 [`WindowTable::close`]，可单测）；**全部窗口关闭** ⇒ 事件循环退出 |
+//! | 5 焦点模型 | winit 本就按窗发 `Focused` ⇒ 按 [`WindowId`] 路由，App 收到的 `FocusChanged` 只关于那一扇窗 |
+//!
+//! **T4.4-R3 补齐的生命周期路由**（全部**带 id**；`window_destroyed` 之外的同一条
+//! 「默认转发 ⇒ 单窗口零改动；覆盖 ⇒ 旧方法不再被调」纪律）：[`App::window_init`]（每窗
+//! 一次，渲染器在这里创建）、[`App::window_resized`]、[`App::window_redraw`]（该窗的
+//! `RedrawRequested` ⇒ 多窗口下一次只画这一扇）、[`App::window_close_requested`] ——
+//! 这四个默认转发各自的旧方法；**[`App::window_destroyed`] 是纯新增钩子**（没有旧方法
+//! 可转发，默认实现什么都不做，单窗口的收尾本来就随事件循环结束一起发生），App 在这里
+//! 释放**这一扇**的渲染资源。
+//! **两层同源编号（接缝裁决）**：[`WindowId::raw()`] 直传渲染层窗口表
+//! （deer-vk `WindowedRenderer::new_with_primary_id` / `add_window`），映射是恒等式 ——
+//! 禁止靠「0/1 恰好错位对上」的隐式约定。
+//!
+//! ```no_run
+//! use deer_window::{App, Flow, InputEvent, WindowConfig, WindowInfo, WindowId, WindowSpawner, run};
+//!
+//! struct TwoWindows {
+//!     spawner: Option<WindowSpawner>,
+//!     spawned: bool,
+//! }
+//!
+//! impl App for TwoWindows {
+//!     fn init(&mut self, _info: &WindowInfo) -> Result<(), String> { Ok(()) }
+//!     /// 主窗建好后拿到建窗句柄（与 `wake_handle` 同批），排一扇新窗。
+//!     fn window_spawner(&mut self, spawner: WindowSpawner) {
+//!         self.spawner = Some(spawner);
+//!     }
+//!     fn redraw(&mut self) -> Result<Flow, String> {
+//!         if !self.spawned {
+//!             self.spawned = true;
+//!             if let Some(sp) = &self.spawner {
+//!                 sp.spawn_window(WindowConfig::new("第二扇", 320, 200)); // 只排队，安全点才真建
+//!             }
+//!         }
+//!         Ok(Flow::Continue)
+//!     }
+//!     /// 多窗口 App 覆盖这里（覆盖后 `input` 不再被调）：`id` 就是决策 6 里
+//!     /// 「每窗一棵树」的 `HashMap` 键。
+//!     fn window_input(
+//!         &mut self,
+//!         id: WindowId,
+//!         _info: &WindowInfo,
+//!         _ev: &InputEvent,
+//!     ) -> Result<Flow, String> {
+//!         let _ = id; // 按窗分发给你自己的每窗状态
+//!         Ok(Flow::Continue)
+//!     }
+//! }
+//! # fn main() -> Result<(), String> {
+//! run(WindowConfig::new("主窗", 800, 600), TwoWindows { spawner: None, spawned: false })
+//! # }
+//! ```
+//!
+//! **明确不做**（决策 8，登记在案）：跨窗口拖放 · owned/父子窗口 · 窗口间消息传递 ·
+//! 每窗独立 GPU 实例 · 多线程渲染。渲染侧按窗的资源表（决策 3）已在 **R2（deer-vk）**
+//! 落地；每窗一棵树的上层整合、双窗 demo 与四件套已在 **R3（deer-gui）** 落地
+//! （见 `deer-gui` 的 `docs/features/multi-window.md` 与 `dual_window` 示例）。
+//!
+//! **仍未做（别当成已实现）**：自定义用户事件类型（对外**只有** [`Waker`] 与
+//! [`WindowSpawner`] 两个面 —— `Wake` 是私有类型，App 拿不到 `EventLoopProxy::send_event`）、
+//! 跨进程唤醒、**按窗定向**的多窗口唤醒（目前的唤醒是 App 级的，所有活窗一起重画）。
 
 mod display;
 mod host;
@@ -213,8 +283,8 @@ pub use display::{
     map_wheel, printable_text, raw_handle_from_rwh06, raw_handle_from_win32,
 };
 pub use host::{
-    App, Flow, FrameCounter, REDRAW_ENV, RedrawPolicy, WakePlan, WakeStats, Waker, earliest,
-    parse_redraw_policy, plan_wake, resolve_redraw_policy, run,
+    App, Flow, FrameCounter, REDRAW_ENV, RedrawPolicy, WakePlan, WakeStats, Waker, WindowId,
+    WindowSpawner, earliest, parse_redraw_policy, plan_wake, resolve_redraw_policy, run, run_multi,
 };
 
 // ——— crate 内部胶水（**不从根导出任何新名字**；全部只在 `cfg(test)` 下存在）———

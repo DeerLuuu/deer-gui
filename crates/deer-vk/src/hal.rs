@@ -28,7 +28,23 @@
 //!   数据只有**呈现之后**才有效 ⇒ 请用 [`crate::WindowedRenderer::read_back_last_frame()`]
 //!   （`render_and_present()` 之后调；交换链图像确实申请了 `TRANSFER_SRC`）。
 //!   这里刻意**不做「隐式呈现」**那种惊吓式语义；离屏回读取 [`crate::OffscreenRenderer`]。
-//! - 只支持一个交换链（一个窗口）。
+//!
+//! ## 多交换链（T4.4-R2：原「只支持一个交换链」的限制已移除）
+//!
+//! 旧实现里 `VulkanDevice` 只挂**一条** `WindowedRenderer`，第二次 `create_swapchain`
+//! 会**悄悄替换**第一条（旧句柄随即指到新窗口上 —— 既泄漏又串扰）。现在：
+//!
+//! - `create_swapchain` 第一次调用照旧建链（主窗，[`crate::windowed::PRIMARY_WINDOW_ID`]）；
+//! - **之后的每次调用都在同一条 `WindowedRenderer` 上 `add_window`** ——
+//!   所有交换链**共享同一个 `VkDevice` / `VkInstance` / 字形图集**（决策 3「Godot 同款」），
+//!   每条各自持有 surface/swapchain/帧资源；返回的 [`VulkanSwapchain`] 记着自己的窗口 id，
+//!   `resize` 只作用于自己的那一条（不再串扰）；
+//! - [`VulkanFrame`] 同样记着自己的窗口 id，`record`/`submit_and_present` 各画各的窗口。
+//!
+//! **仍受 HAL trait 形状限制的一点**（登记，不动 trait）：[`Device::begin_frame`]
+//! 没有窗口参数 ⇒ 它的帧固定作用于**主窗**（第一次 `create_swapchain` 的那条）。
+//! 改 trait 属公开 API 变更，按 `AGENTS.md` §6 要先登记再动手；多窗帧提交请直接用
+//! [`crate::WindowedRenderer`] 的 `*_window(id)` API（T4.4-R3 的整合走这条路）。
 //!
 //! ## 纹理（T1.2 之后）
 //!
@@ -49,7 +65,7 @@ use deer_core::{ DrawList, GpuError, GpuResult, TextureId };
 use deer_gpu::{ AdapterInfo, Device, Extent, Frame, PresentResult, RawWindowHandle, Swapchain, TargetFormat, TextureDesc, TextureRegion };
 
 use crate::device::{Texture, TextureFormat, UploadRegion, VkDevice};
-use crate::windowed::{FrameOutcome, WindowedRenderer};
+use crate::windowed::{FrameOutcome, PRIMARY_WINDOW_ID, WindowId, WindowedRenderer};
 
 /// 共享的窗口链句柄：`Swapchain` 与 `Frame` 都要碰它，而 HAL 的两个 trait 对象
 /// 无法互相借用 —— 所以用 `Rc<RefCell<..>>`（HAL 刻意不要求 `Send`/`Sync`）。
@@ -123,6 +139,9 @@ pub struct VulkanDevice {
     chain: Chain,
     /// 纹理用的设备 + 槽位表（惰性建，见 [`TextureStore`]）。
     textures: RefCell<Option<TextureStore>>,
+    /// **下一个 HAL 建的交换链**拿到的窗口 id（T4.4-R2：从 1 起自增；
+    /// 0 是主窗保留键，被第一次 `create_swapchain` 占用）。
+    next_window_id: WindowId,
 }
 
 impl VulkanDevice {
@@ -133,6 +152,7 @@ impl VulkanDevice {
             adapter,
             chain: Rc::new(RefCell::new(None)),
             textures: RefCell::new(None),
+            next_window_id: 1,
         }
     }
 
@@ -220,19 +240,41 @@ impl Device for VulkanDevice {
         extent: Extent,
         _format: TargetFormat,
     ) -> GpuResult<Box<dyn Swapchain>> {
-        // 复用 M2b 已验证的那条链（它自己做：实例扩展 → surface → 设备 → 交换链 → 管线）。
+        // 第一次调用：复用 M2b 已验证的那条链（它自己做：实例扩展 → surface → 设备 → 交换链 → 管线）。
+        // **之后的调用：同一条 `WindowedRenderer` 上 `add_window`** —— 所有交换链共享
+        // 同一个 VkDevice/实例/图集（决策 3），每条各自持有 surface/swapchain/帧资源。
         // 清屏色用黑色；真正的清屏色由示例/上层决定（M3 会把 `DrawCmd` 送上来后一并处理）。
-        let renderer = WindowedRenderer::new(
-            self.adapter_index,
-            window,
-            extent,
-            deer_core::Color::rgb(0, 0, 0),
-        )?;
-        let actual = renderer.extent();
-        let format = target_format_of(renderer.format());
-        *self.chain.borrow_mut() = Some(renderer);
+        let mut guard = self.chain.borrow_mut();
+        let (window_id, actual, format) = match guard.as_mut() {
+            None => {
+                let renderer = WindowedRenderer::new(
+                    self.adapter_index,
+                    window,
+                    extent,
+                    deer_core::Color::rgb(0, 0, 0),
+                )?;
+                let actual = renderer.extent();
+                let format = target_format_of(renderer.format());
+                *guard = Some(renderer);
+                (PRIMARY_WINDOW_ID, actual, format)
+            }
+            Some(renderer) => {
+                let id = self.next_window_id;
+                self.next_window_id += 1;
+                renderer.add_window(
+                    id,
+                    window,
+                    extent,
+                    deer_core::Color::rgb(0, 0, 0),
+                )?;
+                let actual = renderer.extent_of(id)?;
+                let format = target_format_of(renderer.format_of(id)?);
+                (id, actual, format)
+            }
+        };
         Ok(Box::new(VulkanSwapchain {
             chain: Rc::clone(&self.chain),
+            window_id,
             extent: actual,
             format,
         }))
@@ -285,6 +327,9 @@ impl Device for VulkanDevice {
     }
 
     fn begin_frame(&mut self) -> GpuResult<Box<dyn Frame>> {
+        // ⚠️ HAL trait 的 `begin_frame` 没有窗口参数（改 trait 属公开 API 变更，先登记）⇒
+        // 帧固定作用于**主窗**（第一次 `create_swapchain` 的那条链）。给其它窗口录帧
+        // 请直接用 `WindowedRenderer` 的 `*_window(id)` API。
         if self.chain.borrow().is_none() {
             return Err(GpuError::Unsupported(
                 "deer-vk: 还没有交换链 —— 先调 Device::create_swapchain（HAL 在打开设备时还不知道窗口）"
@@ -293,6 +338,7 @@ impl Device for VulkanDevice {
         }
         Ok(Box::new(VulkanFrame {
             chain: Rc::clone(&self.chain),
+            window_id: PRIMARY_WINDOW_ID,
             pending_ui: None,
         }))
     }
@@ -334,8 +380,13 @@ fn texture_format_of(format: TargetFormat) -> TextureFormat {
 }
 
 /// 交换链句柄（HAL 形状）。
+///
+/// T4.4-R2：记着**自己的窗口 id** —— `resize` 只作用于自己的那条链
+/// （旧实现第二次 `create_swapchain` 会悄悄替换整条链，旧句柄随即指到别人的窗口上）。
 pub struct VulkanSwapchain {
     chain: Chain,
+    /// 本交换链对应的窗口（第一次创建 = 主窗 `PRIMARY_WINDOW_ID`，之后自增）。
+    window_id: WindowId,
     extent: Extent,
     format: TargetFormat,
 }
@@ -355,8 +406,8 @@ impl Swapchain for VulkanSwapchain {
             code: -1,
             message: "deer-vk: 交换链已被释放".to_string(),
         })?;
-        r.resize(extent)?;
-        self.extent = r.extent();
+        r.resize_window(self.window_id, extent)?;
+        self.extent = r.extent_of(self.window_id)?;
         Ok(())
     }
 }
@@ -375,6 +426,8 @@ impl Swapchain for VulkanSwapchain {
 /// `begin_frame`，若把本帧顶点存进共享的 `chain`，两个帧对象就会互相覆盖。
 pub struct VulkanFrame {
     chain: Chain,
+    /// 本帧目标窗口（T4.4-R2；经 `Device::begin_frame` 拿到的帧固定是主窗）。
+    window_id: WindowId,
     /// `record` 的准备产物；`submit_and_present` 消费它。
     ///
     /// `None` = 还没调过 `record`（或 `begin_frame` 之后直接提交）——
@@ -412,7 +465,7 @@ impl Frame for VulkanFrame {
             message: "deer-vk: HAL 帧的交换链已被释放（create_swapchain 之后又动了 chain？）"
                 .to_string(),
         })?;
-        self.pending_ui = Some(s.prepare_ui(list, text)?);
+        self.pending_ui = Some(s.prepare_ui(self.window_id, list, text)?);
         Ok(())
     }
 
@@ -435,7 +488,7 @@ impl Frame for VulkanFrame {
             message: "deer-vk: 交换链已被释放".to_string(),
         })?;
         let unified = self.pending_ui.as_deref().unwrap_or(&[]);
-        Ok(present_result_of(r.present_prepared(unified)?))
+        Ok(present_result_of(r.present_prepared(self.window_id, unified)?))
     }
 }
 
@@ -544,6 +597,7 @@ mod tests {
         let frame_chain: Chain = Rc::new(RefCell::new(None));
         let mut f = VulkanFrame {
             chain: frame_chain,
+            window_id: PRIMARY_WINDOW_ID,
             pending_ui: None,
         };
 

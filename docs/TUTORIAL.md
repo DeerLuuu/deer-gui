@@ -516,7 +516,8 @@ deer-gui = { path = "../deer-gui/crates/deer-gui" }
 | **anchors 锚定** | ✅ 已支持（L4）：`Pos::Anchors` ⇒ 四边钉在父内容盒的比例位置，**resize 时锚定边跟随、偏移保持**；与 `Offset` 同一个机制（同一个 `position` 字段）。**没有**百分比偏移（偏移是像素）/ 跨层锚定。见 [`features/anchors.md`](features/anchors.md) |
 | **图片文件 → 像素** | ✅ BMP 已支持（`deer_gpu::image::decode_bmp`：24/32 位、底行优先 → RGBA8 → 直喂纹理）；**PNG 解码未做**（自有 png.rs 只是编码器）。见 [`features/image-decode.md`](features/image-decode.md) |
 | **高分屏 / DPI 缩放** | ✅ 透传（AF-3）：`WindowInfo.scale_factor` + `ScaleFactorChanged` 事件，OS 报多少给多少；**坐标与窗口尺寸仍是物理像素，不自动缩放**。见 [`features/window.md`](features/window.md) 第 8 节 |
-| **可停靠面板 dock** / 多窗口 | ❌ M6 |
+| **多窗口**（动态 spawn + 事件按窗路由 + 共享设备的多交换链） | ✅ 已支持（T4.4，**仅 Windows**）：`WindowSpawner` 动态开新窗；`App` 的 `window_init`/`window_redraw`/`window_input`/… 按 id 路由；关一窗另一窗存活、全关退出。见 [`features/multi-window.md`](features/multi-window.md) |
+| **可停靠面板 dock** | ❌ M6 |
 | 12 个 `deer-ui` 控件的语义 | 🔄 M6（节点已有 **12 种**：基础 5 种 + 选择类 3 种（5c）+ 数值类 4 种（5d）；仍缺 `Icon`/`DropMenu`/`Dialog`/`Overlay`/`HoverTip`） |
 
 完整清单与每个功能的边界：[`../FEATURES.md`](../FEATURES.md)。
@@ -620,7 +621,7 @@ $env:DEER_WINDOW_HOLD='1'; cargo run -p deer-gui --features window --example win
   回读**强制一次 GPU→CPU 同步**，所以只在第一帧做一次。
 - 目前**只有 Windows** 实现了窗口句柄的填充；非 Windows 会明确返回 `Err`。
 
-**仍然做不到**：多窗口 / 全屏 / HDR / 帧率上限、
+**仍然做不到**：全屏 / HDR / 帧率上限（多窗口**已支持** —— 见 [`features/multi-window.md`](features/multi-window.md)）、
 `size <= 0` 的文本与 CPU 一致（见第 13 章）。
 （方向键导航、按键滚动、右键透传、按键重复都已落地 —— 见 [`features/input.md`](features/input.md)。）
 **滚动（滚动条 + 点轨道跳转 + 惯性）与 IME 预编辑已经做到了**（[`features/scrollbar.md`](features/scrollbar.md)、
