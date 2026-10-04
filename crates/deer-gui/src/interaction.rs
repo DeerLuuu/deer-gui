@@ -33,6 +33,9 @@ use std::collections::BTreeMap;
 use deer_core::{ DrawCmd, DrawList, RectI };
 use deer_core::layout::{Geometry, ScrollMetrics, ScrollOffsets};
 use deer_core::node::{Kind, Node};
+// 值解析的**唯一**实现（M6 5d）：提交判据、规范化回写、拖动基准都从这里走 ——
+// 绘制侧（deer-gpu）判「画不画标记」用的是同一份，两边不可能各写一套。
+use deer_core::values::{format_hex_color, format_num, parse_hex_color, parse_num};
 
 // ---------------------------------------------------------------------------
 // 一、输入事件模型 —— M5-1 冻结定义的**本地镜像**
@@ -159,8 +162,52 @@ mod mirror {
 // 二、状态与「发生了什么」
 // ---------------------------------------------------------------------------
 
+/// 数值类控件的**值域与步长**（M6 5d）：按控件 id 键控住在 [`UiState::num_opts`]。
+///
+/// 表里**没有**某个 id = 无值域、步长 1.0（[`NumOpts::default`] 就是这个形态，
+/// 所以「没塞」与「塞了全默认」是同一件事）。两个字段都是**应用数据**（texts 同一条
+/// 纪律）：App 想约束就自己塞，控件只读不写。
+///
+/// - `min`/`max`：`NumberField` 提交时夹取、`ScrubNum` 拖动时夹取；`None` = 该边不夹。
+///   **值域不是 L3 的布局 min/max**（那两兄弟在 `LayoutProps`，管的是像素尺寸）；
+/// - `step`：`ScrubNum` 每**像素**对应的值变化（1 px × step）；`NumberField` 不用步长
+///   （没有步进按钮，最小版不做）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NumOpts {
+    /// 值域下界（`None` = 不设下界）。
+    pub min: Option<f64>,
+    /// 值域上界（`None` = 不设上界）。
+    pub max: Option<f64>,
+    /// 拖动步长（值/像素）。默认 1.0。
+    pub step: f64,
+}
+
+impl Default for NumOpts {
+    fn default() -> NumOpts {
+        NumOpts { min: None, max: None, step: 1.0 }
+    }
+}
+
+/// [`Kind::ScrubNum`] 拖动中的**瞬态锚点**（M6 5d）。
+///
+/// 按下时建立（`start_x` = 按下 x，`base` = 按下时 `parse_num(label)` 的基准值），
+/// **抬起 / 窗口失焦即清**（[`UiState::scrub`]）。拖动中的值 = `base + (x − start_x) × step`
+/// —— 锚点固定不动，所以「App 没来得及重建树」也不影响后续值；`last` 是上一次
+/// 发出去的值，实现「变了才发」（静止的拖动不发事件，与 `Scrolled` 同纪律）。
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScrubAnchor {
+    /// 被拖的控件 id（= 捕获者，也是事件的 id）。
+    pub id: String,
+    /// 按下时的指针 x（像素）。
+    pub start_x: f32,
+    /// 按下时从 label 解析出的基准值。
+    pub base: f64,
+    /// 上一次发出去的值（「变了才发」的判据）。
+    pub last: f64,
+}
+
 /// 交互状态：**唯一真相**（窗口层渲染的树由它派生）。
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct UiState {
     /// **IME 预编辑缓冲**（还没上屏的那一段）。默认 `None` ⇒ 既有行为不变。
     pub preedit: Option<Preedit>,
@@ -204,6 +251,39 @@ pub struct UiState {
     /// 为什么偏移住在 `UiState` 里：滚轮必须在**唯一入口**（[`handle`]）被消费 ——
     /// 若另开一个「带滚动的 handle」，那条路径上的滚轮就会静默无效，而没人能一眼看出来。
     pub scroll: ScrollState,
+    /// **分段选择的当前选中**（M6 5c：组 id → 选中段的节点 id）。表里没有 = 该组还没有选中段。
+    ///
+    /// 值是**应用数据**（texts 同一条纪律）：按 id 键控、住在树外 ⇒ 整树重建不丢
+    /// （Keep）；App 要初值就自己塞（`state.segments.insert("mode".into(), week_id)`），
+    /// 不塞 = 没有选中段（合法状态）。`handle` 在点击结算时更新它并发
+    /// [`UiEvent::SelectionChanged`]（**真的换了选中才发**）。
+    pub segments: BTreeMap<String, String>,
+    /// **标签组的开/关**（M6 5c：芯片节点 id → 是否开）。表里没有 = 关。
+    ///
+    /// 键是**芯片自己**的 id（不是组 id）：每个芯片独立开/关，值就是它的状态。
+    /// `handle` 每次点击芯片都翻转它并发 [`UiEvent::ChipToggled`]（`on` = 翻转后的新值）。
+    pub chips: BTreeMap<String, bool>,
+    /// **页签栏的活动页**（M6 5c：组 id → 活动页的节点 id）。表里没有 = 没有活动页。
+    ///
+    /// 存节点 id 而不是下标：与 hover/focus/texts 同一套「id 键控」约定，标签重名、
+    /// 树增删页都不会错位；发 [`UiEvent::TabChanged`] 时才换算成 `index`
+    /// （组直接子节点的树序下标，**禁用页也一起数**）。
+    pub tabs: BTreeMap<String, String>,
+    /// **数值类控件的值域/步长**（M6 5d：控件 id → [`NumOpts`]）。表里没有 =
+    /// 无值域、步长 1.0。App 塞初值（`state.num_opts.insert("age".into(), NumOpts { min: Some(0.0), max: Some(150.0), step: 1.0 })`），
+    /// 控件只读：`NumberField` 提交夹取、`ScrubNum` 拖动步进/夹取都用它。
+    pub num_opts: BTreeMap<String, NumOpts>,
+    /// **开关的开/关**（M6 5d：开关**自身** id → 是否开）。表里没有 = 关。
+    ///
+    /// 与 `chips` 同形但**独立一张表**：Switch 是独立控件（不是组的孩子），键是它
+    /// 自己的 id。想默认开就塞表（`state.switches.insert(id, true)`）。
+    /// 开/关是**持久视觉**（绘制侧读 `InteractState::switches`）。
+    pub switches: BTreeMap<String, bool>,
+    /// **拖动调值的瞬态锚点**（M6 5d）。`None` = 没在拖。
+    ///
+    /// 按下落在 `ScrubNum` 上才建立；**抬起 / 窗口失焦即清**。瞬态（不跨重建持久
+    /// —— 它不是值，值的真相在 App 的数据里，经 label 回到树上）。
+    pub scrub: Option<ScrubAnchor>,
 }
 
 /// 滚动状态：**偏移**（布局的输入）+ **上限**（布局的输出）。
@@ -404,7 +484,11 @@ pub fn inertia_deadline(state: &UiState) -> Option<std::time::Instant> {
 }
 
 /// 一次 `handle` 产生的「发生了什么」。窗口层据此置 dirty 并重绘。
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// ⚠️ M6 5d 起只保 `PartialEq`、**不再保 `Eq`**：`NumberChanged` 携带 `f64`
+/// （`f64` 没有全序等价，`NaN != NaN`），这是数值语义的诚实代价 —— 判等纪律
+/// 与 `InputEvent`（坐标是 `f32`）先例一致：**带浮点的类型只用 `PartialEq`**。
+#[derive(Debug, Clone, PartialEq)]
 pub enum UiEvent {
     HoverChanged(Option<String>),
     FocusChanged(Option<String>),
@@ -421,6 +505,48 @@ pub enum UiEvent {
     /// 语义与 `Clicked` 对称：**按下处 == 抬起处**才发（右键拖走再抬起不算）；
     /// 但**不参与焦点/pressed**（右键不是「激活」）。禁用子树/被裁剪 ⇒ 不发。
     PointerRight { id: String },
+    /// **分段选择**（M6 5c）：点了 `Segmented` 组的一个段，选中**真的换了**。
+    ///
+    /// `id` = 组节点 id；`selected` = **新选中段**的节点 id（不是标签文本 —— 与
+    /// `Clicked` 同一条「事件用 id 关联」约定）。点**已选中**的段没有变化 ⇒ 只发
+    /// `Clicked`、不发这条（与 `Scrolled`「变了才发」同一纪律）；禁用段点不到
+    /// ⇒ 什么都不发。当前选中值随后可读 [`UiState::segments`]。
+    SelectionChanged { id: String, selected: String },
+    /// **标签开关**（M6 5c）：点了 `ChipGroup` 组的一个芯片。
+    ///
+    /// `id` = 组节点 id；`chip` = 芯片节点 id；`on` = **翻转之后**的状态。
+    /// 开关是「翻转」语义：**每次点击必翻转发一次**（这与单选的「变了才发」刻意不同
+    /// —— 点击本身就是动作）。当前开关表见 [`UiState::chips`]。
+    ChipToggled { id: String, chip: String, on: bool },
+    /// **页签切换**（M6 5c）：点了 `TabBar` 的一个页签，活动页**真的换了**。
+    ///
+    /// `id` = 组节点 id；`index` = 新活动页在组**直接子节点**里的树序下标
+    /// （**禁用页也一起数** —— App 自己的页签数组含禁用项，按同一个下标对齐）。
+    /// **内容切换是 App 的事**：TabBar 只报告，App 拿着 index 换自己渲染的内容。
+    /// 点当前活动页没有变化 ⇒ 只发 `Clicked`；禁用页点不到 ⇒ 不发。
+    /// 活动页见 [`UiState::tabs`]（存的是节点 id，发事件时才换算下标）。
+    TabChanged { id: String, index: usize },
+    /// **数值变了**（M6 5d）：`NumberField` **提交成功**（失焦 / `Enter`）或
+    /// `ScrubNum` **拖动中真的变了**。
+    ///
+    /// `id` = 控件节点 id；`value` = **夹取之后**的新值（值域见
+    /// [`UiState::num_opts`]）。`NumberField` 提交失败（不可解析）**不发**、
+    /// `ScrubNum` 拖动中值没变**不发**（与 `Scrolled`「变了才发」同纪律）。
+    /// 提交成功后草稿会被**规范化回写**（`format_num`），但这**不发**
+    /// `TextChanged` —— 值已经由本事件报告，规范化不是用户新输入。
+    NumberChanged { id: String, value: f64 },
+    /// **开关翻转**（M6 5d）：`Switch` 被点击 / `Enter` / `Space` 激活。
+    ///
+    /// `id` = 开关节点 id（它是独立控件，不是组的孩子 —— 与
+    /// [`UiEvent::ChipToggled`] 的「组 + 芯片」两个 id 刻意不同）；`on` =
+    /// **翻转之后**的新值。翻转语义：**每次激活必翻转发一次**（与 r14b 同型，
+    /// 与单选的「变了才发」刻意不同）。当前开关表见 [`UiState::switches`]。
+    Toggled { id: String, on: bool },
+    /// **颜色提交成功**（M6 5d）：`ColorField` 按 `#RRGGBB` 解析成功（失焦 /
+    /// `Enter`）。`id` = 控件节点 id；`rgb` = 解析出的三通道。
+    /// 解析失败**不发**（色块退回 `border` 色 = 标记）；成功后草稿回写规范化串
+    /// `#rrggbb`（同样**不发** `TextChanged`）。
+    ColorChanged { id: String, rgb: [u8; 3] },
 }
 
 /// 滚轮的**每「一格」对应的像素数**（`InputEvent::Wheel::dy` 的单位由窗口层决定：
@@ -458,6 +584,10 @@ impl UiState {
                 id: p.id.clone(),
                 text: p.text.clone(),
             }),
+            segments: self.segments.clone(),
+            chips: self.chips.clone(),
+            tabs: self.tabs.clone(),
+            switches: self.switches.clone(),
         }
     }
 
@@ -726,15 +856,28 @@ fn node_by_id<'a>(n: &'a Node, id: &str) -> Option<&'a Node> {
     n.children.iter().find_map(|c| node_by_id(c, id))
 }
 
-/// 这个 id 是不是**可聚焦**的控件（`Button`/`Field` 且不在禁用子树里）。
+/// 这个 id 是不是**可聚焦**的控件，且不在禁用子树里。
 ///
-/// 与 [`focusables`] 的可聚焦集合**共用同一条判据**（`kind` + 禁用），所以
+/// 与 [`focusables`] 的可聚焦集合**共用同一条判据**（[`focusable_kind`] + 禁用），所以
 /// 「点击能聚焦谁」与「`Tab` 能走到谁」不会分叉 —— 否则会出现
 /// 「`Tab` 走不到的控件，点一下就能聚焦」这种两套规则。
 fn node_is_focusable(root: &Node, id: &str) -> bool {
     node_by_id(root, id)
-        .filter(|n| matches!(n.kind, Kind::Button | Kind::Field))
+        .filter(|n| focusable_kind(n.kind))
         .is_some_and(|n| !path_is_dead(root, n))
+}
+
+/// 可聚焦的 **Kind**（M6 5d 扩）：按钮、三个值输入框（`Field`/`NumberField`/
+/// `ColorField` —— 编辑草稿必须有焦点）、开关（`Enter`/`Space` 翻转需要焦点）。
+///
+/// **`ScrubNum` 刻意不在内**：它是拖动控件（T3.7 指针捕获已经保证拖动事件不丢），
+/// 没有任何键盘语义，进焦点序只会让 `Tab` 多停一站。这条答案只此一份：
+/// [`node_is_focusable`]（点击聚焦）与 [`focusables`]（`Tab` 序）都调它。
+fn focusable_kind(k: Kind) -> bool {
+    matches!(
+        k,
+        Kind::Button | Kind::Field | Kind::NumberField | Kind::ColorField | Kind::Switch
+    )
 }
 
 /// 指针位置上的节点 id（`hit` 的薄封装，省得每个分支都写一遍）。
@@ -802,8 +945,8 @@ fn wheel_scroll(state: &mut UiState, root: &Node, dy: f32) -> Option<(String, i3
 
 /// 可聚焦节点的**树序**（`Tab` 循环用）。
 ///
-/// 可聚焦 = `Kind::Button` / `Kind::Field`，且**不在禁用子树里**（禁用的整棵子树跳过）。
-/// 只依赖树，不依赖几何 —— 所以「零尺寸的按钮仍在焦点序列里」，
+/// 可聚焦 = [`focusable_kind`]（按钮 / 三个值输入框 / 开关），且**不在禁用子树里**
+/// （禁用的整棵子树跳过）。只依赖树，不依赖几何 —— 所以「零尺寸的按钮仍在焦点序列里」，
 /// 但它在屏幕上按不到（`hit` 不给它）。这是刻意的：焦点序不引入第二个几何真相。
 pub fn focusables(root: &Node) -> Vec<String> {
     fn walk(n: &Node, dead: bool, out: &mut Vec<String>) {
@@ -811,7 +954,7 @@ pub fn focusables(root: &Node) -> Vec<String> {
         if dead || n.props.disabled {
             return;
         }
-        if matches!(n.kind, Kind::Button | Kind::Field) {
+        if focusable_kind(n.kind) {
             out.push(n.id.clone());
         }
         for c in &n.children {
@@ -912,6 +1055,160 @@ fn nearest_focusable(
 }
 
 // ---------------------------------------------------------------------------
+// 五c、选择类结算（M6 5c：Segmented / ChipGroup / TabBar）
+// ---------------------------------------------------------------------------
+
+/// 按 id 找节点，**带回它的父节点**（前序遍历，确定性；找不到 ⇒ `None`）。
+///
+/// 根没有父 ⇒ 找到的是根时返回 `None`（点击结算到组外的普通容器上，
+/// 本来就不该触发任何选择语义）。
+fn find_with_parent<'a>(n: &'a Node, id: &str) -> Option<(&'a Node, &'a Node)> {
+    for c in &n.children {
+        if c.id == id {
+            return Some((n, c));
+        }
+        if let Some(found) = find_with_parent(c, id) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// 点击结算后的**选择类语义**（M6 5c）：落点若是 [`Kind::Segmented`]/
+/// [`Kind::ChipGroup`]/[`Kind::TabBar`] 的**直接子节点**，就更新 `UiState`
+/// 里的值映射（`segments`/`chips`/`tabs`）并发对应事件。
+///
+/// 规则（r14，与 input.md 的事件表逐字同步）：
+///
+/// - **r14a** Segmented：点新段 ⇒ 写 `segments[组] = 段` + 发 `SelectionChanged`；
+///   点**已选中**的段 = 没有变化 ⇒ 什么都不发（`Clicked` 已由调用方发过）；
+/// - **r14b** ChipGroup：点芯片 ⇒ 翻转 `chips[芯片]` + 发 `ChipToggled { on: 新值 }`
+///   —— **每次点击都发**（翻转本身就是动作，与 r14a 的「变了才发」刻意不同）；
+/// - **r14c** TabBar：点新页 ⇒ 写 `tabs[组] = 页` + 发 `TabChanged { index }`
+///   （index = 直接子节点的树序下标，**禁用页也一起数**）；点当前页不发；
+/// - **r14d** 只认**直接子节点**：更深一层的命中（嵌套容器里的文本）不属于任何组，
+///   不上溯（边界写进指南的「做不到什么」）；
+/// - **r14e** 禁用/被裁剪的子节点根本不会成为捕获者（`hit` 拒绝）⇒ 天然到不了这里，
+///   不需要再判一遍（与「禁用子树静默」同一道闸门，不设第二道）。
+///
+/// 调用点只有两处 —— 左键抬起（按捕获者结算）与 `Enter` 键激活：**所有** `Clicked`
+/// 的来源都过这里，指针路径与键盘路径不可能分叉。
+fn resolve_selection(state: &mut UiState, root: &Node, clicked: &str, out: &mut Vec<UiEvent>) {
+    let Some((parent, node)) = find_with_parent(root, clicked) else {
+        return;
+    };
+    match parent.kind {
+        Kind::Segmented => {
+            if state.segments.get(&parent.id).map(String::as_str) != Some(node.id.as_str()) {
+                state.segments.insert(parent.id.clone(), node.id.clone());
+                out.push(UiEvent::SelectionChanged {
+                    id: parent.id.clone(),
+                    selected: node.id.clone(),
+                });
+            }
+        }
+        Kind::ChipGroup => {
+            let on = !state.chips.get(&node.id).copied().unwrap_or(false);
+            state.chips.insert(node.id.clone(), on);
+            out.push(UiEvent::ChipToggled {
+                id: parent.id.clone(),
+                chip: node.id.clone(),
+                on,
+            });
+        }
+        // 守卫 = 「活动页真的换了」；守卫体内的不变式 expect 见 r14c 注释。
+        Kind::TabBar
+            if state.tabs.get(&parent.id).map(String::as_str) != Some(node.id.as_str()) =>
+        {
+            // 内部不变式：`find_with_parent` 找到的节点必是 parent 的**直接孩子** ——
+            // 走到这里说明遍历写错了（与 `hit()` 的不变式 expect 同一风格）。
+            let index = parent.children.iter().position(|c| c.id == node.id).expect(
+                "内部不变式：选择结算的落点必是组的直接子节点 —— 走到这里说明遍历写错了",
+            );
+            state.tabs.insert(parent.id.clone(), node.id.clone());
+            out.push(UiEvent::TabChanged { id: parent.id.clone(), index });
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 五d、数值类结算与提交（M6 5d）
+// ---------------------------------------------------------------------------
+
+/// 值夹取（M6 5d 的**唯一**夹取处）：`min`/`max` 各自独立（`None` = 该边不夹）。
+///
+/// 顺序固定「先下界后上界」：值域倒置（min > max，App 配错了）时**上界赢**
+/// —— 与「同一个尺寸只能有一种结果」的消歧纪律同源，不许出现随实现抖动的答案。
+fn clamp_num(v: f64, opts: NumOpts) -> f64 {
+    let mut v = v;
+    if let Some(min) = opts.min {
+        v = v.max(min);
+    }
+    if let Some(max) = opts.max {
+        v = v.min(max);
+    }
+    v
+}
+
+/// 开关结算（M6 5d，r16）：落点**本身**是 [`Kind::Switch`] ⇒ 翻转
+/// `UiState::switches[它自己的 id]` 并发 [`UiEvent::Toggled { on: 翻转后的新值 }`]。
+///
+/// 与 r14b（芯片）同一翻转语义：**每次激活必翻转发一次**（点击本身就是动作）。
+/// 调用点三处 —— 左键抬起（按捕获者结算）、`Enter`、`Space`：**所有**激活来源都过
+/// 这里，指针与键盘不可能分叉。禁用子树里的开关到不了调用点（`hit` 拒绝 / 键盘分支
+/// 自查 `path_is_dead`），这里不再设第二道闸门（与 r14e 同一条纪律）。
+fn resolve_switch(state: &mut UiState, root: &Node, clicked: &str, out: &mut Vec<UiEvent>) {
+    let Some(node) = node_by_id(root, clicked) else {
+        return;
+    };
+    if node.kind != Kind::Switch || path_is_dead(root, node) {
+        return;
+    }
+    let on = !state.switches.get(clicked).copied().unwrap_or(false);
+    state.switches.insert(clicked.to_string(), on);
+    out.push(UiEvent::Toggled { id: clicked.to_string(), on });
+}
+
+/// 值输入框的**提交**（M6 5d）：解析当前草稿 → 成功则发值事件并把草稿**规范化回写**；
+/// 失败则什么都不做（草稿原样留在 `texts` 里，「非空且不可解析」的标记由绘制侧画）。
+///
+/// - `NumberField`：[`parse_num`] → [`clamp_num`] → 发 [`UiEvent::NumberChanged`] →
+///   回写 [`format_num`]；
+/// - `ColorField`：[`parse_hex_color`] → 发 [`UiEvent::ColorChanged`] → 回写
+///   [`format_hex_color`]（`#rrggbb` 小写带 `#`）；
+/// - 普通 `Field`：不是值输入框，空转（它没有「提交」概念，输入即值）。
+///
+/// 规范化回写**不发** `TextChanged`：值已经由值事件报告，回写只是把草稿
+/// （`" 42 "` / `"#FF8800"`）收敛成规范形 —— 这不是用户新输入，发了只会让 App 把
+/// 同一个值处理两遍。调用点两处：`Enter`（焦点不走的提交）+ 函数末尾的失焦钩子。
+fn commit_value_field(state: &mut UiState, root: &Node, id: &str, out: &mut Vec<UiEvent>) {
+    let Some(node) = node_by_id(root, id) else {
+        return;
+    };
+    if !node.kind.is_value_field() || node.kind == Kind::Field || path_is_dead(root, node) {
+        return;
+    }
+    let draft = state.texts.get(id).cloned().unwrap_or_default();
+    match node.kind {
+        Kind::NumberField => {
+            if let Some(v) = parse_num(&draft) {
+                let v = clamp_num(v, state.num_opts.get(id).copied().unwrap_or_default());
+                state.texts.insert(id.to_string(), format_num(v));
+                out.push(UiEvent::NumberChanged { id: id.to_string(), value: v });
+            }
+        }
+        Kind::ColorField => {
+            if let Some(rgb) = parse_hex_color(&draft) {
+                state.texts.insert(id.to_string(), format_hex_color(rgb));
+                out.push(UiEvent::ColorChanged { id: id.to_string(), rgb });
+            }
+        }
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 六、状态机（M5-2）
 // ---------------------------------------------------------------------------
 
@@ -919,22 +1216,24 @@ fn nearest_focusable(
 ///
 /// | 事件 | 效果 |
 /// |---|---|
-/// | `PointerMoved` | 同步 `hover`（变了才发 `HoverChanged`）；**捕获中（`pressed` 在手）⇒ 路由给捕获者：hover 钉在捕获节点上**（T3.7，D7 按下即默认捕获 —— 拖出不换人） |
-/// | `PointerDown { Left }` | 同步 `hover`；**命中的可聚焦控件 ⇒ 聚焦它**（变了才发 `FocusChanged`）；记 `pressed` = **捕获**（按下即默认捕获，D7） |
-/// | `PointerUp { Left }` | 同步 `hover`（捕获已随抬起释放，hover 回到物理位置）；**按捕获者结算 `Clicked`**（抬起在哪都算 —— 改前是「抬起处==按下处」，即拖出即丢）；释放 `pressed` |
-/// | `KeyDown { Tab }` | 树序循环焦点（`Shift` 反向）⇒ `FocusChanged` |
-/// | `KeyDown { Escape }` | 清焦点 ⇒ `FocusChanged(None)` |
-/// | `KeyDown { Enter }` | 焦点在**启用的按钮**上 ⇒ `Clicked`（键激活 = 点击） |
-/// | `KeyDown { Backspace }` | 焦点是启用的输入框 ⇒ 删**一个字符**（Unicode 字符，不是字节）⇒ `TextChanged` |
-/// | `TextInput` | 焦点是启用的输入框 ⇒ 追加 ⇒ `TextChanged` |
-/// | `FocusChanged { focused: false }` | 窗口失焦：清 `hover`/`pressed`（`focus`/`texts` 不动）|
+/// | `PointerMoved` | 同步 `hover`（变了才发 `HoverChanged`）；**捕获中（`pressed` 在手）⇒ 路由给捕获者：hover 钉在捕获节点上**（T3.7，D7 按下即默认捕获 —— 拖出不换人）；**拖动调值锚点在手且捕获者仍是它** ⇒ 反解成值（M6 5d：`base + Δx·step`，夹值域，**变了才发** `NumberChanged`） |
+/// | `PointerDown { Left }` | 同步 `hover`；**命中的可聚焦控件 ⇒ 聚焦它**（变了才发 `FocusChanged`）；记 `pressed` = **捕获**（按下即默认捕获，D7）；**落在 `ScrubNum` 上 ⇒ 建立拖动锚点**（label 解析失败 = 不进入） |
+/// | `PointerUp { Left }` | 同步 `hover`（捕获已随抬起释放，hover 回到物理位置）；**按捕获者结算 `Clicked`**（抬起在哪都算 —— 改前是「抬起处==按下处」，即拖出即丢）；释放 `pressed`、清拖动锚点；**落点是选择类组的直接子节点 ⇒ 追加选择结算**（r14：`SelectionChanged`/`ChipToggled`/`TabChanged`，变了才发 —— 芯片是翻转语义，每次都发）；**落点本身是 `Switch` ⇒ 追加开关结算**（r16：`Toggled`，翻转语义每次都发） |
+/// | `KeyDown { Tab }` | 树序循环焦点（`Shift` 反向）⇒ `FocusChanged`；**焦点从值输入框离开 ⇒ 失焦提交**（见函数末尾钩子） |
+/// | `KeyDown { Escape }` | 清焦点 ⇒ `FocusChanged(None)`；焦点从值输入框离开 ⇒ 失焦提交 |
+/// | `KeyDown { Enter }` | 焦点在**启用的按钮**上 ⇒ `Clicked` + r14 结算；焦点在**启用的开关**上 ⇒ `Clicked` + r16 翻转（与指针同路）；焦点在**值输入框**上 ⇒ **提交**（解析 → 值事件 → 规范化回写）；`Field` 不受 `Enter` 影响 |
+/// | `KeyDown { Char(' ') }`（= winit 的 Space） | 焦点在**启用的开关**上 ⇒ 与 `Enter` 同一条激活路径（`Clicked` + 翻转）；焦点在**值输入框**上不消费（空格是草稿正文）；其余不消费 |
+/// | `KeyDown { Backspace }` | 焦点是启用的**值输入框**（`Field`/`NumberField`/`ColorField`）⇒ 删**一个字符**（Unicode 字符，不是字节）⇒ `TextChanged` |
+/// | `TextInput` | 焦点是启用的**值输入框** ⇒ 插入**光标处** ⇒ `TextChanged` |
+/// | 函数末尾（所有事件共用） | **失焦提交**：处理前焦点在值输入框、处理后焦点换了人（Tab/Escape/点别处）⇒ 替它提交一次（`commit_value_field`）。窗口失焦**不动 UI 焦点** ⇒ 不触发（与「FocusChanged{false} 不清 focus/texts」同一条边界） |
+/// | `FocusChanged { focused: false }` | 窗口失焦：清 `hover`/`pressed`/**拖动锚点**（`focus`/`texts` 不动）|
 /// | `ScaleFactorChanged`（AF-3） | **不消费**（透传红线 Q4：DPI 系数由窗口层转给 App，坐标/尺寸不换算，`UiState` 不动） |
 /// | `Wheel { dy }` | **滚动**：`hover` 最近的可滚动祖先（含自身）偏移 `-dy ×` [`WHEEL_STEP_PX`]`，夹在 `[0, max_scroll]`；变了才发 `Scrolled` |
 /// | `KeyDown { Up/Down }`（T3.1，焦点**不是**输入框时） | **几何邻近**焦点移动（严格方向；无焦点 ⇒ 不定义；到边停） |
 /// | `KeyDown { PageUp/PageDown/Home/End }`（T3.2，焦点**不是**输入框时） | **按键滚动**：焦点容器优先、退 `hover`；翻页 = 视口高；Home/End 到边 |
 /// | `PointerDown { Right }`（T3.3，Q1） | **按下即发** `PointerRight`（纯透传；不 pressed/不焦点；禁用子树不发） |
 /// | `KeyDown { repeat: true }`（T3.6） | 与 `false` 同语义（**能区分**；要不要忽略重复由调用方决定） |
-/// | 其余（`KeyUp`、中键、`Key::Char`/`Other`、`focused: true`、`ScaleFactorChanged`） | 不消费（见「已知边界」） |
+/// | 其余（`KeyUp`、中键、非空格的 `Key::Char`/`Other`、`focused: true`、`ScaleFactorChanged`） | 不消费（见「已知边界」） |
 ///
 /// 只有**状态真的变了**才产出事件（`M5-4` 的 dirty 约定依赖这一点）。
 ///
@@ -956,6 +1255,11 @@ pub fn handle(
     }
 
     let mut out: Vec<UiEvent> = Vec::new();
+
+    // ★ M6 5d **失焦提交**的半个前提：事件处理**前**的焦点。若它是一个值输入框
+    // （`NumberField`/`ColorField`）而处理**后**焦点换了人（Tab/Escape/点别处），
+    // 函数末尾会替它提交一次（解析 → 发事件 → 规范化回写）。见 `commit_value_field`。
+    let focus_before = state.focus.clone();
 
     match ev {
         InputEvent::PointerMoved { x, y } => {
@@ -983,6 +1287,29 @@ pub fn handle(
                             id: drag.id.clone(),
                             offset,
                         });
+                    }
+                }
+            }
+            // ★ M6 5d **拖动调值**（ScrubNum）：锚点在手、且捕获者仍是它 ⇒ 把移动
+            // 反解成值：`base + (x − start_x) × step`，夹进值域（若有），**变了才发**
+            // `NumberChanged`。App 拿着事件改自己的数据 → 重建树（新 label）—— 锚点
+            // 不动，所以「App 慢一帧」不影响后续值；与滚动条拖动（`scroll.drag`）互斥
+            // （后者从不置 `pressed`，前者必是捕获者）。节点若被重建掉了/禁用了 ⇒
+            // 清锚点、停发（fail-closed，不给幽灵控件发事件）。
+            if let (Some(anchor), Some(captured)) = (state.scrub.clone(), state.pressed.clone()) {
+                if anchor.id == captured {
+                    let alive = node_by_id(root, &anchor.id)
+                        .is_some_and(|n| !path_is_dead(root, n));
+                    if !alive {
+                        state.scrub = None;
+                    } else {
+                        let opts = state.num_opts.get(&anchor.id).copied().unwrap_or_default();
+                        let raw = anchor.base + ((*x - anchor.start_x) as f64) * opts.step;
+                        let value = clamp_num(raw, opts);
+                        if value != anchor.last {
+                            state.scrub = Some(ScrubAnchor { last: value, ..anchor.clone() });
+                            out.push(UiEvent::NumberChanged { id: anchor.id.clone(), value });
+                        }
                     }
                 }
             }
@@ -1062,7 +1389,20 @@ pub fn handle(
                     out.push(UiEvent::FocusChanged(Some(id)));
                 }
             }
-            state.pressed = id;
+            state.pressed = id.clone();
+            // ★ M6 5d：按下落在 `ScrubNum` 上 ⇒ 建立拖动调值锚点（按下 x + 从当前
+            // label 解析出的基准值 —— **App 必须把当前值格式化进 label**，这是整个
+            // 回路的约定）。解析失败 ⇒ 不进入拖动调值（这次按下仍是一次普通捕获/
+            // 点击）；禁用/裁剪的点到不了这里（`hit` 已拒绝）。滚动条分支上面已
+            // 提前收尾，两种捕获不会叠加。
+            state.scrub = id.as_deref().and_then(|sid| {
+                let n = node_by_id(root, sid)?;
+                if n.kind != Kind::ScrubNum || path_is_dead(root, n) {
+                    return None;
+                }
+                let base = parse_num(n.props.label.as_deref().unwrap_or(""))?;
+                Some(ScrubAnchor { id: sid.to_string(), start_x: *x, base, last: base })
+            });
             }
         }
         // 右/中键：**不参与左键的按下/点击语义**（pressed/Clicked 独占属左键）。
@@ -1107,8 +1447,16 @@ pub fn handle(
                 // 已登记进 `ROADMAP.md` 的 D7 行）。上面那行 `sync_hover` 已经把 hover
                 // 送回抬起处的物理节点（捕获随 `take()` 释放，移动事件从下一条起回到
                 // 普通命中测试）。
-                out.push(UiEvent::Clicked(captured));
+                out.push(UiEvent::Clicked(captured.clone()));
+                // ★ M6 5c 选择类结算（r14）：落点是 Segmented/ChipGroup/TabBar 的直接
+                // 子节点 ⇒ 更新值映射 + 发对应事件（没有变化就只有 `Clicked`）。
+                resolve_selection(state, root, &captured, &mut out);
+                // ★ M6 5d 开关结算：落点本身是 `Switch` ⇒ 翻转 + `Toggled`（r16，
+                // 与 r14 同型；键盘激活走同一条，见 `Enter`/`Space` 分支）。
+                resolve_switch(state, root, &captured, &mut out);
             }
+            // ★ M6 5d：左键抬起 = 拖动调值结束（无论刚才点在哪）⇒ 锚点即清（瞬态）。
+            state.scrub = None;
         }
         // 右/中键的**抬起**：只同步 hover（按下语义已在 Down 分支完成 —— `PointerRight`
         // 是按下即发，没有抬起配对）。
@@ -1157,14 +1505,53 @@ pub fn handle(
         InputEvent::KeyDown {
             key: Key::Enter, ..
         } => {
-            let live_button = state
+            // M6 5d 起焦点上的「激活」分三档（同一道「启用」闸门）：
+            // - `Button` ⇒ `Clicked` + 选择结算（既有）；
+            // - `Switch` ⇒ `Clicked` + 开关结算（与指针点击同一条 `resolve_switch`）；
+            // - 值输入框（`NumberField`/`ColorField`）⇒ **提交**（解析 → 发值事件 →
+            //   规范化回写）；`Field` 依旧不受 `Enter` 影响（多行语义未定，不臆造）。
+            let live_focus = state
                 .focus
                 .as_deref()
                 .and_then(|id| node_by_id(root, id))
-                .filter(|n| n.kind == Kind::Button && !path_is_dead(root, n))
+                .filter(|n| !path_is_dead(root, n))
+                .map(|n| (n.id.clone(), n.kind));
+            if let Some((id, kind)) = live_focus {
+                match kind {
+                    Kind::Button => {
+                        out.push(UiEvent::Clicked(id.clone()));
+                        // ★ M6 5c（r14）：键盘激活与指针点击走**同一条**选择结算 ——
+                        // 焦点在段/芯片/页签上按 `Enter`，效果与点它完全一致。
+                        resolve_selection(state, root, &id, &mut out);
+                    }
+                    Kind::Switch => {
+                        out.push(UiEvent::Clicked(id.clone()));
+                        resolve_switch(state, root, &id, &mut out);
+                    }
+                    _ if kind.is_value_field() => commit_value_field(state, root, &id, &mut out),
+                    _ => {}
+                }
+            }
+        }
+        // `Space`（winit 的 `Named(Space)` ⇒ `Key::Char(' ')`，`deer-window` display.rs
+        // 的冻结映射 —— 空格是可打印字符，不是命令键）：焦点在启用的 **Switch** 上
+        // ⇒ 与 `Enter` 完全同一条激活路径（`Clicked` + 翻转）。焦点在**值输入框**上
+        // ⇒ **不消费**（空格是草稿正文，由 `TextInput` 分支照常插入草稿）；其余焦点
+        // ⇒ 不消费。真实窗口流里 `KeyDown{Char(' ')}` 后还会跟一条 `TextInput{" "}`，
+        // 但 Switch 不是值输入框 ⇒ 那条被忽略 ⇒ **不会双翻转**。
+        InputEvent::KeyDown {
+            key: Key::Char(' '),
+            ..
+        } => {
+            let live_switch = state
+                .focus
+                .as_deref()
+                .and_then(|id| node_by_id(root, id))
+                .filter(|n| n.kind == Kind::Switch && !path_is_dead(root, n))
                 .map(|n| n.id.clone());
-            if let Some(id) = live_button {
-                out.push(UiEvent::Clicked(id));
+            if let Some(id) = live_switch {
+                out.push(UiEvent::Clicked(id.clone()));
+                resolve_switch(state, root, &id, &mut out);
             }
         }
         InputEvent::KeyDown {
@@ -1315,6 +1702,9 @@ pub fn handle(
         InputEvent::FocusChanged { focused: false } => {
             // 窗口失焦：抬起事件可能永远不来了 ⇒ 按下状态必须丢，否则回来一点就成点击。
             state.pressed = None;
+            // M6 5d：拖动调值锚点同样按「窗口失焦即清」（builder 文档的承诺）——
+            // 抬起可能永远不来，锚点残留会让下一次移动凭空发 `NumberChanged`。
+            state.scrub = None;
             if state.hover.is_some() {
                 state.hover = None;
                 out.push(UiEvent::HoverChanged(None));
@@ -1326,6 +1716,19 @@ pub fn handle(
             // 同步记账），交互层**不消费、不换算** —— 命中、布局、绘制仍全是物理像素的
             // 纯函数；也不动 `UiState`（DPI 变化不是 UI 状态变化；重绘由窗口层的
             // `Gate::Always` 负责，不经过本层的任何事件）。
+        }
+    }
+
+    // ★ M6 5d **失焦提交**：处理前焦点在某个值输入框、处理后焦点换了人（含清空）
+    // ⇒ 替它提交一次（解析 → 发值事件 → 规范化回写）。这就是 `NumberField`/
+    // `ColorField` 的「失焦提交」—— blur 的全部来源（Tab / Escape / 点到别处）都
+    // 经过 `state.focus` 的变化，所以一个钩子覆盖所有失焦路径，不可能漏。
+    // （`handle` 里有两处提前 `return out`：都在「焦点不是值输入框」的分支里
+    //（PageUp/PageDown/Home/End），此时 `focus_before` 就算有值也不是活的值输入框，
+    // `commit_value_field` 会自行空转 —— 语义等价，特此登记。）
+    if let Some(prev) = focus_before {
+        if state.focus.as_deref() != Some(prev.as_str()) {
+            commit_value_field(state, root, &prev, &mut out);
         }
     }
 
@@ -1405,14 +1808,19 @@ fn scrollbar_grab(root: &Node, geo: &Geometry, state: &UiState, x: f32, y: f32) 
     best.map(|(_, d)| d)
 }
 
-/// 当前焦点所在的**可用输入框** id；不是输入框 / 焦点为空 / 路径已死 ⇒ `None`。
+/// 当前焦点所在的**可用值输入框** id；不是值输入框 / 焦点为空 / 路径已死 ⇒ `None`。
 ///
 /// 校验原本写在文本编辑的辅助函数里，**如今多了一个使用者（光标移动）**，
 /// 若把校验抄第二份，两边迟早漂 —— 「这里也算输入框」在一处为真、另一处为假是最难查的那类 bug。
+///
+/// M6 5d 起「输入框」的判据收口为 [`Kind::is_value_field`]（`Field`/`NumberField`/
+/// `ColorField`）：后两种的**编辑期草稿**与 `Field` 同住 `texts`，所以打字/退格/
+/// 光标/IME 的全套机械**原样复用** —— 唯一的区别在**提交**（提交才解析，见
+/// `commit_value_field`）。
 fn focused_field_id(root: &Node, state: &UiState) -> Option<String> {
     let id = state.focus.clone()?;
     let node = node_by_id(root, &id)?;
-    if node.kind != Kind::Field || path_is_dead(root, node) {
+    if !node.kind.is_value_field() || path_is_dead(root, node) {
         return None;
     }
     Some(id)
@@ -2680,6 +3088,13 @@ mod tests {
             carets: Default::default(),
             scroll: Default::default(),
             preedit: None,
+            segments: Default::default(),
+            chips: Default::default(),
+            tabs: Default::default(),
+            // M6 5d 同一课（漏字段 ⇒ E0063 test build 崩）：本树没有数值类控件 ⇒ 全空。
+            num_opts: Default::default(),
+            switches: Default::default(),
+            scrub: None,
         };
         // 前置：这份语料确实一个可滚动容器都没有（否则下面的 `Wheel` 断言在测空气）。
         let mut scrollers = Vec::new();
@@ -3377,6 +3792,13 @@ mod tests {
         // ⚠️ 预编辑也要**非空** —— 空值上「带没带」恒等，判据就没判别力
         //    （今天第二条判据栽在这个模式上，见记忆）
         s.preedit = Some(Preedit { id: "box".into(), text: "zhong".into() });
+        // ⚠️ 选择类三张值表同理（M6 5c）：先塞非空值，再断言「带过去了」。
+        s.segments.insert("seg".into(), "b0".into());
+        s.chips.insert("b1".into(), true);
+        s.tabs.insert("bar".into(), "b2".into());
+        // ⚠️ M6 5d 的开关表同理：先塞非空值（空表上「带没带」恒等）。
+        s.switches.insert("b3".into(), true);
+        s.carets.insert("f".into(), 3);
         assert_eq!(
             s.scroll.scroll_to("box", 40),
             Some(40),
@@ -3392,6 +3814,10 @@ mod tests {
             scroll,
             carets,
             preedit,
+            segments,
+            chips,
+            tabs,
+            switches,
         } = i;
         assert_eq!(hover, s.hover, "hover 必须原样带过去");
         assert_eq!(focus, s.focus);
@@ -3414,6 +3840,16 @@ mod tests {
             s.preedit.as_ref().map(|p| (p.id.as_str(), p.text.as_str())),
             "预编辑必须带过去 —— 漏了它看不到正在拼的那一段"
         );
+        // 选择类三张值表也必须带过去（M6 5c）：漏了它们组内永远画不出选中/开/关。
+        // ⚠️ 前置：三张表必须**非空** —— 空表上「带没带」恒等，判据没有判别力
+        //    （与上面偏移/预编辑的教训同一条）。
+        assert!(!s.segments.is_empty() && !s.chips.is_empty() && !s.tabs.is_empty(), "测试前置：三张值表都要非空");
+        assert_eq!(segments, s.segments, "分段选中表必须带过去 —— 漏了它选中段不亮");
+        assert_eq!(chips, s.chips, "芯片开关表必须带过去 —— 漏了它开着的芯片画成关");
+        assert_eq!(tabs, s.tabs, "页签活动页表必须带过去 —— 漏了它活动页不亮");
+        // 开关表同理（M6 5d）：漏了它开关永远画成「关」。
+        assert!(!s.switches.is_empty(), "测试前置：开关表必须非空");
+        assert_eq!(switches, s.switches, "开关表必须带过去 —— 漏了它开着的开关画成关");
     }
 
     // ---- T3.5：`texts` 光标（字符位） --------------------------------------

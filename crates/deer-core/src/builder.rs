@@ -120,6 +120,101 @@ impl Builder {
         self.push_named(n, Kind::Field)
     }
 
+    // —— M6 5d：数值类四件（NumberField / ScrubNum / Switch / ColorField）—————
+
+    /// 数值输入框：[`Kind::Field`] 的数值变体（M6 5d）。
+    ///
+    /// 编辑期草稿住 `UiState::texts`（与 `Field` 同一套光标/退格/IME 机械），
+    /// 提交时（失焦 / `Enter`）才解析；值域/步长住 `UiState::num_opts`（按 id 键控，
+    /// App 塞，表里没有 = 无值域、步长 1.0）。返回节点 id（事件与两张表用的就是它）。
+    /// 扩 `Kind` 的裁定见 `docs/features/number-field.md`（交互层必须认出它才发得出
+    /// `NumberChanged`，且「不可解析」下划线是新的绘制档）。
+    pub fn number_field(&mut self, label: impl Into<String>) -> String {
+        self.value_leaf(Kind::NumberField, "", label, |_| {})
+    }
+
+    /// 同 [`Builder::number_field`]，可指定 id（事件/`num_opts`/`texts` 的键）并就地改节点
+    /// （宽度、禁用等）。`id` 传空串 = 自动生成（`number_field_N`）。
+    pub fn number_field_opts(
+        &mut self,
+        id: impl Into<String>,
+        label: impl Into<String>,
+        f: impl FnOnce(&mut Node),
+    ) -> String {
+        self.value_leaf(Kind::NumberField, id, label, f)
+    }
+
+    /// 拖动调值（M6 5d）：显示一个数值（`label` = App 格式化的当前值），按住左右拖改值，
+    /// 拖动中持续发 `UiEvent::NumberChanged`（依赖 T3.7 指针捕获）。基准值 = 按下时
+    /// `parse_num(label)` —— **App 必须把当前值格式化进 label**（事件 → 改自己的数据 →
+    /// 重建树 → 新 label，这就是整个回路）。
+    pub fn scrub_num(&mut self, label: impl Into<String>) -> String {
+        self.value_leaf(Kind::ScrubNum, "", label, |_| {})
+    }
+
+    /// 同 [`Builder::scrub_num`]，可指定 id 并就地改节点。`id` 传空串 = 自动生成。
+    pub fn scrub_num_opts(
+        &mut self,
+        id: impl Into<String>,
+        label: impl Into<String>,
+        f: impl FnOnce(&mut Node),
+    ) -> String {
+        self.value_leaf(Kind::ScrubNum, id, label, f)
+    }
+
+    /// 开关（M6 5d）：点击 / `Enter` / `Space`（后两者需焦点在它上）翻转并发
+    /// `UiEvent::Toggled { id, on }`；开/关值住 `UiState::switches`（**键 = 它自己的
+    /// id**，表里没有 = 关）。想默认开就塞表：`state.switches.insert(id, true)`。
+    pub fn switch(&mut self, label: impl Into<String>) -> String {
+        self.value_leaf(Kind::Switch, "", label, |_| {})
+    }
+
+    /// 同 [`Builder::switch`]，可指定 id 并就地改节点。`id` 传空串 = 自动生成。
+    pub fn switch_opts(
+        &mut self,
+        id: impl Into<String>,
+        label: impl Into<String>,
+        f: impl FnOnce(&mut Node),
+    ) -> String {
+        self.value_leaf(Kind::Switch, id, label, f)
+    }
+
+    /// 颜色输入框（M6 5d 最小版）：文本输入 `#RRGGBB` + 色块预览；提交时（失焦 /
+    /// `Enter`）解析，成功发 `UiEvent::ColorChanged { rgb }` 并回写规范化串。
+    /// 完整取色器不做（见 color-field.md「做不到什么」）。
+    pub fn color_field(&mut self, label: impl Into<String>) -> String {
+        self.value_leaf(Kind::ColorField, "", label, |_| {})
+    }
+
+    /// 同 [`Builder::color_field`]，可指定 id 并就地改节点。`id` 传空串 = 自动生成。
+    pub fn color_field_opts(
+        &mut self,
+        id: impl Into<String>,
+        label: impl Into<String>,
+        f: impl FnOnce(&mut Node),
+    ) -> String {
+        self.value_leaf(Kind::ColorField, id, label, f)
+    }
+
+    /// 四种数值类控件的**共同构造**：叶子 + 标签 + 可选显式 id。
+    /// `f` 在 `push_named` 之前跑：它只能就地改字段（layout/props/id），改不动
+    /// 「先设参数、最后定 id」的顺序纪律（那对消费式方法才成立，见模块头注释）。
+    fn value_leaf(
+        &mut self,
+        kind: Kind,
+        id: impl Into<String>,
+        label: impl Into<String>,
+        f: impl FnOnce(&mut Node),
+    ) -> String {
+        let mut n = Node::new(kind, "").with_label(label);
+        let explicit = id.into();
+        if !explicit.is_empty() {
+            n.id = explicit;
+        }
+        f(&mut n);
+        self.push_named(n, kind)
+    }
+
     /// 挂载一个节点；`id` 为空时按 kind 自动生成。
     ///
     /// 显式名字会被 [`IdGen::reserve`] 记下并占号 —— 否则自动 id 可能撞上它。
@@ -142,7 +237,7 @@ impl Builder {
 
     /// 容器 + 闭包式嵌套。**闭包内 new 出来的节点挂在容器下。**
     pub fn container(&mut self, kind: Kind, id: impl Into<String>, body: impl FnOnce(&mut Builder)) {
-        assert!(kind.is_container(), "container() 只接受 Column/Row");
+        assert!(kind.is_container(), "container() 只接受容器 Kind（Column/Row/选择类组）");
         let n = Node::new(kind, id);
         self.push(n);
         let parent_path = self.path.clone();
@@ -165,7 +260,7 @@ impl Builder {
         layout: LayoutProps,
         body: impl FnOnce(&mut Builder),
     ) {
-        assert!(kind.is_container(), "container_opts() 只接受 Column/Row");
+        assert!(kind.is_container(), "container_opts() 只接受容器 Kind（Column/Row/选择类组）");
         let id: String = id.into();
         let resolved = if id.is_empty() { self.ids.next(kind) } else { id };
         self.container_with(kind, resolved, layout, body);
@@ -193,6 +288,137 @@ impl Builder {
         self.path = cur_path;
         body(self);
         self.path = parent_path;
+    }
+
+    // —— M6 5a：RowActions（行尾动作按钮组 · **组合层**） ————————————————
+
+    /// 行尾动作按钮组：**`Row` + 每个标签一个 `button`**（M6 控件族 5a · 组合层）。
+    ///
+    /// 为什么是组合而不是扩 `Kind`：RowActions 的每个像素、每条 `Clicked`、每个
+    /// 可聚焦项都**已经**来自 `Row`（布局/命中）与 `Button`（绘制/交互）——
+    /// 扩 `Kind` 要同步 registry/scene/builder/绘制四处，却不会带来任何新行为；
+    /// 组合层只是把「建一个 Row、逐个建 button、收好 id」这段样板收进库里
+    /// （判据：与手写等价树 `structurally_eq` 且绘制命令逐条相同，见
+    /// `crates/deer-gui/tests/m6_basics.rs`）。
+    ///
+    /// - 返回**按钮 id 列表**（顺序与 `labels` 一致；事件关联用 id，不进树）；
+    /// - Row 自身 id 自动生成（`row_N`）；要指定 id / 布局（间距、对齐、尺寸）用
+    ///   [`Builder::row_actions_opts`]；
+    /// - `labels` 为空 ⇒ 一个没有子节点的 Row（合法；无 padding 的容器零绘制命令）。
+    pub fn row_actions(&mut self, labels: &[&str]) -> Vec<String> {
+        self.row_actions_opts("", LayoutProps::default(), labels)
+    }
+
+    /// 同 [`Builder::row_actions`]，但可指定 Row 的 id 与整体布局参数。
+    ///
+    /// 典型用法：`L::new().gap(8.0).main(Align::End).to_props()` —— 间距防粘连、
+    /// 主轴 `end` 让动作组贴到行尾（组在父 Row 里时）。`id` 传空串 = 自动生成。
+    pub fn row_actions_opts(
+        &mut self,
+        id: impl Into<String>,
+        layout: LayoutProps,
+        labels: &[&str],
+    ) -> Vec<String> {
+        let mut buttons: Vec<String> = Vec::with_capacity(labels.len());
+        self.container_opts(Kind::Row, id, layout, |r| {
+            for label in labels {
+                buttons.push(r.button(*label));
+            }
+        });
+        buttons
+    }
+
+    // —— M6 5c：选择类三组（Segmented / ChipGroup / TabBar · **Kind 扩展**）———
+
+    /// 分段选择组：互斥单选，**`Kind::Segmented` + 每标签一个 `button`**（M6 5c）。
+    ///
+    /// 与 RowActions（组合层）不同，三个选择类组**扩了 `Kind`**，理由（逐条写进
+    /// 指南的「语义」）：① 交互层必须在树里认出「这是一组选择」才发得出
+    /// `SelectionChanged` 等值事件（组合层没有任何识别通道；给 `NodeProps` 加
+    /// 「角色」字段要同步 registry/scene/.dui 三处，代价更大还得多一个字段）；
+    /// ② 「选中」是本系统**第一种持久视觉**（hover/pressed/focus 全是瞬态），
+    /// 需要绘制侧新的一档状态色 —— 满足「需要新视觉形态才扩 Kind」的判据。
+    ///
+    /// - 返回**段 id 列表**（顺序与 `labels` 一致；`UiState::segments` 的值、事件里的
+    ///   `selected` 用的就是它）；
+    /// - 组 id 自动生成（`segmented_N`）；要指定 id / 布局（间距、尺寸）用
+    ///   [`Builder::segmented_opts`]；
+    /// - 当前选中**不在树里**：App 把初值塞进 `UiState::segments`（组 id → 段 id），
+    ///   没塞 = 没有选中段（合法状态）；
+    /// - `labels` 为空 ⇒ 一个没有子节点的组（合法；什么也选不了）。
+    pub fn segmented(&mut self, labels: &[&str]) -> Vec<String> {
+        self.selection_group(Kind::Segmented, "", LayoutProps::default(), labels)
+    }
+
+    /// 同 [`Builder::segmented`]，但可指定组 id 与整体布局参数（gap 防粘连是主用途）。
+    /// `id` 传空串 = 自动生成。
+    pub fn segmented_opts(
+        &mut self,
+        id: impl Into<String>,
+        layout: LayoutProps,
+        labels: &[&str],
+    ) -> Vec<String> {
+        self.selection_group(Kind::Segmented, id, layout, labels)
+    }
+
+    /// 标签组：多选，**`Kind::ChipGroup` + 每标签一个 `button`**（M6 5c）。
+    /// 每个芯片独立开/关；开关表住 `UiState::chips`（芯片 id → bool，**表里没有 = 关**）。
+    /// 其余约定见 [`Builder::segmented`]（Kind 扩展的同一份理由）。
+    pub fn chip_group(&mut self, labels: &[&str]) -> Vec<String> {
+        self.selection_group(Kind::ChipGroup, "", LayoutProps::default(), labels)
+    }
+
+    /// 同 [`Builder::chip_group`]，但可指定组 id 与整体布局参数。`id` 传空串 = 自动生成。
+    pub fn chip_group_opts(
+        &mut self,
+        id: impl Into<String>,
+        layout: LayoutProps,
+        labels: &[&str],
+    ) -> Vec<String> {
+        self.selection_group(Kind::ChipGroup, id, layout, labels)
+    }
+
+    /// 页签栏：单选页签，**`Kind::TabBar` + 每标签一个 `button`**（M6 5c）。
+    /// 点击发 `TabChanged { id, index }`（index = 页签在组**直接子节点**里的树序下标，
+    /// **禁用页也一起数**）；内容切换是 App 的事。单个页签禁用 = 该页签自己的
+    /// `props.disabled`：本便捷构造不带禁用参数，需要时用
+    /// `container_opts(Kind::TabBar, …)` + `button_opts(…, |n| n.props.disabled = true)`
+    /// 手写这个组（两条路径产出**结构相等**的树，判据见 `tests/m6_select.rs`）。
+    /// 其余约定见 [`Builder::segmented`]（Kind 扩展的同一份理由）。
+    pub fn tab_bar(&mut self, labels: &[&str]) -> Vec<String> {
+        self.selection_group(Kind::TabBar, "", LayoutProps::default(), labels)
+    }
+
+    /// 同 [`Builder::tab_bar`]，但可指定组 id 与整体布局参数。`id` 传空串 = 自动生成。
+    pub fn tab_bar_opts(
+        &mut self,
+        id: impl Into<String>,
+        layout: LayoutProps,
+        labels: &[&str],
+    ) -> Vec<String> {
+        self.selection_group(Kind::TabBar, id, layout, labels)
+    }
+
+    /// 三个选择类组的**共同构造**：`Kind` 对应的组容器 + 每标签一个 `button`，
+    /// 返回子按钮 id 列表。语义差异（单选/多选/页签）在交互层，不在构造层。
+    fn selection_group(
+        &mut self,
+        kind: Kind,
+        id: impl Into<String>,
+        layout: LayoutProps,
+        labels: &[&str],
+    ) -> Vec<String> {
+        assert!(
+            kind.is_selection_group(),
+            "selection_group() 只接受 Segmented/ChipGroup/TabBar"
+        );
+        let mut items: Vec<String> = Vec::with_capacity(labels.len());
+        self.container_opts(kind, id, layout, |g| {
+            for label in labels {
+                items.push(g.button(*label));
+            }
+        });
+        items
     }
 
     pub fn build(&self) -> Node {
@@ -362,5 +588,303 @@ pub fn props(label: Option<&str>, disabled: bool) -> NodeProps {
         label: label.map(|s| s.to_string()),
         disabled,
             extra: Default::default(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// RowActions 的**构造判据**：便捷构造出的树必须与「手写 Row + button」
+    /// 结构相等（组合层 = 既有控件的等价书写，不产生第二种树形）。
+    #[test]
+    fn row_actions_builds_exactly_the_hand_written_row_of_buttons() {
+        let mut a = Builder::new(Kind::Column, "app");
+        let ids = a.row_actions_opts("actions", L::new().gap(8.0).to_props(), &["编辑", "删除"]);
+
+        let mut b = Builder::new(Kind::Column, "app");
+        b.container_opts(Kind::Row, "actions", L::new().gap(8.0).to_props(), |r| {
+            r.button("编辑");
+            r.button("删除");
+        });
+
+        let ta = a.build();
+        let tb = b.build();
+        // 前置断言：返回的 id 必须真的是树里那两个按钮的 id（否则「收 id」收错了人，
+        // 后面按 id 关联事件的用法全会静默落空）。
+        let row = &ta.children[0];
+        assert_eq!(
+            ids,
+            row.children.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+            "返回的按钮 id 必须与树里的按钮逐一对上"
+        );
+        assert!(ta.structurally_eq(&tb), "组合层必须产出与手写等价的树");
+    }
+
+    /// 自动 id 规则与两条构筑路径**同一份**（`IdGen` 按 kind 计数 —— B-1 的前提）：
+    /// 第一次调用得 `row_1` + `button_1/2`，第二次调用不得撞号。
+    #[test]
+    fn row_actions_auto_ids_follow_the_kind_counters() {
+        let mut app = Builder::new(Kind::Column, "app");
+        let first = app.row_actions(&["a", "b"]);
+        let second = app.row_actions(&["c"]);
+        let tree = app.build();
+
+        assert_eq!(first, vec!["button_1", "button_2"]);
+        assert_eq!(second, vec!["button_3"]);
+        let rows: Vec<&Node> = tree
+            .children
+            .iter()
+            .filter(|c| c.kind == Kind::Row)
+            .collect();
+        assert_eq!(
+            rows.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            vec!["row_1", "row_2"],
+            "两次便捷构造的 Row 自动 id 不得撞号"
+        );
+        // 前置断言：标签按序进树（「顺序与 labels 一致」是文档承诺，得真钉住）。
+        assert_eq!(rows[0].children[0].props.label.as_deref(), Some("a"));
+        assert_eq!(rows[0].children[1].props.label.as_deref(), Some("b"));
+        assert_eq!(rows[1].children[0].props.label.as_deref(), Some("c"));
+    }
+
+    /// `row_actions_opts` 的参数直通：指定 id 就用指定 id（并进 `IdGen` 占号），
+    /// 布局参数原样落在 Row 上（ gap 是防粘连的主用途）。
+    #[test]
+    fn row_actions_opts_passes_id_and_layout_through() {
+        let mut app = Builder::new(Kind::Column, "app");
+        let ids =
+            app.row_actions_opts("actions", L::new().gap(8.0).to_props(), &["编辑"]);
+        let tree = app.build();
+        let row = &tree.children[0];
+        assert_eq!(row.id, "actions");
+        assert_eq!(row.layout.gap, 8.0);
+        assert_eq!(ids, vec!["button_1"], "显式 Row id 不影响 button 的自动编号");
+        // 占号：之后再自动生成 Row 不得撞上显式名（`IdGen::reserve` 的职责）。
+        let mut app2 = Builder::new(Kind::Column, "app");
+        let _ = app2.row_actions_opts("actions", L::new().to_props(), &["x"]);
+        let again = app2.row_actions(&["y"]);
+        let tree2 = app2.build();
+        assert_ne!(
+            tree2.children[0].id, tree2.children[1].id,
+            "显式 id 之后的自动 Row id 不得与显式名冲突"
+        );
+        assert_eq!(again, vec!["button_2"], "button 计数跨调用连续");
+    }
+
+    /// 空标签组：合法（空 Row）。这条钉的是「不 panic、不静默吞容器」。
+    #[test]
+    fn row_actions_with_no_labels_is_an_empty_row() {
+        let mut app = Builder::new(Kind::Column, "app");
+        let ids = app.row_actions(&[]);
+        let tree = app.build();
+        assert!(ids.is_empty());
+        assert_eq!(tree.children.len(), 1, "Row 本身还在");
+        assert_eq!(tree.children[0].kind, Kind::Row);
+        assert!(tree.children[0].children.is_empty());
+    }
+
+    // —— M6 5c：选择类三组的构造判据（与 RowActions 同一套纪律）———————
+
+    /// **判据本体**：三个便捷构造产出的树必须与「手写容器 + button」**结构相等**
+    /// （Kind 扩展改变的是「组是什么」，不是「怎么建组」—— 两条构筑路径仍同一份规则）。
+    #[test]
+    fn selection_groups_build_hand_written_equivalent_trees() {
+        // 便捷路径
+        let mut a = Builder::new(Kind::Column, "app").gap(4.0);
+        let seg = a.segmented_opts("seg", L::new().gap(2.0).to_props(), &["日", "周", "月"]);
+        let chips = a.chip_group_opts("chips", L::new().gap(6.0).to_props(), &["红", "蓝"]);
+        let tabs = a.tab_bar_opts("tabs", L::new().to_props(), &["A", "B"]);
+        let ta = a.build();
+
+        // 手写路径（container_opts + button，逐字对应）
+        let mut b = Builder::new(Kind::Column, "app").gap(4.0);
+        b.container_opts(Kind::Segmented, "seg", L::new().gap(2.0).to_props(), |g| {
+            g.button("日");
+            g.button("周");
+            g.button("月");
+        });
+        b.container_opts(Kind::ChipGroup, "chips", L::new().gap(6.0).to_props(), |g| {
+            g.button("红");
+            g.button("蓝");
+        });
+        b.container_opts(Kind::TabBar, "tabs", L::new().to_props(), |g| {
+            g.button("A");
+            g.button("B");
+        });
+        let tb = b.build();
+
+        assert!(ta.structurally_eq(&tb), "便捷构造必须与手写组结构相等");
+        // 前置断言：返回的 id 必须真的是组孩子的 id（事件关联与 UiState 键全靠它）。
+        for (ids, group) in [(&seg, "seg"), (&chips, "chips"), (&tabs, "tabs")] {
+            let node = ta.children.iter().find(|c| c.id == group).unwrap();
+            assert_eq!(
+                ids,
+                &node.children.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+                "`{group}` 返回的 id 必须与树里的孩子逐一对上"
+            );
+        }
+        // 前置断言：组 Kind 与孩子 Kind 都对（防「便捷构造建错容器」这类低级漂移）。
+        assert_eq!(ta.children[0].kind, Kind::Segmented);
+        assert_eq!(ta.children[1].kind, Kind::ChipGroup);
+        assert_eq!(ta.children[2].kind, Kind::TabBar);
+        assert!(
+            ta.children
+                .iter()
+                .all(|g| g.children.iter().all(|c| c.kind == Kind::Button)),
+            "组的直接子节点必须是 Button"
+        );
+    }
+
+    /// 自动 id 规则与两条构筑路径**同一份**（`IdGen` 按 kind 计数）：
+    /// 组 id 用新 kind 的计数器（`segmented_1` …），按钮计数跨组连续。
+    #[test]
+    fn selection_group_auto_ids_follow_the_kind_counters() {
+        let mut app = Builder::new(Kind::Column, "app");
+        let seg = app.segmented(&["日", "周"]);
+        let chips = app.chip_group(&["红"]);
+        let tabs = app.tab_bar(&["A"]);
+        let again = app.segmented(&["x"]);
+        let tree = app.build();
+
+        assert_eq!(seg, vec!["button_1", "button_2"]);
+        assert_eq!(chips, vec!["button_3"]);
+        assert_eq!(tabs, vec!["button_4"]);
+        assert_eq!(again, vec!["button_5"], "按钮计数跨组连续");
+        let kinds: Vec<&str> = tree.children.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["segmented_1", "chip_group_1", "tab_bar_1", "segmented_2"],
+            "组 id 按 kind 计数，第二次 Segmented 不得撞号"
+        );
+    }
+
+    /// 组是**横排容器**：布局按 Row 同一套数学落位（孩子 x 递增），
+    /// 且吃容器参数（gap 生效）。这是「is_horizontal 收口」的行为判据。
+    #[test]
+    fn selection_groups_lay_out_horizontally_with_gap() {
+        let mut app = Builder::new(Kind::Column, "app");
+        app.segmented_opts("seg", L::new().gap(8.0).to_props(), &["日", "周", "月"]);
+        let tree = app.build();
+        assert!(tree.children[0].layout.gap == 8.0, "前置：opts 的 gap 直通到组");
+
+        let geo = crate::layout::layout(
+            &tree,
+            crate::node::Rect::new(0.0, 0.0, 300.0, 100.0),
+            crate::layout::TextStyle { font_size: 14.0, line_height: 18.0 },
+            &crate::layout::ApproxMeasure,
+        );
+        let xs: Vec<f32> = tree.children[0]
+            .children
+            .iter()
+            .map(|c| geo.get(&c.id).expect("前置：孩子必须有几何").x)
+            .collect();
+        assert!(
+            xs[0] < xs[1] && xs[1] < xs[2],
+            "三个段必须横排（x 递增），实际 x = {xs:?}"
+        );
+        // 间隙判据：x 间距 = 前段宽 + gap（横排数学真的吃到了 gap）。
+        let w0 = geo.get(&tree.children[0].children[0].id).unwrap().w;
+        assert!(
+            (xs[1] - xs[0] - w0 - 8.0).abs() < 0.5,
+            "段间距必须是「前段宽 + gap(8)」，实际 {xs:?} w0={w0}"
+        );
+    }
+
+    // —— M6 5d：数值类四件的构造判据（与选择类同一套纪律）———————————
+
+    /// **判据本体**：四个便捷构造产出的树必须与「手写 `Node::new(kind, id).with_label`」
+    /// **结构相等**（扩的是 Kind 与语义，不是「怎么建叶子」—— 两条构筑路径仍同一份规则）。
+    #[test]
+    fn value_leaf_builders_match_hand_written_nodes() {
+        let mut a = Builder::new(Kind::Column, "app");
+        let num = a.number_field_opts("age", "年龄", |n| n.layout.width = Some(Size::Px(80.0)));
+        let vol = a.scrub_num_opts("vol", "40", |_| {});
+        let wifi = a.switch_opts("wifi", "Wi-Fi", |_| {});
+        let tint = a.color_field_opts("tint", "#ff8800", |_| {});
+        let ta = a.build();
+
+        // 手写路径（逐字对应）
+        let tb = Node::new(Kind::Column, "app").push(
+            Node::new(Kind::NumberField, "age")
+                .with_label("年龄")
+                .with_layout(crate::node::LayoutProps {
+                    width: Some(Size::Px(80.0)),
+                    ..Default::default()
+                }),
+        ).push(Node::new(Kind::ScrubNum, "vol").with_label("40"))
+            .push(Node::new(Kind::Switch, "wifi").with_label("Wi-Fi"))
+            .push(Node::new(Kind::ColorField, "tint").with_label("#ff8800"));
+
+        assert!(ta.structurally_eq(&tb), "便捷构造必须与手写叶子结构相等");
+        // 前置断言：返回的 id 就是显式指定的那批（事件与 UiState 两张表的键）。
+        assert_eq!(num, "age");
+        assert_eq!(vol, "vol");
+        assert_eq!(wifi, "wifi");
+        assert_eq!(tint, "tint");
+        // 前置断言：Kind 落对（防「便捷构造建错控件」这类低级漂移）。
+        let kinds: Vec<Kind> = ta.children.iter().map(|c| c.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![Kind::NumberField, Kind::ScrubNum, Kind::Switch, Kind::ColorField]
+        );
+        // 叶子判据：四种都不是容器、不横排（与 Button/Field 同一侧）。
+        for k in kinds {
+            assert!(!k.is_container(), "{k:?} 必须是叶子");
+            assert!(!k.is_horizontal(), "{k:?} 不是横排容器");
+        }
+    }
+
+    /// 自动 id 规则与两条构筑路径同一份（`IdGen` 按 kind 计数）：
+    /// 四种控件各有自己的计数器，跨调用连续且不与显式名冲突。
+    #[test]
+    fn value_leaf_auto_ids_follow_the_kind_counters() {
+        let mut app = Builder::new(Kind::Column, "app");
+        let a1 = app.number_field("a");
+        let s1 = app.scrub_num("s");
+        let w1 = app.switch("w");
+        let c1 = app.color_field("c");
+        let a2 = app.number_field("a2");
+        let tree = app.build();
+
+        assert_eq!(a1, "number_field_1");
+        assert_eq!(s1, "scrub_num_1");
+        assert_eq!(w1, "switch_1");
+        assert_eq!(c1, "color_field_1");
+        assert_eq!(a2, "number_field_2", "计数跨调用连续");
+        assert_eq!(tree.children[0].props.label.as_deref(), Some("a"), "标签按序进树");
+
+        // 占号：显式名之后的自动 id 不得撞上（`IdGen::reserve` 认得新前缀）。
+        let mut app2 = Builder::new(Kind::Column, "app");
+        let _ = app2.switch_opts("switch_1", "x", |_| {});
+        let again = app2.switch("y");
+        assert_eq!(again, "switch_2", "显式 `switch_1` 必须占掉 1 号");
+    }
+
+    /// 四种数值类叶子能走完整布局（有几何）—— measure 的合并臂没有漏人。
+    #[test]
+    fn value_leaves_get_geometry_from_layout() {
+        let mut app = Builder::new(Kind::Column, "app").padding(4.0).gap(4.0);
+        app.number_field_opts("age", "年龄", |_| {});
+        app.scrub_num_opts("vol", "40", |_| {});
+        app.switch_opts("wifi", "Wi-Fi", |_| {});
+        app.color_field_opts("tint", "#ff8800", |_| {});
+        let tree = app.build();
+        let geo = crate::layout::layout(
+            &tree,
+            crate::node::Rect::new(0.0, 0.0, 200.0, 200.0),
+            crate::layout::TextStyle { font_size: 14.0, line_height: 18.0 },
+            &crate::layout::ApproxMeasure,
+        );
+        for id in ["age", "vol", "wifi", "tint"] {
+            let f = geo.get(id).unwrap_or_else(|| panic!("测试前置：{id} 必须有几何"));
+            assert!(f.w > 0.0 && f.h > 0.0, "{id} 的几何必须是正面积，实际 {f:?}");
+        }
+        // 前置断言：四个叶子的 y 必须递增（竖排容器真的在排它们）。
+        let ys: Vec<f32> = ["age", "vol", "wifi", "tint"]
+            .iter()
+            .map(|id| geo.get(*id).expect("前置").y)
+            .collect();
+        assert!(ys[0] < ys[1] && ys[1] < ys[2] && ys[2] < ys[3], "四个叶子必须竖排，y = {ys:?}");
     }
 }

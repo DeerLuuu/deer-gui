@@ -30,6 +30,7 @@ pub mod layout;
 pub mod node;
 pub mod registry;
 pub mod scene;
+pub mod values;
 
 pub use builder::{Builder, L};
 pub use draw::{Color, DrawCmd, DrawList, RectI, TextureId};

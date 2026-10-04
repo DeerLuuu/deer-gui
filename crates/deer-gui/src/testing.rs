@@ -1968,6 +1968,10 @@ fn build_with<M: Measure>(
         measure,
     );
     // `UiState` 是交互层的真相；渲染层只认它的**只读子集** `InteractState`。
+    // 选择类三张值表（M6 5c）随子集原样带过去 —— 它们不需要任何额外接线
+    // （与 scroll 不同：这里刻意不灌滚动度量，Harness 的帧因此不画滚动条），
+    // 不带的话 Harness 的帧里永远画不出选中/开/关，视觉判据全体失明。
+    // M6 5d 的开关表同理：不带的话 Harness 的帧里开关永远画成「关」。
     let interact = InteractState {
         hover: state.hover.clone(),
         focus: state.focus.clone(),
@@ -1975,6 +1979,10 @@ fn build_with<M: Measure>(
         scroll: Default::default(),
         carets: Default::default(),
         preedit: None,
+        segments: state.segments.clone(),
+        chips: state.chips.clone(),
+        tabs: state.tabs.clone(),
+        switches: state.switches.clone(),
     };
     // `FieldText::Content` ⇒ 输入框画的是 `state.texts[id]`；
     // `InteractiveRenderer` 会给**每个有几何的节点**发一条 `NodeHint` ⇒ 裁剪快照非空。

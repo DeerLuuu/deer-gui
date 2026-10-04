@@ -29,6 +29,46 @@ pub enum Kind {
     Button,
     /// 输入框
     Field,
+    /// **分段选择组**（M6 5c）：互斥单选 —— **直接子节点 = 段**（通常是 `Button`），
+    /// 点击一段 = 选中它并（在真的换了选中时）发 `UiEvent::SelectionChanged`。
+    /// 布局与 `Row` 同一套数学（横排）；当前选中住 `deer-gui` 侧 `UiState::segments`
+    /// （组 id → 段 id，值是应用数据，不进树 —— texts 同一条纪律）。
+    Segmented,
+    /// **标签组**（M6 5c）：多选 —— **直接子节点 = 芯片**，每个独立开/关；
+    /// 点击芯片发 `UiEvent::ChipToggled { on: 翻转后的新值 }`。
+    /// 开/关表住 `UiState::chips`（芯片 id → bool，表里没有 = 关）。
+    ChipGroup,
+    /// **页签栏**（M6 5c）：单选页签 —— **直接子节点 = 页签**，点击发
+    /// `UiEvent::TabChanged { index }`（内容切换是 App 的事，TabBar 只报告）。
+    /// 活动页住 `UiState::tabs`（组 id → 页 id）；单个页签禁用 = 该页签自身的
+    /// `props.disabled`（禁用子树静默的既有语义原样生效）。
+    TabBar,
+    /// **数值输入框**（M6 5d）：[`Kind::Field`] 的数值变体 —— 编辑期草稿与 `Field`
+    /// 同住 `UiState::texts`（复用全套光标/退格/IME 机械），**提交时**（失焦 / `Enter`）
+    /// 才解析：解析成功 ⇒ 夹进值域（若有）并发 `UiEvent::NumberChanged { value: f64 }`；
+    /// 解析失败 ⇒ 什么都不发，绘制侧按「非空且不可解析」画下划线标记
+    /// （判据是 `deer_core::value::parse_num` —— 与交互层**同一份**实现）。
+    /// 值域（min/max，**值域不是 L3 的布局尺寸**）与默认步长住 `UiState::num_opts`。
+    NumberField,
+    /// **拖动调值**（M6 5d）：显示一个数值（`props.label` = App 格式化的当前值），
+    /// 在它上面**按住左右拖**改值 —— 依赖 T3.7 指针捕获（拖出不丢事件）；
+    /// 拖动中**持续**发 `UiEvent::NumberChanged`（变了才发）。基准值 = 按下时
+    /// `parse_num(label)`（解析失败 ⇒ 这次按下不进入拖动调值）；步长/值域住
+    /// `UiState::num_opts`。拖动锚点（按下 x + 基准值）是**瞬态**，住
+    /// `UiState::scrub`（抬起/窗口失焦即清）。
+    ScrubNum,
+    /// **开关**（M6 5d）：点击 / `Enter`（焦点在它上）/ `Space`（焦点在它上）
+    /// 都翻转开/关并发 `UiEvent::Toggled { id, on: 翻转后的新值 }`。
+    /// 开/关值住 `UiState::switches`（节点自身 id → bool，表里没有 = 关）——
+    /// 与 `chips` 同形但**独立一张表**：Switch 是独立控件（不是组的孩子），
+    /// 键是它自己的 id。开/关是持久视觉（绘制侧读 `InteractState::switches`）。
+    Switch,
+    /// **颜色输入框**（M6 5d，最小版）：文本输入 hex 颜色 + 色块预览 —— 编辑期
+    /// 草稿住 `UiState::texts`（与 [`Kind::Field`] 同一套机械），提交时
+    /// （失焦 / `Enter`）按 `#RRGGBB` 解析：成功 ⇒ 回写规范化串并发
+    /// `UiEvent::ColorChanged { rgb: [u8; 3] }`；失败 ⇒ 不发，色块退回 `border` 色
+    /// （色块本身就是标记）。完整取色器**不做**（见 color-field.md「做不到什么」）。
+    ColorField,
 }
 
 impl Kind {
@@ -39,6 +79,13 @@ impl Kind {
             Kind::Text => "text",
             Kind::Button => "button",
             Kind::Field => "field",
+            Kind::Segmented => "segmented",
+            Kind::ChipGroup => "chip_group",
+            Kind::TabBar => "tab_bar",
+            Kind::NumberField => "number_field",
+            Kind::ScrubNum => "scrub_num",
+            Kind::Switch => "switch",
+            Kind::ColorField => "color_field",
         }
     }
 
@@ -49,13 +96,48 @@ impl Kind {
             "text" => Kind::Text,
             "button" => Kind::Button,
             "field" => Kind::Field,
+            "segmented" => Kind::Segmented,
+            "chip_group" => Kind::ChipGroup,
+            "tab_bar" => Kind::TabBar,
+            "number_field" => Kind::NumberField,
+            "scrub_num" => Kind::ScrubNum,
+            "switch" => Kind::Switch,
+            "color_field" => Kind::ColorField,
             _ => return None,
         })
     }
 
-    /// 容器可含子节点；叶子不可。
+    /// 容器可含子节点；叶子不可。选择类三种组是**容器**（它们的孩子就是选项），
+    /// 与 Row/Column 共用整套布局数学（见 [`Kind::is_horizontal`]）。
     pub const fn is_container(self) -> bool {
-        matches!(self, Kind::Column | Kind::Row)
+        matches!(
+            self,
+            Kind::Column | Kind::Row | Kind::Segmented | Kind::ChipGroup | Kind::TabBar
+        )
+    }
+
+    /// 主轴沿**水平**方向排子的容器（`Row` 与三个选择类组）。
+    ///
+    /// 布局的 measure/place 只在两处区分横竖（`Kind::Row` 判据的原位置）——
+    /// 收口成这一个谓词，免得「新横排容器」在某处被当成竖排而两边各写一份。
+    /// 对既有五种 Kind 它与 `== Kind::Row` **逐点相等**（Row ⇒ true，其余 ⇒ false），
+    /// 所以既有树的布局逐位不变（opt-in 红线）。
+    pub const fn is_horizontal(self) -> bool {
+        matches!(self, Kind::Row | Kind::Segmented | Kind::ChipGroup | Kind::TabBar)
+    }
+
+    /// 选择类组的**直接子节点 = 选项**（M6 5c）。交互层据此把点击结算成
+    /// `SelectionChanged` / `ChipToggled` / `TabChanged`（见 `deer-gui` 的 `handle`）。
+    pub const fn is_selection_group(self) -> bool {
+        matches!(self, Kind::Segmented | Kind::ChipGroup | Kind::TabBar)
+    }
+
+    /// **值域输入框族**（M6 5d）：编辑期有文本草稿、提交时才按值解析的输入框
+    /// （`Field` / `NumberField` / `ColorField`）。文本编辑的全部入口
+    /// （可聚焦集合、`TextInput`/`Backspace`/光标/IME 的目标判据）共用这一个谓词
+    /// —— 「这里也算输入框」只能有一份答案，否则两处迟早漂。
+    pub const fn is_value_field(self) -> bool {
+        matches!(self, Kind::Field | Kind::NumberField | Kind::ColorField)
     }
 }
 
@@ -422,7 +504,20 @@ impl IdGen {
         if !self.used.insert(id.to_string()) {
             return;
         }
-        for kind in [Kind::Column, Kind::Row, Kind::Text, Kind::Button, Kind::Field] {
+        for kind in [
+            Kind::Column,
+            Kind::Row,
+            Kind::Text,
+            Kind::Button,
+            Kind::Field,
+            Kind::Segmented,
+            Kind::ChipGroup,
+            Kind::TabBar,
+            Kind::NumberField,
+            Kind::ScrubNum,
+            Kind::Switch,
+            Kind::ColorField,
+        ] {
             let prefix = format!("{}_", kind.as_str());
             if let Some(n) = id.strip_prefix(&prefix).and_then(|s| s.parse::<u32>().ok()) {
                 let slot = self.counters.entry(kind).or_insert(0);

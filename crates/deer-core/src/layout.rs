@@ -204,7 +204,9 @@ pub fn measure_tree(root: &Node, style: TextStyle, m: &impl Measure) -> Intrinsi
 
 fn measure_into(n: &Node, style: TextStyle, m: &impl Measure, out: &mut Intrinsics) -> (f32, f32) {
     let (mut w, mut h) = match n.kind {
-        Kind::Column | Kind::Row => {
+        // 容器（含 M6 5c 的三个选择类组）：同一套求和/取大数学，
+        // 横竖由 [`Kind::is_horizontal`] 一处区分 —— 组是横排（与 Row 同）。
+        Kind::Column | Kind::Row | Kind::Segmented | Kind::ChipGroup | Kind::TabBar => {
             let pad = n.layout.padding;
             let gap = n.layout.gap;
             // 先无条件测子节点（**不做任何覆盖** —— 这一点很关键，见下）。
@@ -233,11 +235,12 @@ fn measure_into(n: &Node, style: TextStyle, m: &impl Measure, out: &mut Intrinsi
                 .map(|&i| {
                     let c = &n.children[i];
                     let (cw, ch) = raw[i];
-                    let explicit = if n.kind == Kind::Row { c.layout.width } else { c.layout.height };
+                    let explicit =
+                        if n.kind.is_horizontal() { c.layout.width } else { c.layout.height };
                     match explicit {
                         Some(Size::Px(v)) => v.max(0.0),
                         _ => {
-                            if n.kind == Kind::Row {
+                            if n.kind.is_horizontal() {
                                 cw
                             } else {
                                 ch
@@ -248,7 +251,7 @@ fn measure_into(n: &Node, style: TextStyle, m: &impl Measure, out: &mut Intrinsi
                 .collect();
             let count = flow.len();
             let gaps = if count > 0 { gap * (count - 1) as f32 } else { 0.0 };
-            if n.kind == Kind::Row {
+            if n.kind.is_horizontal() {
                 let inner: f32 = main.iter().sum::<f32>() + gaps;
                 let max_h = flow.iter().map(|&i| raw[i].1).fold(0.0_f32, f32::max);
                 (inner + pad * 2.0, max_h + pad * 2.0)
@@ -272,7 +275,7 @@ fn measure_into(n: &Node, style: TextStyle, m: &impl Measure, out: &mut Intrinsi
             };
             (w, h)
         }
-        Kind::Field => {
+        Kind::Field | Kind::NumberField | Kind::ColorField => {
             let label_w = n
                 .props
                 .label
@@ -284,7 +287,9 @@ fn measure_into(n: &Node, style: TextStyle, m: &impl Measure, out: &mut Intrinsi
                 metrics::FIELD_H.max(style.line_height),
             )
         }
-        Kind::Button => {
+        // M6 5d：`ScrubNum`/`Switch` 与 Button 同一套按钮数学（`ScrubNum` 显示一个数值、
+        // `Switch` 是带文字的开关 —— 固有尺寸都来自标签）。
+        Kind::Button | Kind::ScrubNum | Kind::Switch => {
             let label = n.props.label.as_deref().unwrap_or("");
             let label_w = m.width(label, style);
             (
@@ -610,7 +615,7 @@ impl PlaceCtx<'_> {
     let gap = n.layout.gap;
     let inner_w = (w - pad * 2.0).max(0.0);
     let inner_h = (h - pad * 2.0).max(0.0);
-    let horizontal = n.kind == Kind::Row;
+    let horizontal = n.kind.is_horizontal();
     let main_avail = if horizontal { inner_w } else { inner_h };
     let cross_avail = if horizontal { inner_h } else { inner_w };
     // 垂直滚动容器：主轴**不再按视口夹取**子节点（否则「内容高于视口」这个前提本身

@@ -140,6 +140,13 @@ fn scripted_replay_is_deterministic_and_matches_expected_state() {
         carets: std::collections::BTreeMap::from([("field_1".to_string(), 3usize)]),
         scroll: Default::default(),
         preedit: None,
+        segments: Default::default(),
+        chips: Default::default(),
+        tabs: Default::default(),
+        // M6 5d 同一课（漏字段 ⇒ E0063 test build 崩）：本脚本没有数值类控件 ⇒ 全空。
+        num_opts: Default::default(),
+        switches: Default::default(),
+        scrub: None,
     };
     assert_eq!(state1, expect_state, "最终状态必须逐字段相等");
 

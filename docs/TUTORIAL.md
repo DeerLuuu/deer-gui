@@ -155,6 +155,66 @@ let tree = app.build();
 - **禁用按钮是灰的**（用 `border` 色，不是强调色）—— 这是渲染器的既定行为，有测试钉住
 - 只有带 `pad` 的容器才画底色，否则整屏都是方块、看不出层次
 
+**顺手一提（M6 5a）**：上面那个 `actions` 行是常见样板，`row_actions_opts` 一次建出
+「Row + 每个标签一个按钮」，返回按钮 id 列表（事件关联用）—— 产出的树与手写逐字
+等价（结构相等 + 绘制命令逐条相同，都有测试钉住）：
+
+```rust
+let actions = p.row_actions_opts("actions", L::new().gap(8.0).to_props(), &["保存", "另存为", "删除"]);
+```
+
+语义与边界（想给单个按钮禁用、想问「溢出折叠呢」）见 [`docs/features/row-actions.md`](docs/features/row-actions.md)。
+
+**选择类控件（M6 5c）**：表单里常见的三种「选择」各有现成构造 —— 它们是三种**容器 Kind**
+（`segmented`/`chip_group`/`tab_bar`），孩子就是选项（按钮）：
+
+```rust
+// 单选（互斥）：点一个段选中它，App 收 UiEvent::SelectionChanged { id, selected }
+let seg = p.segmented_opts("mode", L::new().gap(2.0).to_props(), &["日", "周", "月"]);
+
+// 多选（独立开关）：每个芯片独立开/关，App 收 UiEvent::ChipToggled { id, chip, on }
+let chips = p.chip_group_opts("tags", L::new().gap(4.0).to_props(), &["红", "蓝", "绿"]);
+
+// 页签（单选 + App 换内容）：App 收 UiEvent::TabChanged { id, index } —— index 含禁用页一起数
+let tabs = p.tab_bar_opts("tabs", L::new().gap(2.0).to_props(), &["文件", "编辑", "视图"]);
+```
+
+两个要点：**值在 App 手里**（想默认选中就把初值塞进 `UiState` 的 `segments`/`chips`/`tabs`
+三张表，和 `texts` 一个用法）；当前选中的项是强调色底，未选中的是灰色底。语义、禁用页、
+「做不到什么」见 [`segmented`](features/segmented.md) / [`chip-group`](features/chip-group.md) /
+[`tab-bar`](features/tab-bar.md) 三份指南；能自检的完整示例：
+
+```sh
+cargo run -p deer-gui --features testing --example m6_select
+```
+
+**数值类控件（M6 5d）**：表单里四种「值」各有现成构造 —— 它们是四种**叶子 Kind**：
+
+```rust
+// 数值输入框：草稿随便打，**提交才解析**（Enter 或点别处失焦）——
+// App 收 UiEvent::NumberChanged { id, value }（已按值域夹取）
+let age = p.number_field_opts("age", "0", |n| n.layout.width = Some(Size::Px(80.0)));
+
+// 拖动调值：按住左右拖改值（label 就是当前值的显示串，App 拿事件改数据后重建树）
+let vol = p.scrub_num_opts("vol", "40", |_| {});
+
+// 开关：点击 / Enter / Space 三路翻转 —— App 收 UiEvent::Toggled { id, on }
+let wifi = p.switch_opts("wifi", "Wi-Fi", |_| {});
+
+// 颜色输入框：#RRGGBB + 色块预览 —— App 收 UiEvent::ColorChanged { id, rgb }
+let tint = p.color_field_opts("tint", "#ff8800", |_| {});
+```
+
+两个要点：**值域/步长在 App 手里**（塞 `UiState` 的 `num_opts` 表，`NumOpts { min, max, step }`；
+不塞 = 无值域、步长 1.0/px）；数值/颜色**提交成功才发事件**（打字过程只有草稿在长），
+`Switch` 则是每次激活必翻转必发。开关开着是强调色底、关着是灰色底。语义、提交规则、
+「做不到什么」见 [`number-field`](features/number-field.md) / [`scrub-num`](features/scrub-num.md) /
+[`switch`](features/switch.md) / [`color-field`](features/color-field.md) 四份指南；能自检的完整示例：
+
+```sh
+cargo run -p deer-gui --features testing --example m6_values
+```
+
 ---
 
 ## 4. 换主题
@@ -458,7 +518,7 @@ deer-gui = { path = "../deer-gui/crates/deer-gui" }
 | **高分屏 / DPI 缩放** | ✅ 透传（AF-3）：`WindowInfo.scale_factor` + `ScaleFactorChanged` 事件，OS 报多少给多少；**坐标与窗口尺寸仍是物理像素，不自动缩放**。见 [`features/window.md`](features/window.md) 第 8 节 |
 | **多窗口**（动态 spawn + 事件按窗路由 + 共享设备的多交换链） | ✅ 已支持（T4.4，**仅 Windows**）：`WindowSpawner` 动态开新窗；`App` 的 `window_init`/`window_redraw`/`window_input`/… 按 id 路由；关一窗另一窗存活、全关退出。见 [`features/multi-window.md`](features/multi-window.md) |
 | **可停靠面板 dock** | ❌ M6 |
-| 12 个 `deer-ui` 控件的语义 | ❌ M6（现在只有 5 种节点） |
+| 12 个 `deer-ui` 控件的语义 | 🔄 M6（节点已有 **12 种**：基础 5 种 + 选择类 3 种（5c）+ 数值类 4 种（5d）；仍缺 `Icon`/`DropMenu`/`Dialog`/`Overlay`/`HoverTip`） |
 
 完整清单与每个功能的边界：[`../FEATURES.md`](../FEATURES.md)。
 里程碑与顺序：[`../ROADMAP.md`](../ROADMAP.md)。

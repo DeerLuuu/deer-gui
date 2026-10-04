@@ -90,7 +90,10 @@ impl<'a, M: Measure> DefaultRenderer<'a, M> {
         let disabled = n.props.disabled;
 
         match n.kind {
-            Kind::Column | Kind::Row => {
+            // 容器（含 M6 5c 的三个选择类组）：同一套「有 padding 才画底」。
+            // 默认渲染器**无状态** ⇒ 不画选中/开/关（与 `Field` 只画占位标签同理）；
+            // 选中视觉是 `InteractiveRenderer` 按 `InteractState` 画的。
+            Kind::Column | Kind::Row | Kind::Segmented | Kind::ChipGroup | Kind::TabBar => {
                 // 只有显式给了内边距的容器才画底（否则整屏都是方块，无法看清层次）
                 if n.layout.padding > 0.0 {
                     list.push(DrawCmd::FillRoundRect {
@@ -118,7 +121,10 @@ impl<'a, M: Measure> DefaultRenderer<'a, M> {
                     });
                 }
             }
-            Kind::Button => {
+            // 按钮族三件（M6 5d）共用同一份无状态视觉：`Button` 本体、`ScrubNum`
+            //（显示值 = label）、`Switch`（无状态渲染器**不读开/关** —— 与 5c 的
+            // 「不画选中」同理，状态视觉是 `InteractiveRenderer` 的活）。
+            Kind::Button | Kind::ScrubNum | Kind::Switch => {
                 let bg = if disabled {
                     self.theme.border
                 } else {
@@ -141,7 +147,9 @@ impl<'a, M: Measure> DefaultRenderer<'a, M> {
                     align: 0,
                 });
             }
-            Kind::Field => {
+            // 值输入框族（M6 5d）：`NumberField` 无状态时就是「带占位标签的输入框」
+            // —— 草稿与「不可解析」标记都跟着编辑状态走，是 `InteractiveRenderer` 的活。
+            Kind::Field | Kind::NumberField => {
                 list.push(DrawCmd::FillRoundRect {
                     rect,
                     radius: 4,
@@ -158,6 +166,47 @@ impl<'a, M: Measure> DefaultRenderer<'a, M> {
                     color: self.theme.text_dim,
                     size: self.theme.font_size,
                     align: 0,
+                });
+            }
+            Kind::ColorField => {
+                // 与 `Field` 同款壳，但 label 是**颜色本身**（树数据，无状态可画）：
+                // 右侧画一个色块，颜色 = 对 label 再解析一次（失败 ⇒ `border` 色 =
+                // 与壳同色 ⇒ 色块「消失」就是标记）。文本矩形右侧收窄，与色块不重叠。
+                list.push(DrawCmd::FillRoundRect {
+                    rect,
+                    radius: 4,
+                    color: self.theme.border,
+                });
+                list.push(DrawCmd::StrokeRect {
+                    rect,
+                    color: self.theme.text_dim,
+                    width: 1,
+                });
+                let label = n.props.label.clone().unwrap_or_default();
+                let side = (rect.h - 4).max(1);
+                list.push(DrawCmd::Text {
+                    rect: RectI::new(
+                        rect.x + 2,
+                        rect.y + 2,
+                        (rect.w - 4 - side - 4).max(1),
+                        (rect.h - 4).max(1),
+                    ),
+                    text: label.clone(),
+                    color: self.theme.text_dim,
+                    size: self.theme.font_size,
+                    align: 0,
+                });
+                let rgb = deer_core::values::parse_hex_color(&label)
+                    .map(|c| Color::rgb(c[0], c[1], c[2]));
+                list.push(DrawCmd::FillRoundRect {
+                    rect: RectI::new(
+                        rect.right() - 2 - side,
+                        rect.y + 2,
+                        side,
+                        side,
+                    ),
+                    radius: 0,
+                    color: rgb.unwrap_or(self.theme.border),
                 });
             }
         }

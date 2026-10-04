@@ -90,6 +90,11 @@ fn frame_with(tree: &Node, theme: &Theme, geo: &Geometry, state: &UiState) -> Fr
         scroll: Default::default(),
         carets: Default::default(),
         preedit: None,
+        segments: Default::default(),
+        chips: Default::default(),
+        tabs: Default::default(),
+        // M6 5d 同一课（漏字段 ⇒ E0063 test build 崩）：本夹具没有开关 ⇒ 空。
+        switches: Default::default(),
     };
     let list = InteractiveRenderer::with_texts(
         theme.clone(),
@@ -208,6 +213,13 @@ fn scripted_replay_is_deterministic_and_matches_expected_state() {
         carets: BTreeMap::from([("field_1".to_string(), 2usize)]),
         scroll: Default::default(),
         preedit: None,
+        segments: Default::default(),
+        chips: Default::default(),
+        tabs: Default::default(),
+        // M6 5d 同一课：本脚本没有数值类控件 ⇒ 全空。
+        num_opts: Default::default(),
+        switches: Default::default(),
+        scrub: None,
     };
     println!("期望终态 = {}", fmt_state(&expected_state));
     assert_eq!(r1.state, expected_state, "终态必须逐字段相等");
@@ -462,6 +474,13 @@ fn states(theme: &Theme, tree: &Node, geo: &Geometry) -> Vec<(&'static str, Fram
             carets: Default::default(),
             scroll: Default::default(),
             preedit: None,
+            segments: Default::default(),
+            chips: Default::default(),
+            tabs: Default::default(),
+            // M6 5d 同一课：本夹具没有数值类控件 ⇒ 全空。
+            num_opts: Default::default(),
+            switches: Default::default(),
+            scrub: None,
         },
     );
     out
@@ -755,6 +774,14 @@ fn four_states_differ_only_inside_the_expected_rectangles() {
         // 合并提示：这条线给 `UiState` 新增了 `scroll`（合并另一条线时漏它 ⇒ E0063 全 test build 崩）。
         scroll: Default::default(),
         preedit: None,
+        // M6 5c 同一课：`segments`/`chips`/`tabs` 三张值表（漏了 ⇒ E0063 test build 崩）。
+        segments: Default::default(),
+        chips: Default::default(),
+        tabs: Default::default(),
+        // M6 5d 同一课：`num_opts`/`switches`/`scrub` 三个新字段（漏了 ⇒ E0063）。
+        num_opts: Default::default(),
+        switches: Default::default(),
+        scrub: None,
     };
     let no_focus_state = UiState {
         focus: None,
