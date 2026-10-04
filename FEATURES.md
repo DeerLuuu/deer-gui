@@ -71,6 +71,7 @@
 | **GPU 文本渲染**（字形四边形 + 图集纹理 + 最近邻采样，与 CPU **逐字节对照**） | ✅ | [gpu-geometry](docs/features/gpu-geometry.md#3-完整-api) | `cargo run -p deer-gui --example gpu_geometry` |
 | **窗口里显示界面**（把 `DrawList` 的形状与文本**呈到窗口**，上屏像素与 CPU 逐像素对照） | ✅ | [window](docs/features/window.md) | `DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example window_parity` |
 | **输入与焦点**（事件通路 + 命中/状态机（含裁剪与禁用）+ Tab/Shift+Tab/Escape 焦点 + 文本输入 + **输入框光标**（T3.5：在光标处插入 / `Backspace` 删**光标前一个 Unicode 字符** / **左右方向键**移动光标，单位是**字符位**）+ 脚本化重放 + **只在状态变化时重绘**） | ✅ | [input](docs/features/input.md) | `cargo run -p deer-gui --features window --example interactive_form` |
+| **多窗口**（T4.4：`WindowSpawner` **动态 spawn** 新窗 + 生命周期按窗路由（`window_init`/`window_redraw`/`window_input`/`window_resized`/`window_close_requested`/`window_destroyed`，全部默认转发旧方法 ⇒ 单窗口零改动）+ `WindowId::raw()` **同源直传**渲染层窗口表（`WindowedRenderer::new_with_primary_id`/`add_window`/`*_window(id)`，共享一个 `VkDevice` 与字形图集）+ 关一窗另一窗存活、全关退出；**仅 Windows**；决策 8 的五项不做登记在案） | ✅ | [multi-window](docs/features/multi-window.md) | `DEER_VK_WINDOW_TESTS=1 cargo run -p deer-gui --features window --example dual_window` |
 | **日志**（零依赖门面；分级 + 按 target 过滤；`DEER_LOG` 开关；**默认完全静默**、只写 stderr） | ✅ | [logging](docs/features/logging.md) | `cargo run -p deer-gui --example logging` |
 | **IME 预编辑**（中文/日文「还没上屏的那一段」：只进 `UiState::preedit` 缓冲、**不进 `texts`**；提交进 `texts` 并清缓冲 ⇒ **无双写**；画在光标处 + 下划线、**光标推到它之后**） | ✅ | [ime](docs/features/ime.md) | `cargo run -p deer-gui --example ime_preedit` |
 | **剪贴板**（AF-2：`deer_window::Clipboard` 公共构造器式句柄；自写 Win32 `OpenClipboard`/`EmptyClipboard`/`SetClipboardData`/`GetClipboardData`，只有 `CF_UNICODETEXT` 纯文本，不引第三方；每次调用原子地 Open（带重试）→ 干活 → Close；往返保真含中文/emoji 多字节；**非 Windows 明确 `Err(CLIPBOARD_UNSUPPORTED_MSG)` 不静默**；含 NUL 文本与 NULL 属主写入明确拒绝；写入会按 Win32 语义清掉其它格式） | ✅ | [clipboard](docs/features/clipboard.md) | `cargo run -p deer-gui --features window --example clipboard_probe` |
@@ -91,7 +92,7 @@
 | **字距与连字**（`kern` / `GSUB` / `GPOS`） | M4 残余 | 不做整形，`advance` 就是 `hmtx` 的原始值 |
 | **CFF / OpenType-CFF 字体**（`OTTO`） | M4 残余 | 解析层直接报错，不静默给空轮廓；只支持 `glyf` 轮廓 |
 | **竖排 / RTL / 复杂脚本整形** | M4 残余 | 完全没有；不读 `GSUB`/`GPOS` |
-| **输入与焦点的剩余部分**（仅剩：停靠 / 多窗口） | M5/M6 | **输入地基全部落地**：事件通路、命中/状态机、Tab/Escape 焦点、文本输入、脚本重放、事件驱动重绘、滚轮垂直滚动、可视滚动条（拖滑块 + 点轨道跳转）、惯性收口（T3.2b）、输入框光标（T3.5/T3.8）、IME 预编辑（T3.4）、**方向键上下导航（T3.1 几何邻近）**、**按键滚动（`PageUp`/`PageDown`/`Home`/`End`）**、**右键透传 `PointerRight`（T3.3）**、**按键重复 `repeat: bool`（T3.6）**、**指针捕获（T3.7 按下即捕获：拖出仍路由、抬起按捕获者结算，D7）**（见 [`input.md`](docs/features/input.md) 第 6 节）；**真机输入法**只能人肉验证 |
+| **输入与焦点的剩余部分**（仅剩：停靠；多窗口已在 T4.4 落地，见上面「多窗口」行） | M5/M6 | **输入地基全部落地**：事件通路、命中/状态机、Tab/Escape 焦点、文本输入、脚本重放、事件驱动重绘、滚轮垂直滚动、可视滚动条（拖滑块 + 点轨道跳转）、惯性收口（T3.2b）、输入框光标（T3.5/T3.8）、IME 预编辑（T3.4）、**方向键上下导航（T3.1 几何邻近）**、**按键滚动（`PageUp`/`PageDown`/`Home`/`End`）**、**右键透传 `PointerRight`（T3.3）**、**按键重复 `repeat: bool`（T3.6）**、**指针捕获（T3.7 按下即捕获：拖出仍路由、抬起按捕获者结算，D7）**（见 [`input.md`](docs/features/input.md) 第 6 节）；**真机输入法**只能人肉验证 |
 | **可停靠面板 dock**（拖动改位置 / 边缘折叠） | M6 | 完全没有 |
 | **控件族**（12 个 `deer-ui` 控件的语义） | M6 | 现在只有 5 种节点：`column`/`row`/`text`/`button`/`field` |
 | **DX12 / Metal 后端** | M7 | 完全没有 |

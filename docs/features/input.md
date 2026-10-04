@@ -304,7 +304,8 @@ assert!(parse_script("# 注释行\nbad:3").unwrap_err().contains("第 2 条"));
 - **输入框光标**（T3.5 建模 + T3.8 渲染）：画面上真的有一根竖线，失焦时不画。
 
 **仍未做**：
-- **停靠面板 / 多窗口**；
+- **停靠面板**（多窗口已落地 —— T4.4：输入按窗路由（`App::window_input(id, …)`），每窗一棵树 +
+  一个状态机，见 [`multi-window.md`](multi-window.md)）；
 
 - **`Focused` 只能人肉验证**（`DEER_INPUT_HOLD=1` 留窗观察），没有自动判据
   （`Ime` 那半已有自动判据，见 [`ime.md`](ime.md)；**真机输入法**仍需人拼一段中文肉眼确认）。

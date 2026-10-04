@@ -237,6 +237,20 @@ impl WindowId {
     pub(crate) fn from_raw(n: u64) -> WindowId {
         WindowId(n)
     }
+
+    /// 本窗的原始序号（T4.4-R3 接缝裁决）：主窗 = `1`，之后按建窗顺序自增。
+    ///
+    /// ## 为什么必须公开（T4.4-R3 的显式映射，禁止隐式约定）
+    ///
+    /// 渲染层（deer-vk 的 `WindowedRenderer` 窗口表）也用 `u64` 键索引每窗一份的
+    /// surface/swapchain/帧资源。两层编号**不同源**就会踩「0/1 错位」：本层主窗是
+    /// `1`，渲染层 `WindowedRenderer::new` 的保留键是 `0` —— 靠「恰好都对」的隐式
+    /// 约定迟早串链。裁决：**本层的 [`WindowId`] 值直传渲染层**（`raw()` ⇒
+    /// `WindowedRenderer::new_with_primary_id` / `add_window`），两层共用**同一个**
+    /// 序号，映射是恒等式、没有任何偏移交换。
+    pub fn raw(self) -> u64 {
+        self.0
+    }
 }
 
 /// **多窗口的建窗句柄**（T4.4-R1，决策 2）：与 [`Waker`] **同一根通道**（同一个
@@ -498,6 +512,59 @@ pub trait App {
     ) -> Result<Flow, String> {
         let _ = id;
         self.input(info, ev)
+    }
+
+    /// **多窗口初始化路由**（T4.4-R3）：与 [`App::init`] 同时机（每建一扇窗调一次），
+    /// 但**带着本层的 [`WindowId`]** —— 多窗口 App 在这里创建渲染器时，把 `id.raw()`
+    /// 直传渲染层的窗口表（见 [`WindowId::raw`]：两层同源编号的裁决）。
+    ///
+    /// 默认实现**转发既有 [`App::init`]**（忽略 id）—— 单窗口用户**零改动**。
+    /// 覆盖本方法之后 [`App::init`]**不再被调用**（转发只发生在默认实现里）；
+    /// 多窗口 App 仍需给 [`App::init`] 一个（空的）实现 —— 它是必选方法。
+    fn window_init(&mut self, id: WindowId, info: &WindowInfo) -> Result<(), String> {
+        let _ = id;
+        self.init(info)
+    }
+
+    /// **多窗口尺寸变化路由**（T4.4-R3）：与 [`App::resized`] 同时机，但**带着 id** ——
+    /// 多窗口下「哪扇窗变了尺寸」必须可区分（渲染层要 `resize_window(该窗的键)`）。
+    /// 默认实现转发既有 [`App::resized`]；覆盖之后 [`App::resized`] 不再被调用。
+    fn window_resized(&mut self, id: WindowId, width: u32, height: u32) -> Result<(), String> {
+        let _ = id;
+        self.resized(width, height)
+    }
+
+    /// **多窗口重绘路由**（T4.4-R3）：与 [`App::redraw`] 同时机（该窗的
+    /// `RedrawRequested` 到达），但**带着 id** —— 多窗口下一次重绘请求只属于
+    /// **一扇窗**，App 据此只画那一扇（渲染层 `draw_and_present_window(该窗的键)`）。
+    ///
+    /// 默认实现转发既有 [`App::redraw`] —— 单窗口用户**零改动**。
+    /// 覆盖本方法之后 [`App::redraw`]**不再被调用**（与 [`App::window_input`]/
+    /// [`App::input`] 同一条转发纪律：两条路不能同时响）。
+    /// 返回值语义与 [`App::redraw`] 逐字一致（`Flow::Exit` ⇒ 结束事件循环）。
+    fn window_redraw(&mut self, id: WindowId) -> Result<Flow, String> {
+        let _ = id;
+        self.redraw()
+    }
+
+    /// **多窗口关闭确认路由**（T4.4-R3）：与 [`App::close_requested`] 同时机
+    /// （用户点了**那一扇**窗的 X），但**带着 id**。返回 [`Flow::Exit`] =
+    /// **允许关闭这一扇窗**（不是结束事件循环 —— 只剩这一扇时关闭它才会退出，
+    /// 决策 4 由本层保证）；返回 [`Flow::Continue`] = 否决（哪扇都不关）。
+    /// 默认实现转发既有 [`App::close_requested`]；覆盖之后它不再被调用。
+    fn window_close_requested(&mut self, id: WindowId) -> Flow {
+        let _ = id;
+        self.close_requested()
+    }
+
+    /// **多窗口销毁通知**（T4.4-R3）：一扇窗**已经从本层的活窗表里移除**后调一次
+    /// （用户关闭落地或窗口被外部销毁；同一扇窗**至多一次** —— 重复销毁在表里是
+    /// 幂等的 `Unknown`，不会重复派发）。App 在这里释放**该窗**的渲染资源
+    /// （渲染层 `remove_window(id.raw())`）。
+    ///
+    /// 默认实现**什么都不做** ⇒ 单窗口用户零改动（单窗口本来随事件循环结束一起收）。
+    fn window_destroyed(&mut self, id: WindowId) {
+        let _ = id;
     }
 
     /// 点了关闭按钮/系统关闭：默认允许关闭。
@@ -1087,7 +1154,7 @@ impl<A: App> RunHandler<A> {
             if is_main { "，主窗" } else { "" }
         );
 
-        if let Err(e) = self.app.init(&info) {
+        if let Err(e) = self.app.window_init(id, &info) {
             return self.fail(event_loop, format!("App::init 失败：{e}"));
         }
 
@@ -1117,6 +1184,23 @@ impl<A: App> RunHandler<A> {
         // 其实是 OS（窗口显示后的 WM_PAINT）给的。保留它是为了**非 Windows / 其它 winit 后端**，
         // 以及「没有 OS 帧时 OnDemand 也能起步」。
         self.request_redraw_for(winit_id);
+        //
+        // ⚠️ **T4.4-R3：同时给「其它活窗」补一次重绘请求**（治好 spawn 时的续帧链断裂，实测）。
+        //
+        // winit 0.30（Windows）的 `request_redraw` 走 `RedrawWindow(RDW_INTERNALPAINT)`，
+        // 这条「内部绘制」在**嵌套消息泵**里可能被吞 —— 实测形态：窗 A 在它的 `RedrawRequested`
+        // 回调里发起 `WindowSpawner::spawn_window`，A 的续帧请求（同一回调末尾发出）恰逢
+        // `user_event` → `create_window`（winit 建窗自带嵌套泵）⇒ A 的请求**石沉大海**，
+        // A 的 `Continuous` 续帧链从此断掉（只有 spawn 出的那扇一直画）。建窗后给**所有**
+        // 其它活窗各补一次请求（winit 自己会把并发的请求合并成一帧），链路就能从这次
+        // 事故里自愈；单窗口时 `alive` 里没有「其它窗」，这里什么都不做、行为不变。
+        // 记账口径与 [`Self::request_redraw_all`] 一致：一批请求只记一次。
+        self.counter.note_request();
+        for live in self.alive.values() {
+            if live.id != id {
+                live.window.request_redraw();
+            }
+        }
     }
 
     /// **唯一**决定「睡多久」的地方（`resumed` / `user_event` / `about_to_wait` 都调它，实现只有这一份）。
@@ -1396,7 +1480,7 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
                 if self.main == Some(id) {
                     self.extent = extent;
                 }
-                if let Err(e) = self.app.resized(size.width, size.height) {
+                if let Err(e) = self.app.window_resized(id, size.width, size.height) {
                     self.fail(
                         event_loop,
                         format!("App::resized({}x{}) 失败：{e}", size.width, size.height),
@@ -1429,7 +1513,9 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
                 self.dispatch(event_loop, window_id, &ev, Gate::Always);
             }
             WindowEvent::RedrawRequested => {
-                let result = self.app.redraw();
+                // T4.4-R3：这次重绘请求属于 `id` 这一扇窗 ⇒ 经 `window_redraw` 定向派发
+                // （默认转发 `App::redraw` —— 单窗口行为逐字不变）。
+                let result = self.app.window_redraw(id);
                 match self.counter.on_redraw(result) {
                     Ok(()) => {
                         if self.counter.exit_requested() {
@@ -1447,12 +1533,17 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
             }
             // 关闭语义（决策 4）：`CloseRequested` **只关被请求的那扇窗**（`Arc` 落下 ⇒
             // winit 销毁它）；**全部窗口关闭** ⇒ 事件循环退出。App 仍有一票否决
-            // （`close_requested() == Continue` ⇒ 哪扇都不关 —— 与拆分前同语义）。
+            // （`window_close_requested(id) == Continue` ⇒ 哪扇都不关 —— 与拆分前同语义；
+            //   T4.4-R3 起带着 id 问，多窗口 App 能按窗决定允许/否决）。
             WindowEvent::CloseRequested => {
-                if self.app.close_requested() == Flow::Exit {
+                if self.app.window_close_requested(id) == Flow::Exit {
                     match self.table.close(id) {
                         CloseOutcome::Closed { last } => {
                             self.alive.remove(&window_id);
+                            // 该窗已从活窗表移除 ⇒ 通知 App 释放**这一扇**的渲染资源
+                            // （渲染层 `remove_window`）。「至多一次」由表保证：
+                            // 随后的 `Destroyed` 回执对同一 id 是 `Unknown` ⇒ 不再派发。
+                            self.app.window_destroyed(id);
                             if last {
                                 self.exiting = true;
                                 event_loop.exit();
@@ -1463,10 +1554,13 @@ impl<A: App + 'static> ApplicationHandler<Wake> for RunHandler<A> {
                 }
             }
             // 窗口被外部销毁（或上面 close 落地后的回执）：账面清理**必须幂等**
-            // （[`WindowTable::close`] 对未知 id 是 `Unknown` ⇒ 无动作）。
+            // （[`WindowTable::close`] 对未知 id 是 `Unknown` ⇒ 无动作、也不重复派发
+            //   `window_destroyed` —— 关闭路径已经派发过一次）。
             // 最后一扇窗没了 ⇒ 退出（决策 4 的另一半：「全部窗口关闭 ⇒ 事件循环退出」）。
             WindowEvent::Destroyed => {
-                let _ = self.table.close(id);
+                if matches!(self.table.close(id), CloseOutcome::Closed { .. }) {
+                    self.app.window_destroyed(id);
+                }
                 self.alive.remove(&window_id);
                 if self.table.is_empty() {
                     self.exiting = true;
@@ -1961,6 +2055,113 @@ mod window_input_forwarding_tests {
         assert_eq!(
             app.legacy_inputs, 0,
             "覆盖 window_input 之后 input **不再被调**（转发只在默认实现里）"
+        );
+    }
+
+    /// **T4.4-R3：四个新钩子的默认转发**（`window_init`/`window_resized`/
+    /// `window_redraw`/`window_close_requested`）—— 只实现旧方法的 App（单窗口
+    /// 用户的既有写法）必须原样收到转发，一条不多、一条不少。这是「单窗口零改动」
+    /// 在整条生命周期上的推广（与上面 `window_input` 的转发单测同一套纪律）。
+    #[test]
+    fn new_lifecycle_hooks_forward_to_the_legacy_methods_by_default() {
+        #[derive(Default)]
+        struct LegacyApp {
+            inits: usize,
+            resized: Vec<(u32, u32)>,
+            redraws: usize,
+            closes: usize,
+        }
+        impl App for LegacyApp {
+            fn init(&mut self, _info: &WindowInfo) -> Result<(), String> {
+                self.inits += 1;
+                Ok(())
+            }
+            fn resized(&mut self, width: u32, height: u32) -> Result<(), String> {
+                self.resized.push((width, height));
+                Ok(())
+            }
+            fn redraw(&mut self) -> Result<Flow, String> {
+                self.redraws += 1;
+                Ok(Flow::Continue)
+            }
+            fn close_requested(&mut self) -> Flow {
+                self.closes += 1;
+                Flow::Exit
+            }
+        }
+
+        let mut app = LegacyApp::default();
+        // 每个钩子各调一次（两条不同的 id —— 默认实现不挑窗）。
+        for wid in [WindowId::from_raw(1), WindowId::from_raw(2)] {
+            app.window_init(wid, &info()).expect("window_init 默认转发");
+            app.window_resized(wid, 640, 480).expect("window_resized 默认转发");
+            assert_eq!(app.window_redraw(wid).expect("window_redraw 默认转发"), Flow::Continue);
+            assert_eq!(app.window_close_requested(wid), Flow::Exit, "close 转发不改语义");
+        }
+        assert_eq!(app.inits, 2, "window_init 必须转发进 init（每窗一次）");
+        assert_eq!(app.resized, vec![(640, 480), (640, 480)], "resized 收到原样的物理尺寸");
+        assert_eq!(app.redraws, 2, "window_redraw 必须转发进 redraw");
+        assert_eq!(app.closes, 2, "window_close_requested 必须转发进 close_requested");
+    }
+
+    /// **T4.4-R3：覆盖新钩子之后旧方法不再被调**（与 `window_input`/`input` 同一条
+    /// 「两条路不能同时响」的纪律 —— 不然多窗口 App 会被同一事件打两次）。
+    #[test]
+    fn overriding_the_new_hooks_silences_the_legacy_methods() {
+        struct MultiApp {
+            init_ids: Vec<u64>,
+            redraw_ids: Vec<u64>,
+            legacy_redraws: usize,
+            legacy_inits: usize,
+        }
+        impl App for MultiApp {
+            fn init(&mut self, _info: &WindowInfo) -> Result<(), String> {
+                self.legacy_inits += 1; // 多窗口 App 给它的只是空实现 —— 但也要证明它没被调
+                Ok(())
+            }
+            fn redraw(&mut self) -> Result<Flow, String> {
+                self.legacy_redraws += 1;
+                Ok(Flow::Continue)
+            }
+            fn window_init(
+                &mut self,
+                id: WindowId,
+                _info: &WindowInfo,
+            ) -> Result<(), String> {
+                self.init_ids.push(id.raw());
+                Ok(())
+            }
+            fn window_redraw(&mut self, id: WindowId) -> Result<Flow, String> {
+                self.redraw_ids.push(id.raw());
+                Ok(Flow::Continue)
+            }
+        }
+
+        let mut app = MultiApp {
+            init_ids: Vec::new(),
+            redraw_ids: Vec::new(),
+            legacy_redraws: 0,
+            legacy_inits: 0,
+        };
+        app.window_init(WindowId::from_raw(1), &info()).expect("覆盖者接管 init");
+        assert_eq!(app.window_redraw(WindowId::from_raw(1)).expect("覆盖者接管 redraw"), Flow::Continue);
+        assert_eq!(app.init_ids, vec![1], "覆盖者拿到本层的原始序号");
+        assert_eq!(app.redraw_ids, vec![1], "重绘路由带 id");
+        assert_eq!(app.legacy_inits, 0, "覆盖 window_init 之后 init 不再被调");
+        assert_eq!(app.legacy_redraws, 0, "覆盖 window_redraw 之后 redraw 不再被调");
+    }
+
+    /// **T4.4-R3：`WindowId::raw` 就是构造值**（两层同源映射的根基）：主窗从 1 起、
+    /// 按建窗顺序自增 ⇒ `raw()` 暴露的值必须与 `from_raw` 恒等，且不同窗的值可区分 ——
+    /// 渲染层窗口表拿它当键，键一混就是「串链」。
+    #[test]
+    fn raw_returns_the_constructor_value_and_distinguishes_windows() {
+        assert_eq!(WindowId::from_raw(1).raw(), 1, "主窗 = 1（本层自发序号从 1 起）");
+        assert_eq!(WindowId::from_raw(2).raw(), 2);
+        assert_ne!(
+            WindowId::from_raw(1).raw(),
+            WindowId::from_raw(2).raw(),
+            "两扇窗的原始序号必须可区分（渲染层表键不串的前提）"
         );
     }
 }

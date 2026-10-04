@@ -445,7 +445,8 @@ set "DEER_WINDOW_REDRAW=continuous" && cargo run -q -p deer-window --example <�
 
 详见 `crates/deer-window/src/lib.rs` 的「唤醒面」一节与 `crates/deer-window/examples/wake_probe.rs`
 （配套单测 `crates/deer-window/tests/wake_policy.rs`）。**仍未做**：自定义用户事件类型（对外**只有 `Waker`** 这一个面）、
-跨进程唤醒、多窗口唤醒。
+跨进程唤醒。**多窗口唤醒是 App 级的**（唤醒会让**所有**活窗重画；T4.4 起，见 [`multi-window.md`](multi-window.md)）——
+按窗定向唤醒未做。
   这是**已知限制**，不是判据。
 
 ## 7. 常见坑
@@ -489,7 +490,9 @@ set "DEER_WINDOW_REDRAW=continuous" && cargo run -q -p deer-window --example <�
     （不透明 0、半透明 ≤1 LSB）。窗口里画的是**当前帧的界面快照**：**没有动画/时间系统**（按时间的动画需自行声明
     `Continuous`，见第 6 节）；**滚动容器已有**，但滚动偏移要由应用自己喂进布局（见
     [`scroll-and-multiline.md`](scroll-and-multiline.md)）。
-  - **不支持多窗口、全屏 / 无边框、HDR**，也**没有帧率上限**。
+  - **多窗口**：**已支持**（T4.4，见 [`multi-window.md`](multi-window.md)）—— 动态 spawn、生命周期按窗路由、
+    共享一个 `VkDevice` 的多交换链、关一窗另一窗存活。**本指南描述的是单窗口用法**（该用法不变）；
+    多窗口的 App 组装见那份指南。**仍不支持**全屏 / 无边框、HDR，也**没有帧率上限**。
   - **DPI（AF-3 起，改了旧反述）**：旧说法是「只透传 `Resized` 给的物理像素，DPI 不透传」——
     现在**缩放系数也透传了**：`WindowInfo.scale_factor`（建窗初值，之后同步更新）+
     `InputEvent::ScaleFactorChanged { scale_factor }`（OS 报多少给多少，`f64` 原样）。

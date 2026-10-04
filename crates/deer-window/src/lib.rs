@@ -206,11 +206,20 @@
 //!
 //! | 决策 | 落点 |
 //! |---|---|
-//! | 1 事件签名 | 新增 [`App::window_input`]，**默认实现转发既有 `App::input`** ⇒ 单窗口用户零改动；多窗口用户覆盖它，拿 [`WindowId`] 区分窗 |
+//! | 1 事件签名 | 新增 [`App::window_input`]，**默认实现转发既有 `App::input`** ⇒ 单窗口用户零改动；多窗口用户覆盖它，拿 [`WindowId`] 区分窗。（实现签名比登记文本多一个 `info: &WindowInfo` 参数 —— 默认转发 `App::input` 需要该窗的信息，维护者裁决接受；见 `ROADMAP.md` 设计登记的收口注记） |
 //! | 2 建窗模型 | 主窗仍由 [`run()`] 首建；之后经 [`WindowSpawner`]（`App::window_spawner` 交付，与 [`Waker`] **同一根通道**）`spawn_window(config)` **排队**，在事件循环的安全点（持 `ActiveEventLoop` 的 `user_event` 臂）真正建窗 |
 //! | 3 多配置启动 | [`run_multi`]：每一项各建一扇窗（第一项 = 主窗），与 [`run()`] **同一条代码路径** |
 //! | 4 关闭语义 | `CloseRequested` **只关该窗**（判定收在 [`WindowTable::close`]，可单测）；**全部窗口关闭** ⇒ 事件循环退出 |
 //! | 5 焦点模型 | winit 本就按窗发 `Focused` ⇒ 按 [`WindowId`] 路由，App 收到的 `FocusChanged` 只关于那一扇窗 |
+//!
+//! **T4.4-R3 补齐的生命周期路由**（与 [`App::window_input`] 同一条「默认转发 ⇒ 单窗口
+//! 零改动；覆盖 ⇒ 旧方法不再被调」的纪律，全部**带 id**）：[`App::window_init`]（每窗
+//! 一次，渲染器在这里创建）、[`App::window_resized`]、[`App::window_redraw`]（该窗的
+//! `RedrawRequested` ⇒ 多窗口下一次只画这一扇）、[`App::window_close_requested`]、
+//! [`App::window_destroyed`]（该窗已从活窗表移除，App 在这里释放**这一扇**的渲染资源）。
+//! **两层同源编号（接缝裁决）**：[`WindowId::raw()`] 直传渲染层窗口表
+//! （deer-vk `WindowedRenderer::new_with_primary_id` / `add_window`），映射是恒等式 ——
+//! 禁止靠「0/1 恰好错位对上」的隐式约定。
 //!
 //! ```no_run
 //! use deer_window::{App, Flow, InputEvent, WindowConfig, WindowInfo, WindowId, WindowSpawner, run};
@@ -253,8 +262,9 @@
 //! ```
 //!
 //! **明确不做**（决策 8，登记在案）：跨窗口拖放 · owned/父子窗口 · 窗口间消息传递 ·
-//! 每窗独立 GPU 实例 · 多线程渲染。**R1 也还没做**：渲染侧按窗的资源表（决策 3，R2）、
-//! 每窗一棵树的上层整合与四件套文档（R3）。
+//! 每窗独立 GPU 实例 · 多线程渲染。渲染侧按窗的资源表（决策 3）已在 **R2（deer-vk）**
+//! 落地；每窗一棵树的上层整合、双窗 demo 与四件套已在 **R3（deer-gui）** 落地
+//! （见 `deer-gui` 的 `docs/features/multi-window.md` 与 `dual_window` 示例）。
 //!
 //! **仍未做（别当成已实现）**：自定义用户事件类型（对外**只有** [`Waker`] 与
 //! [`WindowSpawner`] 两个面 —— `Wake` 是私有类型，App 拿不到 `EventLoopProxy::send_event`）、
