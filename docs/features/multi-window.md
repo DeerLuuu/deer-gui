@@ -54,8 +54,11 @@ fn window_redraw(&mut self, id: WindowId) -> Result<Flow, String> {
 | `WindowId::raw() -> u64` | 本层自发序号：主窗 = 1，按建窗顺序自增；**直传渲染层当表键** | — |
 | `WindowSpawner::spawn_window(config)` | **排队**建新窗（决策 2：真正的建窗在事件循环安全点）；句柄经 `App::window_spawner` 交付（主窗 init 之后一次） | — |
 
-**覆盖任意 `window_*` 钩子之后，对应的旧方法（`init`/`redraw`/`input`/`resized`/`close_requested`）
-不再被调用**（转发只发生在默认实现里 —— 两条路不能同时响）。单窗口 App 一行不用改。
+**「默认转发」只适用于有旧方法对应的四个钩子**（`window_init`/`window_redraw`/`window_input`/
+`window_resized`/`window_close_requested` —— 覆盖后对应的旧方法（`init`/`redraw`/`input`/`resized`/
+`close_requested`）不再被调用，转发只发生在默认实现里，两条路不能同时响）；
+**`window_destroyed` 是纯新增钩子**：没有旧方法可转发，默认实现什么都不做（单窗口的收尾本来就随
+事件循环结束一起发生），多窗口 App 覆盖它来释放该窗的渲染资源。单窗口 App 一行不用改。
 
 ### 渲染层（`deer_vk::windowed::WindowedRenderer`，按 `WindowId` 索引的窗口表）
 

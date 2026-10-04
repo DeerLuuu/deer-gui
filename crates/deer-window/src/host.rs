@@ -2164,4 +2164,136 @@ mod window_input_forwarding_tests {
             "两扇窗的原始序号必须可区分（渲染层表键不串的前提）"
         );
     }
+
+    /// **F-49-1：覆盖向补齐（resized / close）**——覆盖 `window_resized` /
+    /// `window_close_requested` 之后，旧入口（`App::resized` / `App::close_requested`）
+    /// 必须**静默不被调**（与 init/redraw/input 的覆盖纪律同一条：两条路不能同时响）。
+    #[test]
+    fn overriding_window_resized_and_close_silences_the_legacy_methods() {
+        struct MultiApp {
+            resized_ids: Vec<(u64, u32, u32)>,
+            close_ids: Vec<u64>,
+            legacy_resized: usize,
+            legacy_closes: usize,
+        }
+        impl App for MultiApp {
+            fn init(&mut self, _info: &WindowInfo) -> Result<(), String> {
+                Ok(())
+            }
+            fn redraw(&mut self) -> Result<Flow, String> {
+                Ok(Flow::Continue)
+            }
+            fn resized(&mut self, _width: u32, _height: u32) -> Result<(), String> {
+                self.legacy_resized += 1;
+                Ok(())
+            }
+            fn close_requested(&mut self) -> Flow {
+                self.legacy_closes += 1;
+                Flow::Exit
+            }
+            fn window_resized(&mut self, id: WindowId, width: u32, height: u32) -> Result<(), String> {
+                self.resized_ids.push((id.raw(), width, height));
+                Ok(())
+            }
+            fn window_close_requested(&mut self, id: WindowId) -> Flow {
+                self.close_ids.push(id.raw());
+                Flow::Exit
+            }
+        }
+
+        let mut app = MultiApp {
+            resized_ids: Vec::new(),
+            close_ids: Vec::new(),
+            legacy_resized: 0,
+            legacy_closes: 0,
+        };
+        app.window_resized(WindowId::from_raw(1), 800, 600)
+            .expect("覆盖者接管 resize");
+        assert_eq!(app.window_close_requested(WindowId::from_raw(1)), Flow::Exit);
+        assert_eq!(
+            app.resized_ids,
+            vec![(1, 800, 600)],
+            "覆盖者拿到该窗的 id 与原样透传的物理尺寸"
+        );
+        assert_eq!(app.close_ids, vec![1], "覆盖者拿到**该窗**的 id");
+        assert_eq!(
+            app.legacy_resized, 0,
+            "覆盖 window_resized 之后 resized **不再被调**"
+        );
+        assert_eq!(
+            app.legacy_closes, 0,
+            "覆盖 window_close_requested 之后 close_requested **不再被调**"
+        );
+    }
+
+    /// **F-49-1：`window_destroyed` 覆盖向**——覆盖者必须拿到**被移除那扇窗**的 id
+    /// （宿主在活窗表移除后调一次；幂等性由表保证 ⇒ 同一窗至多一次）。
+    #[test]
+    fn overridden_window_destroyed_receives_the_window_id() {
+        struct MultiApp {
+            destroyed: Vec<u64>,
+        }
+        impl App for MultiApp {
+            fn init(&mut self, _info: &WindowInfo) -> Result<(), String> {
+                Ok(())
+            }
+            fn redraw(&mut self) -> Result<Flow, String> {
+                Ok(Flow::Continue)
+            }
+            fn window_destroyed(&mut self, id: WindowId) {
+                self.destroyed.push(id.raw());
+            }
+        }
+
+        let mut app = MultiApp { destroyed: Vec::new() };
+        app.window_destroyed(WindowId::from_raw(2));
+        app.window_destroyed(WindowId::from_raw(1));
+        assert_eq!(
+            app.destroyed,
+            vec![2, 1],
+            "覆盖者按调用顺序收到每一扇被移除窗的 id（释放该窗渲染资源的钥匙）"
+        );
+    }
+
+    /// **F-49-1：`window_destroyed` 默认方向**——它是**纯新增钩子**：没有旧方法可转发，
+    /// 默认实现什么都不做（不转发 `close_requested`/`resized` 等，也不 panic）。
+    /// 断言形态：只实现旧方法的 App 调它 ⇒ **所有旧计数纹丝不动**（「不转发」的可观察化）。
+    #[test]
+    fn default_window_destroyed_is_a_pure_noop_not_a_forward() {
+        #[derive(Default)]
+        struct LegacyApp {
+            inits: usize,
+            resized: usize,
+            redraws: usize,
+            closes: usize,
+        }
+        impl App for LegacyApp {
+            fn init(&mut self, _info: &WindowInfo) -> Result<(), String> {
+                self.inits += 1;
+                Ok(())
+            }
+            fn resized(&mut self, _width: u32, _height: u32) -> Result<(), String> {
+                self.resized += 1;
+                Ok(())
+            }
+            fn redraw(&mut self) -> Result<Flow, String> {
+                self.redraws += 1;
+                Ok(Flow::Continue)
+            }
+            fn close_requested(&mut self) -> Flow {
+                self.closes += 1;
+                Flow::Exit
+            }
+        }
+
+        let mut app = LegacyApp::default();
+        // 未覆盖 `window_destroyed` ⇒ 走默认 no-op：调用安全、任何旧方法都不被碰。
+        app.window_destroyed(WindowId::from_raw(1));
+        app.window_destroyed(WindowId::from_raw(2));
+        assert_eq!(
+            (app.inits, app.resized, app.redraws, app.closes),
+            (0, 0, 0, 0),
+            "默认 window_destroyed 不得转发给任何旧方法（它是纯新增钩子，不是转发的第五个）"
+        );
+    }
 }

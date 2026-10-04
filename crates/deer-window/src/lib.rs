@@ -212,11 +212,13 @@
 //! | 4 关闭语义 | `CloseRequested` **只关该窗**（判定收在 [`WindowTable::close`]，可单测）；**全部窗口关闭** ⇒ 事件循环退出 |
 //! | 5 焦点模型 | winit 本就按窗发 `Focused` ⇒ 按 [`WindowId`] 路由，App 收到的 `FocusChanged` 只关于那一扇窗 |
 //!
-//! **T4.4-R3 补齐的生命周期路由**（与 [`App::window_input`] 同一条「默认转发 ⇒ 单窗口
-//! 零改动；覆盖 ⇒ 旧方法不再被调」的纪律，全部**带 id**）：[`App::window_init`]（每窗
+//! **T4.4-R3 补齐的生命周期路由**（全部**带 id**；`window_destroyed` 之外的同一条
+//! 「默认转发 ⇒ 单窗口零改动；覆盖 ⇒ 旧方法不再被调」纪律）：[`App::window_init`]（每窗
 //! 一次，渲染器在这里创建）、[`App::window_resized`]、[`App::window_redraw`]（该窗的
-//! `RedrawRequested` ⇒ 多窗口下一次只画这一扇）、[`App::window_close_requested`]、
-//! [`App::window_destroyed`]（该窗已从活窗表移除，App 在这里释放**这一扇**的渲染资源）。
+//! `RedrawRequested` ⇒ 多窗口下一次只画这一扇）、[`App::window_close_requested`] ——
+//! 这四个默认转发各自的旧方法；**[`App::window_destroyed`] 是纯新增钩子**（没有旧方法
+//! 可转发，默认实现什么都不做，单窗口的收尾本来就随事件循环结束一起发生），App 在这里
+//! 释放**这一扇**的渲染资源。
 //! **两层同源编号（接缝裁决）**：[`WindowId::raw()`] 直传渲染层窗口表
 //! （deer-vk `WindowedRenderer::new_with_primary_id` / `add_window`），映射是恒等式 ——
 //! 禁止靠「0/1 恰好错位对上」的隐式约定。

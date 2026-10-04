@@ -1697,6 +1697,10 @@ impl WindowedRenderer {
     /// 返回「表里**确实有**这条链吗」：`Ok(false)` = 本来就不在（幂等）。
     /// **允许移除主窗**：移除后既有单窗口 API 会明确报错（诊断读数回退为 0 ——
     /// 表的真实状态用 [`Self::window_count`] / [`Self::contains_window`] 观察）。
+    ///
+    /// 自动化判据：`swapchain_smoke.rs::validation_layer_pins_the_two_drain_fixes`
+    /// 修复点①（删掉本处的排空 ⇒ 校验消息 +N ⇒ 测试红，已实测；红的时候进程还会以
+    /// `STATUS_ACCESS_VIOLATION` 收尾 —— 销毁竞态的后果比消息更重）。
     pub fn remove_window(&mut self, id: WindowId) -> GpuResult<bool> {
         if !self.chains.contains_key(&id) {
             return Ok(false);
@@ -2492,6 +2496,8 @@ impl WindowedRenderer {
             // prepare 发生在**本帧栅栏等待之前**，而上一帧（本窗或其它窗的）提交可能仍在飞、
             // 其命令缓冲还引用着旧缓冲。单窗口时代这条路径不可达（语料尺寸稳定 ⇒ 只在首帧增长、
             // 没有在飞前驱），多窗 + 内容变化的 demo 第一次把它踩出来。
+            // 自动化判据：`swapchain_smoke.rs::validation_layer_pins_the_two_drain_fixes`
+            // 修复点②（删掉本守卫 ⇒ 校验消息 +1 ⇒ 测试红，已实测）。
             if buffers
                 .vb
                 .as_ref()

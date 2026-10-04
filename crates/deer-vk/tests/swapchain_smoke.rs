@@ -553,6 +553,25 @@ fn windowed_chain_end_to_end() {
     }
 }
 
+/// **真窗口测试的进程级串行锁**（T4.4 评审期实测，不是猜的）：
+/// 三个真窗判据（`windowed_chain_end_to_end` / `two_windows_share_one_device…` /
+/// `validation_layer_pins_the_two_drain_fixes`）在 cargo test 的线程池里**并行**跑时，
+/// 驱动（本机 Intel）会偶发 `vkCreateSwapchainKHR → VK_ERROR_INITIALIZATION_FAILED`
+/// —— 多路 WSI 同时建链是驱动的薄弱点。锁住「建窗 → 建链 → 画帧 → 收尾」全程，
+/// 一次只让一个真窗判据碰驱动 ⇒ 竞态消失（连续复跑验证）。
+/// 残余边界（如实说明）：dtor 探针是**子进程**，跨进程不经这把锁 —— 它只建一扇窗、
+/// 生命周期极短，历史上也未与在程测试撞过；若哪天真撞，升级成命名互斥体再议。
+#[cfg(windows)]
+static REAL_WINDOW_TESTS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 拿真窗串行锁（容忍 poison：前一个判据崩了不该连坐后面的判据）。
+#[cfg(windows)]
+fn real_window_lock() -> std::sync::MutexGuard<'static, ()> {
+    REAL_WINDOW_TESTS_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 #[cfg(windows)]
 fn run_windowed_e2e() {
     use std::time::Instant;
@@ -564,6 +583,8 @@ fn run_windowed_e2e() {
         eprintln!("跳过：本机 Vulkan 不提供 VK_KHR_surface / VK_KHR_win32_surface");
         return;
     }
+    // 真窗判据串行（见 REAL_WINDOW_TESTS_LOCK 的说明）
+    let _serial = real_window_lock();
 
     // 数值门槛也要先 `trim()`：`cmd /c "set DEER_WINDOW_ADAPTER=1 && …"` 的值是 `"1 "`，
     // 不带 `trim` 时 `parse()` 失败 ⇒ **静默退回适配器 0**（以为在测指定 GPU、实际测的是另一块）。
@@ -1108,6 +1129,9 @@ fn run_two_window_multi_swapchain() {
     use deer_core::{ DrawCmd, DrawList, RectI };
     use std::time::Instant;
 
+    // 真窗判据串行（见 REAL_WINDOW_TESTS_LOCK 的说明）
+    let _serial = real_window_lock();
+
     // 本机没有 Vulkan / 没有 WSI 扩展 ⇒ 如实跳过（不伪装通过）
     if !ffi::Instance::extension_available(surface::SURFACE_EXTENSION)
         || !ffi::Instance::extension_available(surface::WIN32_SURFACE_EXTENSION)
@@ -1368,6 +1392,186 @@ fn run_two_window_multi_swapchain() {
     drop(win_a);
     drop(win_b);
     println!("T4.4-R2 多交换链判据全部通过 ✅");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 5c. 真窗口：**两个「排空」根因修复的自动化判据**（F-48-1 / F-49-2；默认跳过，同一门槛）
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// **两个「排空」修复点的「改坏必红」判据**（评审 F-48-1/F-49-2；按 stacked 惯例落在 r3 分支）。
+///
+/// 钉住的两个修复点（都在 `windowed.rs`，实测由校验层抓出的真缺陷）：
+///
+/// ① **`remove_window` 的排空顺序**：先 `vkDeviceWaitIdle` 再整链析构。判据形态：
+///    窗 2 呈现一帧（提交**在飞**）后**立即** `remove_window` ⇒ 断言校验消息计数不增。
+///    改坏（删掉排空）⇒ destroy 与在飞提交竞态 ⇒ `vkDestroySemaphore/SwapchainKHR in use`
+///    （双窗 demo 首跑的实测形态）⇒ 本测试红。
+///
+/// ② **界面缓冲容量增长前排空**：prepare 阶段（本帧栅栏等待**之前**）触发的旧缓冲销毁。
+///    判据形态：窗 1 先画一份极小语料（vb 初始容量 4 KiB），**紧接着**画一份超容量语料
+///    ⇒ 旧缓冲销毁 + 新建 ⇒ 断言计数不增。改坏（删掉增长前排空）⇒
+///    `vkDestroyBuffer in use by VkCommandBuffer`（点击改内容触发了重分配的实测形态）⇒ 本测试红。
+///
+/// 断言口径：[`deer_vk::ffi::validation_message_count`]（**按线程**）的窗口差值 == 0 ——
+/// 与 `gpu_vs_cpu.rs::assert_no_validation_messages` 同一套（不含并行测试的干扰）。
+///
+/// **门槛**：真窗（`DEER_VK_WINDOW_TESTS=1`）**且校验层**（`DEER_VK_VALIDATION=1`）——
+/// 没有校验层时「改坏」不会产生任何消息，判据空转 ⇒ 未设校验层时明确打印
+/// 「这不是通过，是被显式跳过」。
+#[test]
+fn validation_layer_pins_the_two_drain_fixes() {
+    if !window_tests_enabled() {
+        eprintln!("跳过：需要真实窗口（设 DEER_VK_WINDOW_TESTS=1 启用）");
+        return;
+    }
+    if !ffi::env_flag("DEER_VK_VALIDATION") {
+        eprintln!(
+            "跳过：**这不是通过，是被显式跳过** —— 本判据钉的是「改坏 ⇒ 校验消息 > 0」，\
+             没有校验层（DEER_VK_VALIDATION=1）时改坏也不会产生消息"
+        );
+        return;
+    }
+    #[cfg(windows)]
+    {
+        run_validation_pins_drain_fixes();
+    }
+    #[cfg(not(windows))]
+    {
+        eprintln!("跳过：真窗口端到端验证目前只在 Windows 上实现（surface.rs 也只实现了 Windows）");
+    }
+}
+
+#[cfg(windows)]
+fn run_validation_pins_drain_fixes() {
+    use deer_core::{ DrawCmd, DrawList, RectI };
+
+    // 真窗判据串行（见 REAL_WINDOW_TESTS_LOCK 的说明）
+    let _serial = real_window_lock();
+
+    // 本机没有 Vulkan / 没有 WSI 扩展 ⇒ 如实跳过（不伪装通过）
+    if !ffi::Instance::extension_available(surface::SURFACE_EXTENSION)
+        || !ffi::Instance::extension_available(surface::WIN32_SURFACE_EXTENSION)
+    {
+        eprintln!("跳过：本机 Vulkan 不提供 VK_KHR_surface / VK_KHR_win32_surface");
+        return;
+    }
+    let adapter: usize = std::env::var("DEER_WINDOW_ADAPTER")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+
+    // 类名与 `run_windowed_e2e` / 双窗判据一致（类注册是进程级 Once，见那边的 ⚠️ 注记）
+    let win_a = Win32TestWindow::create("deer-vk-swapchain-smoke", 480, 360)
+        .expect("建测试窗口 A 失败");
+    let win_b = Win32TestWindow::create("deer-vk-swapchain-smoke", 520, 400)
+        .expect("建测试窗口 B 失败");
+    let raw_a = RawWindowHandle {
+        platform: Platform::Windows,
+        handle: win_a.hwnd as usize,
+        display: win_a.hinstance as usize,
+    };
+    let raw_b = RawWindowHandle {
+        platform: Platform::Windows,
+        handle: win_b.hwnd as usize,
+        display: win_b.hinstance as usize,
+    };
+
+    let mut r = match WindowedRenderer::new(
+        adapter,
+        raw_a,
+        Extent { width: 480, height: 360 },
+        Color::rgb(CLEAR_R, CLEAR_G, CLEAR_B),
+    ) {
+        Ok(r) => r,
+        Err(GpuError::Unsupported(msg)) => {
+            eprintln!("跳过：本机这个适配器无法在此窗口上呈现（{msg}）");
+            return;
+        }
+        Err(e) => panic!("创建主窗渲染器失败（adapter={adapter}）：{e}"),
+    };
+    const SECOND: WindowId = 7;
+    r.add_window(
+        SECOND,
+        raw_b,
+        Extent { width: 520, height: 400 },
+        Color::rgb(0x24, 0x10, 0x14),
+    )
+    .expect("第二窗入表失败");
+
+    /// 极小语料（1 个矩形 ⇒ 6 顶点 ⇒ 初始 4 KiB 容量装得下）。
+    fn tiny_list() -> DrawList {
+        let mut l = DrawList::new();
+        l.push(DrawCmd::FillRect {
+            rect: RectI::new(8, 8, 32, 24),
+            color: Color::WHITE,
+        });
+        l
+    }
+    /// **超容量**语料（300 个矩形 ⇒ 1800 顶点 × 52 B ≈ 93.6 KiB > 4 KiB ⇒ 必然触发
+    /// 顶点/索引缓冲的容量增长 —— 修复点 ② 的场景）。矩形全部落在窗内 ⇒ 不被裁剪掉。
+    fn huge_list() -> DrawList {
+        let mut l = DrawList::new();
+        for i in 0..300u32 {
+            l.push(DrawCmd::FillRect {
+                rect: RectI::new((i % 30) as i32 * 15, (i / 30) as i32 * 12, 10, 8),
+                color: Color::rgb(30, 40, 200),
+            });
+        }
+        l
+    }
+    fn present(r: &mut WindowedRenderer, id: WindowId, list: &DrawList) {
+        match r.draw_and_present_window(id, list, None) {
+            Ok(FrameOutcome::Presented) => {}
+            Ok(FrameOutcome::OutOfDate) => {
+                let cur = r.extent_of(id).expect("extent");
+                r.resize_window(id, cur).expect("过期后重建该窗交换链");
+            }
+            Err(e) => panic!("呈现失败（id={id}）：{e}"),
+        }
+    }
+
+    // ── 修复点 ①（F-49-2）：remove_window 的排空顺序 ──────────────────────
+    // 窗 2 呈现一帧 ⇒ 提交在飞 ⇒ **立即**移除（修复 = 先 wait_idle 再析构）。
+    let before = ffi::validation_message_count();
+    present(&mut r, SECOND, &tiny_list());
+    let removed = r.remove_window(SECOND).expect("remove_window 失败");
+    assert!(removed, "前置：被移除的链必须在表上");
+    // 排空一次，让校验层对「非法销毁」的任何滞后报告也落进本窗口差值里
+    r.wait_idle().expect("wait_idle 失败");
+    let after_remove = ffi::validation_message_count();
+    assert_eq!(
+        after_remove, before,
+        "修复点①被改坏：remove_window 在提交仍在飞时析构了窗 2 的链 \
+         （先排空再销毁的顺序被删？）⇒ 校验层报 {} 条消息（vkDestroySemaphore/SwapchainKHR in use）",
+        after_remove - before
+    );
+    println!(
+        "修复点①（remove_window 排空顺序）✅ 在飞提交下整链移除，校验消息 {before} → {after_remove}（要求不增）"
+    );
+
+    // ── 修复点 ②（F-48-1）：界面缓冲容量增长前排空 ──────────────────────
+    // 窗 1 先画极小语料（vb 初始 4 KiB），**紧接着**画超容量语料 ⇒ 旧缓冲销毁。
+    present(&mut r, PRIMARY_WINDOW_ID, &tiny_list());
+    let before_growth = ffi::validation_message_count();
+    present(&mut r, PRIMARY_WINDOW_ID, &huge_list());
+    // 前一帧（极小语料）的提交此刻大概率仍在飞（FRAMES_IN_FLIGHT=2，本帧走另一槽不等待）
+    // ⇒ 修复在场（增长前排空）⇒ 旧缓冲销毁时队列已排空 ⇒ 零消息。
+    let after_growth = ffi::validation_message_count();
+    assert_eq!(
+        after_growth, before_growth,
+        "修复点②被改坏：容量增长销毁旧缓冲时上一帧命令缓冲仍在飞 \
+         （增长前排空的守卫被删？）⇒ 校验层报 {} 条消息（vkDestroyBuffer in use by VkCommandBuffer）",
+        after_growth - before_growth
+    );
+    println!(
+        "修复点②（缓冲容量增长前排空）✅ 极小语料 → 超容量语料触发重分配，校验消息 {before_growth} → {after_growth}（要求不增）"
+    );
+
+    r.wait_idle().expect("收尾 wait_idle");
+    drop(r);
+    drop(win_a);
+    drop(win_b);
+    println!("T4.4 两个「排空」修复点的自动化判据全部通过 ✅（落实评审 F-48-1/F-49-2）");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
