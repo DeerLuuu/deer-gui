@@ -12,7 +12,7 @@
 | **M2** | Vulkan 逻辑设备 + 交换链 | M2a：逻辑设备/管线/命令/离屏回读；M2b：窗口 + `VkSurfaceKHR` + 交换链 + 帧同步 + 呈现 | ✅ **完成（M2a + M2b）** |
 | **M3** | 渲染器 + 管线（矩形/圆角/裁剪/文本） | M3a：形状的 `DrawList` → GPU（顶点缓冲 + 静态管线 + 与 CPU 逐像素对照）；M3b：文本/字形 → GPU（第二条管线 + 图集纹理 + 逐像素对照）；M3c：把界面**呈到窗口**（共用管线层 + 线性交换链 + 上屏 parity）；M3+：批处理（**统一管线（形状 + 文本 → 一条管线）+ 跨帧复用缓冲已落地**） | 🔄 **进行中（M3a + M3b + M3c 完成；M3+ 批处理部分完成）** |
 | **M4** | 文本 | 字体解析（TTF/OTF）+ 字形光栅化 + 图集 + 文本度量（替换 `ApproxMeasure`）+ 换行 | 🔄 **进行中（解析 / 光栅化 / 图集 / 度量与换行 / CPU 真实字形 ✅；hinting 与亚像素待做）** |
-| **M5** | 输入 + 焦点 + dock | **已落地**：输入事件通路（`InputEvent` + winit 映射 + `App::input`）、命中与状态机（`hit`/`handle`/`ClipSnapshot`，含裁剪与禁用感知）、点击 / `Tab` / `Shift+Tab` / `Escape` 焦点、文本输入（追加 + `Backspace` 按 Unicode 字符删末尾）、脚本化事件重放；**M5b：事件驱动重绘（默认省电）** —— `ControlFlow::Wait` + `App::wants_redraw()` + `RedrawPolicy`（默认 `OnDemand`），可用 `DEER_WINDOW_REDRAW=continuous` 关掉省电（见 [`docs/features/window.md`](docs/features/window.md) 第 6 节）。**仍未做**：**dock**、多窗口、上下文菜单本体与中键语义（M6+）（**输入地基已全部落地**：滚轮垂直滚动、可视滚动条 + 拖滑块 + 点轨道跳转 + 惯性两行接线（T3.2/T3.2b）、IME 预编辑（T3.4）、`texts` 光标 + 光标渲染（T3.5/T3.8）、方向键上下导航（T3.1）、按键滚动（T3.2 收尾）、右键透传（T3.3）、按键重复（T3.6）、**指针捕获（T3.7，按下即捕获 —— D7；A 线收官）**） | 🔄 **部分完成（见 [`docs/features/input.md`](docs/features/input.md) 第 6 节）** |
+| **M5** | 输入 + 焦点 + dock | **已落地**：输入事件通路（`InputEvent` + winit 映射 + `App::input`）、命中与状态机（`hit`/`handle`/`ClipSnapshot`，含裁剪与禁用感知）、点击 / `Tab` / `Shift+Tab` / `Escape` 焦点、文本输入（追加 + `Backspace` 按 Unicode 字符删末尾）、脚本化事件重放；**M5b：事件驱动重绘（默认省电）** —— `ControlFlow::Wait` + `App::wants_redraw()` + `RedrawPolicy`（默认 `OnDemand`），可用 `DEER_WINDOW_REDRAW=continuous` 关掉省电（见 [`docs/features/window.md`](docs/features/window.md) 第 6 节）；**多窗口已落地（T4.4，R1/R2/R3）**：动态 spawn、生命周期按窗路由、共享 VkDevice 的多交换链、关一窗另一窗存活（见 [`docs/features/multi-window.md`](docs/features/multi-window.md)）。**仍未做**：**dock**、上下文菜单本体与中键语义（M6+）（**输入地基已全部落地**：滚轮垂直滚动、可视滚动条 + 拖滑块 + 点轨道跳转 + 惯性两行接线（T3.2/T3.2b）、IME 预编辑（T3.4）、`texts` 光标 + 光标渲染（T3.5/T3.8）、方向键上下导航（T3.1）、按键滚动（T3.2 收尾）、右键透传（T3.3）、按键重复（T3.6）、**指针捕获（T3.7，按下即捕获 —— D7；A 线收官）**） | 🔄 **部分完成（见 [`docs/features/input.md`](docs/features/input.md) 第 6 节）** |
 | **M6** | 控件族 | 从 `deer-ui` 迁移 12 个控件的**语义**：`Btn`/`ChipGroup`/`Segmented`/`TabBar`/`Switch`/`NumberField`/`ScrubNum`/`ColorField`/`Dialog`/`Overlay`/`DropMenu`/`HoverTip`/`Icon`/`Row`/`RowActions`/`Keep` | ⬜ |
 | **M7** | DX12 / Metal 后端 | 各自实现 HAL trait；用 `deer-gpu` 的 CPU 参考后端做像素级对照 | ⬜ |
 
@@ -81,7 +81,7 @@ M3 原写成一条「渲染器 + 管线（矩形/圆角/裁剪/文本）」。�
 （`ui_index_barrier_count()` / `ui_indirect_barrier_count()`），与顶点那条**同一套三条判据**
 （首帧各 +1 / 同语料不增 / 空帧不增），实测 `(0,0,0) → (1,1,1) → (1,1,1) → (1,1,1)`；
 **双向变异均已实测变红**（只删 index 自增 ⇒ `(1,0,1)` 红 / 只删 indirect 自增 ⇒ `(1,1,0)` 红 /
-删掉 index 整个发射块 ⇒ 红）。**仍未做**：「每进程只支持一个窗口」的测试基建限制（方案 (b)）未修。详见 [`docs/features/window.md`](docs/features/window.md) 第 7 节的边界条目。 |
+删掉 index 整个发射块 ⇒ 红）。**T4.4 已收口**：「每进程只支持一个窗口」的测试基建限制（方案 (b)）**已修** —— 多交换链 + `WindowedRenderer` 窗口表 + 双窗整合（R1/R2/R3，见「设计登记：多窗口（T4.4）」的收口记录），双窗 parity 与关闭语义均有真窗判据（`dual_window` / `two_windows_share_one_device_and_do_not_cross_talk`）。窗口侧的历史边界条目详见 [`docs/features/window.md`](docs/features/window.md) 第 7 节。 |
 
 **M3 的不可回退前提**（细节见 [`docs/features/gpu-geometry.md`](docs/features/gpu-geometry.md) 第 3 节）：
 
@@ -420,7 +420,7 @@ deer-gui  → 全部
 
 | # | 决策点 | 裁定 |
 |---|---|---|
-| 1 | App 事件签名 | **新增 `App::window_input(id: WindowId, event: &InputEvent)`，默认实现转发既有 `App::input`** —— 单窗口用户零改动、公开 API 非破坏；多窗口用户覆盖新方法 |
+| 1 | App 事件签名 | **新增 `App::window_input(id: WindowId, info: &WindowInfo, event: &InputEvent)`，默认实现转发既有 `App::input`** —— 单窗口用户零改动、公开 API 非破坏；多窗口用户覆盖新方法。**收口注记（T4.4-R3，维护者裁决接受）**：实现签名较本登记文本多一个 `info: &WindowInfo` 参数 —— 默认转发 `App::input` 需要该窗自己的信息（尺寸/句柄），缺了它「单窗口零改动」写不出来；以实现为准 |
 | 2 | 建窗模型 | **直接做动态 spawn**：`WindowSpawner` 句柄（`App` 经与 `Waker` 同型的通道获取），`spawn_window(config)` 把请求**排队到事件循环**，在安全点借 `ActiveEventLoop` 真正建窗（winit 0.30 约束）；主窗仍由 `run()` 首建 |
 | 3 | 渲染归属 | **Godot 同款**：共享一个 VkDevice（`RenderingDevice` 单例式），按 `WindowId` 索引各自的 surface/swapchain/帧资源；字形图集 / TextEngine / 纹理**全局共享一份** |
 | 4 | 关闭语义 | `CloseRequested` 只关该窗；**全部窗口关闭** ⇒ 事件循环退出 |
@@ -430,11 +430,16 @@ deer-gui  → 全部
 | 8 | 明确不做（登记） | 跨窗口拖放（DnD）· owned/父子窗口 · 窗口间消息传递 · 每窗独立 GPU 实例 · 多线程渲染 |
 
 **交付切分（三步三 PR，按 §7）**：
-- **R1**：deer-window —— `WindowId` 事件路由 + `WindowSpawner` 排队建窗 + 多 `WindowConfig` 启动（纯窗口层，路由可单测）；
-- **R2**：deer-vk —— 多交换链（Device 级表）+ `WindowedRenderer` 按 WindowId 表化；
+
+- **R1**：deer-window —— `WindowId` 事件路由 + `WindowSpawner` 排队建窗 + 多 `WindowConfig` 启动（纯窗口层，路由可单测）。
+  ✅ 完成（PR #46，base master，未合并）：`host.rs`（`WindowId`/`window_input`/`WindowSpawner`/`run_multi`/关闭语义/每窗焦点/`WindowTable` 纯逻辑 + 5 单测）与 `lib.rs`（导出 + 文档节）。
+- **R2**：deer-vk —— 多交换链（Device 级表）+ `WindowedRenderer` 按 WindowId 表化。
+  ✅ 完成（PR #48，base feat/t44-r1-window，未合并）：`WindowChain` 每窗一份 surface/swapchain/帧资源；共享 `UiResources`（图集/描述符集全局一份）；`add_window`/`remove_window`/`*_window(id)`/`*_of(id)`；HAL「只支持一个交换链」解除；真窗测试 `two_windows_share_one_device_and_do_not_cross_talk`。
 - **R3**：整合 —— 双窗 `window_parity` 各自通过 + 双窗 demo + 四件套。
+  ✅ 完成（PR base feat/t44-r2-swapchains，未合并）：`dual_window` 示例（动态 spawn + 双窗各自 parity 逐字节 0 + 真实点击按窗到账 + 关一窗另一窗存活 + 全关退出，门槛档 exit=0 零校验消息）+ 生命周期按窗钩子（`window_init`/`window_redraw`/`window_resized`/`window_close_requested` 默认转发旧方法，`window_destroyed` 纯新增默认 no-op）+ `WindowId::raw()` 同源直传（接缝裁决：两层映射是恒等式，保留键 0 不在表 = 回归判据）+ 本指南四件套。**整合期实测修掉的两个真缺陷**（自动化判据 `swapchain_smoke.rs::validation_layer_pins_the_two_drain_fixes`）：① `remove_window` 曾「先析构后排空」（校验层 `vkDestroySemaphore/SwapchainKHR in use`）⇒ 改为先 `vkDeviceWaitIdle`（R2 侧）；② 顶点缓冲**容量增长**在 prepare 阶段销毁旧缓冲，而上一帧命令缓冲可能仍在飞（校验层 `vkDestroyBuffer in use`，单窗口时代不可达、双窗 + 内容变化第一次踩出）⇒ 增长前排空（R2 侧）。
 
 **验收（R3 出口）**：动态 spawn 第二个窗口 ⇒ 两窗各自渲染、各自收事件、各自 parity；关一窗另一窗存活；最后关窗应用退出。
+✅ **已验收（T4.4-R3）**：`dual_window` 门槛档在 `DEER_VK_WINDOW_TESTS=1 DEER_VK_VALIDATION=1` 下 `exit=0` 且零校验消息 —— 双窗 parity（各自回读 vs CPU 同一列表，不透明逐字节 0）、按窗点击到账（窗 1=1 次、窗 2=1 次）、`remove` 后主窗存活 3+ 帧且回读正确、最后一扇关闭后事件循环退出；单窗口红线 `window_parity` 不回退（0 / ≤1 LSB）。
 
 ### M4 的细步与状态
 

@@ -91,6 +91,12 @@ required-features = ["window"]
 name = "testkit_demo"
 required-features = ["testing"]
 
+# T4.4-R3：双窗整合验收（动态 spawn 第二窗 + 按窗路由 + 双窗 parity + 关一窗另一窗存活）。
+# 窗口路径 ⇒ 必须要 window feature（理由与上面 interactive_form 那段逐字相同）。
+[[example]]
+name = "dual_window"
+required-features = ["window"]
+
 [lib]
 name = "deer_gui"
 path = "src/lib.rs"

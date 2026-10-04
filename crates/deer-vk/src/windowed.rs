@@ -1547,9 +1547,53 @@ impl WindowedRenderer {
     /// → 渲染通道（格式 = 交换链格式）→ 三角形管线（复用 M2a 的 SPIR-V）→ 每帧命令缓冲 + 同步。
     ///
     /// 主窗占用保留键 [`PRIMARY_WINDOW_ID`]；要再开窗口用 [`Self::add_window`]
-    /// （共享同一个设备 —— 决策 3）。
+    /// （共享同一个设备 —— 决策 3）。多窗口整合请改用 [`Self::new_with_primary_id`]
+    /// （让窗口表的键与窗口层的 id **同源**，见它的文档）。
     pub fn new(
         adapter_index: usize,
+        window: RawWindowHandle,
+        want: Extent,
+        clear: Color,
+    ) -> GpuResult<WindowedRenderer> {
+        Self::open_with_primary(adapter_index, PRIMARY_WINDOW_ID, window, want, clear)
+    }
+
+    /// [`Self::new`] 的**同源键**版本（T4.4-R3 接缝裁决）：主窗这条链占用**调用方给的**
+    /// `id`，而不是保留键 [`PRIMARY_WINDOW_ID`]。
+    ///
+    /// ## 为什么需要它（唯一、显式的两层映射）
+    ///
+    /// deer-window（R1）的 `WindowId` 是窗口层自发序号，**主窗 = 1**；而本渲染器
+    /// `new()` 的保留键是 `0`。整合层若把「第 1 扇窗」放进键 `0`、把「第 2 扇」放进
+    /// 键 `2`，就是在靠「0/1 错位恰好对上」的隐式约定 —— 正是接缝评审点名禁止的
+    /// 串链形态。裁决（见 deer-window `WindowId::raw` 的文档）：**窗口层的
+    /// `WindowId::raw()` 值直传本层当表键**，两层共用同一个序号、映射是恒等式：
+    ///
+    /// ```text
+    ///   window_init(id, info)      ⇒  new_with_primary_id(adapter, id.raw(), info.raw, …)   // 第一扇
+    ///   window_init(id, info)      ⇒  add_window(id.raw(), info.raw, …)                    // 之后每扇
+    ///   window_redraw(id)          ⇒  draw_and_present_window(id.raw(), …)
+    ///   window_destroyed(id)       ⇒  remove_window(id.raw())
+    /// ```
+    ///
+    /// `id` 的唯一性由调用方保证（deer-window 的序号天然唯一且不复用）；保留键
+    /// [`PRIMARY_WINDOW_ID`]（0）在本路径下**不被占用**，因此它也成为一条现成的
+    /// 回归判据：同源整合正确的渲染器，`window_ids()` 里**不该**出现 0
+    /// （0 在 = 键错位 = 有链不挂在你以为的窗上）。
+    pub fn new_with_primary_id(
+        adapter_index: usize,
+        id: WindowId,
+        window: RawWindowHandle,
+        want: Extent,
+        clear: Color,
+    ) -> GpuResult<WindowedRenderer> {
+        Self::open_with_primary(adapter_index, id, window, want, clear)
+    }
+
+    /// `new` / `new_with_primary_id` 的公共主体（唯一差别是主窗链占哪个键）。
+    fn open_with_primary(
+        adapter_index: usize,
+        id: WindowId,
         window: RawWindowHandle,
         want: Extent,
         clear: Color,
@@ -1575,7 +1619,7 @@ impl WindowedRenderer {
         let chain = WindowChain::open(&device, surface, want, clear)?;
 
         Ok(WindowedRenderer {
-            chains: BTreeMap::from([(PRIMARY_WINDOW_ID, chain)]),
+            chains: BTreeMap::from([(id, chain)]),
             ui: None,
             device,
             instance,
@@ -1653,6 +1697,10 @@ impl WindowedRenderer {
     /// 返回「表里**确实有**这条链吗」：`Ok(false)` = 本来就不在（幂等）。
     /// **允许移除主窗**：移除后既有单窗口 API 会明确报错（诊断读数回退为 0 ——
     /// 表的真实状态用 [`Self::window_count`] / [`Self::contains_window`] 观察）。
+    ///
+    /// 自动化判据：`swapchain_smoke.rs::validation_layer_pins_the_two_drain_fixes`
+    /// 修复点①（删掉本处的排空 ⇒ 校验消息 +N ⇒ 测试红，已实测；红的时候进程还会以
+    /// `STATUS_ACCESS_VIOLATION` 收尾 —— 销毁竞态的后果比消息更重）。
     pub fn remove_window(&mut self, id: WindowId) -> GpuResult<bool> {
         if !self.chains.contains_key(&id) {
             return Ok(false);
@@ -2442,6 +2490,21 @@ impl WindowedRenderer {
             // ⇒ 这里不能写 `.as_slice()`（那会解析到 `str` 的 unstable 方法）。
             let bytes = std::mem::size_of_val(unified);
             let buffers = &mut chain.buffers;
+            // ⚠️ **容量增长会销毁旧缓冲 ⇒ 销毁前必须排空**（T4.4-R3 的双窗 demo 用
+            // 「点击改内容 ⇒ 触发重分配」实测抓到的真缺陷，校验层报
+            // `vkDestroyBuffer … in use by VkCommandBuffer`，VUID-vkDestroyBuffer-buffer-00922）：
+            // prepare 发生在**本帧栅栏等待之前**，而上一帧（本窗或其它窗的）提交可能仍在飞、
+            // 其命令缓冲还引用着旧缓冲。单窗口时代这条路径不可达（语料尺寸稳定 ⇒ 只在首帧增长、
+            // 没有在飞前驱），多窗 + 内容变化的 demo 第一次把它踩出来。
+            // 自动化判据：`swapchain_smoke.rs::validation_layer_pins_the_two_drain_fixes`
+            // 修复点②（删掉本守卫 ⇒ 校验消息 +1 ⇒ 测试红，已实测）。
+            if buffers
+                .vb
+                .as_ref()
+                .is_some_and(|v| v.capacity < bytes as u64)
+            {
+                dev.wait_idle()?;
+            }
             ensure_ui_vertex_capacity(
                 dev,
                 &mut buffers.vb,
@@ -2476,6 +2539,14 @@ impl WindowedRenderer {
             let vertex_count = unified.len() as u32;
             let buffers = &mut chain.buffers;
 
+            // 与顶点缓冲同一条纪律：容量增长销毁旧缓冲前排空（见上面的注记）。
+            if buffers
+                .index
+                .as_ref()
+                .is_some_and(|v| v.capacity < vertex_count as u64 * 4)
+            {
+                dev.wait_idle()?;
+            }
             let mut index_slot = buffers.index.take();
             ensure_ui_vertex_capacity(
                 dev,
@@ -2501,6 +2572,17 @@ impl WindowedRenderer {
                 chain.ui_index_barrier = true;
             }
 
+            // 间接命令缓冲恒定 20 字节（4096 初值装得下）—— 但为防将来改变大小，
+            // 与前两块同一条纪律：先查容量、增长前排空。
+            if buffers
+                .indirect
+                .as_ref()
+                .is_some_and(|v| {
+                    v.capacity < std::mem::size_of::<DrawIndexedIndirectCommand>() as u64
+                })
+            {
+                dev.wait_idle()?;
+            }
             let mut indirect_slot = buffers.indirect.take();
             ensure_ui_vertex_capacity(
                 dev,
